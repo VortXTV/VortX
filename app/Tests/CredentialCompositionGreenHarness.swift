@@ -919,12 +919,24 @@ struct CredentialCompositionGreenHarness {
             static let shared = MediaServerStore()
             func syncBlob() -> String? { nil }
             func applySyncBlob(_ blob: String) {}
+            struct SyncSettlementReceipt {
+                func matches(source: String, operationID: UUID) -> Bool { false }
+            }
+            enum SyncSettlement { case settled(SyncSettlementReceipt), refused }
+            func applySyncBlobSettled(_ blob: String, operationID: UUID,
+                                      isCurrent: @escaping () -> Bool) -> SyncSettlement { .refused }
         }
 
         final class IPTVPlaylistStore {
             static let shared = IPTVPlaylistStore()
             func syncBlob() -> String? { nil }
             func applySyncBlob(_ blob: String) {}
+            struct SyncSettlementReceipt {
+                func matches(source: String, operationID: UUID) -> Bool { false }
+            }
+            enum SyncSettlement { case settled(SyncSettlementReceipt), refused }
+            func applySyncBlobSettled(_ blob: String, operationID: UUID,
+                                      isCurrent: @escaping () -> Bool) -> SyncSettlement { .refused }
         }
 
         enum SearchHistoryStore {

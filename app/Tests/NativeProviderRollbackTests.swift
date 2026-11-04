@@ -11,6 +11,8 @@ private enum VortXSyncCrypto {
 }
 private enum DiagnosticsLog { static func log(_ category: String, _ message: String) {} }
 @MainActor private final class ProviderHarness {
+    // These existing fixtures do not run a concurrent account-file restore.
+    var accountFileRestoreBusy = false
     var stored: Data
     let capture = CredentialScopeRegistry.Capture(namespace: "synthetic.account")
     let actor = "00000000-0000-0000-0000-000000000001"

@@ -699,14 +699,13 @@ struct iOSSettingsView: View {
                         Label("Add Profile", systemImage: "plus")
                     }
                     .buttonStyle(ChipButtonStyle())
-                    if profiles.profiles.count > 1 {
-                        Button {
-                            profiles.pickedThisLaunch = false   // re-presents the launch picker
-                        } label: {
-                            Label("Switch Profile", systemImage: "person.2.fill")
-                        }
-                        .buttonStyle(ChipButtonStyle())
+                    Button {
+                        profiles.requestPicker()
+                    } label: {
+                        Label("Profiles & Tools", systemImage: "person.2.fill")
                     }
+                    .buttonStyle(ChipButtonStyle())
+                    .disabled(!profiles.canRequestPicker)
                 }
                 .padding(.vertical, 2)
             }
@@ -2372,7 +2371,7 @@ private enum SettingsSearchSection: CaseIterable {
 
     var keywords: [String] {
         switch self {
-        case .profiles: return ["profile", "avatar", "pin", "switch profile", "add profile"]
+        case .profiles: return ["profile", "avatar", "pin", "switch profile", "add profile", "profiles & tools", "backup", "verify", "finish"]
         case .language: return ["app language", "system default", "localization", "translation"]
         case .account: return ["vortx account", "sync", "sign in", "integrations", "stremio", "trakt", "simkl",
                                "import", "metadata", "tmdb", "mdblist", "fanart", "debrid", "real-debrid",

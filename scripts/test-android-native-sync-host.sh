@@ -22,9 +22,12 @@ nice -n 15 ./gradlew :app:testPlayDebugUnitTest \
   --tests com.vortx.android.sync.VortXSyncManagerBackupRevisionTest \
   --tests com.vortx.android.sync.NativeAccountSyncTest \
   --tests com.vortx.android.integrations.NativeProspectiveProviderTest \
+  --tests com.vortx.android.engine.NativeRepositoryMutationJniTest \
   --tests com.vortx.android.engine.NativeOwnerHistoryJniTest \
   --tests com.vortx.android.engine.NativeOwnerHistoryCompatibilityTest \
   --tests com.vortx.android.engine.NativeRawHostPreferencesTest \
+  --tests com.vortx.android.engine.DetachedAccountFileKernelJniTest \
+  --tests com.vortx.android.sync.AccountBackupRepairJniTest \
   --no-daemon --max-workers=1 --no-parallel --no-build-cache --no-configuration-cache --stacktrace
 # Exact methods, not a stale aggregate count. No executed receipt is written before XML validation.
 python3 - <<'PY'
@@ -74,6 +77,26 @@ expected = {
         "absent vault observes qualified legacy fallback without initializing secure storage",
         "complete vault witness rejects same encoded replacement and pending only change",
     },
+    "com.vortx.android.engine.NativeRepositoryMutationJniTest": {
+        "whole series and season use exact isolated inventory and one durable commit",
+        "foreign video malformed inventory and failed bulk commit never mutate playback",
+        "profile switch during inventory lookup cannot mark either profile",
+        "action acknowledgments without a matching watched projection cannot commit",
+        "validated addon replacement keeps order disabled intent and unchanged peers atomically",
+        "invalid failed protected and stale addon replacements preserve original state",
+        "queued visibility action rejects switched and ABA profile before any mutation",
+        "visibility acknowledges full installed list and retained row can turn back on",
+        "queued visibility cannot use a replaced same-scope session or a copied stale row",
+        "mount retirement after provider lookup but before admission never writes either checkpoint",
+        "successful native checkpoint cannot mirror through a replacement same-scope mount",
+        "optional mirror exceptions preserve durable save and removal success",
+        "actual caller cancellation after checkpoint remains cancellation",
+        "fresh provider refusal at actual interceptor opens no socket",
+        "claimed provider call cancels on original manager or credential retirement",
+        "fresh provider redirects and retry-after stay on one prepared call",
+        "canceled provider callback holds the writer until actual drain",
+        "deliberate saves and removals mirror to watchlists after the commit while plain adds never do",
+    },
     "com.vortx.android.engine.NativeOwnerHistoryJniTest": {
         "openForkRequestAndQuiescentCloseUseRealPrivateSessionProtocol",
         "javaVerifierExceptionRejectsAndDoesNotRemainPendingOnThread",
@@ -107,6 +130,12 @@ expected = {
         "preparedAccountRejectionAndLateCallbackNeverPersistOrAccept",
         "preparedAccountCallbackCannotMoveToAnotherThreadOrReusePersistence",
         "preparedAccountRetainsOriginalFileAndAuthorityThroughAdmission",
+    },
+    "com.vortx.android.engine.DetachedAccountFileKernelJniTest": {
+        "actualLegacyImportSeparateReplayAndColdMergeRetainOwnerAndSharedKidsPolicy",
+    },
+    "com.vortx.android.sync.AccountBackupRepairJniTest": {
+        "actualConversionAndSelectedNativeReimportKeepSourceAndParentalPolicy",
     },
     "com.vortx.android.engine.NativeRawHostPreferencesTest": {
         "ordinary edit preserves original import tokens and unknown local metadata",
@@ -155,6 +184,9 @@ jni_required = {
         "generic frozen receipt survives fresh GET while rejected candidate and retired lifetime cannot ACK",
     },
     "com.vortx.android.engine.NativeOwnerHistoryJniTest": set(expected["com.vortx.android.engine.NativeOwnerHistoryJniTest"]),
+    "com.vortx.android.engine.NativeRepositoryMutationJniTest": set(expected["com.vortx.android.engine.NativeRepositoryMutationJniTest"]),
+    "com.vortx.android.engine.DetachedAccountFileKernelJniTest": set(expected["com.vortx.android.engine.DetachedAccountFileKernelJniTest"]),
+    "com.vortx.android.sync.AccountBackupRepairJniTest": set(expected["com.vortx.android.sync.AccountBackupRepairJniTest"]),
 }
 assert all(names <= expected[name] for name, names in jni_required.items())
 files = sorted(root.glob("TEST-*.xml"))

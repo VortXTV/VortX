@@ -31,6 +31,7 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class TvWhosWatchingPickerRouteTest {
     @get:Rule val compose = createComposeRule()
+    private var accountRequests = 0
 
     private val owner = UserProfile(
         id = UserProfile.OWNER_ID,
@@ -44,11 +45,20 @@ class TvWhosWatchingPickerRouteTest {
         compose.setContent {
             VortXTheme {
                 Box(Modifier.width(1280.dp).height(720.dp)) {
-                    TvProfilePicker(gateway, onDone = {})
+                    TvProfilePicker(gateway, onDone = {}, accountControl = com.vortx.android.ui.profilepicker.ProfilePickerAccountControl("Sign in") { accountRequests++ })
                 }
             }
         }
         compose.waitForIdle()
+    }
+
+    @Test fun accountControlBeforeOpeningLockedProfileDoesNotCaptureOrSelectIt() {
+        val gateway = PickerGateway(owner)
+        show(gateway)
+        enter("profile-picker-account")
+        assertEquals(1, accountRequests)
+        assertEquals(0, gateway.selectionAdmissionCaptureCalls)
+        assertTrue(gateway.selectedIDs.isEmpty())
     }
 
     private fun enter(tag: String) {

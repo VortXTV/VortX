@@ -3,6 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/native-watched-swift-inputs.sh
 source scripts/xperience-observation-swift-inputs.sh
+source scripts/native-owner-history-fixture-inputs.sh
 receive_sdk="${VORTX_SYNC_TEST_SDK:?exact accepted macOS static SDK required}"
 receive_library="$receive_sdk/libvortx_ffi.a"
 receive_headers="$receive_sdk/Headers/vortx"
@@ -16,26 +17,38 @@ VORTX_RECEIVE_SOURCE_HEAD=$(git -C "$PWD" rev-parse HEAD)
 receive_inputs=(
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift
     app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}"
-    "${xperience_observation_swift_inputs[@]}"
+    "${xperience_observation_swift_inputs[@]}" app/SourcesShared/VortxNativeOwnerHistoryIngress.swift app/SourcesShared/LegacyWatchOwnership.swift
     app/SourcesShared/VortxNativeOwnAccountProducer.swift app/SourcesShared/AuthenticatedHTTPTransport.swift app/SourcesShared/LinkAuthService.swift
     app/SourcesShared/SyncDocumentRevisionPolicy.swift
-    app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/VortxNativePreviouslyWatched.swift app/SourcesShared/VortxNativeProfiles.swift
+    app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/LibraryGenreFacts.swift app/SourcesShared/VortxNativePreviouslyWatched.swift app/SourcesShared/VortxNativeProfiles.swift
     app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxNativeProviderCredentials.swift app/SourcesShared/VortxProfileOverlayWitness.swift
     app/SourcesShared/CatalogRowResolution.swift app/SourcesShared/VortXSyncCrypto.swift app/SourcesShared/NativeForegroundSyncPolicy.swift app/SourcesShared/SyncBackupUploadFailure.swift
     app/SourcesShared/AddonReorderMove.swift app/SourcesShared/ProfileRosterSyncPolicy.swift app/SourcesShared/PlaybackMutationOwnershipPolicy.swift
     app/SourcesShared/HomeCatalogLoadPolicy.swift app/SourcesShared/TabBarPrefs.swift
     app/SourcesShared/BecauseYouWatchedHistoryPolicy.swift app/SourcesShared/ContinueWatchingPreferences.swift app/SourcesShared/HomeContinueWatchingSelection.swift
-    app/SourcesShared/CredentialRetryCoordinator.swift "$receive_dir/UserProfile.swift" "$receive_dir/Discovery.swift" "$receive_dir/Models.swift" "$receive_dir/CatalogConsumers.swift" "$receive_dir/HomeRails.swift" "$receive_dir/Combined.swift"
+    app/SourcesShared/CredentialRetryCoordinator.swift "$receive_dir/UserProfile.swift" "$receive_dir/Discovery.swift" "$receive_dir/Models.swift" "$receive_dir/CatalogConsumers.swift" "$receive_dir/HomeRails.swift" "$receive_dir/Combined.swift" "$receive_dir/OwnerHistoryFixtureCarriers.swift"
 )
+# The fixture owns its isolated Keychain and registry. Its exact value declarations are extracted.
+for history_source in "${native_owner_history_fixture_swift_inputs[@]}"; do
+    case "$history_source" in
+        app/SourcesShared/Keychain.swift|app/SourcesShared/CredentialScope.swift) continue ;;
+    esac
+    for receive_source in "${receive_inputs[@]}"; do
+        if [[ "$history_source" == "$receive_source" ]]; then continue 2; fi
+    done
+    receive_inputs+=("$history_source")
+done
 receive_conservation_inputs=(
     "$receive_library" "$receive_headers/vortx_ffi.h" "$receive_headers/module.modulemap"
     scripts/test-apple-sync-receive-publication.sh scripts/native-watched-swift-inputs.sh
-    scripts/xperience-observation-swift-inputs.sh test/xperience-harness-inputs.cjs
+    scripts/xperience-observation-swift-inputs.sh scripts/native-owner-history-fixture-inputs.sh test/xperience-harness-inputs.cjs
     test/addon-guarded-presentation-inputs.cjs app/Tests/AppleHistoryFixture.swift test/mpv-bounded-child.mjs
     test/apple-sync-receive-publication.mjs app/Tests/AppleSyncReceivePublicationPeer.swift
-    app/SourcesShared/Profiles.swift app/SourcesShared/CoreBridge.swift app/SourcesShared/VortXSyncManager.swift
+    app/SourcesShared/Profiles.swift app/SourcesShared/CoreBridge.swift app/SourcesShared/VortXSyncManager.swift app/SourcesShared/CredentialScope.swift
     app/SourcesShared/ProfileDiscoveryPreferences.swift app/SourcesShared/CoreModels.swift
     app/SourcesShared/StremioAccount.swift app/SourcesShared/CatalogPreferences.swift app/SourcesShared/HomeRailPreferences.swift
+    app/SourcesShared/TraktHomeNextEpisodeProducer.swift app/SourcesShared/TraktNextEpisodeConsumer.swift
+    app/SourcesShared/TraktPlaybackShadow.swift app/SourcesShared/SIMKLContinueWatching.swift app/SourcesShared/SIMKLContinueWatchingShadow.swift
 )
 for receive_source in "${receive_inputs[@]}"; do
     [[ "$receive_source" != app/SourcesShared/*.swift ]] || receive_conservation_inputs+=("$receive_source")

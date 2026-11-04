@@ -327,6 +327,8 @@ final class KeychainFailureClosedStore: @unchecked Sendable {
 
     @discardableResult
     func set(_ value: String?, for account: String) -> CredentialMutationResult {
+        let operation = beginObservedMutation(account)
+        defer { endObservedMutation(account, operation: operation) }
         // Preserve ordinary setter intent ordering: a newer set retires an older writer before legacy
         // cleanup, while cleanup itself remains outside every lock. The file transaction is acquired only
         // around the durable marker/backend sequence. A busy transaction returns failure without entering
@@ -353,6 +355,133 @@ final class KeychainFailureClosedStore: @unchecked Sendable {
         }
     }
 
+    /// Opaque process/API observation. Only this store can mint one from a certified backend read.
+    /// It authorizes no cross-process/OS CAS: other API writers retire it through this instance's
+    /// generation; uncoordinated backend writers are detected by exact bytes where observable.
+    struct ConfirmedRead: Sendable {
+        fileprivate let storeIdentity: UUID
+        fileprivate let account: String
+        fileprivate let generation: UInt64
+        let result: ReadResult
+        fileprivate init(storeIdentity: UUID, account: String, generation: UInt64, result: ReadResult) {
+            self.storeIdentity = storeIdentity; self.account = account
+            self.generation = generation; self.result = result
+        }
+    }
+    private let confirmedReadIdentity = UUID()
+    // Track actual original-slot mutation lifetimes, including reservation/legacy cleanup,
+    // transaction refusal and every early return. This is process state, never a credential key.
+    // Legacy setters/replacers keep their existing ordering; witnessed reads refuse their pending
+    // authority rather than minting from a reserved-but-not-yet-durable generation.
+    private var inFlightMutations: [String: Set<UUID>] = [:]
+    private func beginObservedMutation(_ account: String) -> UUID {
+        let operation = UUID()
+        lock.lock(); inFlightMutations[account, default: []].insert(operation); lock.unlock()
+        return operation
+    }
+    private func endObservedMutation(_ account: String, operation: UUID) {
+        lock.lock()
+        inFlightMutations[account]?.remove(operation)
+        if inFlightMutations[account]?.isEmpty == true { inFlightMutations.removeValue(forKey: account) }
+        lock.unlock()
+    }
+    private func mutationObservationMatches(_ account: String, generation: UInt64, exclusive operation: UUID? = nil) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard generations[account, default: 0] == generation else { return false }
+        if let operation { return inFlightMutations[account] == Set([operation]) }
+        return inFlightMutations[account]?.isEmpty != false
+    }
+
+    /// Carry the actual planning read's generation to its eventual CAS. Cleanup is outside locks;
+    /// marker/backend reads are serialized with same-slot writes and owner/generation checked on
+    /// both sides. A retired read, marker or unavailable backend produces no usable capability.
+    func confirmedRead(_ account: String, isCurrentOwner: () -> Bool) -> ConfirmedRead? {
+        guard isCurrentOwner() else { return nil }
+        lock.lock()
+        guard inFlightMutations[account]?.isEmpty != false else { lock.unlock(); return nil }
+        let generation = generations[account, default: 0]
+        let needSweep = !didSweepLegacy; didSweepLegacy = true
+        if accountLocks[account] == nil { accountLocks[account] = NSLock() }
+        let accountLock = accountLocks[account]!
+        lock.unlock()
+        purgeLegacySlots(for: account, fullSweep: needSweep)
+        guard isCurrentOwner(), mutationObservationMatches(account, generation: generation),
+              accountLock.try() else { return nil }
+        defer { accountLock.unlock() }
+        guard isCurrentOwner(), mutationObservationMatches(account, generation: generation),
+              invalidationState(for: account) == .clear else { return nil }
+        let result = readSecure(account)
+        guard result != .failure, isCurrentOwner(),
+              invalidationState(for: account) == .clear, isCurrentOwner(),
+              mutationObservationMatches(account, generation: generation) else { return nil }
+        return .init(storeIdentity: confirmedReadIdentity, account: account, generation: generation, result: result)
+    }
+
+    /// Exact missing/value CAS against the actual planning read, including its same-value intent
+    /// generation. The synchronous original-owner fence never escapes this call or its transaction.
+    func compareAndSetConfirmed(_ expected: ConfirmedRead, with replacement: String?, account: String,
+                                isCurrentOwner: () -> Bool) -> MutationResult {
+        let operation = beginObservedMutation(account)
+        defer { endObservedMutation(account, operation: operation) }
+        guard expected.storeIdentity == confirmedReadIdentity, Data(expected.account.utf8) == Data(account.utf8),
+              expected.result != .failure, isCurrentOwner(),
+              mutationObservationMatches(account, generation: expected.generation, exclusive: operation) else { return .failure }
+        func matches(_ actual: ReadResult) -> Bool {
+            switch (expected.result, actual) {
+            case (.missing, .missing): return true
+            case let (.value(a), .value(b)): return Data(a.utf8) == Data(b.utf8)
+            default: return false
+            }
+        }
+        lock.lock()
+        let needSweep = !didSweepLegacy; didSweepLegacy = true
+        if accountLocks[account] == nil { accountLocks[account] = NSLock() }
+        let accountLock = accountLocks[account]!
+        lock.unlock()
+        let observed = expected.generation
+        purgeLegacySlots(for: account, fullSweep: needSweep)
+        return mutationTransaction {
+            accountLock.lock(); defer { accountLock.unlock() }
+            guard isCurrentOwner(), mutationObservationMatches(account, generation: observed, exclusive: operation),
+                  invalidationState(for: account) == .clear, matches(readSecure(account)),
+                  isCurrentOwner(), mutationObservationMatches(account, generation: observed, exclusive: operation) else { return .failure }
+            lock.lock()
+            guard generations[account, default: 0] == observed,
+                  inFlightMutations[account] == Set([operation]), observed < UInt64.max else {
+                lock.unlock(); return .failure
+            }
+            let generation = observed + 1; generations[account] = generation
+            lock.unlock()
+            guard isCurrentOwner(), markInvalidatedDurably(account) == .success,
+                  isCurrentOwner(), mutationObservationMatches(account, generation: generation, exclusive: operation),
+                  writeSecure(replacement, account) == .success,
+                  isCurrentOwner(), confirmedReplacementMatches(replacement, account: account),
+                  mutationObservationMatches(account, generation: generation, exclusive: operation), isCurrentOwner(),
+                  clearInvalidationDurably(account) == .success,
+                  isCurrentOwner(), mutationObservationMatches(account, generation: generation, exclusive: operation) else {
+                // Keep uncertainty unavailable to confirmed readers. Never roll back over a
+                // later local writer or put the remote candidate in the volatile edit fallback.
+                return .failure
+            }
+            lock.lock()
+            let current = generations[account, default: 0] == generation && inFlightMutations[account] == Set([operation])
+            if current {
+                pendingOverrides.removeValue(forKey: account)
+                lastKnownValues[account] = replacement.map(VolatileValue.value) ?? .deleted
+            }
+            lock.unlock()
+            return current ? .success : .failure
+        }
+    }
+
+    private func confirmedReplacementMatches(_ replacement: String?, account: String) -> Bool {
+        switch (replacement, readSecure(account)) {
+        case let (.some(expected), .value(actual)): return Data(expected.utf8) == Data(actual.utf8)
+        case (.none, .missing): return true
+        default: return false
+        }
+    }
+
     /// Replace one exact UTF-8 value only if the same backend bytes and store generation remain
     /// current. A failed compare does not start a transition or publish a volatile replacement.
     func replaceConfirmedUTF8(
@@ -360,6 +489,8 @@ final class KeychainFailureClosedStore: @unchecked Sendable {
         with replacement: Data,
         account: String
     ) -> CredentialMutationResult {
+        let operation = beginObservedMutation(account)
+        defer { endObservedMutation(account, operation: operation) }
         guard let expectedString = String(data: expected, encoding: .utf8),
               Data(expectedString.utf8) == expected,
               let replacementString = String(data: replacement, encoding: .utf8),
@@ -1015,6 +1146,17 @@ enum Keychain {
     @discardableResult
     static func set(_ value: String?, for account: String) -> CredentialMutationResult {
         secureStore.set(value, for: account)
+    }
+
+    /// Preserve an opaque actual planning read through the synchronous provider merge.
+    static func confirmedRead(_ account: String, isCurrentOwner: () -> Bool) -> KeychainFailureClosedStore.ConfirmedRead? {
+        secureStore.confirmedRead(account, isCurrentOwner: isCurrentOwner)
+    }
+
+    /// Same-instance API generation and exact-byte compare; no OS cross-process atomicity claim.
+    static func compareAndSetConfirmed(_ expected: KeychainFailureClosedStore.ConfirmedRead, with replacement: String?,
+        for account: String, isCurrentOwner: () -> Bool) -> CredentialMutationResult {
+        secureStore.compareAndSetConfirmed(expected, with: replacement, account: account, isCurrentOwner: isCurrentOwner)
     }
 
     @discardableResult

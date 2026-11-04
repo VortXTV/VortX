@@ -75,7 +75,17 @@ struct ProfilePickerView: View {
     @State private var isEditing = false
     @State private var signInNeeded = false
     @State private var accountHelpNeeded = false
+    @State private var accountHelpAllowsDiagnostics = false
+    @State private var accountHelpDiagnosticCredential: CredentialScopeRegistry.Capture?
+    @State private var accountHelpDiagnosticGrant: ProfilePickerToolsDiagnosticGrant?
+    @State private var toolsRoute: ProfilePickerToolsRoute?
+    /// Bound when the root constructs this picker, before delayed presentation or first appearance.
+    @State private var pickerPresentation: ProfileStore.PickerPresentation
+    /// Display state only; every effect separately requires the original request's Tools admission.
+    @State private var manualPINPending: Bool
+    @State private var manualPINInteraction = ProfilePickerPINInteractionAdmission()
     @StateObject private var profileAction = ProfileMutationPresentation()
+    @StateObject private var accountAuthentication: AccountAuthenticationPresentation
     @StateObject private var artwork = ProfilePickerArtwork.shared
     @ObservedObject private var nativeSync = VortXSyncManager.shared
     @State private var deferredSelection = NativeProfileActionPreparation.DeferredSelection<CredentialScopeRegistry.Capture>()
@@ -98,7 +108,13 @@ struct ProfilePickerView: View {
         return !store.profiles.contains { $0.pin != nil }
     }
 
-    init(core: CoreBridge = .shared) { self.core = core }
+    init(core: CoreBridge = .shared, authentication: AccountAuthenticationPresentation? = nil,
+         pickerPresentation: ProfileStore.PickerPresentation) {
+        self.core = core
+        _pickerPresentation = State(initialValue: pickerPresentation)
+        _manualPINPending = State(initialValue: pickerPresentation.pinChallenge != nil)
+        _accountAuthentication = StateObject(wrappedValue: authentication ?? AccountAuthenticationPresentation())
+    }
 
     private var visibleProfileError: String? {
         if nativeSync.accountReconnectRequired {
@@ -146,9 +162,6 @@ struct ProfilePickerView: View {
                                 Text("Sign in to your VortX account to load your profiles.")
                                     .font(.callout).foregroundStyle(.white)
                                     .multilineTextAlignment(.center)
-                                Button("Sign in") { deferredSelection.cancel(); accountHelpNeeded = true }
-                                    .buttonStyle(.borderedProminent)
-                                    .tint(theme.accent)
                             }
                             if profileAction.isRunning {
                                 ProgressView(profileActionStatus).tint(Theme.Palette.accent).foregroundStyle(.white)
@@ -173,7 +186,7 @@ struct ProfilePickerView: View {
                                     .padding(12)
                                     .background(.red.opacity(0.22), in: RoundedRectangle(cornerRadius: 16))
                                     .accessibilityIdentifier("profile-picker-error")
-                                Button("Account settings") { deferredSelection.cancel(); accountHelpNeeded = true }
+                                Button("Account settings") { openAccountHelp() }
                                     .buttonStyle(.bordered)
                                     .tint(.white)
                             }
@@ -187,26 +200,47 @@ struct ProfilePickerView: View {
                         .frame(minHeight: geometry.size.height,
                                alignment: layout.isPhone ? .bottom : .center)
                     }
-                    .disabled(pinTarget != nil || profileAction.isRunning)
-                    .accessibilityHidden(pinTarget != nil)
+                    .disabled(manualPINPending || pinTarget != nil || profileAction.isRunning)
+                    .accessibilityHidden(manualPINPending || pinTarget != nil)
                     // Outside the disabled picker: a stuck profile/restore must not block its own log.
                     .safeAreaInset(edge: .bottom) {
-                        if exportAllowedBeforeProfile {
-                            diagnosticRecoveryButton
-                                .padding(.horizontal, 24)
-                                .padding(.vertical, 12)
-                                // The full-width focus section bridges every centered profile row
-                                // to the footer, including tiles away from the middle of the screen.
-                                .frame(maxWidth: .infinity)
-                                .profileFocusSection()
-                                .disabled(pinTarget != nil)
-                                .accessibilityHidden(pinTarget != nil)
+                        VStack(spacing: Theme.Space.md) {
+                            ProfilePickerAccountControls(
+                                onSignIn: {
+                                    openAccountHelp()
+                                },
+                                beforeConfirmedSignOut: {
+                                    deferredSelection.cancel()
+                                    profileAction.cancel(preservingFailure: true)
+                                    pinTarget = nil; pinCredential = nil; pinIsForEditing = false
+                                    signInCredential = nil; signInProfileID = nil
+                                    signInNeeded = false; accountHelpNeeded = false
+                                },
+                                admission: { pickerAdmissionPermits })
+                            if manualPickerDismissal != nil {
+                                Button("Back") { closeManualPicker() }
+                                    .buttonStyle(ChipButtonStyle())
+                                    .disabled(profileAction.isRunning || accountAuthentication.blocksDismissal)
+                                    .accessibilityIdentifier("manual-profile-picker-back")
+                            }
+                            toolsButton
                         }
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 12)
+                        // Outside the disabled grid, including when profile opening fails.
+                        .frame(maxWidth: .infinity)
+                        .profileFocusSection()
+                        .disabled(manualPINPending || pinTarget != nil)
+                        .accessibilityHidden(manualPINPending || pinTarget != nil)
                     }
                 }
             }
 
-            if let target = pinTarget {
+            if manualPINPending, let target = pickerPresentation.pinChallenge {
+                PinGateOverlay(profile: target,
+                               onUnlock: { finishManualPIN(target) },
+                               onCancel: { closeManualPicker() })
+            } else if let target = pinTarget {
                 PinGateOverlay(profile: target,
                                onUnlock: {
                                    finishPIN(target)
@@ -226,9 +260,19 @@ struct ProfilePickerView: View {
             #endif
         }
         .profileCover(isPresented: $accountHelpNeeded) {
-            ProfileAccountRecoveryView().environmentObject(VortXSyncManager.shared)
+            ProfileAccountRecoveryView(allowsDiagnosticExport: accountHelpAllowsDiagnostics,
+                                       diagnosticCredential: accountHelpDiagnosticCredential,
+                                       diagnosticGrant: accountHelpDiagnosticGrant,
+                                       authentication: accountAuthentication)
+                .environmentObject(VortXSyncManager.shared)
         }
-        .interactiveDismissDisabled(profileAction.isRunning)
+        .profileCover(item: $toolsRoute) { route in
+            ProfilePickerToolsView(route: route,
+                services: .live(restore: .live, accountGrant: route.accountFiles)) { closeTools(route.id) }
+        }
+        .onAppear { manualPINInteraction.appear(isActive: scenePhase == .active) }
+        .disabled(!pickerPresentation.permitsPresentation())
+        .interactiveDismissDisabled(profileAction.isRunning || accountAuthentication.blocksDismissal)
         .task(id: artworkTaskKey) {
             guard artworkIsVisible else {
                 artwork.stopRotation()
@@ -239,15 +283,17 @@ struct ProfilePickerView: View {
             artwork.startRotation(reduceMotion: reduceMotion)
         }
         .onDisappear {
+            manualPINInteraction.disappear()
             artwork.stopRotation()
-            profileAction.cancel()
+            // A full-screen Tools child must retain only the failed-profile diagnostic exception.
+            profileAction.cancel(preservingFailure: toolsRoute != nil || accountHelpNeeded)
             deferredSelection.cancel()
             // A full-screen child can hide its presenter without removing its identity.
             if !signInNeeded { signInCredential = nil; signInProfileID = nil }
         }
         .onValueChange(of: nativeSync.accountRestoreState) { state in
             if state == .failed { deferredSelection.cancel(); focusDiagnosticRecovery() }
-            if state == .ready, !profileAction.isRunning { profileAction.cancel() }
+            if state == .ready, !profileAction.isRunning { profileAction.cancel(preservingFailure: toolsRoute != nil || accountHelpNeeded) }
             resumeDeferredSelection()
         }
         .onValueChange(of: nativeSync.nativeCheckpointStatus) { _ in resumeDeferredSelection() }
@@ -262,36 +308,128 @@ struct ProfilePickerView: View {
             if error != nil { focusDiagnosticRecovery() }
             resumeDeferredSelection()
         }
+        .onValueChange(of: accountHelpNeeded) { presented in
+            if !presented {
+                accountHelpAllowsDiagnostics = false
+                accountHelpDiagnosticCredential = nil
+                accountHelpDiagnosticGrant = nil
+                if toolsRoute == nil { profileAction.cancel() }
+            }
+        }
         .onValueChange(of: signInNeeded) { presented in if !presented { finishPendingSignIn() } }
-        .onValueChange(of: scenePhase) { phase in if phase == .active { resumeDeferredSelection() } }
+        .onValueChange(of: scenePhase) { phase in
+            manualPINInteraction.sceneDidChange(isActive: phase == .active)
+            if phase == .active { resumeDeferredSelection() }
+        }
         .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
+            profileAction.cancel()
             deferredSelection.cancel()
+            accountHelpAllowsDiagnostics = false
+            accountHelpDiagnosticCredential = nil
+            accountHelpDiagnosticGrant = nil
+            if let route = toolsRoute { closeTools(route.id) }
+            ProfilePickerToolsController.shared.credentialDidChange()
+            accountAuthentication.credentialDidChange()
             pinTarget = nil; pinCredential = nil; pinIsForEditing = false
             signInCredential = nil; signInProfileID = nil
         }
     }
 
-    @ViewBuilder private var diagnosticRecoveryButton: some View {
-        #if os(tvOS)
-        DiagnosticLogExportButton()
+    private var pickerAdmissionPermits: Bool { pickerPresentation.permitsTools() }
+    private var manualPickerDismissal: (@MainActor @Sendable () -> Void)? { pickerPresentation.dismiss }
+
+    private func finishManualPIN(_ target: UserProfile) {
+        guard manualPINPending, manualPINInteraction.permitsVerification, pinTarget == nil,
+              !profileAction.isRunning, !accountAuthentication.blocksDismissal,
+              let challenge = pickerPresentation.pinChallenge, target.id == challenge.id,
+              target.hasPin, target.pin == challenge.pin, pickerPresentation.permitsPresentation(),
+              pickerPresentation.unlockPIN?() == true else { return }
+        // Only updates the displayed phase. This flag never authorizes Tools or account effects.
+        manualPINPending = false
+    }
+
+    private func closeManualPicker() {
+        guard pinTarget == nil, !profileAction.isRunning, !accountAuthentication.blocksDismissal else { return }
+        manualPickerDismissal?()
+    }
+
+    @ViewBuilder private var toolsButton: some View {
+        Button { openTools() } label: { Label("Tools", systemImage: "wrench.and.screwdriver") }
+            .buttonStyle(ChipButtonStyle())
+            .disabled(!pickerAdmissionPermits)
+            .accessibilityIdentifier("profile-picker-tools")
+            .accessibilityHint("Download, repair or restore a backup, or export diagnostic logs.")
+            #if os(tvOS)
             .focused($diagnosticFocused)
             .onAppear { focusDiagnosticRecovery() }
-        #else
-        DiagnosticLogExportButton()
-        #endif
+            #endif
+    }
+
+    private func diagnosticGrant() -> ProfilePickerToolsDiagnosticGrant {
+        let manualAdmission = pickerPresentation.permitsTools
+        let permitted = exportAllowedBeforeProfile && pinTarget == nil && manualAdmission()
+        let credential = CredentialScopeRegistry.shared.capture()
+        let store = store, sync = nativeSync, action = profileAction
+        return .init(allowed: permitted, credential: credential, admission: {
+            guard manualAdmission() else { return false }
+            if sync.accountReconnectRequired || action.errorMessage != nil || sync.accountRestoreState == .failed { return true }
+            return !store.profiles.contains { $0.pin != nil }
+        })
+    }
+
+    private func openTools() {
+        let manualAdmission = pickerPresentation.permitsTools
+        guard pinTarget == nil, manualAdmission() else { return }
+        let grant = diagnosticGrant()
+        let routeID = UUID()
+        let credential = CredentialScopeRegistry.shared.capture()
+        let originalOwner: ProfilePickerToolsController.Owner?
+        if nativeSync.isSignedIn, let account = nativeSync.account,
+           let canonical = CredentialScope(canonicalRemoteAccountID: account.id), credential.scope == canonical {
+            originalOwner = .init(credential: credential, accountID: account.id)
+        } else { originalOwner = nil }
+        let routeAdmission = ProfilePickerToolsRouteAdmission(isForeground: scenePhase == .active)
+        let fileGrant = ProfilePickerToolsAccountGrant(owner: originalOwner, admission: { [self] in
+            // No diagnostic failure exception grants account files. PIN and foreground remain live.
+            manualAdmission() && self.pinTarget == nil && self.toolsRoute?.id == routeID && routeAdmission.permits
+        })
+        deferredSelection.cancel()
+        profileAction.cancel(preservingFailure: true)
+        toolsRoute = .init(id: routeID, diagnostics: grant,
+            focusDiagnostics: nativeSync.accountReconnectRequired || profileAction.errorMessage != nil || nativeSync.accountRestoreState == .failed,
+            accountFiles: fileGrant, admission: routeAdmission)
+    }
+
+    private func closeTools(_ id: UUID) {
+        guard toolsRoute?.id == id else { return }
+        toolsRoute?.admission?.retire()
+        ProfilePickerToolsController.shared.dismiss(id)
+        toolsRoute = nil
+        profileAction.cancel()
+    }
+
+    private func openAccountHelp() {
+        guard pickerAdmissionPermits, pinTarget == nil else { return }
+        deferredSelection.cancel()
+        // Opening the account form must not grant device-wide log access that the
+        // picker refused. Freeze this route's grant before auth changes its roster.
+        accountHelpAllowsDiagnostics = exportAllowedBeforeProfile && pinTarget == nil
+        accountHelpDiagnosticCredential = CredentialScopeRegistry.shared.capture()
+        accountHelpDiagnosticGrant = diagnosticGrant()
+        accountHelpNeeded = true
     }
 
     private func focusDiagnosticRecovery() {
         #if os(tvOS)
-        guard pinTarget == nil, exportAllowedBeforeProfile,
+        guard pickerAdmissionPermits, pinTarget == nil, exportAllowedBeforeProfile,
               nativeSync.accountReconnectRequired || profileAction.errorMessage != nil || nativeSync.accountRestoreState == .failed else { return }
         diagnosticFocused = true
         #endif
     }
 
     private var artworkIsVisible: Bool {
-        scenePhase == .active && pinTarget == nil && editorProfile == nil &&
-        !signInNeeded && !accountHelpNeeded && !profileAction.isRunning
+        scenePhase == .active && !manualPINPending && pinTarget == nil && editorProfile == nil &&
+        !signInNeeded && !accountHelpNeeded && toolsRoute == nil && !profileAction.isRunning
     }
 
     private var artworkTaskKey: String {
@@ -363,12 +501,14 @@ struct ProfilePickerView: View {
                               isEditing: isEditing, side: side, nameTextSize: nameTextSize) { pick(profile) }
         } else if index == store.profiles.count {
             ProfilePickerActionTile(title: "Add", symbol: "plus", side: side, nameTextSize: nameTextSize) {
+                guard pickerAdmissionPermits else { return }
                 deferredSelection.cancel()
                 editorProfile = UserProfile(name: "", avatar: "🎬", accentID: theme.accentID)
             }
         } else {
             ProfilePickerActionTile(title: isEditing ? "Done" : "Edit",
                                     symbol: isEditing ? "checkmark" : "pencil", side: side, nameTextSize: nameTextSize) {
+                guard pickerAdmissionPermits else { return }
                 deferredSelection.cancel()
                 isEditing.toggle()
             }
@@ -376,6 +516,7 @@ struct ProfilePickerView: View {
     }
 
     private func pick(_ profile: UserProfile) {
+        guard pickerAdmissionPermits else { return }
         guard !nativeSync.accountReconnectRequired else {
             deferredSelection.cancel(); profileAction.cancel(); return
         }
@@ -988,17 +1129,46 @@ private struct ProfilePickerButtonContent: View {
 /// A full-screen account form needs its own way back to the picker, including before sign-in.
 struct ProfileAccountRecoveryView: View {
     @Environment(\.dismiss) private var dismiss
+    var allowsDiagnosticExport = true
+    var diagnosticCredential: CredentialScopeRegistry.Capture?
+    var diagnosticGrant: ProfilePickerToolsDiagnosticGrant?
+    @StateObject private var authentication: AccountAuthenticationPresentation
+
+    init(allowsDiagnosticExport: Bool = true,
+         diagnosticCredential: CredentialScopeRegistry.Capture? = nil,
+         diagnosticGrant: ProfilePickerToolsDiagnosticGrant? = nil,
+         authentication: AccountAuthenticationPresentation? = nil) {
+        self.allowsDiagnosticExport = allowsDiagnosticExport
+        self.diagnosticCredential = diagnosticCredential
+        self.diagnosticGrant = diagnosticGrant
+        _authentication = StateObject(wrappedValue: authentication ?? AccountAuthenticationPresentation())
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 Text("VortX account").font(.title2.bold())
                 Spacer()
-                Button("Done") { dismiss() }.buttonStyle(.bordered)
+                Button("Done") { dismissIfAllowed() }
+                    .buttonStyle(.bordered)
+                    .disabled(authentication.blocksDismissal)
             }
             .padding()
-            SyncSettingsView(onSignedIn: { dismiss() })
+            SyncSettingsView(allowsDiagnosticExport: allowsDiagnosticExport,
+                             diagnosticCredential: diagnosticCredential,
+                             diagnosticGrant: diagnosticGrant,
+                             onSignedIn: { dismissIfAllowed() }, authentication: authentication)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        .interactiveDismissDisabled(authentication.blocksDismissal)
+        #if os(tvOS)
+        .onExitCommand { dismissIfAllowed() }
+        #endif
+    }
+
+    private func dismissIfAllowed() {
+        guard !authentication.blocksDismissal else { return }
+        dismiss()
     }
 }
 

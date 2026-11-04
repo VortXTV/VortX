@@ -10,7 +10,7 @@ enum VXDiagExportPolicy {
 
     // MARK: - Transfer lifecycle
 
-    struct TransferClaim: Equatable {
+    struct TransferClaim: Equatable, Sendable {
         fileprivate let generation: UInt64
     }
 
@@ -65,6 +65,9 @@ enum VXDiagExportPolicy {
             state = .inFlight
             return TransferClaim(generation: generation)
         }
+
+        /// Deferred delivery may only release bytes for the still-in-flight exact session claim.
+        func owns(_ claim: TransferClaim) -> Bool { claim.generation == generation && state == .inFlight }
 
         mutating func complete(_ claim: TransferClaim, success: Bool) -> TransferCompletion {
             guard claim.generation == generation, state == .inFlight else { return .stale }

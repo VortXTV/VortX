@@ -61,7 +61,11 @@ private struct NativePreferenceLocalAdmission {
     let target: ManagerPlaybackMutationTarget
     let intent: NativePreferenceIntentStore.Intent
 }
-private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
+// Current whole Session inputs use the actual provider value and raw account exporters.
+// Secure storage remains unavailable in this upload fixture; no provider hydration is claimed.
+enum Keychain {
+    static func confirmedString(_ key: String) -> CredentialDurableReadResult { .missing }
+}
 
 @MainActor private final class CoreBridge {
     static let shared = CoreBridge()
@@ -101,33 +105,54 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
     }
     func reportNativeProfileFailure(_ operation: String, error: Error) {}
     var hasNativeSession: Bool { session != nil }
+    let hasOwnerHistorySession = false
     func hasCertifiedNativeSession(capture: CredentialScopeRegistry.Capture, profileID: UUID?) -> Bool {
         session != nil && capture.generation == generation && profileID == ProfileStore.shared.activeID
     }
     func settleResidentNativeSession(capture: CredentialScopeRegistry.Capture) async {}
-    func mergeNativeAccountDocument(_ remote: VortxJSON?, hostRemote: VortxJSON?, capture: CredentialScopeRegistry.Capture,
+    struct FixtureHostAccountReceipt { let presentation: VortxJSON; let rawHost: Data }
+    func mergeNativeAccountDocumentReceipt(_ remote: VortxJSON?, hostRemote: VortxJSON?, capture: CredentialScopeRegistry.Capture,
         legacyMaterial: Data?, hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [Int], websiteAddonEvents: [Int],
-        legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]], sourceAuthority: VortxNativeOwnAccountProducer.Authority?, authenticatedSourceArchive: Data?) async throws -> VortxJSON {
+        legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]], sourceAuthority: VortxNativeOwnAccountProducer.Authority?, authenticatedSourceArchive: Data?,
+        hostRemoteRaw: Data? = nil, publicationSource: ManagerHarness.FixtureReceivedProviderCloudAuthority? = nil) async throws -> FixtureHostAccountReceipt {
         // This upload fixture does not perform legacy/provider conversion. Fail closed if
         // its existing synthetic preparation collaborator supplies real migration state.
-        guard legacyMaterial?.isEmpty != false, sourceAuthority == nil, authenticatedSourceArchive == nil else {
+        guard legacyMaterial?.isEmpty != false, sourceAuthority == nil, authenticatedSourceArchive == nil,
+              websiteEvents.isEmpty, websiteAddonEvents.isEmpty, legacyWatchlists.isEmpty else {
             throw VortxNativeError.invalidSnapshot
         }
+        try publicationSource?.withActive {}
         guard capture.generation == generation, let session else { throw VortxNativeError.superseded }
         let action = remote.map { VortxJSON.object(["type": .string("merge_native_sync"), "document": $0]) }
             ?? .object(["type": .string("get_state")])
         _ = try await session.dispatch([String(decoding: JSONEncoder().encode(action), as: UTF8.self)], now: 100,
-                                       hostRemote: hostRemote, hostEdits: hostEdits)
+                                       hostRemote: hostRemote, hostEdits: hostEdits, hostRemoteRaw: hostRemoteRaw)
+        try publicationSource?.withActive {}
+        guard capture.generation == generation, self.session === session else { throw VortxNativeError.superseded }
         let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
-        let host = try await session.hostPreferencesDocument()
+        // The actual Session returns raw committed host bytes. Never reconstruct those
+        // persistence/export bytes from the disposable presentation DTO.
+        let publication = try await session.hostPreferencesPublication()
+        let host = publication.presentation
         snapshots["native_state"] = try JSONEncoder().encode(state)
         snapshots["native_host_preferences"] = try JSONEncoder().encode(host)
-        return .object(["nativeSync": state["nativeSync"]!, "nativeHostPreferences": host,
-                        "profileEditResults": .object([:])])
+        return .init(presentation: .object(["nativeSync": state["nativeSync"]!, "nativeHostPreferences": host,
+                        "profileEditResults": .object([:])]), rawHost: publication.rawDocument)
+    }
+    // Compatibility surface for the deliberately supported historical manager source lane.
+    func mergeNativeAccountDocument(_ remote: VortxJSON?, hostRemote: VortxJSON?, capture: CredentialScopeRegistry.Capture,
+        legacyMaterial: Data?, hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [Int], websiteAddonEvents: [Int],
+        legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]], sourceAuthority: VortxNativeOwnAccountProducer.Authority?, authenticatedSourceArchive: Data?) async throws -> VortxJSON {
+        try await mergeNativeAccountDocumentReceipt(remote, hostRemote: hostRemote, capture: capture,
+            legacyMaterial: legacyMaterial, hostEdits: hostEdits, websiteEvents: websiteEvents,
+            websiteAddonEvents: websiteAddonEvents, legacyWatchlists: legacyWatchlists,
+            sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive).presentation
     }
 }
 
 @MainActor private final class ManagerHarness {
+    // These existing fixtures do not run a concurrent account-file restore.
+    var accountFileRestoreBusy = false
     static var shared: ManagerHarness!
     struct Command: Decodable {
         let mode: String; let directory: String; let baseURL: String; let actor: String
@@ -149,6 +174,7 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
     var account: Account? = Account(id: AppleSyncManagerPeer.account)
     var dataKey: Data? = AppleSyncManagerPeer.key
     var isSignedIn = true
+    private var accountReconnectFailureCapture: CredentialScopeRegistry.Capture?
     var hasAppliedAccountDoc = true
     private var settingsShadow: [String: Any] = [:]
     var nativeLegacyWatchlistPending = Set<String>()
@@ -195,6 +221,34 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
     private func currentSyncableDomain() -> [String: Any] {
         UserDefaults.standard.persistentDomain(forName: "fixture") ?? [:]
     }
+    // This upload fixture has no received-provider reservation. Its declared aperture keeps
+    // the existing credential lifetime and prior producer-authority refusal; it does not model
+    // the cloud-source epoch. That production authority is executed by local-adoption checks.
+    @MainActor fileprivate struct FixtureReceivedProviderCloudAuthority {
+        let current: () -> Bool
+        var isCurrent: Bool { current() && !Task.isCancelled }
+        func withActive(_ operation: () throws -> Void) throws {
+            guard current(), !Task.isCancelled else { throw VortxNativeError.superseded }
+            try operation()
+        }
+        func including(_ previous: VortxNativeOwnAccountProducer.Authority?) -> VortxNativeOwnAccountProducer.Authority? {
+            previous
+        }
+    }
+    private typealias ReceivedProviderCloudAuthority = FixtureReceivedProviderCloudAuthority
+    private func mergeOwnerHistoryForExport(plaintext: Data, version: Int, observation: UUID,
+        capture: CredentialScopeRegistry.Capture, orderIntent: AddonOrderIntent?,
+        cloudAuthority: FixtureReceivedProviderCloudAuthority) async -> DerivedSyncDoc? {
+        preconditionFailure("Typed owner-history export is outside this upload fixture")
+    }
+    private func captureReceivedProviderCloudAuthority(_ capture: CredentialScopeRegistry.Capture) throws -> FixtureReceivedProviderCloudAuthority {
+        guard isCurrent(capture), !Task.isCancelled else { throw VortxNativeError.superseded }
+        return FixtureReceivedProviderCloudAuthority(current: { self.isCurrent(capture) })
+    }
+    private func requireReceivedProviderCloudSource(_ pulled: VersionedPull,
+        authority: FixtureReceivedProviderCloudAuthority) throws -> FixtureReceivedProviderCloudAuthority {
+        try authority.withActive {}; return authority
+    }
     func hasPendingAccountDocApply(for capture: CredentialScopeRegistry.Capture) -> Bool { false }
     func settleNativeProviderJournal(capture: CredentialScopeRegistry.Capture) async -> Bool { isCurrent(capture) }
     func restoreAccountDocIfNeeded(credentialCapture capture: CredentialScopeRegistry.Capture) async -> Bool { hasAppliedAccountDoc }
@@ -202,7 +256,16 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
     func withRemoteApplySuppressed(_ body: () -> Void) { body() }
     func publishAppliedAddonOrder(_ order: [String]) {}
     func nativeEmptyAccountDocument(capture: CredentialScopeRegistry.Capture) throws -> [String: Any] { ["fixtureSibling": "retained"] }
-    func mergedNativeProviderState(_ doc: [String: Any], capture: CredentialScopeRegistry.Capture) throws -> FixtureProviders { FixtureProviders() }
+    func mergedNativeProviderState(_ doc: [String: Any], capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials {
+        guard isCurrent(capture) else { throw VortxNativeError.superseded }
+        var provider = try VortxNativeProviderCredentials(scope: AppleSyncManagerPeer.account, actor: command.actor)
+        let wire = try doc["nativeProviderCredentials"].map {
+            try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0))
+        }
+        try provider.merge(wire)
+        guard provider.local.document.fields.isEmpty else { throw VortxNativeError.unavailable }
+        return provider
+    }
     private func prepareNativeLegacyMaterial(_ doc: [String: Any], capture: CredentialScopeRegistry.Capture) async throws -> NativeLegacyPreparation {
         NativeLegacyPreparation(material: Data(), authority: nil, sourceArchive: nil)
     }
@@ -210,8 +273,14 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
     static func nativeWebsiteAddonEvents(_ doc: [String: Any]) throws -> [Int] { [] }
     func nativeLegacyWatchlists(_ doc: [String: Any]) throws -> [UUID: [VortxNativeWatchlist.Entry]] { [:] }
     func publishNativeWebsiteOutcome(_ value: VortxJSON, capture: CredentialScopeRegistry.Capture) throws {}
-    func persistMergedNativeProviders(_ value: FixtureProviders, capture: CredentialScopeRegistry.Capture) throws -> FixtureProviders { value }
-    func mirrorNativeProviderKeys(_ value: FixtureProviders, original: Any?) throws -> [String: Any] { [:] }
+    func persistMergedNativeProviders(_ value: VortxNativeProviderCredentials, capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials {
+        guard isCurrent(capture), value.local.document.fields.isEmpty else { throw VortxNativeError.unavailable }
+        return value
+    }
+    func mirrorNativeProviderKeys(_ value: VortxNativeProviderCredentials, original: Any?) throws -> [String: Any] {
+        guard value.local.document.fields.isEmpty else { throw VortxNativeError.unavailable }
+        return original as? [String: Any] ?? [:]
+    }
     func applyNativeGlobals(_ host: VortxJSON) {}
     func rememberNativeBackup(capture: CredentialScopeRegistry.Capture) -> Bool { isCurrent(capture) }
     func acknowledgeNativeProviders(_ doc: [String: Any], capture: CredentialScopeRegistry.Capture) throws {}
@@ -228,6 +297,12 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
     func retire() {
         credentialAuthority.generation += 1
         CoreBridge.shared.generation = credentialAuthority.generation
+    }
+    private func restoreNativeCheckpointWithCloudRead(credentialCapture capture: CredentialScopeRegistry.Capture,
+        userInitiated: Bool, cloudRead: ReceivedProviderCloudAuthority?) async -> Bool {
+        guard cloudRead?.isCurrent ?? true else { return false }
+        let restored = await restoreNativeCheckpoint(credentialCapture: capture)
+        return restored && (cloudRead?.isCurrent ?? true)
     }
     func restoreNativeCheckpoint(credentialCapture capture: CredentialScopeRegistry.Capture) async -> Bool {
         ensureCalls += 1
@@ -904,7 +979,7 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
             result["accepted"] = .bool(stamped > 0)
         case "pull":
             let capture = credentialAuthority.capture()
-            if case .doc(let doc, let version) = await pullDocVersionedResult(credentialCapture: capture) {
+            if case .doc(let doc, let version, _, _) = await pullDocVersionedResult(credentialCapture: capture) {
                 let remote = try doc["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
                 let host = try doc["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
                 _ = try await CoreBridge.shared.mergeNativeAccountDocument(remote, hostRemote: host, capture: capture,

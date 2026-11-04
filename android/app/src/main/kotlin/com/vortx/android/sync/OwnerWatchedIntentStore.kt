@@ -1,6 +1,7 @@
 package com.vortx.android.sync
 
 import android.content.Context
+import com.vortx.android.engine.AccountFileLocalPresence
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
 import org.json.JSONObject
@@ -16,6 +17,7 @@ internal class OwnerWatchedIntentStore(private val persistence: LibraryProofPers
             return if (snapshot.availability == PersistentCredentialAvailability.AVAILABLE) Result.success(snapshot.values[key])
             else Result.failure(IllegalStateException("Watched intent storage unavailable"))
         }
+        override fun inspectExisting(vararg keys: String) = store.inspectExisting(*keys)
         override fun write(key: String, value: String) = store.set(key, value)
     })
 
@@ -23,6 +25,9 @@ internal class OwnerWatchedIntentStore(private val persistence: LibraryProofPers
         val key get() = title + '\u001f' + video
         fun json() = JSONObject().put("t", title).put("v", video).put("w", watched).put("u", updated).put("a", actor)
     }
+
+    @Synchronized fun inspectRestorePresence(account: String): AccountFileLocalPresence =
+        persistence.inspectExisting(key(account))
 
     @Synchronized fun entries(account: String): List<Entry> = load(account)?.optJSONObject("entries")?.let(::parse).orEmpty().values.toList()
 

@@ -20,9 +20,7 @@ class VortXSessionOwnerTransitionContractTest {
         val resume = source
             .substringAfter("private fun resumeRetainedSessionWork(retained: RetainedSessionWork?)")
             .substringBefore("private fun captureSyncLease()")
-        val adopt = source
-            .substringAfter("private fun adopt(")
-            .substringBefore("// MARK: - HTTP")
+        val adopt = adoptionSource(source)
 
         assertTrue(setup.contains("initialOwnerEpoch = initialSessionLoad.ownerEpochOrInitial()"))
         // Native provider credentials own their account admission; durable session mutation remains
@@ -49,11 +47,7 @@ class VortXSessionOwnerTransitionContractTest {
             resume.indexOf("armPendingSync(it, recordEdit = false)") <
                 resume.indexOf("startRealtime()"),
         )
-        assertTrue(adopt.contains("val result = operation.commitSessionMutation("))
-        assertTrue(adopt.contains("onCommitted = ::cancelSessionWork"))
-        assertTrue(adopt.contains("sessionState.replace(s) {"))
-        assertTrue(adopt.contains("armPendingSync(it, recordEdit = false)"))
-        assertFalse(adopt.contains("sessionState.serialized"))
+        assertAdoptionContract(adopt)
     }
 
     @Test
@@ -106,12 +100,13 @@ class VortXSessionOwnerTransitionContractTest {
             .substringAfter("fun clear(ownerEpoch: Long): Boolean")
             .substringBefore("private companion object")
 
-        assertTrue(persist.contains("KEY_TOKEN to s.token"))
+        assertTrue(persist.contains("KEY_TOKEN to s.currentBearer"))
         assertTrue(persist.contains("KEY_ACCOUNT to acct.toString()"))
         assertTrue(persist.contains("KEY_DATA_KEY to VortXCrypto.b64(s.dataKey)"))
         assertTrue(persist.contains("KEY_OWNER_EPOCH to ownerEpoch.toString()"))
         assertTrue(load.contains("confirmedSnapshot(KEY_TOKEN, KEY_ACCOUNT, KEY_DATA_KEY, KEY_OWNER_EPOCH)"))
-        assertTrue(load.contains("SessionLoad.Available(Session(token, account, dataKey), ownerEpoch)"))
+        assertTrue(load.contains("SessionLoad.Available(null, ownerEpoch, ownerEpochRaw == ownerEpoch.toString())"))
+        assertTrue(load.contains("SessionLoad.Available(Session(token, account, dataKey), ownerEpoch, ownerEpochRaw == ownerEpoch.toString())"))
         assertTrue(clear.contains("KEY_TOKEN to null"))
         assertTrue(clear.contains("KEY_ACCOUNT to null"))
         assertTrue(clear.contains("KEY_DATA_KEY to null"))
@@ -126,25 +121,40 @@ class VortXSessionOwnerTransitionContractTest {
             .substringAfter("private fun beginAuthOperation()")
             .substringBefore("private fun cancelSessionWork()")
         val register = source
-            .substringAfter("suspend fun register(email: String, username: String, password: String)")
+            .substringAfter("suspend fun register(email: String, username: String, password: String, completion: PickerAuthCompletion? = null)")
             .substringBefore("/**\n     * Sign in with email-or-username")
+        val ordinarySignIn = source
+            .substringAfter("suspend fun signIn(login: String, password: String, totp: String? = null, completion: PickerAuthCompletion? = null)")
+            .substringBefore("internal suspend fun signInForPickerFileRecovery(")
+        val recoverySignIn = source
+            .substringAfter("internal suspend fun signInForPickerFileRecovery(")
+            .substringBefore("private suspend fun signIn(operation:")
         val signIn = source
-            .substringAfter("suspend fun signIn(login: String, password: String, totp: String? = null)")
-            .substringBefore("/**\n     * Forgot-password recovery")
+            .substringAfter("private suspend fun signIn(operation:")
+            .substringBefore("/** Start the joiner side")
         val recover = source
-            .substringAfter("suspend fun recover(email: String, recoveryCode: String, newPassword: String)")
+            .substringAfter("suspend fun recover(email: String, recoveryCode: String, newPassword: String, completion: PickerAuthCompletion? = null)")
             .substringBefore("/** Sign out only after")
         val transport = source
             .substringAfter("private suspend fun request(")
             .substringBefore("/**\n     * Keystore-encrypted persistence")
 
-        assertTrue(beginAuth.contains("operations.beginAuth()"))
+        assertTrue(beginAuth.contains("operations.beginAuthIf { pickerFileRecoveryIntent = null; true }"))
         assertFalse(beginAuth.contains("cancelSessionWork"))
-        listOf(register, signIn, recover).forEach { flow ->
+        assertTrue(ordinarySignIn.contains("signIn(beginAuthOperation(), login, password, totp, completion)"))
+        assertTrue(recoverySignIn.contains("operations.beginAuthIf { attemptCurrent() && pickerFileRecoveryIntentCurrent(intent) }"))
+        assertTrue(recoverySignIn.contains("return signIn(operation, login, password, totp, completion, intent, caller, attemptCurrent)"))
+        listOf(register, recover).forEach { flow ->
             assertTrue(flow.indexOf("val operation = beginAuthOperation()") in 0 until flow.indexOf("request("))
-            assertResponseFenceAfterEveryRequest(flow)
-            assertTrue(flow.contains("adopt(operation, token, acct, dataKey)"))
+            assertResponseFenceAfterEveryRequest(flow, "if (!operation.isCurrent())")
+            assertTrue(flow.contains("adopt(operation, token, acct, dataKey, completion)"))
         }
+        assertTrue(signIn.contains("fun current(): Boolean = operation.isCurrent() && (recoveryIntent == null ||"))
+        assertTrue(signIn.contains("recoveryCaller?.isActive != false && recoveryAttemptCurrent?.invoke() == true"))
+        assertTrue(signIn.contains("operations.snapshot { pickerFileRecoveryIntentCurrent(recoveryIntent) }"))
+        assertTrue(signIn.contains("adopt(operation, token, acct, dataKey, completion, recoveryIntent, recoveryCaller, recoveryAttemptCurrent)"))
+        assertEquals(2, signIn.windowed("candidateCurrent = transportCurrent".length).count { it == "candidateCurrent = transportCurrent" })
+        assertResponseFenceAfterEveryRequest(signIn, "if (!current())")
         assertMutatingAuthFence(
             register,
             endpoint = "\"/v1/auth/register\"",
@@ -155,7 +165,7 @@ class VortXSessionOwnerTransitionContractTest {
         assertMutatingAuthFence(
             signIn,
             endpoint = "\"/v1/auth/login\"",
-            guard = "if (!operation.isCurrent()) return AuthResult.Failed(AUTH_SUPERSEDED)",
+            guard = "if (!current()) return AuthResult.Failed(AUTH_SUPERSEDED)",
             permit = "val loginPermit = operation.acquireCallPermit()",
             permitArgument = "callPermit = loginPermit",
         )
@@ -335,28 +345,94 @@ class VortXSessionOwnerTransitionContractTest {
             .substringAfter("suspend fun mergeBoth(): Boolean")
             .substringBefore("// MARK: - Session adoption + persistence")
 
-        assertTrue(reconcile.contains("val lease = captureSyncLease()"))
+        assertTrue(source.contains("suspend fun reconcileAfterSignIn(): SignInReconcile = reconcileAfterSignIn(captureSyncLease())"))
+        assertTrue(reconcile.contains("reconcileAfterSignIn(captureCompletionLease(owner))"))
+        assertTrue(reconcile.contains("val lease = captured ?: return SignInReconcile.UNREACHABLE"))
+        val completionCapture = reconcile.substringAfter("private fun captureCompletionLease(").substringBefore("private suspend fun reconcileAfterSignIn(")
+        assertTrue(completionCapture.contains("operations.snapshot"))
+        assertTrue(completionCapture.contains("if (!isPickerCompletionOwnerCurrent(owner)) null else captureSyncLease()"))
         assertTrue(reconcile.contains("accountHasSyncData(lease)"))
         assertTrue(reconcile.contains("syncUp(lease)"))
-        assertTrue(mergeBoth.contains("val lease = captureSyncLease()"))
+        assertTrue(source.contains("suspend fun mergeBoth(): Boolean = mergeBoth(captureSyncLease())"))
+        assertTrue(mergeBoth.contains("mergeBoth(captureCompletionLease(owner))"))
+        assertTrue(mergeBoth.contains("val lease = captured ?: return false"))
         assertTrue(mergeBoth.contains("syncDown(lease, force = true)"))
         assertTrue(mergeBoth.contains("syncUp(lease)"))
         assertEquals(1, mergeBoth.windowed("captureSyncLease".length).count { it == "captureSyncLease" })
     }
 
-    private fun assertResponseFenceAfterEveryRequest(flow: String) {
+    @Test
+    fun adoptionContractIgnoresSeparateRenewalHelpersAndRejectsUnsafeAdoptionMutations() {
+        val source = readSource()
+        val adopt = adoptionSource(source)
+        assertAdoptionContract(adopt)
+        val renewal = source.substringAfter("\n    private class SessionRenewalCapture(")
+            .substringBefore("// MARK: - HTTP")
+        assertTrue(renewal.contains("sessionState.serialized"))
+        assertFalse(adopt.contains("private class SessionRenewalCapture("))
+        val mutations = listOf(
+            adopt.replace("operation.commitSessionMutation(", "operation.retiredMutation("),
+            adopt.replace("onCommitted = ::cancelSessionWork", "onCommitted = {}"),
+            adopt.replace("sessionState.replace(s) {", "sessionState.retiredReplace(s) {"),
+            adopt.replace("completion?.record(capturePickerCompletionOwner())", "completion?.retiredRecord(capturePickerCompletionOwner())"),
+            adopt.replace("sessionState.replace(s) {", "completion?.record(capturePickerCompletionOwner())\n                sessionState.replace(s) {"),
+            adopt.replace("armPendingSync(lease, recordEdit = false)", "retiredArm(lease)"),
+            adopt.replace("if (adoption == SessionAdoption.ADOPTED && recoveryIntent == null)", "if (adoption == SessionAdoption.ADOPTED)"),
+            adopt.replace("publishPickerFileRecoverySession(s.takeIf { recoveryIntent != null })", "publishPickerFileRecoverySession(null)"),
+            adopt.replace("val account = Account(", "sessionState.serialized {}\n        val account = Account("),
+        )
+        mutations.forEachIndexed { index, mutation ->
+            assertFalse("Mutation $index must change the actual adoption body", mutation == adopt)
+            var rejected = false
+            try { assertAdoptionContract(mutation) } catch (_: AssertionError) { rejected = true }
+            assertTrue("Unsafe adoption mutation $index was accepted", rejected)
+        }
+        listOf(
+            source.replace("\n    private fun adopt(", "\n    private fun renamedAdopt("),
+            source.replace("\n    private class SessionRenewalCapture(", "\n    private class RenamedRenewalCapture("),
+            source + "\n    private fun adopt(",
+            source + "\n    private class SessionRenewalCapture(",
+        ).forEach { malformed ->
+            var rejected = false
+            try { adoptionSource(malformed) } catch (_: IllegalArgumentException) { rejected = true }
+            assertTrue("Missing or ambiguous adoption boundary was accepted", rejected)
+        }
+    }
+
+    /** Fail closed on ambiguous declarations; renewal's tuple lock is not an adoption mutation. */
+    private fun adoptionSource(source: String): String {
+        val start = "\n    private fun adopt("
+        val end = "\n    private class SessionRenewalCapture("
+        val begin = source.indexOf(start)
+        val finish = source.indexOf(end)
+        require(begin >= 0 && source.indexOf(start, begin + start.length) < 0)
+        require(finish > begin && source.indexOf(end, finish + end.length) < 0)
+        return source.substring(begin, finish)
+    }
+
+    private fun assertAdoptionContract(adopt: String) {
+        assertTrue(adopt.contains("val result = operation.commitSessionMutation("))
+        assertTrue(adopt.contains("onCommitted = ::cancelSessionWork"))
+        assertTrue(adopt.contains("sessionState.replace(s) {"))
+        assertTrue(adopt.contains("completion?.record(capturePickerCompletionOwner())"))
+        assertTrue(adopt.indexOf("sessionState.replace(s) {") < adopt.indexOf("completion?.record("))
+        val pause = adopt.indexOf("publishPickerFileRecoverySession(s.takeIf { recoveryIntent != null })")
+        assertTrue(pause in adopt.indexOf("sessionState.replace(s) {") until adopt.indexOf("completion?.record("))
+        val ordinary = adopt.indexOf("if (adoption == SessionAdoption.ADOPTED && recoveryIntent == null)")
+        val lease = adopt.indexOf("captureSyncLease()?.takeIf { it.accountId == account.id && it.token == token }")
+        val arm = adopt.indexOf("armPendingSync(lease, recordEdit = false)")
+        assertTrue(ordinary > adopt.indexOf("completion?.record(") && lease > ordinary && arm > lease)
+        assertFalse(adopt.contains("sessionState.serialized"))
+    }
+
+    private fun assertResponseFenceAfterEveryRequest(flow: String, guard: String) {
         var request = flow.indexOf("request(")
+        assertTrue(request >= 0)
         while (request >= 0) {
             val nextRequest = flow.indexOf("request(", request + 1)
             val flowEnd = if (nextRequest < 0) flow.length else nextRequest
-            val responseFence = flow.indexOf("if (!operation.isCurrent())", request)
-            // Two legal fence shapes: the classic post-response isCurrent() re-check, or the QR
-            // pairing shape where acquireCallPermit() (null once superseded) gates the call right
-            // before it. Both prove the operation was still current across the request.
-            val postOk = responseFence > request && responseFence < flowEnd
-            val preGuard = flow.lastIndexOf("acquireCallPermit()", request)
-            val preOk = preGuard >= 0 && request - preGuard < 300
-            assertTrue(postOk || preOk)
+            val responseFence = flow.indexOf(guard, request)
+            assertTrue(responseFence > request && responseFence < flowEnd)
             request = nextRequest
         }
     }

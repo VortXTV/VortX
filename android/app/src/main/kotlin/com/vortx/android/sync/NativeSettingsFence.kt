@@ -1,12 +1,25 @@
 package com.vortx.android.sync
 
+import android.content.Context
 import android.content.SharedPreferences
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.NoSuchFileException
+import java.nio.file.Path
+import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.FileTime
 import android.os.Handler
 import android.os.Looper
 import java.util.WeakHashMap
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 
-/** Process settings writer owner. No account or credential data is stored in its witness.
- * Application supplies this wrapper to every vortx_settings/vortx_sync_dirty caller.
+/** Process settings writer owner and first-open provenance for the exact Restore preferences.
+ * Application supplies the wrapper on the credential-protected application context.
  * Lock order: Session -> account admission -> provider -> this fence -> checkpoint store.
  * Preference notifications are posted after replacement, never invoked while holding this fence.
  */
@@ -14,15 +27,305 @@ internal object NativeSettingsFence {
     private val lock = Any()
     private val wrappers = java.util.IdentityHashMap<SharedPreferences, Fenced>()
     private var revision = 0L
+    @Volatile private var openedBackings = emptySet<String>()
+    private val originalRestoreBackings = mutableMapOf<String, Fenced>()
+    @Volatile private var originalEmptyRetryQueue: EmptyRetryQueue? = null
+
+    private class EmptyRetryQueue(val root: Path, val observation: ExistingEmptyProviderRetryBacking.Observation) {
+        var wrapper: Fenced? = null // Only read/written under lock; terminal edits retire the volatile receipt.
+    }
+    private const val SETTINGS = "vortx_settings"
+    @Volatile private var flatRestore: FlatRestore? = null
+    private var flatMutations = 0
+
+    internal interface HeldRestoreFlatSettings {
+        /** Scalar transport check. The caller separately checks the original session and route. */
+        fun requireCurrent(owner: SessionOwnerSnapshot.Account)
+    }
+
+    private class FlatRestore(
+        private val owner: SessionOwnerSnapshot.Account,
+        private val wrapper: Fenced,
+        private val pristine: PristineBacking,
+        private val job: Job?,
+    ) : HeldRestoreFlatSettings {
+        override fun requireCurrent(owner: SessionOwnerSnapshot.Account) {
+            job?.ensureActive()
+            check(this.owner == owner && flatRestore === this && wrapper.pristine === pristine) {
+                "Original flat settings Restore admission retired"
+            }
+        }
+    }
+
+    /** A terminal edit from an ingress that has not yet been adapted to refuse before side effects. */
+    internal class RestoreFlatSettingsBusy : IllegalStateException("Account Restore is using local settings")
+
+    /**
+     * Hold the actual settings writer lane. This is only safe to compose after reachable settings
+     * writers handle refusal at ingress or their owner has positively quiesced them.
+     */
+    suspend fun <T : Any> withRestoreFlatSettingsExclusion(
+        owner: SessionOwnerSnapshot.Account,
+        requireOriginal: () -> Unit,
+        operation: suspend (HeldRestoreFlatSettings) -> T,
+    ): T? {
+        val job = currentCoroutineContext()[Job]
+        job?.ensureActive()
+        requireOriginal()
+        val held = synchronized(lock) {
+            if (flatRestore != null || flatMutations != 0) return null
+            val wrapper = originalRestoreBackings[SETTINGS]
+            val pristine = wrapper?.pristine
+            if (wrapper == null || pristine == null)
+                throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
+            FlatRestore(owner, wrapper, pristine, job).also { flatRestore = it }
+        }
+        try {
+            requireOriginal()
+            held.requireCurrent(owner)
+            return operation(held)
+        } finally {
+            synchronized(lock) {
+                if (flatRestore === held) flatRestore = null
+            }
+        }
+    }
+
+    /**
+     * Run a synchronous mutation only after the writer is admitted. Null means the caller still
+     * owns its unsubmitted intent. Return or display refusal before publishing any new UI state.
+     */
+    fun <T : Any> tryFlatSettingsMutation(operation: () -> T): T? {
+        if (!enterFlatMutation()) return null
+        try {
+            return operation()
+        } finally {
+            leaveFlatMutation()
+        }
+    }
+
+    /** Admit before scheduling any work and hold membership through child completion and cleanup. */
+    fun launchFlatSettingsMutation(scope: CoroutineScope, operation: suspend CoroutineScope.() -> Unit): Job? {
+        if (!enterFlatMutation()) return null
+        val job = try {
+            scope.launch(start = CoroutineStart.LAZY, block = operation)
+        } catch (failure: Throwable) {
+            leaveFlatMutation()
+            throw failure
+        }
+        job.invokeOnCompletion { leaveFlatMutation() }
+        job.start()
+        return job
+    }
+
+    private fun enterFlatMutation(): Boolean = synchronized(lock) {
+        if (flatRestore != null) return@synchronized false
+        flatMutations++
+        true
+    }
+
+    private fun leaveFlatMutation() = synchronized(lock) {
+        check(flatMutations > 0) { "Flat settings mutation membership underflow" }
+        flatMutations--
+    }
+
+    enum class RestoreAuxiliaryBacking(val fileName: String) {
+        SYNC_STATE("vortx_sync_state"),
+        DIRTY_SETTINGS("vortx_sync_dirty"),
+        ADDON_PREFS("vortx.addon.prefs"),
+        PROVIDER_RETRY_QUEUE("vortx_account_sync_queue"),
+    }
+    private val restoreBackings = RestoreAuxiliaryBacking.entries.mapTo(mutableSetOf(SETTINGS)) { it.fileName }
+
+    /** The Application calls this before the platform can load or normalize the first settings file.
+     * Only each exact backing's first open performs a bounded number of no-follow metadata reads.
+     * Ordinary later opens and the platform open/result retain their existing behavior. */
+    fun open(context: Context, name: String, mode: Int, platformOpen: () -> SharedPreferences): SharedPreferences {
+        if (name != RestoreAuxiliaryBacking.PROVIDER_RETRY_QUEUE.fileName || originalEmptyRetryQueue == null)
+            return checkNotNull(openObserved(context, name, mode, prepareOnly = false, platformOpen = platformOpen))
+        return synchronized(lock) {
+            val original = originalEmptyRetryQueue
+            try {
+                val opened = checkNotNull(openObserved(context, name, mode, prepareOnly = false, platformOpen = platformOpen))
+                if (original != null) {
+                    val wrapper = opened as? Fenced
+                    if (context.isDeviceProtectedStorage || mode != Context.MODE_PRIVATE ||
+                        context.dataDir.toPath() != original.root || wrapper == null || wrapper.name != name ||
+                        original.wrapper?.let { it !== wrapper } == true ||
+                        wrapper.backing.all != original.observation.expectedCache) {
+                        originalEmptyRetryQueue = null
+                    } else {
+                        original.wrapper = wrapper
+                    }
+                }
+                opened
+            } catch (failure: Exception) {
+                originalEmptyRetryQueue = null
+                throw failure
+            }
+        }
+    }
+
+    /** App startup only. Never let a proof preparation open or normalize old or unknown data. */
+    fun preparePristineRestoreBacking(context: Context, backing: RestoreAuxiliaryBacking, platformOpen: () -> SharedPreferences) {
+        openObserved(context, backing.fileName, Context.MODE_PRIVATE, prepareOnly = true, platformOpen = platformOpen)
+    }
+
+    private fun openObserved(context: Context, name: String, mode: Int, prepareOnly: Boolean,
+        platformOpen: () -> SharedPreferences): SharedPreferences? {
+        if (name !in restoreBackings || name in openedBackings)
+            return if (prepareOnly) null else wrap(name, platformOpen())
+        return synchronized(lock) {
+            if (name in openedBackings) return@synchronized if (prepareOnly) null else wrap(name, platformOpen())
+            try {
+                val pristine = try {
+                    val ordinaryQueueOpen = !prepareOnly && name == RestoreAuxiliaryBacking.PROVIDER_RETRY_QUEUE.fileName
+                    if (ordinaryQueueOpen || context.isDeviceProtectedStorage || mode != Context.MODE_PRIVATE) null
+                    else PristineBacking.beforeOpen(context.dataDir.toPath(), name)
+                        ?.takeIf { !prepareOnly || it.canPrepareBeforeOpen() }
+                } catch (_: Exception) { null }
+                if (prepareOnly && pristine == null) {
+                    if (name == RestoreAuxiliaryBacking.PROVIDER_RETRY_QUEUE.fileName) {
+                        originalEmptyRetryQueue = try {
+                            if (context.isDeviceProtectedStorage || mode != Context.MODE_PRIVATE) null else {
+                                val root = context.dataDir.toPath()
+                                ExistingEmptyProviderRetryBacking.observe(root)?.let { EmptyRetryQueue(root, it) }
+                            }
+                        } catch (_: Exception) { null }
+                    }
+                    return@synchronized null
+                }
+                val backing = platformOpen()
+                val wasAlreadyWrapped = backing is Fenced || wrappers.containsKey(backing)
+                val wrapper = wrap(name, backing)
+                val bound = if (!wasAlreadyWrapped) try {
+                    pristine?.finishOpen()?.takeIf { !prepareOnly || it.observeMissing() != null }
+                } catch (_: Exception) { null } else null
+                if (bound != null && wrapper is Fenced && wrapper.name == name) {
+                    wrapper.pristine = bound
+                    originalRestoreBackings[name] = wrapper
+                }
+                wrapper
+            } finally {
+                openedBackings = openedBackings + name
+            }
+        }
+    }
+
+    /** Actual retained wrapper only. No getter opens a store, touches keys or updates backing.
+     * The returned closure reads a volatile identity and is suitable for final worker currency. */
+    fun capturePristineRestoreBacking(existing: SharedPreferences): (() -> Boolean)? =
+        capturePristineRestoreBacking(existing, SETTINGS)
+
+    /**
+     * Restore worker only, while the provider writer reservation excludes queue producers. The
+     * original absent backing or strict-empty bytes and any actual platform cache must still agree.
+     */
+    fun captureProviderRetryRestoreBacking(): (() -> Boolean)? = synchronized(lock) {
+        val original = originalEmptyRetryQueue
+            ?: return@synchronized capturePristineRestoreBacking(RestoreAuxiliaryBacking.PROVIDER_RETRY_QUEUE)
+        val stillEmpty = try {
+            val current = ExistingEmptyProviderRetryBacking.observe(original.root)
+            current == original.observation &&
+                (original.wrapper?.let { it.backing.all == original.observation.expectedCache } ?: true)
+        } catch (_: Exception) { false }
+        if (!stillEmpty || originalEmptyRetryQueue !== original) {
+            originalEmptyRetryQueue = null
+            return@synchronized null
+        }
+        return@synchronized { originalEmptyRetryQueue === original }
+    }
+
+    /** Existing retained wrapper only, including stores owned by a different writer component. */
+    fun capturePristineRestoreBacking(backing: RestoreAuxiliaryBacking): (() -> Boolean)? {
+        val existing = synchronized(lock) { originalRestoreBackings[backing.fileName] } ?: return null
+        return capturePristineRestoreBacking(existing, backing)
+    }
+
+    fun capturePristineRestoreBacking(existing: SharedPreferences, backing: RestoreAuxiliaryBacking): (() -> Boolean)? {
+        val wrapper = (existing as? Fenced)?.takeIf { it.name == backing.fileName } ?: return null
+        val witness = try { capturePristineRestoreBacking(wrapper, backing.fileName) } catch (_: Exception) { null }
+        if (witness == null) wrapper.pristine = null
+        return witness
+    }
+
+    private fun capturePristineRestoreBacking(existing: SharedPreferences, name: String): (() -> Boolean)? {
+        val wrapper = (existing as? Fenced)?.takeIf { it.name == name } ?: return null
+        val original = wrapper.pristine ?: return null
+        val before = original.observeMissing() ?: return null
+        val current = synchronized(lock) { wrapper.pristine === original && wrapper.backing.all.isEmpty() }
+        if (!current || original.observeMissing() != before || wrapper.pristine !== original) return null
+        return { wrapper.pristine === original }
+    }
+
+    private class PristineBacking(private val root: Path, private val name: String,
+        private val appIdentity: Any, private val directoryIdentity: Any?) {
+        data class Directory(val identity: Any, val modified: FileTime)
+        private val directory = root.resolve("shared_prefs")
+
+        fun canPrepareBeforeOpen(): Boolean = if (directoryIdentity == null)
+            directoryAttributes(directory) == null && directoryAttributes(root)?.identity == appIdentity
+        else observeMissing() != null
+
+        fun finishOpen(): PristineBacking? {
+            val now = directoryAttributes(directory) ?: return null
+            if (directoryAttributes(root)?.identity != appIdentity ||
+                directoryIdentity != null && now.identity != directoryIdentity || !primaryAndRollbackMissing(directory, name) ||
+                directoryAttributes(directory) != now) return null
+            return PristineBacking(root, name, appIdentity, now.identity)
+        }
+
+        fun observeMissing(): Directory? {
+            if (directoryAttributes(root)?.identity != appIdentity) return null
+            val before = directoryAttributes(directory)?.takeIf { it.identity == directoryIdentity } ?: return null
+            // Bounded first-start preparation and existing-only Restore inspection.
+            Files.newDirectoryStream(directory).use { entries ->
+                var count = 0
+                for (entry in entries) {
+                    val name = entry.fileName.toString()
+                    if (++count > 4096 || name == "${this.name}.xml" || name.startsWith("${this.name}.xml.")) return null
+                }
+            }
+            return before.takeIf { directoryAttributes(directory) == it && directoryAttributes(root)?.identity == appIdentity }
+        }
+
+        companion object {
+            private fun attributes(path: Path): BasicFileAttributes? = try {
+                Files.readAttributes(path, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+            } catch (_: NoSuchFileException) { null }
+
+            private fun directoryAttributes(path: Path): Directory? {
+                val attrs = attributes(path) ?: return null
+                check(attrs.isDirectory)
+                return Directory(checkNotNull(attrs.fileKey()), attrs.lastModifiedTime())
+            }
+
+            private fun primaryAndRollbackMissing(directory: Path, name: String): Boolean =
+                attributes(directory.resolve("$name.xml")) == null &&
+                    attributes(directory.resolve("$name.xml.bak")) == null
+
+            fun beforeOpen(root: Path, name: String): PristineBacking? {
+                val app = directoryAttributes(root) ?: return null
+                val directory = root.resolve("shared_prefs")
+                val before = directoryAttributes(directory)
+                if (!primaryAndRollbackMissing(directory, name) ||
+                    directoryAttributes(directory) != before || directoryAttributes(root) != app) return null
+                return PristineBacking(root, name, app.identity, before?.identity)
+            }
+        }
+    }
     /** Deterministic queued-notification tests. No arbitrary scheduler callback runs under the fence. */
     internal var queuedNotificationsForTest: MutableList<() -> Unit>? = null
     class Observation internal constructor(internal val revision: Long)
 
     fun wrap(name: String, backing: SharedPreferences): SharedPreferences {
-        if (name != "vortx_settings" && name != "vortx_sync_dirty") return backing
+        if (name !in restoreBackings) return backing
         return synchronized(lock) {
-            if (backing is Fenced) return@synchronized backing
-            wrappers[backing] ?: Fenced(backing).also { wrappers[backing] = it }
+            val wrapper = if (backing is Fenced) backing else
+                wrappers[backing] ?: Fenced(name, backing).also { wrappers[backing] = it }
+            if (wrapper !== originalRestoreBackings[name]) originalRestoreBackings[name]?.pristine = null
+            if (wrapper.name != name) wrapper.pristine = null
+            wrapper
         }
     }
     fun <T> capture(read: () -> T): Pair<Observation, T> = synchronized(lock) {
@@ -39,17 +342,27 @@ internal object NativeSettingsFence {
         action()
     }
 
-    private class Fenced(val backing: SharedPreferences) : SharedPreferences by backing {
+    private class Fenced(val name: String, val backing: SharedPreferences) : SharedPreferences by backing {
+        private val tracksSettingsRevision = name == SETTINGS || name == RestoreAuxiliaryBacking.DIRTY_SETTINGS.fileName
+        @Volatile var pristine: PristineBacking? = null
         private val listeners = WeakHashMap<SharedPreferences.OnSharedPreferenceChangeListener,
             SharedPreferences.OnSharedPreferenceChangeListener>()
-        override fun getAll(): MutableMap<String, *> = synchronized(lock) {
-            backing.all.mapValuesTo(linkedMapOf()) { (_, value) ->
-                if (value is Set<*>) value.toSet() else value
+        override fun getAll(): MutableMap<String, *> {
+            if (!tracksSettingsRevision) return backing.all
+            return synchronized(lock) {
+                backing.all.mapValuesTo(linkedMapOf()) { (_, value) ->
+                    if (value is Set<*>) value.toSet() else value
+                }
             }
         }
         override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? =
-            synchronized(lock) { backing.getStringSet(key, defValues)?.toMutableSet() }
+            if (!tracksSettingsRevision) backing.getStringSet(key, defValues)
+            else synchronized(lock) { backing.getStringSet(key, defValues)?.toMutableSet() }
         override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener) {
+            if (!tracksSettingsRevision) {
+                backing.registerOnSharedPreferenceChangeListener(listener)
+                return
+            }
             synchronized(lock) {
                 if (listeners.containsKey(listener)) return
                 val weak = java.lang.ref.WeakReference(listener)
@@ -65,7 +378,8 @@ internal object NativeSettingsFence {
             }
         }
         override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener) {
-            synchronized(lock) { listeners.remove(listener)?.let(backing::unregisterOnSharedPreferenceChangeListener) }
+            if (!tracksSettingsRevision) backing.unregisterOnSharedPreferenceChangeListener(listener)
+            else synchronized(lock) { listeners.remove(listener)?.let(backing::unregisterOnSharedPreferenceChangeListener) }
         }
         override fun edit(): SharedPreferences.Editor = Editor(backing.edit())
         private inner class Editor(private val editor: SharedPreferences.Editor) : SharedPreferences.Editor {
@@ -77,11 +391,24 @@ internal object NativeSettingsFence {
             override fun putBoolean(key: String?, value: Boolean) = apply { editor.putBoolean(key, value) }
             override fun remove(key: String?) = apply { editor.remove(key) }
             override fun clear() = apply { editor.clear() }
-            private fun replace(commit: Boolean): Boolean = synchronized(lock) {
+            private fun replace(commit: Boolean): Boolean {
+                if (!tracksSettingsRevision) {
+                    pristine = null // Before terminal mutation, including failed and same-value attempts.
+                    if (name == RestoreAuxiliaryBacking.PROVIDER_RETRY_QUEUE.fileName) originalEmptyRetryQueue = null
+                    return replaceBacking(commit)
+                }
+                return synchronized(lock) {
+                    // Keep the staged editor untouched on refusal. In particular, apply() must
+                    // not claim success by returning without submitting its changes.
+                    if (name == SETTINGS && flatRestore != null) throw RestoreFlatSettingsBusy()
+                    pristine = null
                     check(revision < Long.MAX_VALUE) { "Settings revision exhausted" }
                     revision += 1 // Every attempted replacement retires observations, including ABA/failure.
-                    if (commit) editor.commit() else { editor.apply(); true }
+                    replaceBacking(commit)
+                }
             }
+            private fun replaceBacking(commit: Boolean): Boolean =
+                if (commit) editor.commit() else { editor.apply(); true }
             override fun commit() = replace(true)
             override fun apply() { replace(false) }
         }

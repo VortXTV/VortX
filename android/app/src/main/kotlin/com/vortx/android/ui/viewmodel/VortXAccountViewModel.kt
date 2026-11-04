@@ -3,8 +3,13 @@ package com.vortx.android.ui.viewmodel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vortx.android.sync.VortXSyncManager
+import com.vortx.android.sync.PickerAccountSnapshot
+import com.vortx.android.sync.PickerAuthCompletion
+import com.vortx.android.sync.PickerSignOutResult
+import com.vortx.android.sync.runPickerSignOut
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -14,6 +19,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.net.URLEncoder
+import java.util.concurrent.atomic.AtomicBoolean
 
 /// Which auth flow the signed-out form is showing. All three land in the same signed-in state.
 enum class VortXAccountMode { SIGN_IN, REGISTER, RECOVER }
@@ -149,19 +155,123 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     // Editing A -> B -> A revokes old cleanup, without enabling a second concurrent submit.
     private var authFormIdentity = Any()
     private var activeAuthSubmission: Any? = null
+    private var authSubmissionJob: Job? = null
+    private var completionOwner: PickerAccountSnapshot? = null
+    private var pickerFileRecoveryIntent: VortXSyncManager.PickerFileRecoverySignIn? = null
+    private var activeRecoveryAttempt: AtomicBoolean? = null
+    private val _pickerFileRecoverySignIn = MutableStateFlow(false)
+    internal val pickerFileRecoverySignIn: StateFlow<Boolean> = _pickerFileRecoverySignIn.asStateFlow()
+    private val _postAuthCompleting = MutableStateFlow(false)
+    internal val postAuthCompleting: StateFlow<Boolean> = _postAuthCompleting.asStateFlow()
+    private val _pickerPresentationOpen = MutableStateFlow(false)
+    internal val pickerPresentationOpen: StateFlow<Boolean> = _pickerPresentationOpen.asStateFlow()
+    private val _pickerDismissalNotice = MutableStateFlow<String?>(null)
+    internal val pickerDismissalNotice: StateFlow<String?> = _pickerDismissalNotice.asStateFlow()
+
+    private fun clearPendingCompletion() {
+        completionOwner = null
+        _postAuthCompleting.value = false
+        _recoveryCode.value = null
+        _showReconcile.value = false
+        _pickerDismissalNotice.value = null
+    }
+    private fun settleCompletionIfFinished() {
+        if (!_postAuthCompleting.value && _recoveryCode.value == null && !_showReconcile.value) completionOwner = null
+    }
+    private fun retireObsoleteCompletion() {
+        val owner = completionOwner ?: return
+        if (!sync.isPickerCompletionOwnerCurrent(owner)) {
+            clearPendingCompletion()
+            invalidateAuthForm(); authSubmissionJob?.cancel(); stopQrJoiner(); clearAuthInputs()
+            _pickerPresentationOpen.value = false
+        }
+    }
+    internal fun hasPendingPickerCompletion(): Boolean {
+        retireObsoleteCompletion()
+        return completionOwner != null && (_postAuthCompleting.value || _recoveryCode.value != null || _showReconcile.value)
+    }
+    internal fun openPickerPresentation() {
+        retireObsoleteCompletion()
+        if (pickerFileRecoveryIntent != null) {
+            abandonPickerFileRecoverySignIn()
+            invalidateAuthForm()
+            clearAuthInputs()
+        }
+        _pickerDismissalNotice.value = null
+        _pickerPresentationOpen.value = true
+    }
+    /** Explicit entry from the signed-out picker. Normal sign-in never enters this mode. */
+    internal fun openPickerFileRecoverySignIn(expected: PickerAccountSnapshot): Boolean {
+        if (activeAuthSubmission != null || hasPendingPickerCompletion()) return false
+        val intent = sync.beginPickerFileRecoverySignIn(expected) ?: return false
+        stopQrJoiner()
+        clearAuthInputs()
+        _mode.value = VortXAccountMode.SIGN_IN
+        pickerFileRecoveryIntent = intent
+        _pickerFileRecoverySignIn.value = true
+        _pickerDismissalNotice.value = null
+        _pickerPresentationOpen.value = true
+        return true
+    }
+
+    private fun abandonPickerFileRecoverySignIn() {
+        pickerFileRecoveryIntent?.let(sync::abandonPickerFileRecoverySignIn)
+        pickerFileRecoveryIntent = null
+        _pickerFileRecoverySignIn.value = false
+    }
+
+    internal fun requestClosePickerPresentation(): Boolean {
+        if (authSubmissionJob?.isActive == true && activeAuthSubmission != null && pickerFileRecoveryIntent == null) {
+            _pickerDismissalNotice.value = "Wait for the current account request to finish before returning to profiles."
+            return false
+        }
+        if (hasPendingPickerCompletion()) {
+            _pickerDismissalNotice.value = if (_recoveryCode.value != null)
+                "Save your recovery code and finish account setup before returning to profiles."
+                else "Finish account setup before returning to profiles."
+            return false
+        }
+        _pickerPresentationOpen.value = false
+        abandonPickerFileRecoverySignIn()
+        invalidateAuthForm(); authSubmissionJob?.cancel(); stopQrJoiner(); clearAuthInputs()
+        return true
+    }
+    internal fun retirePickerPresentationForSignOut() {
+        abandonPickerFileRecoverySignIn()
+        _pickerPresentationOpen.value = false
+        invalidateAuthForm(); stopQrJoiner()
+        if (!hasPendingPickerCompletion()) { authSubmissionJob?.cancel(); clearAuthInputs() }
+    }
+    internal fun resumePickerCompletionIfCurrent() {
+        if (hasPendingPickerCompletion()) _pickerPresentationOpen.value = true
+    }
+    internal fun requireAccountReconcile() = requireAccountReconcile(sync.capturePickerCompletionOwner())
+    private fun requireAccountReconcile(owner: PickerAccountSnapshot) {
+        retireObsoleteCompletion()
+        sync.publishIfPickerCompletionOwnerCurrent(owner) {
+            completionOwner = owner; _showReconcile.value = true
+        }
+    }
 
     private fun invalidateAuthForm() {
         authFormIdentity = Any()
+        // Editing retires only this request. Keep the explicit route sticky for the next retry.
+        activeRecoveryAttempt?.let { attempt ->
+            attempt.set(false)
+            authSubmissionJob?.cancel()
+        }
     }
 
     init {
+        viewModelScope.launch { sync.pickerAccountRevision.collect { retireObsoleteCompletion() } }
+        viewModelScope.launch { sync.sessionUiState.collect { retireObsoleteCompletion() } }
         viewModelScope.launch {
             sync.syncProblem.collect { problem -> _syncNotice.value = problem }
         }
     }
 
     fun onModeChange(mode: VortXAccountMode) {
-        if (_mode.value == mode) return
+        if (pickerFileRecoveryIntent != null || _mode.value == mode) return
         invalidateAuthForm()
         _mode.value = mode
         _formState.value = VortXAccountFormState.Idle
@@ -181,7 +291,7 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     }
 
     fun startQrJoiner() {
-        if (qrJoinJob?.isActive == true || account.value != null) return
+        if (pickerFileRecoveryIntent != null || qrJoinJob?.isActive == true || account.value != null) return
         qrJoinJob = viewModelScope.launch { runQrJoiner() }
     }
 
@@ -214,9 +324,10 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
             var remint = false
             while (currentCoroutineContext().isActive && !remint) {
                 delay(QR_POLL_INTERVAL_MS)
+                val completion = PickerAuthCompletion()
                 when (
                     val action = reducer.onResult(
-                        sync.qrPoll(session),
+                        sync.qrPoll(session, completion),
                         System.currentTimeMillis() - mintedAt,
                     )
                 ) {
@@ -236,7 +347,7 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
                         // Detach the current job first so its onDispose does not cancel reconciliation.
                         qrJoinJob = null
                         _qrJoinState.value = VortXQrJoinState.SignedIn(action.email)
-                        onQrAuthed()
+                        onQrAuthed(completion.owner)
                         return
                     }
                 }
@@ -246,7 +357,7 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
 
     /// Submit whichever flow [mode] is showing. One submit in flight at a time.
     fun submit() {
-        if (_formState.value == VortXAccountFormState.Submitting) return
+        if (_formState.value == VortXAccountFormState.Submitting || activeRecoveryAttempt != null) return
         val error = validate()
         if (error != null) {
             _formState.value = VortXAccountFormState.Error(error)
@@ -255,40 +366,77 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         stopQrJoiner()
         val identity = Any()
         val submittedMode = _mode.value
+        val recoveryIntent = pickerFileRecoveryIntent
+        val recoveryAttempt = recoveryIntent?.let { AtomicBoolean(true) }
         val admission = sync.captureLocalLibraryMutationAdmission()
         authFormIdentity = identity
         activeAuthSubmission = identity
+        activeRecoveryAttempt = recoveryAttempt
         _formState.value = VortXAccountFormState.Submitting
-        viewModelScope.launch {
+        var recoveryPublication: (() -> Unit)? = null
+        val job = viewModelScope.launch(start = if (recoveryAttempt == null) CoroutineStart.DEFAULT else CoroutineStart.LAZY) {
             try {
                 if (authFormIdentity !== identity) return@launch
                 when (submittedMode) {
-                    VortXAccountMode.SIGN_IN -> signIn()
+                    VortXAccountMode.SIGN_IN -> {
+                        if (recoveryIntent == null) signIn()
+                        else recoveryPublication = prepareRecoverySignIn(recoveryIntent, checkNotNull(recoveryAttempt))
+                    }
                     VortXAccountMode.REGISTER -> register()
                     VortXAccountMode.RECOVER -> recover()
                 }
             } catch (cancel: CancellationException) {
-                if (authFormIdentity === identity) clearAuthInputs()
+                if (recoveryAttempt == null && authFormIdentity === identity) clearAuthInputs()
                 throw cancel
             } catch (_: Exception) {
-                // Adoption revokes the old account admission, but must not leave its own
-                // original secrets live. Never clear fields belonging to an edited form.
-                if (authFormIdentity === identity) clearAuthInputs()
-                admission?.invoke {
-                    if (authFormIdentity === identity) {
-                        _formState.value = VortXAccountFormState.Error(AUTH_RETRY_NOTICE)
+                if (recoveryAttempt == null) {
+                    // Adoption revokes the old account admission, but must not leave its own
+                    // original secrets live. Never clear fields belonging to an edited form.
+                    if (authFormIdentity === identity) clearAuthInputs()
+                    admission?.invoke {
+                        if (authFormIdentity === identity) {
+                            _formState.value = VortXAccountFormState.Error(AUTH_RETRY_NOTICE)
+                        }
+                        true
                     }
-                    true
+                } else {
+                    recoveryPublication = {
+                        resetAuthInputs()
+                        admission?.invoke {
+                            _formState.value = VortXAccountFormState.Error(AUTH_RETRY_NOTICE)
+                            true
+                        }
+                    }
                 }
             } finally {
-                // An edit still waits for this request, while a mode-change/new submission
-                // can already own another spinner. Neither completion clears replacement input.
-                if (activeAuthSubmission === identity) {
-                    activeAuthSubmission = null
-                    if (_formState.value == VortXAccountFormState.Submitting) _formState.value = VortXAccountFormState.Idle
-                }
+                if (recoveryAttempt == null) finishAuthSubmission(identity)
             }
         }
+        authSubmissionJob = job
+        if (recoveryAttempt != null) {
+            // Cancellation before the queued body starts still completes this exact Job.
+            // A running request keeps its slot until the Job actually completes.
+            job.invokeOnCompletion { cause ->
+                val stillAdmitted = recoveryAttempt.getAndSet(false)
+                viewModelScope.launch {
+                    val publication = if (stillAdmitted && authFormIdentity === identity && pickerFileRecoveryIntent === recoveryIntent) {
+                        if (cause is CancellationException) ::resetAuthInputs else recoveryPublication
+                    } else null
+                    finishAuthSubmission(identity, publication)
+                }
+            }
+            job.start()
+        }
+    }
+
+    private fun finishAuthSubmission(identity: Any, publication: (() -> Unit)? = null) {
+        // A retry becomes visibly ready only after its old exact slot has been released.
+        if (activeAuthSubmission !== identity) return
+        activeAuthSubmission = null
+        activeRecoveryAttempt = null
+        publication?.invoke()
+        if (activeAuthSubmission == null && _formState.value == VortXAccountFormState.Submitting)
+            _formState.value = VortXAccountFormState.Idle
     }
 
     /// Fail fast at the boundary with a clear message, before any network or key derivation runs.
@@ -311,29 +459,61 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
 
     private suspend fun signIn() {
         val code = _totp.value.trim().takeIf { it.isNotEmpty() }
-        when (val result = sync.signIn(_login.value.trim(), _password.value, code)) {
-            VortXSyncManager.AuthResult.Ok -> onAuthed()
+        val completion = PickerAuthCompletion()
+        when (val result = sync.signIn(_login.value.trim(), _password.value, code, completion)) {
+            VortXSyncManager.AuthResult.Ok -> onAuthed(completion.owner)
             VortXSyncManager.AuthResult.TotpRequired -> {
                 // First time: reveal the 6-digit field. With a code already supplied it was wrong.
-                _formState.value = if (code == null) {
-                    VortXAccountFormState.Idle
-                } else {
-                    VortXAccountFormState.Error("That code didn't work. Try again.")
-                }
+                _formState.value = totpChallengeState(code)
                 _totpRequired.value = true
             }
             is VortXSyncManager.AuthResult.Failed -> _formState.value = VortXAccountFormState.Error(result.message)
         }
     }
 
+    private suspend fun prepareRecoverySignIn(intent: VortXSyncManager.PickerFileRecoverySignIn,
+        attempt: AtomicBoolean): () -> Unit {
+        val code = _totp.value.trim().takeIf { it.isNotEmpty() }
+        val completion = PickerAuthCompletion()
+        val result = sync.signInForPickerFileRecovery(intent, _login.value.trim(), _password.value, code, completion, attempt::get)
+        return {
+            when (result) {
+                VortXSyncManager.AuthResult.Ok -> {
+                    abandonPickerFileRecoverySignIn()
+                    resetAuthInputs()
+                    if (completion.owner?.let(sync::isPickerCompletionOwnerCurrent) == true) {
+                        _pickerDismissalNotice.value = null
+                        _pickerPresentationOpen.value = false
+                    }
+                }
+                VortXSyncManager.AuthResult.TotpRequired -> {
+                    _totpRequired.value = true
+                    _formState.value = totpChallengeState(code)
+                }
+                is VortXSyncManager.AuthResult.Failed -> _formState.value = VortXAccountFormState.Error(result.message)
+            }
+        }
+    }
+
+    private fun totpChallengeState(code: String?): VortXAccountFormState =
+        if (code == null) VortXAccountFormState.Idle else VortXAccountFormState.Error("That code didn't work. Try again.")
+
     private suspend fun register() {
-        val result = sync.register(_login.value.trim(), _username.value.trim(), _password.value)
-        result.recoveryCode?.let {
-            _recoveryCode.value = it
-            _password.value = ""
+        val original = sync.capturePickerCompletionOwner()
+        val completion = PickerAuthCompletion()
+        completeRegistration(sync.register(_login.value.trim(), _username.value.trim(), _password.value, completion), original, completion.owner)
+    }
+    /** Actual registration-result publication, shared with bounded post-adoption lifecycle fixtures. */
+    internal suspend fun completeRegistration(result: VortXSyncManager.RegisterResult, original: PickerAccountSnapshot, adoptedOwner: PickerAccountSnapshot?) {
+        retireObsoleteCompletion()
+        val owner = if (result.result == VortXSyncManager.AuthResult.Ok) adoptedOwner else original
+        result.recoveryCode?.let { code ->
+            if (owner != null) sync.publishIfPickerCompletionOwnerCurrent(owner) {
+                completionOwner = owner; _recoveryCode.value = code; _password.value = ""
+            }
         }
         when (val auth = result.result) {
-            VortXSyncManager.AuthResult.Ok -> onAuthed()
+            VortXSyncManager.AuthResult.Ok -> onAuthed(owner)
             is VortXSyncManager.AuthResult.Failed -> {
                 if (result.recoveryCode != null) _mode.value = VortXAccountMode.SIGN_IN
                 _formState.value = VortXAccountFormState.Error(auth.message)
@@ -344,8 +524,9 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     }
 
     private suspend fun recover() {
-        when (val result = sync.recover(_login.value.trim(), _recoveryInput.value, _password.value)) {
-            VortXSyncManager.AuthResult.Ok -> onAuthed()
+        val completion = PickerAuthCompletion()
+        when (val result = sync.recover(_login.value.trim(), _recoveryInput.value, _password.value, completion)) {
+            VortXSyncManager.AuthResult.Ok -> onAuthed(completion.owner)
             is VortXSyncManager.AuthResult.Failed -> _formState.value = VortXAccountFormState.Error(result.message)
             VortXSyncManager.AuthResult.TotpRequired -> // recover never asks for TOTP; treat as failure
                 _formState.value = VortXAccountFormState.Error("Recovery failed.")
@@ -361,69 +542,84 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
      *  - UNREACHABLE: pushed nothing (a blip is never treated as a fresh account); realtime's guarded
      *    catch-up pull + poll retry until the doc is reachable.
      */
-    private suspend fun onAuthed() = finishPostAuth {
-        when (sync.reconcileAfterSignIn()) {
-            VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> {
-                _syncNotice.value = null
-                sync.startRealtime()
+    private suspend fun onAuthed(owner: PickerAccountSnapshot?) = finishPostAuth(owner) {
+        val original = checkNotNull(owner)
+        when (sync.reconcileAfterSignIn(original)) {
+            VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> publishCompletion(original) {
+                _syncNotice.value = null; sync.startRealtime()
             }
-            VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA -> _showReconcile.value = true
-            VortXSyncManager.SignInReconcile.UNREACHABLE -> {
+            VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA -> requireAccountReconcile(original)
+            VortXSyncManager.SignInReconcile.UNREACHABLE -> publishCompletion(original) {
                 _syncNotice.value = sync.syncProblem.value ?: "Signed in. Your synced data wasn't reachable yet; it will catch up automatically."
                 sync.startRealtime()
             }
         }
     }
-
-    /** QR is a deliberate transfer from an already approved device, so hydrate it without a second prompt. */
-    private suspend fun onQrAuthed() = finishPostAuth {
-        when (sync.reconcileAfterSignIn()) {
-            VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> _syncNotice.value = null
+    private fun publishCompletion(owner: PickerAccountSnapshot, publication: () -> Unit) {
+        sync.publishIfPickerCompletionOwnerCurrent(owner, publication)
+    }
+    /** QR uses the exact adoption receipt rather than adopting a later current session. */
+    private suspend fun onQrAuthed(owner: PickerAccountSnapshot?) = finishPostAuth(owner) {
+        val original = checkNotNull(owner)
+        when (sync.reconcileAfterSignIn(original)) {
+            VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> publishCompletion(original) { _syncNotice.value = null }
             VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA -> {
-                if (!sync.useAccountData()) _syncNotice.value = sync.syncProblem.value
-                    ?: "Signed in. Your saved data is preserved, but the account restore could not finish yet. Try Sync now again."
+                val restored = sync.useAccountData(original)
+                publishCompletion(original) { if (!restored) _syncNotice.value = sync.syncProblem.value
+                    ?: "Signed in. Your saved data is preserved, but the account restore could not finish yet. Try Sync now again." }
             }
-            VortXSyncManager.SignInReconcile.UNREACHABLE ->
+            VortXSyncManager.SignInReconcile.UNREACHABLE -> publishCompletion(original) {
                 _syncNotice.value = sync.syncProblem.value ?: "Signed in. Your synced data wasn't reachable yet; it will catch up automatically."
+            }
         }
-        sync.startRealtime()
+        publishCompletion(original) { sync.startRealtime() }
     }
 
     /** Shared signed-in completion boundary: a failed restore must not discard the saved session. */
-    internal suspend fun finishPostAuth(action: suspend () -> Unit) {
+    internal suspend fun finishPostAuth(action: suspend () -> Unit) = finishPostAuth(sync.capturePickerCompletionOwner(), action)
+    private suspend fun finishPostAuth(owner: PickerAccountSnapshot?, action: suspend () -> Unit) {
+        retireObsoleteCompletion()
         clearAuthInputs()
+        if (owner == null || !sync.isPickerCompletionOwnerCurrent(owner)) return
+        completionOwner = owner; _postAuthCompleting.value = true
         val admit = sync.captureLocalLibraryMutationAdmission()
         try {
             action()
         } catch (cancel: CancellationException) { throw cancel }
         catch (_: Exception) {
-            admit?.invoke {
-                _syncNotice.value = POST_AUTH_RETRY_NOTICE
-                true
-            }
+            admit?.invoke { _syncNotice.value = POST_AUTH_RETRY_NOTICE; true }
+        } finally {
+            if (completionOwner === owner) { _postAuthCompleting.value = false; settleCompletionIfFinished() }
+            retireObsoleteCompletion()
         }
     }
 
-    private fun clearAuthInputs() {
+    private fun resetAuthInputs() {
         _password.value = ""
         _totp.value = ""
         _recoveryInput.value = ""
         _totpRequired.value = false
+    }
+
+    private fun clearAuthInputs() {
+        resetAuthInputs()
         _formState.value = VortXAccountFormState.Idle
     }
 
     // ---- Reconcile choices (all still union/tombstone-safe inside the manager) ----
 
     /// Recommended: union both ways so every profile from both sides survives, then push.
-    fun reconcileMergeBoth() = resolveReconcile { sync.mergeBoth() }
+    fun reconcileMergeBoth() = resolveReconcile { owner -> sync.mergeBoth(owner) }
 
     /// Adopt the account's data (a forced pull; still a union, so no local-only profile is lost).
-    fun reconcileUseAccount() = resolveReconcile { sync.useAccountData() }
+    fun reconcileUseAccount() = resolveReconcile { owner -> sync.useAccountData(owner) }
 
     /// Keep this device's data (a push; still merged into the pulled doc, never a blind overwrite).
-    fun reconcileKeepDevice() = resolveReconcile { sync.importThisDeviceLibraryAndPush() }
+    fun reconcileKeepDevice() = resolveReconcile { owner -> sync.importThisDeviceLibraryAndPush(owner) }
 
-    private fun resolveReconcile(action: suspend () -> Boolean) {
+    private fun resolveReconcile(action: suspend (PickerAccountSnapshot) -> Boolean) {
+        retireObsoleteCompletion()
+        val owner = completionOwner ?: return
         if (_syncing.value || !_showReconcile.value) return
         // Reuse invocation ownership so a delayed choice cannot publish into a replacement session.
         val admit = sync.captureLocalLibraryMutationAdmission() ?: return
@@ -431,11 +627,12 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         _syncNotice.value = null
         viewModelScope.launch {
             try {
-                val reconciled = action()
+                val reconciled = action(owner)
                 admit {
                     if (_showReconcile.value) {
                         if (reconciled) {
                             _showReconcile.value = false
+                            settleCompletionIfFinished()
                             _syncNotice.value = null
                             sync.startRealtime() // Only a confirmed choice settles reconciliation.
                         } else {
@@ -476,8 +673,12 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     }
 
     /// The user confirmed they stored the one-time recovery code; it is never shown again.
-    fun dismissRecoveryCode() {
+    fun dismissRecoveryCode(expectedCode: String? = null) {
+        retireObsoleteCompletion()
+        if (expectedCode != null && _recoveryCode.value != expectedCode) return
         _recoveryCode.value = null
+        _pickerDismissalNotice.value = null
+        settleCompletionIfFinished()
     }
 
     fun signOut() {
@@ -487,6 +688,27 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
                 "Secure storage is unavailable. Your VortX session was not changed. Please try again."
             return
         }
+        finishSignOutUi()
+    }
+
+    internal fun signOut(expected: PickerAccountSnapshot, retireUi: () -> Unit): PickerSignOutResult = runPickerSignOut(
+        isCurrent = { sync.isPickerAccountCurrent(expected) },
+        retireUi = retireUi,
+        signOut = {
+            invalidateAuthForm()
+            sync.signOut(expected).also { result ->
+                if (result == PickerSignOutResult.SIGNED_OUT) finishSignOutUi()
+                else if (result == PickerSignOutResult.STORAGE_UNAVAILABLE) _syncNotice.value =
+                    "Secure storage is unavailable. Your VortX session was not changed. Please try again."
+            }
+        },
+    )
+
+    private fun finishSignOutUi() {
+        clearPendingCompletion()
+        _pickerPresentationOpen.value = false
+        stopQrJoiner()
+        clearAuthInputs()
         _showReconcile.value = false
         _recoveryCode.value = null
         _syncNotice.value = null
@@ -495,6 +717,10 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     }
 
     override fun onCleared() {
+        abandonPickerFileRecoverySignIn()
+        clearPendingCompletion()
+        invalidateAuthForm()
+        clearAuthInputs()
         stopQrJoiner()
         super.onCleared()
     }

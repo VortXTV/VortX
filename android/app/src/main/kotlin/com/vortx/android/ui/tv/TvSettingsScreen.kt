@@ -132,6 +132,7 @@ fun TvSettingsScreen(
     onProfileSelected: (ProfileSelectionRequest) -> Unit = {},
     onImportedCollections: (() -> Unit)? = null,
     importedReturnSignal: Int = 0,
+    onOpenProfilePickerTools: (() -> Unit)? = null,
 ) {
     val appContext = LocalContext.current.applicationContext
     val homeRailPreferences = remember(appContext) { HomeRailPreferences.shared(appContext) }
@@ -452,11 +453,16 @@ fun TvSettingsScreen(
                 TvSettingsSearchField(query = settingsQuery, onQueryChange = { settingsQuery = it })
             }
 
-            if (show("who's watching", "profile", "switch profile", "kids", "add profile", "edit profile", "delete profile")) {
+            if (show("who's watching", "profile", "switch profile", "kids", "add profile", "edit profile", "delete profile") ||
+                (onOpenProfilePickerTools != null && show("profile picker tools", "backup restore", "verify"))) {
                 item {
                     TvSettingsSection("Who's watching") {
                         TvSettingsNavigationRow(label = "Profiles", detail = "Switch, add, edit or delete profiles. Locked profiles require their PIN.",
                             focusRequester = profilesFocus, onClick = { route = TvSettingsRoute.PROFILES })
+                        onOpenProfilePickerTools?.let {
+                            TvSettingsNavigationRow(label = "Profile picker tools", detail = "Check a retained backup restore.",
+                                onClick = it)
+                        }
                     }
                 }
             }

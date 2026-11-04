@@ -32,9 +32,13 @@
     var nativeUnsupportedSettings: [String] = []
     var nativePreferenceIntentStatus = "idle"
     var fixtureProviderState: VortxNativeProviderCredentials?
+    // Real ordinary raw export remains in mergeLocalIntoDoc. Typed app authority is excluded.
+    private func mergeOwnerHistoryForExport(plaintext: Data, version: Int, observation: UUID,
+        capture: CredentialScopeRegistry.Capture, orderIntent: AddonOrderIntent?) async -> DerivedSyncDoc? { nil }
     func restoreAccountDocIfNeeded(credentialCapture capture: CredentialScopeRegistry.Capture) async -> Bool { preconditionFailure("cold restore outside causal repair proof") }
     func nativeEmptyAccountDocument(capture: CredentialScopeRegistry.Capture) throws -> [String: Any] { preconditionFailure("empty account outside causal repair proof") }
     func restoreNativeCheckpoint(credentialCapture capture: CredentialScopeRegistry.Capture) async -> Bool { preconditionFailure("session restore outside causal repair proof") }
+    private func restoreNativeCheckpointWithCloudRead(credentialCapture capture: CredentialScopeRegistry.Capture, userInitiated: Bool, cloudRead: ReceivedProviderCloudAuthority?) async -> Bool { preconditionFailure("cloud session restore outside causal repair proof") }
     func nativePreferenceStore(capture: CredentialScopeRegistry.Capture) throws -> NativePreferenceIntentStore {
         guard isCurrent(capture), let dataKey else { throw VortxNativeError.superseded }
         return NativePreferenceIntentStore(directoryURL: directory.appendingPathComponent("empty-preference-journal"), key: dataKey, namespace: capture.namespace)
@@ -55,7 +59,7 @@
     func fixtureBaseline() { refreshSettingsShadow() }
     func fixtureStop() { pendingSync?.cancel() }
     func fixtureDocument() async -> [String: Any] {
-        if case .doc(let doc, _) = await pullDocVersionedResult() { return doc }
+        if case .doc(let doc, _, _, _) = await pullDocVersionedResult() { return doc }
         preconditionFailure("expected encrypted fixture document")
     }
 // END MANAGER ENVIRONMENT
@@ -110,11 +114,11 @@
                 try Seed.emit(["accepted": accepted, "version": manager.lastSyncedVersion, "actor": actor])
             } else {
                 let capture = CredentialScopeRegistry.shared.capture()
+                let core = CoreBridge.shared
                 let facade = try await VortxNativeCoreFacade.create(session: session, registry: [], mutationAccepted: {
                     Task { @MainActor in VortXSyncManager.shared.nativeMutationDidCommit(credentialCapture: capture) }
-                }, changed: { CoreBridge.shared.handleHistoryFields($0) })
-                let core = CoreBridge.shared
-                core.nativeFacadeStorage = facade; core.nativeCredentialCapture = capture
+                }, sourceEvent: core.makeHistorySourceCallbackForFixture(), changed: { _ in })
+                core.installHistoryFacadeForFixture(facade)
                 core.nativePublishedAccountGeneration = facade.accountGeneration
                 try core.refreshProfilesForFixture()
                 await Seed.drainMainQueue()

@@ -49,6 +49,7 @@ struct VXDiagTransferPolicyTests {
             expect(completion.connectionCleanup == .waitForPeerClose,
                    "nominal final-send completion cannot immediately cancel the connection")
         }
+        if let claim { expect(!gate.owns(claim), "a completed claim cannot release a deferred chunk") }
         expect(gate.claim() == nil, "successful transfer consumes the one-shot capability")
     }
 
@@ -69,6 +70,8 @@ struct VXDiagTransferPolicyTests {
         let old = gate.claim()!
         gate.reset()
         let current = gate.claim()!
+        expect(!gate.owns(old) && gate.owns(current),
+               "deferred release rejects a retired claim while preserving its successor")
         expect(gate.complete(old, success: true) == .stale,
                "an old connection cannot finish a restarted export session")
         expect(gate.complete(current, success: true) == .deliveredPreservingLog,

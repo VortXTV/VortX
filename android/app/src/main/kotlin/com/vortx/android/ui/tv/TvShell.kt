@@ -114,6 +114,7 @@ fun TvShell(
     importedCollectionsOpen: Boolean = false,
     importedFromHome: Boolean = true,
     importedReturnSignal: Int = 0,
+    onOpenProfilePickerTools: (() -> Unit)? = null,
 ) {
     val appContext = LocalContext.current.applicationContext
     // Bumped when the active tab is re-selected on the rail. A depth-aware destination (Add-ons) pops its own
@@ -322,6 +323,7 @@ fun TvShell(
                     )
                 TvDestination.SETTINGS ->
                     TvSettingsScreen(repo = repo, auth = auth, syncManager = syncManager, onItem = onItem, onProfileSelected = onProfileSelected,
+                        onOpenProfilePickerTools = onOpenProfilePickerTools,
                         onImportedCollections = onImportedCollections?.let { open -> { open(false) } },
                         importedReturnSignal = if (!importedFromHome) importedReturnSignal else 0)
             }

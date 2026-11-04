@@ -1,6 +1,7 @@
 package com.vortx.android.sync
 
 import android.content.Context
+import com.vortx.android.engine.AccountFileLocalPresence
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
 import org.json.JSONArray
@@ -16,8 +17,12 @@ internal class AddonPublicationProofs(private val persistence: LibraryProofPersi
             return if (snapshot.availability == PersistentCredentialAvailability.AVAILABLE) Result.success(snapshot.values[key])
             else Result.failure(IllegalStateException("Publication storage unavailable"))
         }
+        override fun inspectExisting(vararg keys: String) = store.inspectExisting(*keys)
         override fun write(key: String, value: String): Boolean = store.set(key, value)
     })
+
+    @Synchronized fun inspectRestorePresence(account: String): AccountFileLocalPresence =
+        persistence.inspectExisting("owner." + digest(account))
 
     @Synchronized fun published(account: String, native: NativeLibraryOwner, raw: VortXSyncDoc.AddonDescriptor): VortXSyncDoc.AddonDescriptor? {
         val entry = load(account)?.optJSONObject(entryKey(native, raw)) ?: return null

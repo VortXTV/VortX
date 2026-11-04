@@ -45,6 +45,8 @@ enum ProfileMutationPresentationTests {
         first.finish(false)
         await settle { !presentation.isRunning }
         precondition(!duplicateStarted && dismissals == 0 && presentation.errorMessage == "Save failed")
+        presentation.cancel(preservingFailure: true)
+        precondition(!presentation.isRunning && presentation.errorMessage == "Save failed")
         presentation.cancel()
         precondition(presentation.errorMessage == nil)
 
@@ -73,6 +75,11 @@ enum ProfileMutationPresentationTests {
         precondition(view.components(separatedBy: "let admission = core.captureNativeProfileActionAdmission()").count == 6)
         precondition(!view.contains("let target = core.captureNativePlaybackTarget()"))
         precondition(view.contains(".interactiveDismissDisabled(profileAction.isRunning)"))
+        precondition(view.contains("profileAction.cancel(preservingFailure: toolsRoute != nil || accountHelpNeeded)"))
+        precondition(view.contains("if let route = toolsRoute { closeTools(route.id) }"))
+        precondition(view.contains("accountHelpDiagnosticGrant = nil"))
+        precondition(view.contains("toolsRoute = nil\n        profileAction.cancel()"))
+        precondition(view.contains("action.errorMessage != nil || sync.accountRestoreState == .failed"))
         print("PASS actual profile mutation presentation: acknowledgement, failure, retry, duplicate taps, cancelled late completion, captured native UI targets")
     }
 

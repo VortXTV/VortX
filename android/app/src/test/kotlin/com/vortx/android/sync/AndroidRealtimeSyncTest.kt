@@ -275,6 +275,235 @@ class AndroidRealtimeSyncTest {
         }
     }
 
+    @Test fun pickerBackWaitsForUnresolvedManualAuthRequestWithoutDiscardingIt() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            val response = CompletableDeferred<Unit>()
+            f.manager.installSyncTestSeam(checkNotNull(f.manager.currentSession()), 10, transport = { _, path, _, _ ->
+                check(path == "/v1/auth/prelogin"); response.await(); 500 to null
+            })
+            model.openPickerPresentation()
+            model.onLoginChange("fixture@example.invalid"); model.onPasswordChange("fixture password")
+            model.submit(); runCurrent()
+            assertEquals(VortXAccountFormState.Submitting, model.formState.value)
+            assertFalse(model.requestClosePickerPresentation())
+            assertTrue(model.pickerPresentationOpen.value)
+            response.complete(Unit); runCurrent()
+            assertTrue(model.requestClosePickerPresentation())
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun oldRegistrationReceiptCannotAttachItsRecoveryCodeToAReplacementSession() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            val original = f.manager.capturePickerCompletionOwner()
+            val replacement = VortXSyncManager.Session("replacement", account, key)
+            f.manager.replaceSyncSessionTestSeam(replacement)
+            model.completeRegistration(VortXSyncManager.RegisterResult(VortXSyncManager.AuthResult.Ok, "old fixture code"), original, original)
+            assertNull(model.recoveryCode.value); assertFalse(model.showReconcile.value)
+            assertSame(replacement, f.manager.currentSession())
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun registrationBackBeforeRecoveryAcknowledgementKeepsOriginalCodeAndReconcile() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            f.cloud.put("vortx", JSONObject()) // Actual post-auth probe returns the pending account-data choice.
+            model.openPickerPresentation()
+            model.completeRegistration(VortXSyncManager.RegisterResult(VortXSyncManager.AuthResult.Ok, "fixture recovery code"),
+                f.manager.capturePickerCompletionOwner(), f.manager.capturePickerCompletionOwner())
+            assertEquals("fixture recovery code", model.recoveryCode.value)
+            assertTrue(model.showReconcile.value)
+            assertFalse(model.requestClosePickerPresentation())
+            assertTrue(model.pickerPresentationOpen.value)
+            assertEquals("fixture recovery code", model.recoveryCode.value)
+            model.dismissRecoveryCode("fixture recovery code")
+            assertNull(model.recoveryCode.value)
+            assertFalse(model.requestClosePickerPresentation()) // The separate unresolved reconcile still blocks.
+            model.reconcileUseAccount(); runCurrent()
+            assertFalse(model.showReconcile.value)
+            assertTrue(model.requestClosePickerPresentation())
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun signInBackBeforeAccountChoiceKeepsPendingChoiceAndReplacementClearsIt() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            model.openPickerPresentation()
+            model.finishPostAuth { model.requireAccountReconcile() }
+            assertFalse(model.requestClosePickerPresentation())
+            assertTrue(model.showReconcile.value)
+            f.manager.replaceSyncSessionTestSeam(VortXSyncManager.Session("fixture replacement", account, key))
+            runCurrent()
+            assertFalse(model.showReconcile.value); assertNull(model.recoveryCode.value)
+            assertFalse(model.pickerPresentationOpen.value)
+            model.openPickerPresentation()
+            assertFalse(model.hasPendingPickerCompletion())
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun failedSecureClearRetainsUnacknowledgedRecoveryAndResumesItsPresentation() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            f.cloud.put("vortx", JSONObject())
+            model.openPickerPresentation()
+            model.completeRegistration(VortXSyncManager.RegisterResult(VortXSyncManager.AuthResult.Ok, "fixture recovery code"),
+                f.manager.capturePickerCompletionOwner(), f.manager.capturePickerCompletionOwner())
+            val saved = f.manager.currentSession()
+            f.manager.installSessionClearTestSeam { false }
+            val captured = checkNotNull(f.manager.capturePickerAccountSnapshot())
+            val result = model.signOut(captured) { model.retirePickerPresentationForSignOut() }
+            model.resumePickerCompletionIfCurrent(); runCurrent()
+            assertEquals(PickerSignOutResult.STORAGE_UNAVAILABLE, result)
+            assertSame(saved, f.manager.currentSession())
+            assertEquals("fixture recovery code", model.recoveryCode.value)
+            assertTrue(model.showReconcile.value); assertTrue(model.pickerPresentationOpen.value)
+            f.manager.replaceSyncSessionTestSeam(VortXSyncManager.Session("different", account.copy(id = "00000000-0000-0000-0000-000000000999"), key))
+            runCurrent()
+            assertNull(model.recoveryCode.value); assertFalse(model.showReconcile.value)
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun pickerSignOutRechecksActualManagerAfterUiRetirementChangesItsAccount() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            val original = checkNotNull(f.manager.capturePickerAccountSnapshot())
+            val replacement = VortXSyncManager.Session("fixture-replacement", account, key)
+            var retired = false
+            val result = model.signOut(original) {
+                retired = true
+                f.manager.replaceSyncSessionTestSeam(replacement)
+            }
+            assertTrue(retired)
+            assertEquals(PickerSignOutResult.STALE, result)
+            assertSame(replacement, f.manager.currentSession())
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun pickerSignOutCaptureRejectsSameAccountReplacementAndExpiredOperation() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val first = checkNotNull(f.manager.capturePickerAccountSnapshot())
+            assertTrue(f.manager.isPickerAccountCurrent(first))
+            val replacement = VortXSyncManager.Session("fixture-replacement", account, key)
+            f.manager.replaceSyncSessionTestSeam(replacement)
+            assertFalse(f.manager.isPickerAccountCurrent(first))
+            assertEquals(PickerSignOutResult.STALE, f.manager.signOut(first))
+            assertSame(replacement, f.manager.currentSession())
+            val second = checkNotNull(f.manager.capturePickerAccountSnapshot())
+            f.manager.expireSyncOperationTestSeam()
+            assertFalse(f.manager.isPickerAccountCurrent(second))
+            assertEquals(PickerSignOutResult.STALE, f.manager.signOut(second))
+            assertSame(replacement, f.manager.currentSession())
+            assertEquals("PickerAccountSnapshot", first.toString())
+        } finally { f.close() }
+    }
+
+    @Test fun fullEncryptedAccountDownloadWorksWithoutProfileOrNativeMountAndNeverDecryptsOrAcknowledges() = test {
+        val context = MemoryContext()
+        val work = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        val manager = VortXSyncManager(context, work)
+        val original = VortXSyncManager.Session("fixture original", account, key)
+        try {
+            var ordinaryRequests = 0; var downloads = 0
+            manager.installSyncTestSeam(original, 99, transport = { _, _, _, _ -> ordinaryRequests++; 500 to null })
+            manager.installSessionRestoreTestSeam(original)
+            // Valid framing but deliberately not decryptable under key: export must retain opaque ciphertext.
+            val ciphertext = "v2." + com.vortx.android.engine.OHJson.b64(ByteArray(28))
+            val raw = """{"document":"$ciphertext","version":42,"username":"untrusted response metadata","future":{"precise":9007199254740991.1}}""".toByteArray()
+            manager.installAccountFileTransportTestSeam { method, path, token ->
+                downloads++; assertEquals("GET", method); assertEquals("/v1/backup", path)
+                assertEquals(original.token, token); 200 to raw
+            }
+            val names = listOf("vortx_settings", "vortx_sync_state", "vortx_sync_dirty")
+            val before = names.associateWith { context.getSharedPreferences(it, 0).all.toMap() }
+            val file = manager.downloadAccountBackupFile()
+            val wrapper = com.vortx.android.engine.OHJson.Obj(file)
+            assertEquals(account.username, wrapper.text("username"))
+            assertEquals(ciphertext, wrapper.text("document")); assertEquals(42L, com.vortx.android.engine.OHJson.integer(wrapper.raw("version")))
+            assertEquals(1, downloads); assertEquals(0, ordinaryRequests)
+            assertEquals(99L, manager.lastAppliedVersion()) // Downloading a lower cloud revision changes no floor.
+            assertSame(original, manager.currentSession())
+            names.forEach { assertEquals(before[it], context.getSharedPreferences(it, 0).all) }
+        } finally { manager.cancelSyncTestWork() }
+    }
+
+    @Test fun fullEncryptedAccountDownloadRefusesSameValueSessionReplacementAndExpiredOriginalOperation() = test {
+        for (replace in listOf(true, false)) {
+            val context = MemoryContext()
+            val work = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+            val manager = VortXSyncManager(context, work)
+            val original = VortXSyncManager.Session("fixture original", account, key)
+            try {
+                manager.installSyncTestSeam(original, 10, transport = { _, _, _, _ -> error("Unexpected ordinary request") })
+                manager.installSessionRestoreTestSeam(original)
+                val entered = CompletableDeferred<Unit>(); val reply = CompletableDeferred<Unit>()
+                manager.installAccountFileTransportTestSeam { _, _, _ ->
+                    entered.complete(Unit); reply.await()
+                    200 to """{"document":"v2.${com.vortx.android.engine.OHJson.b64(ByteArray(28))}","version":10}""".toByteArray()
+                }
+                val pending = async { runCatching { manager.downloadAccountBackupFile() } }
+                runCurrent(); entered.await()
+                if (replace) manager.replaceSyncSessionTestSeam(VortXSyncManager.Session(original.token, account, key.copyOf()))
+                else manager.expireSyncOperationTestSeam()
+                reply.complete(Unit); runCurrent()
+                val error = pending.await().exceptionOrNull()
+                assertTrue(error is AccountBackupFile.Failure)
+                assertEquals(AccountBackupFile.Reason.SESSION_CHANGED, (error as AccountBackupFile.Failure).reason)
+            } finally { manager.cancelSyncTestWork() }
+        }
+    }
+
+    @Test fun fullEncryptedAccountDownloadKeepsMissingTransportMalformedAndOversizedFailuresDistinct() = test {
+        val context = MemoryContext()
+        val work = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        val manager = VortXSyncManager(context, work)
+        val original = VortXSyncManager.Session("fixture original", account, key)
+        try {
+            manager.installSyncTestSeam(original, 10, transport = { _, _, _, _ -> error("Unexpected ordinary request") })
+            manager.installSessionRestoreTestSeam(original)
+            var status = 404; var raw: ByteArray? = null
+            manager.installAccountFileTransportTestSeam { _, _, _ -> status to raw }
+            suspend fun refused(reason: AccountBackupFile.Reason) {
+                val error = runCatching { manager.downloadAccountBackupFile() }.exceptionOrNull()
+                assertTrue(error is AccountBackupFile.Failure)
+                assertEquals(reason, (error as AccountBackupFile.Failure).reason)
+                assertSame(original, manager.currentSession()); assertEquals(10L, manager.lastAppliedVersion())
+            }
+            refused(AccountBackupFile.Reason.NO_BACKUP)
+            for (failure in listOf(0, 304, 401, 403, 500)) { status = failure; refused(AccountBackupFile.Reason.UNAVAILABLE) }
+            status = 200; refused(AccountBackupFile.Reason.DAMAGED)
+            raw = """{"document":"v2.${com.vortx.android.engine.OHJson.b64(ByteArray(28))}","version":9007199254740991.1}""".toByteArray()
+            refused(AccountBackupFile.Reason.DAMAGED)
+            raw = ByteArray(AccountBackupFile.MAXIMUM_RESPONSE_BYTES + 1) { 32 }
+            refused(AccountBackupFile.Reason.TOO_LARGE)
+        } finally { manager.cancelSyncTestWork() }
+    }
+
+    @Test fun fullEncryptedAccountDownloadDoesNotTreatUnavailableSessionAsSignedOutOrContactTransport() = test {
+        val context = MemoryContext()
+        val work = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        val manager = VortXSyncManager(context, work)
+        val original = VortXSyncManager.Session("fixture original", account, key)
+        try {
+            manager.installSyncTestSeam(original, 10, transport = { _, _, _, _ -> error("Unexpected ordinary request") })
+            manager.installUnavailableSessionRestoreTestSeam()
+            var calls = 0
+            manager.installAccountFileTransportTestSeam { _, _, _ -> calls++; 404 to null }
+            val error = runCatching { manager.downloadAccountBackupFile() }.exceptionOrNull()
+            assertTrue(error is AccountBackupFile.Failure)
+            assertEquals(AccountBackupFile.Reason.SESSION_CHANGED, (error as AccountBackupFile.Failure).reason)
+            assertEquals(0, calls); assertSame(original, manager.currentSession())
+            assertEquals(VortXSyncManager.SessionUiState.UnknownOrUnavailable, manager.sessionUiState.value)
+        } finally { manager.cancelSyncTestWork() }
+    }
+
     @Test fun synchronousSocketStartupFailureRetainsSessionWorkerPollingAndRetry() = test {
         val f = Fixture(testScheduler)
         var attempts = 0
@@ -859,10 +1088,7 @@ class AndroidRealtimeSyncTest {
     }
 
     private fun pendingReconcile(manager: VortXSyncManager): VortXAccountViewModel = VortXAccountViewModel(manager).also { model ->
-        // Set only the already-visible choice state; transport, crypto, manager and VM action are real.
-        val field = VortXAccountViewModel::class.java.getDeclaredField("_showReconcile").apply { isAccessible = true }
-        @Suppress("UNCHECKED_CAST")
-        (field.get(model) as MutableStateFlow<Boolean>).value = true
+        model.requireAccountReconcile()
     }
 
     @Test fun `failed reconcile choices remain visible and actionable until confirmed retry`() = test {

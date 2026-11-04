@@ -1,4 +1,5 @@
 import SwiftUI
+import CryptoKit
 
 /// Local record of the IPTV playlists the user has added (M3U URLs and Xtream Codes logins), each converted
 /// by the hosted `iptv.vortx.tv` worker into a first-party Stremio add-on that flows through VortX's existing
@@ -146,6 +147,24 @@ final class IPTVPlaylistStore: ObservableObject {
         playlists.contains { $0.transportUrl == transportUrl }
     }
 
+    /// Validate known credential fields without decoding/re-encoding away unknown siblings,
+    /// numeric spelling or member order. Ordinary export keeps its compatibility read policy.
+    private func credentialJSONStringForSync(_ slug: String) -> String? {
+        let original: String?
+        #if ACCOUNT_PROVIDER_SETTLEMENT_TESTING
+        if let fixture = settlementFixtureIO {
+            if case .value(let value) = fixture.credential(credAccount(slug)) { original = value }
+            else { original = nil }
+        } else { original = Keychain.string(credAccount(slug)) }
+        #else
+        original = Keychain.string(credAccount(slug))
+        #endif
+        guard let original, let bytes = original.data(using: .utf8),
+              (try? OwnerHistoryExactJSON.Object(bytes)) != nil,
+              (try? JSONDecoder().decode(IPTVCredentials.self, from: bytes)) != nil else { return nil }
+        return original
+    }
+
     // MARK: Sync blob (the account-encrypted `apiKeys` channel)
 
     /// The JSON string mirrored on the account `apiKeys` channel under `vortx.iptv`, or nil when there is
@@ -164,7 +183,14 @@ final class IPTVPlaylistStore: ObservableObject {
     /// UNAFFECTED: the ACCOUNT token itself stays Keychain-only and out of every backup. It is the key that
     /// opens this document, so it can never live inside it, and nothing here changes that.
     func syncBlob() -> String? {
+        #if ACCOUNT_PROVIDER_SETTLEMENT_TESTING
+        let removed: [String: Double]
+        if let fixture = settlementFixtureIO {
+            guard let value = try? fixture.removed() else { return nil }; removed = value
+        } else { removed = Self.loadRemoved() }
+        #else
         let removed = Self.loadRemoved()
+        #endif
         guard !playlists.isEmpty || !removed.isEmpty else { return nil }
         var listJSON: [[String: Any]] = []
         for p in playlists {
@@ -177,9 +203,8 @@ final class IPTVPlaylistStore: ObservableObject {
             ]
             // The credential JSON is carried as an opaque string, so a future field added to IPTVCredentials
             // rides along without a blob-schema change and an older client passes it through untouched.
-            if let c = credentials(for: p.id), let data = try? JSONEncoder().encode(c),
-               let s = String(data: data, encoding: .utf8) {
-                obj["cred"] = s
+            if let original = credentialJSONStringForSync(p.id) {
+                obj["cred"] = original
             }
             listJSON.append(obj)
         }
@@ -242,4 +267,155 @@ final class IPTVPlaylistStore: ObservableObject {
         playlists = bySlug.values.sorted { $0.createdAt > $1.createdAt }   // newest-first, mirroring add()
         persistList()
     }
+    // MARK: - Source-bound received-provider settlement
+
+    enum SyncSettlementRefusal: String, Sendable { case superseded, busy, malformed, credentialUnavailable, persistenceUnverified, publicationUnverified }
+    struct SyncSettlementReceipt: Sendable {
+        private let digest: Data
+        private let operationID: UUID
+        fileprivate init(source: String, operationID: UUID) {
+            digest = AccountProviderSyncBlob.digest(source); self.operationID = operationID
+        }
+        func matches(source: String, operationID: UUID) -> Bool {
+            self.operationID == operationID && digest == AccountProviderSyncBlob.digest(source)
+        }
+    }
+    enum SyncSettlement: Sendable { case settled(SyncSettlementReceipt), refused(SyncSettlementRefusal) }
+    struct SyncSettlementIO {
+        var credential: (String) -> CredentialDurableReadResult
+        var confirmedRead: (String, () -> Bool) -> KeychainFailureClosedStore.ConfirmedRead?
+        var compare: (KeychainFailureClosedStore.ConfirmedRead, String?, String, () -> Bool) -> CredentialMutationResult
+        var list: () throws -> Data?
+        var removed: () throws -> [String: Double]
+        var synchronize: () -> Bool
+        var persist: (Data, [String: Double], () -> Bool) -> Bool
+    }
+    #if ACCOUNT_PROVIDER_SETTLEMENT_TESTING
+    private var settlementFixtureIO: SyncSettlementIO?
+    init(settlementFixtureIO: SyncSettlementIO, playlists: [IPTVPlaylist] = []) {
+        self.settlementFixtureIO = settlementFixtureIO; self.playlists = playlists
+    }
+    #endif
+    private func receivedSettlementIO() -> SyncSettlementIO {
+        #if ACCOUNT_PROVIDER_SETTLEMENT_TESTING
+        if let settlementFixtureIO { return settlementFixtureIO }
+        #endif
+        return .init(credential: { Keychain.confirmedString($0) },
+            confirmedRead: { Keychain.confirmedRead($0, isCurrentOwner: $1) },
+            compare: { Keychain.compareAndSetConfirmed($0, with: $1, for: $2, isCurrentOwner: $3) },
+            list: { try AccountProviderSyncBlob.defaultsData(UserDefaults.standard.object(forKey: Self.defaultsKey)) },
+            removed: { try AccountProviderSyncBlob.defaultsRemoved(UserDefaults.standard.object(forKey: Self.removedKey)) },
+            synchronize: { UserDefaults.standard.synchronize() },
+            persist: { bytes, removed, owns in
+                guard owns() else { return false }
+                UserDefaults.standard.set(removed, forKey: Self.removedKey)
+                guard owns() else { return false }
+                UserDefaults.standard.set(bytes, forKey: Self.defaultsKey)
+                return owns() && UserDefaults.standard.synchronize()
+            })
+    }
+    /// No network or Task is created. A settled receipt covers a checked local merge, not remote
+    /// playlist reachability. Existing nonempty readable credentials remain locally authoritative.
+    func applySyncBlobSettled(_ json: String, operationID: UUID,
+                              isCurrent: @escaping () -> Bool) -> SyncSettlement {
+        let owns: () -> Bool = { !Task.isCancelled && isCurrent() }
+        guard owns() else { return .refused(.superseded) }
+        guard CredentialPublicationOutbox.acquireBoundary() == .acquired else { return .refused(.busy) }
+        defer { CredentialPublicationOutbox.endBoundary() }
+        let io = receivedSettlementIO()
+        var failureStage = SyncSettlementRefusal.malformed
+        do {
+            let root = try AccountProviderSyncBlob.root(json)
+            let remote = try AccountProviderSyncBlob.rows(root, "playlists")
+            let remoteRemoved = try AccountProviderSyncBlob.removed(root)
+            failureStage = .persistenceUnverified
+            guard owns(), io.synchronize(), owns() else { return .refused(.persistenceUnverified) }
+            let originalData = try io.list(), originalRemoved = try io.removed()
+            let original = try originalData.map { try JSONDecoder().decode([IPTVPlaylist].self, from: $0) } ?? []
+            guard original == playlists, Set(original.map(\.id)).count == original.count,
+                  original.allSatisfy({ AccountProviderSyncBlob.validDate($0.createdAt) }) else { return .refused(.persistenceUnverified) }
+            var removed = originalRemoved
+            for (id, stamp) in remoteRemoved where stamp > (removed[id] ?? 0) { removed[id] = stamp }
+            var records = Dictionary(uniqueKeysWithValues: original.map { ($0.id, $0) })
+            // Each slot keeps its original actual read capability throughout planning. Coalesce a
+            // delete followed by a newer remote re-add to one final CAS against that same read;
+            // never fabricate a missing-state capability after a merely planned deletion.
+            var actions: [String: (KeychainFailureClosedStore.ConfirmedRead, String?)] = [:]
+            var actionOrder: [String] = []
+            var observations: [String: KeychainFailureClosedStore.ConfirmedRead] = [:]
+            var credentials: [String: CredentialDurableReadResult] = [:]
+            // A tombstone-only source must retire older local records too. A newer local
+            // re-add wins; no absent remote row is interpreted as deletion.
+            for record in original {
+                if let stamp = removed[record.id], stamp > record.createdAt.timeIntervalSince1970 * 1000 {
+                    let slot = credAccount(record.id)
+                    guard let observation = io.confirmedRead(slot, owns) else { return .refused(.credentialUnavailable) }
+                    observations[slot] = observation
+                    let prior = observation.result
+                    if prior != .missing { actions[slot] = (observation, nil); actionOrder.append(slot) }
+                    credentials[slot] = .missing; records.removeValue(forKey: record.id)
+                }
+            }
+            var seen: Set<String> = []
+            failureStage = .malformed
+            for row in remote {
+                let id = try AccountProviderSyncBlob.string(row, "id")
+                guard !id.isEmpty, id.utf8.count <= 4096, !id.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+                      seen.insert(id).inserted, let kind = IPTVKind(rawValue: try AccountProviderSyncBlob.string(row, "kind")) else { return .refused(.malformed) }
+                let name = try AccountProviderSyncBlob.string(row, "name")
+                let url = try AccountProviderSyncBlob.string(row, "transportUrl")
+                guard !url.isEmpty else { return .refused(.malformed) }
+                let date = try AccountProviderSyncBlob.date(row, "createdAt")
+                let incoming = try AccountProviderSyncBlob.optionalString(row, "cred")
+                if let incoming, !incoming.isEmpty {
+                    _ = try OwnerHistoryExactJSON.Object(Data(incoming.utf8))
+                    _ = try JSONDecoder().decode(IPTVCredentials.self, from: Data(incoming.utf8))
+                }
+                let slot = credAccount(id)
+                guard owns() else { return .refused(.superseded) }
+                if let stamp = removed[id], stamp > date.timeIntervalSince1970 * 1000 { continue }
+                let keepNewerLocal = records[id].map { $0.createdAt > date } ?? false
+                if observations[slot] == nil {
+                    guard let observation = io.confirmedRead(slot, owns) else { return .refused(.credentialUnavailable) }
+                    observations[slot] = observation
+                }
+                guard let observation = observations[slot] else { return .refused(.credentialUnavailable) }
+                let prior = credentials[slot] ?? observation.result
+                let local = try AccountProviderSyncBlob.value(prior)
+                if let local, !local.isEmpty {
+                    // A malformed nonempty slot is unknown, not permission to replace it.
+                    guard (try? OwnerHistoryExactJSON.Object(Data(local.utf8))) != nil,
+                          (try? JSONDecoder().decode(IPTVCredentials.self, from: Data(local.utf8))) != nil else { return .refused(.credentialUnavailable) }
+                }
+                if keepNewerLocal { credentials[slot] = prior; continue }
+                if (local ?? "").isEmpty, let incoming, !incoming.isEmpty {
+                    if actions[slot] == nil { actionOrder.append(slot) }
+                    actions[slot] = (observation, incoming); credentials[slot] = .value(incoming)
+                } else { credentials[slot] = prior }
+                records[id] = IPTVPlaylist(id: id, name: name, kind: kind, transportUrl: url, createdAt: date)
+            }
+            for slot in actionOrder {
+                guard let (expected, value) = actions[slot] else { return .refused(.credentialUnavailable) }
+                guard owns() else { return .refused(.superseded) }
+                guard io.compare(expected, value, slot, owns) == .success,
+                      AccountProviderSyncBlob.sameCredential((io.confirmedRead(slot, owns)?.result ?? .failure), value.map(CredentialDurableReadResult.value) ?? .missing) else { return .refused(.credentialUnavailable) }
+            }
+            for (slot, expected) in credentials {
+                guard AccountProviderSyncBlob.sameCredential((io.confirmedRead(slot, owns)?.result ?? .failure), expected) else { return .refused(.credentialUnavailable) }
+            }
+            let next = records.values.sorted { $0.createdAt == $1.createdAt ? $0.id < $1.id : $0.createdAt > $1.createdAt }
+            guard owns(), try io.list() == originalData, try io.removed() == originalRemoved else { return .refused(.persistenceUnverified) }
+            failureStage = .persistenceUnverified
+            let bytes = try JSONEncoder().encode(next)
+            guard io.persist(bytes, removed, owns), owns(), try io.list() == bytes, try io.removed() == removed else { return .refused(.persistenceUnverified) }
+            playlists = next
+            guard owns(), playlists == next else { return .refused(.publicationUnverified) }
+            for (slot, expected) in credentials {
+                guard AccountProviderSyncBlob.sameCredential((io.confirmedRead(slot, owns)?.result ?? .failure), expected) else { return .refused(.credentialUnavailable) }
+            }
+            guard owns(), try io.list() == bytes, try io.removed() == removed else { return .refused(.persistenceUnverified) }
+            return .settled(.init(source: json, operationID: operationID))
+        } catch { return .refused(owns() ? failureStage : .superseded) }
+    }
+
 }

@@ -1,5 +1,7 @@
 package com.vortx.android.integrations
 
+import com.vortx.android.sync.SessionOwnerSnapshot
+import com.vortx.android.engine.NativeLibraryMirrorOrigin
 import android.content.Context
 import android.util.Log
 import com.vortx.android.BuildConfig
@@ -109,6 +111,77 @@ object TraktAuth {
         get() = tokenMutations.snapshot {
             currentSessionEpoch() to (tokenStore?.connectionState == CredentialConnectionState.CONNECTED)
         }.value.let { (epoch, connected) -> epoch.takeIf { isConfigured && connected } }
+
+    /** Projection already owns native Session/account/mount admission. It must not enter
+     * tokenMutations in that order; use its exact Trakt vault guard for this read-only check. */
+    internal fun profileProjectionEpoch(guard: NativeProviderAccess.Guard): Long? =
+        withProfileProjectionEpoch(guard) { it }
+
+    internal fun profileProjectionEpochIsCurrent(guard: NativeProviderAccess.Guard, expected: Long?): Boolean =
+        withProfileProjectionEpoch(guard) { it == expected } == true
+
+    private fun <T> withProfileProjectionEpoch(guard: NativeProviderAccess.Guard, read: (Long?) -> T): T? {
+        if (guard.keys != NativeProviderCredentials.GROUPS[0]) return null
+        return runCatching {
+            NativeProviderAccess.guarded(guard) {
+                val epoch = currentSessionEpoch()
+                val connection = tokenStore?.connectionState ?: CredentialConnectionState.DISCONNECTED
+                if (epoch <= 0 || connection == CredentialConnectionState.STORAGE_UNAVAILABLE) null
+                else read(epoch.takeIf { isConfigured && connection == CredentialConnectionState.CONNECTED })
+            }
+        }.getOrNull()
+    }
+
+    internal fun watchlistEpoch(expected: SessionOwnerSnapshot.Account): Long? {
+        if (!isConfigured) return null
+        return tokenMutations.snapshotForOwner(expected) {
+            currentSessionEpoch().takeIf { it > 0 && tokenStore?.connectionState == CredentialConnectionState.CONNECTED }
+        }?.value
+    }
+
+    internal fun captureDurableWatchlistCredential(
+        expected: SessionOwnerSnapshot.Account,
+        persistedOwnerEpoch: Long,
+        dataKey: ByteArray,
+    ): DurableProviderMirrorCredential? = tokenMutations.snapshotRetryForOwner(
+        expected, persistedOwnerEpoch, dataKey, ProviderRetryCredentialProof.Provider.TRAKT,
+    ) { captured ->
+        val now = nowSeconds()
+        val expires = captured.expiresAtSeconds
+        val created = captured.createdAtSeconds?.takeIf { it < expires } ?: now
+        isConfigured && !traktTokenExpired(expires, expires - created, now)
+    }
+
+    internal sealed interface MirrorPreparation {
+        data object Refused : MirrorPreparation
+        data object RefreshFailed : MirrorPreparation
+        data object RefreshSucceeded : MirrorPreparation
+        data class Ready(val credential: ProviderMirrorCredential) : MirrorPreparation
+    }
+
+    internal suspend fun prepareWatchlistCredential(origin: NativeLibraryMirrorOrigin, epoch: Long): MirrorPreparation {
+        val snapshot = tokenMutations.snapshotForOwner(origin.expectedAccount) {
+            if (currentSessionEpoch() == epoch) currentStoredToken() else null
+        } ?: return MirrorPreparation.Refused
+        val stored = snapshot.value ?: return MirrorPreparation.Refused
+        if (stored.token.isExpired) {
+            val mirror = MirrorRefresh(origin, stored.lineage)
+            val settled = try {
+                refresh(snapshot.operation, mirror)
+                true
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Exception) { false }
+            // A refresh is not a title request. Neither its success nor its failure
+            // authorizes an old-epoch title retry or adoption of a successor token.
+            val status = mirror.startedStatus ?: return MirrorPreparation.Refused
+            return if (settled && status in 200..299) MirrorPreparation.RefreshSucceeded
+            else MirrorPreparation.RefreshFailed
+        }
+        return MirrorPreparation.Ready(ProviderMirrorCredential(stored.token.accessToken, snapshot.operation) {
+            currentSessionEpoch() == epoch && currentStoredToken()?.lineage == stored.lineage && !stored.token.isExpired
+        })
+    }
 
     // MARK: - Step 1: request a device code
 
@@ -230,8 +303,9 @@ object TraktAuth {
 
     /// A live access token, refreshing first if the stored one is near expiry. Throws
     /// [TraktAuthException.NotSignedIn] when no token is stored.
-    suspend fun validToken(): String {
-        val snapshot = tokenMutations.snapshot(::currentStoredToken)
+    suspend fun validToken(): String = validToken(tokenMutations.snapshot(::currentStoredToken))
+
+    private suspend fun validToken(snapshot: CredentialOperationSnapshot<TokenPersistence.StoredToken?>): String {
         val storedToken = snapshot.value ?: throw TraktAuthException.NotSignedIn
         val token = storedToken.token
         if (token.isExpired) return refresh(snapshot.operation).accessToken
@@ -242,10 +316,19 @@ object TraktAuth {
     /// Exchange the refresh token for a fresh set via `POST /oauth/token`, SINGLE-FLIGHT via [refreshMutex]:
     /// a second concurrent caller re-checks the store under the lock and reuses the winner's fresh token
     /// instead of spending the already-rotated refresh token (which would 401 and drop the session).
+    private class MirrorRefresh(
+        val origin: NativeLibraryMirrorOrigin,
+        val lineage: TokenPersistence.PersistedLineage,
+    ) {
+        var startedStatus: Int? = null
+    }
+
     private suspend fun refresh(
         operation: CredentialMutationCoordinator.Operation,
+        mirror: MirrorRefresh? = null,
     ): TraktToken = refreshAfterSerialization(operation, tokenStore ?: throw TraktAuthException.SecureStorage) { current ->
-        performRefresh(operation, current)
+        if (mirror != null && current.lineage != mirror.lineage) throw TraktAuthException.NotSignedIn
+        performRefresh(operation, current, mirror)
     }
 
     internal suspend fun refreshAfterSerialization(
@@ -272,6 +355,7 @@ object TraktAuth {
     private suspend fun performRefresh(
         operation: CredentialMutationCoordinator.Operation,
         spentToken: TokenPersistence.StoredToken,
+        mirror: MirrorRefresh?,
     ): TraktToken {
         if (!operation.isCurrent()) throw TraktAuthException.NotSignedIn
         ensureConfigured()
@@ -291,12 +375,24 @@ object TraktAuth {
             persistence = persistence,
             clearCurrent = ::signOut,
             request = {
-                IntegrationsHttp.request(
-                    method = "POST",
-                    urlString = "$API_BASE/oauth/token",
-                    headers = baseHeaders(),
-                    body = body,
-                )
+                if (mirror == null) {
+                    IntegrationsHttp.request(
+                        method = "POST",
+                        urlString = "$API_BASE/oauth/token",
+                        headers = baseHeaders(),
+                        body = body,
+                    )
+                } else {
+                    when (val sent = ProviderMirrorTransport.post(mirror.origin, operation,
+                        { currentStoredToken()?.lineage == spentToken.lineage },
+                        "$API_BASE/oauth/token", baseHeaders(), body)) {
+                        ProviderMirrorResponse.Refused -> throw TraktAuthException.NotSignedIn
+                        is ProviderMirrorResponse.Started -> {
+                            mirror.startedStatus = sent.response.status
+                            sent.response
+                        }
+                    }
+                }
             },
         )
     }
@@ -581,16 +677,12 @@ data class TraktToken(
     val expiresAtSeconds: Long get() = createdAt + expiresIn
 
     val isExpired: Boolean
-        get() {
-            val now = System.currentTimeMillis() / 1000L
-            val remaining = expiresAtSeconds - now
-            val leeway = minOf(DEFAULT_LEEWAY_SECONDS, expiresIn / 2)
-            return remaining <= leeway
-        }
+        get() = traktTokenExpired(expiresAtSeconds, expiresIn, System.currentTimeMillis() / 1000L)
+}
 
-    private companion object {
-        const val DEFAULT_LEEWAY_SECONDS = 1800L // 30 minutes, matching the Apple defaultLeeway
-    }
+private fun traktTokenExpired(expiresAt: Long, lifetime: Long, now: Long): Boolean {
+    val leeway = minOf(1800L, lifetime / 2) // 30 minutes, matching the Apple defaultLeeway.
+    return expiresAt - now <= leeway
 }
 
 /// Typed errors for the Trakt auth flow, mapping to the documented device/token status codes plus

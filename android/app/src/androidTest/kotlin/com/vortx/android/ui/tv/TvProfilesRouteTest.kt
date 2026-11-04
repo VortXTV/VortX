@@ -38,6 +38,7 @@ import org.junit.runner.RunWith
 @OptIn(ExperimentalTestApi::class)
 class TvProfilesRouteTest {
     @get:Rule val compose = createComposeRule()
+    private var accountRequests = 0
     private val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Main", avatar = "M", isOwner = true)
     private val other = UserProfile(name = "A very long profile name that must fit a short television viewport without hiding Save", avatar = "K", isKids = true)
 
@@ -93,7 +94,7 @@ class TvProfilesRouteTest {
 
     @Test fun pickerAddPersistsReloadsAndBackReturnsFocusToAdd() {
         val gateway = FixtureGateway(listOf(owner, other))
-        compose.setContent { VortXTheme { TvProfilePicker(gateway, onDone = {}) } }
+        compose.setContent { VortXTheme { TvProfilePicker(gateway, onDone = {}, accountControl = com.vortx.android.ui.profilepicker.ProfilePickerAccountControl("Sign in") { accountRequests++ }) } }
         enter("tv-picker-add")
         compose.onNodeWithTag("tv-profile-name").performTextReplacement("New viewer")
         enter("tv-profile-save")

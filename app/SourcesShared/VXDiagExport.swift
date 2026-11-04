@@ -2,7 +2,6 @@ import Foundation
 import Network
 import CoreImage
 import SwiftUI
-import Darwin   // getifaddrs / ifaddrs / getnameinfo for LAN IPv4 discovery
 import os
 
 /// One-shot LAN export for the rolling diagnostic log (`VXProbe.logFileURL`). Apple TV has no share
@@ -68,20 +67,28 @@ final class VXDiagExport: @unchecked Sendable {
         let logSnapshot: VXProbeLogSnapshot
     }
 
+    typealias DeliveryAuthorization = @MainActor @Sendable () -> Bool
     private let presentationOwned: Bool
-    private init(presentationOwned: Bool = false) { self.presentationOwned = presentationOwned }
+    private let deliveryAuthorization: DeliveryAuthorization?
+    private let deliveryRetirement = VXDiagExportStartCancellation()
+    private init(presentationOwned: Bool = false, deliveryAuthorization: DeliveryAuthorization? = nil) {
+        self.presentationOwned = presentationOwned
+        self.deliveryAuthorization = deliveryAuthorization
+    }
 
     /// A presentation owns this listener, rather than stopping an unrelated Settings export through
     /// the singleton. Each retry/presentation gets its own capability and teardown lifetime.
-    static func makeSession() -> VXDiagExport { VXDiagExport(presentationOwned: true) }
+    static func makeSession(deliveryAuthorization: DeliveryAuthorization? = nil) -> VXDiagExport {
+        VXDiagExport(presentationOwned: true, deliveryAuthorization: deliveryAuthorization)
+    }
 
     // MARK: - Public contract
 
     /// Start (idempotent) the LAN log server and return `(url, qr)` for display, or nil when there is no
-    /// Wi-Fi IPv4 to advertise or the listener cannot start. `url` is `http://LANIP:PORT/`; `qr` encodes it.
+    /// Wi-Fi or Ethernet IPv4 to advertise or the listener cannot start. `url` is `http://LANIP:PORT/`; `qr` encodes it.
     func start() -> (url: String, qr: Image)? {
         guard let ip = Self.lanIPv4() else {
-            NSLog("[diag] export: no LAN IPv4 (not on Wi-Fi?)")
+            NSLog("[diag] export: no usable Wi-Fi or Ethernet IPv4")
             return nil
         }
         guard let boundPort = ensureListening() else {
@@ -150,6 +157,7 @@ final class VXDiagExport: @unchecked Sendable {
 
     /// Tear the listener down so the log is no longer served. Safe to call when not started.
     func stop() {
+        if presentationOwned { deliveryRetirement.cancel() }
         queue.sync { tearDownListener() }
     }
 
@@ -158,6 +166,8 @@ final class VXDiagExport: @unchecked Sendable {
     /// the post-await guard requests cleanup again if that start finishes after dismissal.
     func stopOwnedSession() {
         guard presentationOwned else { return }
+        // Revoke synchronously: queued payload/send admission cannot outrun deferred teardown.
+        deliveryRetirement.cancel()
         queue.async { self.tearDownListener() }
     }
 
@@ -298,65 +308,63 @@ final class VXDiagExport: @unchecked Sendable {
         }
     }
 
+    /// Authorize each payload/header/chunk release against this presentation's ORIGINAL grant.
+    /// Nil preserves the direct account-independent Settings path. Guarded releases run on MainActor:
+    /// admission and the synchronous payload collection/send happen in one turn, with no await between.
+    /// Already handed-off network bytes cannot be recalled; no later chunk is admitted after revocation.
+    private func authorizeDelivery(
+        _ connection: NWConnection,
+        claim: VXDiagExportPolicy.TransferClaim,
+        release: @escaping @Sendable () -> Void
+    ) {
+        let commit: @Sendable () -> Void = { [weak self] in
+            guard let self else { connection.cancel(); return }
+            guard self.ownsDelivery(connection, claim: claim) else {
+                self.finishTransfer(connection, claim: claim, success: false)
+                return
+            }
+            release()
+        }
+        guard let deliveryAuthorization else { commit(); return }
+        Task { @MainActor [weak self] in
+            guard let self else { connection.cancel(); return }
+            guard deliveryAuthorization() else {
+                self.finishTransfer(connection, claim: claim, success: false)
+                self.stopOwnedSession()
+                return
+            }
+            commit()
+        }
+    }
+
+    private func ownsDelivery(_ connection: NWConnection, claim: VXDiagExportPolicy.TransferClaim) -> Bool {
+        guard !deliveryRetirement.isCancelled else { return false }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return connections[ObjectIdentifier(connection)] === connection && transferGate.owns(claim)
+    }
+
     /// Write the current diagnostic log as a text/plain attachment, then close. Any read failure yields an
     /// empty body rather than an error so the phone still gets a (harmless) file.
     private func serve(
         _ connection: NWConnection,
         claim: VXDiagExportPolicy.TransferClaim
     ) {
-        let payload = Self.exportPayload()
-        let body = payload.body
-        let head = """
-        HTTP/1.1 200 OK\r
-        Content-Type: text/plain; charset=utf-8\r
-        Content-Disposition: attachment; filename="vortx-diag.log"\r
-        Content-Length: \(body.count)\r
-        Connection: close\r
-        \r
+        authorizeDelivery(connection, claim: claim) { [self] in
+            let payload = Self.exportPayload()
+            let body = payload.body
+            let head = """
+            HTTP/1.1 200 OK\r
+            Content-Type: text/plain; charset=utf-8\r
+            Content-Disposition: attachment; filename="vortx-diag.log"\r
+            Content-Length: \(body.count)\r
+            Connection: close\r
+            \r
 
-        """
-        NSLog("[diag] export: sending log (%d bytes)", body.count)
-        let ranges = VXDiagExportPolicy.chunkRanges(bodyBytes: body.count)
-        connection.send(content: Data(head.utf8), completion: .contentProcessed { [weak self] error in
-            guard let self else { return }
-            if error != nil {
-                self.finishTransfer(
-                    connection, claim: claim, success: false
-                )
-                return
-            }
-            self.sendBodyChunks(
-                body,
-                ranges: ranges,
-                index: 0,
-                connection: connection,
-                claim: claim
-            )
-        })
-    }
-
-    private func sendBodyChunks(
-        _ body: Data,
-        ranges: [Range<Int>],
-        index: Int,
-        connection: NWConnection,
-        claim: VXDiagExportPolicy.TransferClaim
-    ) {
-        guard ranges.indices.contains(index) else {
-            finishTransfer(
-                connection, claim: claim, success: true
-            )
-            return
-        }
-        let chunk = body.subdata(in: ranges[index])
-        let isFinalChunk = index == ranges.index(before: ranges.endIndex)
-        connection.send(
-            content: chunk,
-            contentContext: isFinalChunk
-                ? NWConnection.ContentContext.finalMessage
-                : NWConnection.ContentContext.defaultMessage,
-            isComplete: true,
-            completion: .contentProcessed { [weak self] error in
+            """
+            NSLog("[diag] export: sending log (%d bytes)", body.count)
+            let ranges = VXDiagExportPolicy.chunkRanges(bodyBytes: body.count)
+            connection.send(content: Data(head.utf8), completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
                 if error != nil {
                     self.finishTransfer(
@@ -367,12 +375,54 @@ final class VXDiagExport: @unchecked Sendable {
                 self.sendBodyChunks(
                     body,
                     ranges: ranges,
-                    index: index + 1,
+                    index: 0,
                     connection: connection,
                     claim: claim
                 )
+            })
+        }
+    }
+
+    private func sendBodyChunks(
+        _ body: Data,
+        ranges: [Range<Int>],
+        index: Int,
+        connection: NWConnection,
+        claim: VXDiagExportPolicy.TransferClaim
+    ) {
+        authorizeDelivery(connection, claim: claim) { [self] in
+            guard ranges.indices.contains(index) else {
+                finishTransfer(
+                    connection, claim: claim, success: true
+                )
+                return
             }
-        )
+            let chunk = body.subdata(in: ranges[index])
+            let isFinalChunk = index == ranges.index(before: ranges.endIndex)
+            connection.send(
+                content: chunk,
+                contentContext: isFinalChunk
+                    ? NWConnection.ContentContext.finalMessage
+                    : NWConnection.ContentContext.defaultMessage,
+                isComplete: true,
+                completion: .contentProcessed { [weak self] error in
+                    guard let self else { return }
+                    if error != nil {
+                        self.finishTransfer(
+                            connection, claim: claim, success: false
+                        )
+                        return
+                    }
+                    self.sendBodyChunks(
+                        body,
+                        ranges: ranges,
+                        index: index + 1,
+                        connection: connection,
+                        claim: claim
+                    )
+                }
+            )
+        }
     }
 
     private func finishTransfer(
@@ -477,38 +527,8 @@ final class VXDiagExport: @unchecked Sendable {
         exportPayload().body
     }
 
-    /// The device's LAN IPv4 for the Wi-Fi interface (`en0`), or nil when not on Wi-Fi. Uses getifaddrs so
-    /// no extra entitlement is needed; falls back to the first non-loopback IPv4 if `en0` is not present.
     private static func lanIPv4() -> String? {
-        var addr: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&addr) == 0, let first = addr else { return nil }
-        defer { freeifaddrs(addr) }
-
-        var preferred: String?   // en0 (Wi-Fi)
-        var fallback: String?    // any other non-loopback IPv4
-        var cursor: UnsafeMutablePointer<ifaddrs>? = first
-        while let ptr = cursor {
-            defer { cursor = ptr.pointee.ifa_next }
-            let flags = Int32(ptr.pointee.ifa_flags)
-            guard flags & (IFF_UP | IFF_RUNNING) == (IFF_UP | IFF_RUNNING),
-                  flags & IFF_LOOPBACK == 0,
-                  let sa = ptr.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) else { continue }
-
-            let name = String(cString: ptr.pointee.ifa_name)
-            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            guard getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count),
-                              nil, 0, NI_NUMERICHOST) == 0 else { continue }
-            let terminator = host.firstIndex(of: 0) ?? host.endIndex
-            let ip = String(decoding: host[..<terminator].map { UInt8(bitPattern: $0) }, as: UTF8.self)
-            guard !ip.isEmpty, !ip.hasPrefix("169.254") else { continue }   // skip link-local
-
-            if name == "en0" {
-                preferred = ip
-            } else if fallback == nil {
-                fallback = ip
-            }
-        }
-        return preferred ?? fallback
+        VXLocalLANAddress.currentIPv4()
     }
 
     /// Generate a scaled QR CGImage for `string` with CoreImage (no external dependency). Returns nil if

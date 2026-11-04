@@ -58,6 +58,8 @@ import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.PlaylistScopeTransition
 import com.vortx.android.update.UpdateChecker
+import com.vortx.android.sync.AccountFileRestoreExternalExclusion
+import com.vortx.android.sync.ApplicationAccountFileRestoreExclusion
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.sync.SessionOwnerSnapshot
 import kotlinx.coroutines.CoroutineScope
@@ -76,7 +78,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
 
     /** All app-context settings writers share the prospective-account commit fence. */
     override fun getSharedPreferences(name: String, mode: Int): android.content.SharedPreferences =
-        com.vortx.android.sync.NativeSettingsFence.wrap(name, super.getSharedPreferences(name, mode))
+        com.vortx.android.sync.NativeSettingsFence.open(this, name, mode) { super.getSharedPreferences(name, mode) }
 
     /// Process-owned recovery work. A failed cleanup cannot cancel another startup child, and IO keeps
     /// encrypted preference reads, engine add-on inspection, and Worker revocation off the main thread.
@@ -181,9 +183,10 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 }
             }
         },
-        mirrorLibrary = { added, type, id ->
-            if (added) com.vortx.android.sync.AccountLibrarySync.onLibraryAdded(this, type, id)
-            else com.vortx.android.sync.AccountLibrarySync.onLibraryRemoved(this, id, type)
+        captureLibraryMirrorOrigin = ::captureNativeLibraryMirrorOrigin,
+        mirrorLibrary = { origin, added, type, id ->
+            if (added) com.vortx.android.sync.AccountLibrarySync.onLibraryAdded(this, origin, type, id)
+            else com.vortx.android.sync.AccountLibrarySync.onLibraryRemoved(this, origin, id, type)
         },
         nzbSourceAggregator = run {
             val keys = DebridKeys(this)
@@ -213,6 +216,15 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         if (isCommunityJsBrokerProcess()) return
         // Durable, scrubbed diagnostics (always-on breadcrumb + the opt-in exportable log). Main process only.
         com.vortx.android.diagnostics.DiagnosticsLog.install(this)
+        // This existing-only provenance starts before any normal provider retry work.
+        runCatching {
+            com.vortx.android.security.AccountFileProviderWriters.withWriter(Unit) {
+                val backing = com.vortx.android.sync.NativeSettingsFence.RestoreAuxiliaryBacking.PROVIDER_RETRY_QUEUE
+                com.vortx.android.sync.NativeSettingsFence.preparePristineRestoreBacking(this, backing) {
+                    super.getSharedPreferences(backing.fileName, Context.MODE_PRIVATE)
+                }
+            }
+        }.onFailure { Log.w(TAG, "Provider retry backing unavailable for account Restore") }
         // Fail closed until the encrypted session store has produced a definitive account or sign-out.
         // This process-wide binding precedes every lazy repository, resolver, and settings consumer.
         DebridKeys.bindAccountOwnerSource { DebridAccountOwnerState.UnknownOrUnavailable }
@@ -362,6 +374,11 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             }
         }
 
+    private var pickerFileRestoreBinding: Pair<VortXSyncManager, AccountFileRestoreExternalExclusion>? = null
+
+    internal fun pickerAccountFileRestoreExclusion(expected: VortXSyncManager?): AccountFileRestoreExternalExclusion? =
+        pickerFileRestoreBinding?.takeIf { it.first === expected && syncManager === expected }?.second
+
     /**
      * Wire the VortX-account issuer and live consent invalidation. Legacy Source Index Boolean methods
      * remain closed; the repository-owned path supplies a captured native/account authorization.
@@ -375,7 +392,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         MoatToken.appContext = applicationContext
         MoatToken.sessionProvider = {
             syncManager?.currentSession()?.let { session ->
-                MoatToken.SessionCredential(bearer = session.token, accountId = session.account.id)
+                MoatToken.SessionCredential(bearer = session.currentBearer, accountId = session.account.id)
             }
         }
         // Compatibility hook for the closed legacy API. The typed path uses its captured account admission.
@@ -387,6 +404,19 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 com.vortx.android.singularity.SourceIndexLifecycle.invalidateDeferred()
             }
         }.also(preferences::registerOnSharedPreferenceChangeListener)
+    }
+
+    /** Issue provenance before the actual repository checkpoint, with no provider credential call. */
+    private fun captureNativeLibraryMirrorOrigin(session: VortxNativeSession,
+        owner: com.vortx.android.engine.VortxNativeOwner): com.vortx.android.engine.NativeLibraryMirrorOrigin? {
+        val manager = syncManager ?: return null
+        val mounted = nativeAccounts.captureLibraryMirrorMount(session) ?: return null
+        if (com.vortx.android.integrations.NativeProviderVault.scope(mounted.account) != owner.scope.accountID) return null
+        val original = manager.captureProviderMirrorCallAuthority() ?: return null
+        // Verify persistence with the captured generation held, before the library dispatch.
+        if (!original.admit { syncManager === manager && manager.sessionOwnerSnapshot() == mounted.account }) return null
+        return com.vortx.android.engine.NativeLibraryMirrorOrigin(session, owner, mounted.account,
+            { action -> original.admit { syncManager === manager && action() } }, mounted::admit, original.acquire)
     }
 
     /** Typed native mount plus persistence-backed VortX credential epoch, captured before any query. */
@@ -467,6 +497,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             }
         syncManager = manager
         manager.attachNativeGateway(nativeAccounts)
+        com.vortx.android.sync.AccountLibrarySync.bind(this, manager)
         // For You switches between the account's synced fields and the signed-out local copy on sign-in.
         applicationScope.launch { manager.account.collect { com.vortx.android.foryou.ForYouStore.shared(this@VortXApplication).reload(invalidate = true) } }
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
@@ -497,6 +528,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
             override fun onActivityDestroyed(activity: Activity) {}
         })
+        pickerFileRestoreBinding = manager to ApplicationAccountFileRestoreExclusion(this, manager)
     }
 
     /// The one [CatalogRepository] the whole app shares, backed by the VortX engine session.

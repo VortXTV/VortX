@@ -5,9 +5,42 @@ import SwiftUI
 /// fully signed out, this only adds cross-device sync, backup, and recovery.
 struct SyncSettingsView: View {
     @EnvironmentObject private var sync: VortXSyncManager
-    /// Embedded sign-in sheets close on confirmed authentication, independently of
-    /// network-bound account restore. Ordinary Account settings leave this nil.
-    var onSignedIn: (() -> Void)? = nil
+    /// Pre-profile callers retain their original device-wide diagnostics admission.
+    /// An account form is not an unlocked profile.
+    var allowsDiagnosticExport: Bool
+    var diagnosticCredential: CredentialScopeRegistry.Capture?
+    var diagnosticGrant: ProfilePickerToolsDiagnosticGrant?
+    /// Embedded sheets close after authentication and one-time-code acknowledgement.
+    /// Account restore remains manager-owned. Ordinary Account settings leave this nil.
+    var onSignedIn: (() -> Void)?
+    @StateObject private var authentication: AccountAuthenticationPresentation
+
+    init(allowsDiagnosticExport: Bool = true,
+         diagnosticCredential: CredentialScopeRegistry.Capture? = nil,
+         diagnosticGrant: ProfilePickerToolsDiagnosticGrant? = nil,
+         onSignedIn: (() -> Void)? = nil,
+         authentication: AccountAuthenticationPresentation? = nil) {
+        self.allowsDiagnosticExport = allowsDiagnosticExport
+        self.diagnosticCredential = diagnosticCredential
+        self.diagnosticGrant = diagnosticGrant
+        self.onSignedIn = onSignedIn
+        _authentication = StateObject(wrappedValue: authentication ?? AccountAuthenticationPresentation())
+    }
+
+    private var working: Bool { authentication.working }
+    private var diagnosticExportIsAllowed: Bool {
+        allowsDiagnosticExport && (diagnosticCredential.map { CredentialScopeRegistry.shared.isCurrent($0) } ?? true)
+            && (exportGrant?.permitsExport ?? true)
+    }
+    private var exportGrant: ProfilePickerToolsDiagnosticGrant? {
+        if let diagnosticGrant { return diagnosticGrant }
+        guard let credential = diagnosticCredential else { return nil }
+        let sync = sync, store = ProfileStore.shared
+        return .init(allowed: allowsDiagnosticExport, credential: credential, admission: {
+            if sync.accountReconnectRequired || sync.accountRestoreState == .failed { return true }
+            return !store.profiles.contains { $0.pin != nil }
+        })
+    }
 
     enum Mode: String, CaseIterable { case signIn = "Sign in", create = "Create", recover = "Recover" }
     @State private var mode: Mode = .signIn
@@ -18,25 +51,28 @@ struct SyncSettingsView: View {
     @State private var totp = ""
     @State private var needsTotp = false
     @State private var recoveryCodeInput = ""
-    @State private var working = false
     @State private var message: String?
     @State private var failed = false
-    @State private var newRecoveryCode: String?   // shown once, right after creating an account
     @State private var showConflict = false       // account already has data: ask which side to keep
     @State private var syncing = false
     @State private var syncNote: String?          // signed-in status line: the tri-state retry surface
-    @State private var showQRSignIn = false
+    private struct QRPresentation: Identifiable { let id: UUID }
+    @State private var qrPresentation: QRPresentation?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 Text("VortX account").screenTitleStyle()
-                if sync.isSignedIn, !sync.accountReconnectRequired, let account = sync.account {
+                if let code = authentication.recoveryCodeForCurrentOwner(accountID: sync.account?.id) {
+                    recoveryCodeCard(code)
+                } else if authentication.working || authentication.reconciling {
+                    ProgressView("Finishing sign-in…")
+                } else if sync.isSignedIn, !sync.accountReconnectRequired, let account = sync.account {
                     signedIn(account)
                 } else {
                     signedOut
                 }
-                DiagnosticLogExportButton()
+                if diagnosticExportIsAllowed { DiagnosticLogExportButton(grant: exportGrant) }
                 // This screen is now VortX-account-only. The external sync providers (Trakt, SIMKL) moved
                 // to the Integrations screen (IntegrationsSettingsView), alongside the Stremio connect card,
                 // since they enrich VortX rather than belonging to the VortX account itself.
@@ -46,14 +82,22 @@ struct SyncSettingsView: View {
             .frame(maxWidth: 720, alignment: .leading)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        .sheet(isPresented: $showQRSignIn) {
-            qrSignInSheet
+        .interactiveDismissDisabled(authentication.blocksDismissal)
+        .navigationBarBackButtonHidden(authentication.blocksDismissal)
+        .sheet(item: $qrPresentation) { presentation in
+            qrSignInSheet(attempt: presentation.id)
                 .environmentObject(sync)
+                .onDisappear { cancelQR(attempt: presentation.id) }
         }
         .alert("Sync conflict", isPresented: $showConflict) {
             // Native data uses the causal merge/restore path, never a legacy whole-document override.
-            Button("Merge both (keep all profiles)") { resolveConflict { await sync.mergeBoth() ? .completed : .failed } }
-            Button("Use account's data") { resolveConflict { await sync.useAccountData() } }
+            if let decision = authentication.pendingConflict {
+                Button("Merge both (keep all profiles)") {
+                    resolveConflict(decision) { await sync.mergeBoth() ? .completed : .failed }
+                }
+                Button("Use account's data") { resolveConflict(decision) { await sync.useAccountData() } }
+                Button("Not now", role: .cancel) { cancelConflict(decision) }
+            }
         } message: {
             Text("This account's profiles differ from this device. Merge both to keep every profile (recommended), or restore the account's data. Saved data is not overwritten by a legacy device backup.")
         }
@@ -65,7 +109,9 @@ struct SyncSettingsView: View {
             if required { mode = .signIn; email = sync.account?.email ?? "" }
         }
         .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
-            // Async outcomes from the previous account must not repaint a replacement session.
+            // Async outcomes and one-time codes cannot repaint a replacement credential epoch.
+            authentication.credentialDidChange()
+            password = ""; totp = ""; recoveryCodeInput = ""
             syncNote = nil
             syncing = false
             showConflict = false
@@ -93,10 +139,19 @@ struct SyncSettingsView: View {
         Text("Your profiles, settings, and metadata keys sync to this account, end-to-end encrypted. They also sync automatically a moment after any change.")
             .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
 
+        if let decision = authentication.pendingConflict {
+            // A system-dismissed alert does not silently discard its decision or trap Done.
+            // Review reopens the same exact lease; Not now explicitly abandons it.
+            Text("A sync decision is waiting. Review it or choose Not now to leave it unchanged.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            Button("Review sync conflict") { reviewConflict(decision) }.buttonStyle(ChipButtonStyle())
+            Button("Not now") { cancelConflict(decision) }.buttonStyle(ChipButtonStyle())
+        }
+
         HStack(spacing: Theme.Space.md) {
             Button(syncing ? "Syncing…" : "Sync now") { syncNow() }
                 .buttonStyle(PrimaryActionStyle())
-                .disabled(syncing)
+                .disabled(syncing || authentication.blocksDismissal)
             Button("Sign out") { sync.signOut(); reset() }
                 .buttonStyle(ChipButtonStyle(selected: false))
         }
@@ -122,9 +177,7 @@ struct SyncSettingsView: View {
     // MARK: Signed out
 
     @ViewBuilder private var signedOut: some View {
-        if let code = newRecoveryCode {
-            recoveryCodeCard(code)
-        } else {
+        Group {
             if sync.accountReconnectRequired {
                 Text("Reconnect your VortX account")
                     .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
@@ -135,7 +188,7 @@ struct SyncSettingsView: View {
                     .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
             }
 
-            Button("Sign in with QR code") { showQRSignIn = true }
+            Button("Sign in with QR code") { openQR() }
                 .buttonStyle(ChipButtonStyle())
                 .disabled(working)
 
@@ -169,7 +222,7 @@ struct SyncSettingsView: View {
 
     // Present the shared joiner directly: iOSSignInView pushes this screen for its email path,
     // so routing back through that view would create a recursive sign-in navigation flow.
-    private var qrSignInSheet: some View {
+    private func qrSignInSheet(attempt: UUID) -> some View {
         ScrollView {
             VStack(spacing: Theme.Space.lg) {
                 HStack {
@@ -177,15 +230,14 @@ struct SyncSettingsView: View {
                         .foregroundStyle(Theme.Palette.textPrimary)
                     Spacer()
                     // In-content dismissal also works on Mac without touching the window toolbar.
-                    Button("Cancel") { showQRSignIn = false }
+                    Button("Cancel") { cancelQR(attempt: attempt) }
                         .buttonStyle(ChipButtonStyle())
                 }
                 VortXAccountJoinerView(onSignedIn: {
-                    showQRSignIn = false
-                    onSignedIn?()
+                    completeQR(attempt: attempt)
                 })
                     .frame(maxWidth: .infinity)
-                DiagnosticLogExportButton()
+                if diagnosticExportIsAllowed { DiagnosticLogExportButton(grant: exportGrant) }
             }
             .padding(Theme.Space.lg)
         }
@@ -193,6 +245,22 @@ struct SyncSettingsView: View {
         #if os(macOS)
         .frame(minWidth: 480, minHeight: 520)
         #endif
+    }
+
+    private func openQR() {
+        guard let attempt = authentication.beginQR() else { return }
+        qrPresentation = QRPresentation(id: attempt)
+    }
+
+    private func cancelQR(attempt: UUID) {
+        guard authentication.endQR(attempt: attempt) else { return }
+        if qrPresentation?.id == attempt { qrPresentation = nil }
+    }
+
+    private func completeQR(attempt: UUID) {
+        guard authentication.endQR(attempt: attempt) else { return }
+        if qrPresentation?.id == attempt { qrPresentation = nil }
+        onSignedIn?() // The joiner's unchanged protocol owns authenticated success.
     }
 
     private var actionLabel: String {
@@ -218,8 +286,9 @@ struct SyncSettingsView: View {
                 .padding(Theme.Space.md)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Theme.Palette.surface2, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
-            Button("I saved it") { newRecoveryCode = nil }
+            Button("I saved it") { completeAuthentication(acknowledgingCode: true) }
                 .buttonStyle(PrimaryActionStyle())
+                .disabled(working || authentication.reconciling)
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -232,103 +301,126 @@ struct SyncSettingsView: View {
     /// whichever side won, the engine should hold the account's owned add-ons + owner library
     /// right away, without waiting for a background/foreground cycle to re-check. Idempotent and
     /// never-zero guarded inside the manager (a .failed/.empty pull does nothing; install-only union).
-    private func resolveConflict(_ action: @escaping () async -> VortXSyncManager.ConflictResolutionOutcome) {
+    private func reviewConflict(_ decision: AccountActionLease) {
+        guard authentication.pendingConflictIsCurrent(decision, accountID: sync.account?.id) else { return }
+        showConflict = true
+    }
+
+    private func cancelConflict(_ decision: AccountActionLease) {
+        guard authentication.cancelConflict(decision, accountID: sync.account?.id) else { return }
+        showConflict = false
+    }
+
+    private func resolveConflict(_ decision: AccountActionLease,
+                                 _ action: @escaping @MainActor () async -> VortXSyncManager.ConflictResolutionOutcome) {
+        guard authentication.claimConflict(decision, accountID: sync.account?.id) else { return }
+        showConflict = false
+        syncing = true
+        syncNote = nil
         Task { @MainActor in
-            syncing = true
-            syncNote = nil
+            guard authentication.conflictActionIsCurrent(decision, accountID: sync.account?.id) else { return }
             let outcome = await action()
-            if outcome == .completed { await sync.hydrateEngineFromOwnedAddons() }
+            guard authentication.conflictActionIsCurrent(decision, accountID: sync.account?.id) else { return }
+            if outcome == .completed {
+                await sync.hydrateEngineFromOwnedAddons(credentialCapture: decision.credential)
+                guard authentication.conflictActionIsCurrent(decision, accountID: sync.account?.id) else { return }
+            }
             switch outcome {
             case .completed: syncNote = nil
             case .pending: syncNote = "Your changes are still waiting to sync. Try again shortly."
             case .failed: syncNote = "Couldn't finish syncing. Your changes are still saved on this device. Try again."
             }
             syncing = false
+            authentication.finishConflict(decision, accountID: sync.account?.id)
         }
     }
 
-    /// Explicit "Sync now": if the account's roster differs from this device, ASK which to keep
-    /// (Merge both / Use account / Keep this device) instead of blind-pushing, so a deliberate push
-    /// never silently drops the other side's profiles. When the rosters match there is nothing to ask,
-    /// so it just pushes as before. An unreachable account doc is a DISTINCT retry state: it must not
-    /// be misread as "no conflict" and silently pushed over a roster that was never compared.
+    /// Retain one exact signed-in owner through restore/probe/push and any resulting
+    /// conflict decision. UI intent must never become an action for a replacement account.
     private func syncNow() {
-        let session = CredentialScopeRegistry.shared.capture()
+        guard sync.isSignedIn, !syncing,
+              let lease = authentication.beginManualSync(accountID: sync.account?.id) else { return }
+        syncing = true
+        syncNote = nil
         Task { @MainActor in
-            guard CredentialScopeRegistry.shared.isCurrent(session) else { return }
-            syncing = true
+            guard authentication.manualSyncIsCurrent(lease, accountID: sync.account?.id) else { return }
             let restored = await sync.retryAccountRestore()
-            guard CredentialScopeRegistry.shared.isCurrent(session) else { return }
+            guard authentication.manualSyncIsCurrent(lease, accountID: sync.account?.id) else { return }
             guard restored else {
                 syncNote = "Couldn't load your account data yet. Your saved data has not been replaced. Try again."
                 syncing = false
+                authentication.finishManualSync(lease, accountID: sync.account?.id)
                 return
             }
             let conflict = await sync.rosterConflictWithAccount()
-            guard CredentialScopeRegistry.shared.isCurrent(session) else { return }
+            guard authentication.manualSyncIsCurrent(lease, accountID: sync.account?.id) else { return }
             switch conflict {
             case .conflict:
+                guard authentication.holdManualConflict(lease, accountID: sync.account?.id) else { return }
                 syncing = false
                 showConflict = true
             case .unreachable:
                 syncNote = "Could not reach VortX sync. Check your connection and try again."
                 syncing = false
+                authentication.finishManualSync(lease, accountID: sync.account?.id)
             case .noConflict:
                 let pushed = await sync.pushThisDevice()
-                guard CredentialScopeRegistry.shared.isCurrent(session) else { return }
+                guard authentication.manualSyncIsCurrent(lease, accountID: sync.account?.id) else { return }
                 syncNote = pushed || sync.backupUploadFailure != nil
                     ? nil
                     : "Couldn't sync your latest changes. They are still saved on this device. Try again."
                 syncing = false
+                authentication.finishManualSync(lease, accountID: sync.account?.id)
             }
         }
     }
 
     private func submit() {
-        working = true; message = nil; failed = false
+        guard let attempt = authentication.begin() else { return }
+        message = nil; failed = false
+        let submittedMode = effectiveMode
         let mail = email.trimmingCharacters(in: .whitespaces).lowercased()
+        let name = username.trimmingCharacters(in: .whitespaces)
+        let submittedPassword = password
+        let submittedTotp = needsTotp ? totp : nil
+        let submittedRecoveryCode = recoveryCodeInput
+        let reconnect = sync.accountReconnectRequired
         Task { @MainActor in
-            switch effectiveMode {
+            guard authentication.mayStartRequest(attempt: attempt) else { return }
+            let result: VortXSyncManager.AuthResult
+            switch submittedMode {
             case .signIn:
-                let r = await sync.signIn(login: mail, password: password, totp: needsTotp ? totp : nil,
-                                          requireCurrentAccount: sync.accountReconnectRequired)
-                handle(r)
+                result = await sync.signIn(login: mail, password: submittedPassword, totp: submittedTotp,
+                                          requireCurrentAccount: reconnect, onAuthenticated: { receipt in
+                    self.authentication.recordAuthenticated(receipt, attempt: attempt, accountID: self.sync.account?.id)
+                })
             case .create:
-                let (r, code) = await sync.register(email: mail, username: username.trimmingCharacters(in: .whitespaces), password: password)
-                if case .ok = r { newRecoveryCode = code }
-                handle(r)
+                let (outcome, _) = await sync.register(email: mail, username: name, password: submittedPassword,
+                                                     onAuthenticated: { receipt, code in
+                    self.authentication.recordAuthenticated(receipt, recoveryCode: code, attempt: attempt,
+                                                       accountID: self.sync.account?.id)
+                })
+                result = outcome
             case .recover:
-                let r = await sync.recover(email: mail, recoveryCode: recoveryCodeInput, newPassword: password)
-                handle(r)
+                result = await sync.recover(email: mail, recoveryCode: submittedRecoveryCode, newPassword: submittedPassword,
+                                            onAuthenticated: { receipt in
+                    self.authentication.recordAuthenticated(receipt, attempt: attempt, accountID: self.sync.account?.id)
+                })
             }
-            working = false
+            handle(result, attempt: attempt)
         }
     }
 
-    private func handle(_ result: VortXSyncManager.AuthResult) {
+    private func handle(_ result: VortXSyncManager.AuthResult, attempt: UUID) {
+        guard authentication.finishAuthentication(attempt: attempt, succeeded: result == .ok,
+                                                  accountID: sync.account?.id) else { return }
         switch result {
         case .ok:
-            password = ""; totp = ""; needsTotp = false
-            if let onSignedIn {
-                onSignedIn()
-                return // adopt() owns the restore after this sheet disappears.
-            }
-            // Decide pull vs seed vs ask: a fresh account is seeded; one with data prompts which to
-            // keep; an UNREACHABLE account doc is a distinct retry state (never misread as fresh and
-            // seeded over, the old nil-collapse misroute).
-            Task {
-                switch await sync.reconcileAfterSignIn() {
-                case .hasAccountData: showConflict = true
-                case .seededFromDevice: break
-                case .unreachable:
-                    syncNote = "Signed in, but VortX sync could not be reached. It will retry; you can also use Sync now."
-                }
-                // Belt-and-braces on top of adopt()'s own hydrate: re-run the account hydrate after the
-                // reconcile decision so ONE interactive sign-in restores add-ons + owner library even if
-                // the adopt-time pass raced the doc pull or the engine boot. Idempotent + never-zero
-                // guarded inside the manager (a .failed/.empty pull does nothing; install-only union).
-                await sync.hydrateEngineFromOwnedAddons()
-            }
+            password = ""; totp = ""; recoveryCodeInput = ""; needsTotp = false
+            // Registration has already recorded its code with the exact adopted owner.
+            // Neither dismissal nor reconcile may consume that code before acknowledgement.
+            if authentication.recoveryCode != nil { return }
+            completeAuthentication()
         case .totpRequired:
             needsTotp = true; message = "Enter your authenticator code."; failed = false
         case .failed(let msg):
@@ -336,11 +428,44 @@ struct SyncSettingsView: View {
         }
     }
 
+    private func completeAuthentication(acknowledgingCode: Bool = false) {
+        guard let owner = authentication.beginCompletion(acknowledgingCode: acknowledgingCode,
+                                                         accountID: sync.account?.id) else { return }
+        if let onSignedIn {
+            guard authentication.finishCompletion(owner, accountID: sync.account?.id),
+                  owner.isCurrent(accountID: sync.account?.id) else { return }
+            onSignedIn() // adopt() owns network restore after this sheet disappears.
+            return
+        }
+        Task { @MainActor in
+            guard authentication.completionIsCurrent(owner, accountID: sync.account?.id) else { return }
+            let outcome = await sync.reconcileAfterSignIn()
+            guard authentication.completionIsCurrent(owner, accountID: sync.account?.id) else { return }
+            let decision: AccountActionLease?
+            switch outcome {
+            case .hasAccountData:
+                guard let held = authentication.holdConflict(from: owner, accountID: sync.account?.id) else { return }
+                decision = held
+            case .seededFromDevice: decision = nil
+            case .unreachable:
+                decision = nil
+                syncNote = "Signed in, but VortX sync could not be reached. It will retry; you can also use Sync now."
+            }
+            await sync.hydrateEngineFromOwnedAddons(credentialCapture: owner.credential)
+            guard authentication.completionIsCurrent(owner, accountID: sync.account?.id) else { return }
+            authentication.finishCompletion(owner, accountID: sync.account?.id)
+            if let decision, authentication.pendingConflictIsCurrent(decision, accountID: sync.account?.id) {
+                showConflict = true
+            }
+        }
+    }
+
     private func reset() {
         email = ""; username = ""; password = ""; totp = ""; recoveryCodeInput = ""
-        needsTotp = false; message = nil; failed = false; newRecoveryCode = nil; mode = .signIn
+        needsTotp = false; message = nil; failed = false; mode = .signIn
+        authentication.invalidate()
         syncNote = nil
-        showQRSignIn = false
+        qrPresentation = nil
     }
 
     // MARK: Field helpers (cross-platform)

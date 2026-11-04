@@ -76,7 +76,8 @@ enum VortxNativeBootstrapArchive {
                   [1, 2].contains(typed["schemaVersion"] as? Int ?? 0) else { throw Failure.malformed }
             try requireUnambiguousJSON(material)
             var forbidden: [String] = []
-            _ = try sanitize(typed, path: "/legacyImportMaterial", exclusions: &forbidden)
+            _ = try sanitize(typed, path: "/legacyImportMaterial", exclusions: &forbidden,
+                             textContext: nativeMaterialContext(typed))
             guard forbidden.isEmpty else { throw Failure.ambiguousCredentialCarrier }
             archive["legacyImportMaterial"] = typed // never rewrite typed input/receipt source clocks
         }
@@ -129,8 +130,9 @@ enum VortxNativeBootstrapArchive {
         try requireUnambiguousJSON(archive)
         _ = try sanitize(host, path: "", exclusions: &forbidden, textContext: .legacyHost)
         if let material = object["legacyImportMaterial"] {
-            guard material is [String: Any] else { throw Failure.malformed }
-            _ = try sanitize(material, path: "/legacyImportMaterial", exclusions: &forbidden)
+            guard let material = material as? [String: Any] else { throw Failure.malformed }
+            _ = try sanitize(material, path: "/legacyImportMaterial", exclusions: &forbidden,
+                             textContext: nativeMaterialContext(material))
         }
         if let source = object["authenticatedSourceArchive"] {
             _ = try sanitize(source, path: "/authenticatedSourceArchive", exclusions: &forbidden, textContext: .legacyHost)
@@ -188,12 +190,14 @@ enum VortxNativeBootstrapArchive {
         }
         return failure
     }
-    private enum TextContext {
+    private enum TextContext: Equatable {
         case ordinary, addonManifest, addonDisplayText
         case settingsDomain, profileRosterData, profileRoster, profileRosterItem, profileName, profileAvatar
         case seriesChoiceData, seriesChoices, seriesChoice, seriesAddonName
         case legacyHost, legacyVortx, legacyLibraryRows, legacyLibraryRow, libraryName
         case legacyAddonRows, legacyAddonSummaryRow
+        case nativeSync(String), nativeProfiles(String), nativeProfileRegister, nativeProfileItem
+        case nativeLegacyImport(String), nativeBaseline(String), nativeRoster(String)
     }
     /// The plain label a loaded copy shows in place of display text that fails every display rule.
     static let replacedDisplayText = "Untitled"
@@ -231,6 +235,95 @@ enum VortxNativeBootstrapArchive {
         guard let id = object["id"] as? String, UUID(uuidString: id) != nil,
               object["name"] is String, object["avatar"] is String else { return false }
         return true
+    }
+    private static func nativeSchema(_ value: Any?, in versions: ClosedRange<Int>) -> Bool {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite, let schema = Int(exactly: number.doubleValue) else { return false }
+        return versions.contains(schema)
+    }
+    private static func nativeBoolean(_ value: Any?) -> Bool? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
+        return number.boolValue
+    }
+    private static func isNativeProfile(_ object: [String: Any], owner: String) -> Bool {
+        // Native Profile has no avatar. Qualify only its display leaf; this is not a
+        // substitute for the kernel's complete schema/account/clock validation.
+        guard let id = object["id"] as? String, UUID(uuidString: id) != nil,
+              object["name"] is String, let isOwner = nativeBoolean(object["owner"]), isOwner == (id == owner),
+              let account = object["account"] as? [String: Any], let kind = account["kind"] as? String,
+              let parental = object["parental"] as? [String: Any], nativeBoolean(parental["kids"]) != nil,
+              nativeBoolean(parental["familyEdit"]) != nil, object["settings"] is [String: Any],
+              let addons = object["addons"] as? String, ["own", "share_primary"].contains(addons) else { return false }
+        switch kind {
+        case "local_only", "pending_own":
+            guard account["value"] == nil else { return false }
+        case "shared":
+            guard !isOwner, account["value"] as? String == owner else { return false }
+        case "own":
+            guard let value = account["value"] as? String, !value.isEmpty,
+                  value.rangeOfCharacter(from: .controlCharacters) == nil else { return false }
+        default: return false
+        }
+        if let pin = object["pin"], !(pin is NSNull), !(pin is String) { return false }
+        if object["deleted"] != nil, nativeBoolean(object["deleted"]) == nil { return false }
+        for key in ["rev", "updatedAt"] {
+            if let value = object[key] {
+                guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                      number.doubleValue.isFinite, number.doubleValue >= 0,
+                      number.doubleValue.rounded(.towardZero) == number.doubleValue else { return false }
+            }
+        }
+        return true
+    }
+    private static func nativeDocumentOwner(_ object: [String: Any]) -> String? {
+        guard nativeSchema(object["schemaVersion"], in: 1...5),
+              let scope = object["scope"] as? String, !scope.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              scope.rangeOfCharacter(from: .controlCharacters) == nil,
+              let owner = object["ownerProfileId"] as? String, UUID(uuidString: owner) != nil,
+              let profiles = object["profiles"] as? [String: Any], let register = profiles[owner] as? [String: Any],
+              register["fieldClocks"] is [String: Any], let profile = register["profile"] as? [String: Any],
+              profile["id"] as? String == owner, isNativeProfile(profile, owner: owner) else { return nil }
+        return owner
+    }
+    private static func nativeMaterialOwner(_ object: [String: Any]) -> String? {
+        guard nativeSchema(object["schemaVersion"], in: 1...2), let roster = object["roster"] as? [[String: Any]],
+              object["deletedProfileIds"] is [String], object["addons"] is [String: Any],
+              object["libraries"] is [String: Any], object["watches"] is [String: Any],
+              object["identityLinks"] is [String: Any] else { return nil }
+        let owners = roster.filter { nativeBoolean($0["owner"]) == true }
+        guard owners.count == 1, let owner = owners[0]["id"] as? String,
+              roster.allSatisfy({ isNativeProfile($0, owner: owner) }) else { return nil }
+        return owner
+    }
+    private static func nativeMaterialContext(_ object: [String: Any]) -> TextContext {
+        nativeMaterialOwner(object).map { .nativeBaseline($0) } ?? .ordinary
+    }
+    private static func nativeChildContext(_ key: String, value: Any, parent: TextContext) -> TextContext? {
+        // Roles travel only through these owning fields, never unknown descendants or
+        // strings decoded by sanitize. All siblings still traverse ordinary inspection.
+        guard let object = value as? [String: Any] else {
+            if case .nativeProfileItem = parent, key == "name", value is String { return .profileName }
+            if case .nativeBaseline(let owner) = parent, key == "roster", value is [Any] { return .nativeRoster(owner) }
+            return nil
+        }
+        switch parent {
+        case .legacyHost where key == "nativeSync":
+            return nativeDocumentOwner(object).map { .nativeSync($0) }
+        case .nativeSync(let owner) where key == "profiles": return .nativeProfiles(owner)
+        case .nativeSync(let owner) where key == "legacyImport":
+            guard nativeSchema(object["schemaVersion"], in: 1...2), let fingerprint = object["fingerprint"] as? String,
+                  fingerprint.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else { return nil }
+            return .nativeLegacyImport(owner)
+        case .nativeProfiles(let owner):
+            guard UUID(uuidString: key) != nil, object["fieldClocks"] is [String: Any],
+                  let profile = object["profile"] as? [String: Any], profile["id"] as? String == key,
+                  isNativeProfile(profile, owner: owner) else { return nil }
+            return .nativeProfileRegister
+        case .nativeProfileRegister where key == "profile": return .nativeProfileItem
+        case .nativeLegacyImport(let owner) where key == "baseline":
+            return nativeMaterialOwner(object) == owner ? .nativeBaseline(owner) : nil
+        default: return nil
+        }
     }
     private static func isLegacyLibraryRow(_ object: [String: Any]) -> Bool {
         // Match the legacy owner row's identity and display fields, without requiring a
@@ -394,7 +487,9 @@ enum VortxNativeBootstrapArchive {
                     // legacy material, native registers and retained independent-source archives.
                     // Never let a display-field exemption flow into another key or decoded carrier.
                     let context: TextContext
-                    if textContext == .settingsDomain, key == "stremiox.profiles", object[key] is Data {
+                    if let native = nativeChildContext(key, value: object[key]!, parent: textContext) {
+                        context = native
+                    } else if textContext == .settingsDomain, key == "stremiox.profiles", object[key] is Data {
                         context = .profileRosterData
                     } else if textContext == .settingsDomain, isSeriesChoicePreference(key), object[key] is Data {
                         context = .seriesChoiceData
@@ -413,6 +508,8 @@ enum VortxNativeBootstrapArchive {
                         context = .addonDisplayText
                     } else if textContext == .legacyHost, key == "vortx", object[key] is [String: Any] {
                         context = .legacyVortx
+                    } else if textContext == .legacyVortx, key == "roster", object[key] is [Any] {
+                        context = .profileRoster
                     } else if (textContext == .legacyHost || textContext == .legacyVortx),
                               key == "library", object[key] is [Any] {
                         context = .legacyLibraryRows
@@ -460,6 +557,9 @@ enum VortxNativeBootstrapArchive {
                 let context: TextContext
                 if textContext == .profileRoster && ($0.element as? [String: Any]).map(isProfileRosterItem) == true {
                     context = .profileRosterItem
+                } else if case .nativeRoster(let owner) = textContext,
+                          let profile = $0.element as? [String: Any], isNativeProfile(profile, owner: owner) {
+                    context = .nativeProfileItem
                 } else if textContext == .legacyLibraryRows && ($0.element as? [String: Any]).map(isLegacyLibraryRow) == true {
                     context = .legacyLibraryRow
                 } else if textContext == .legacyAddonRows && ($0.element as? [String: Any]).map(isLegacyAddonSummaryRow) == true {
@@ -525,9 +625,9 @@ enum VortxNativeBootstrapArchive {
         if let text = value as? String, structuredPrefix(Data(text.utf8)),
            !(textContext == .addonDisplayText && hasLiteralTaggedDisplayLabel(text)),
            !((textContext == .profileName || textContext == .profileAvatar) && (text == "[" || text == "{")),
-           !(textContext == .profileName && hasLiteralDisplayLabel(text)),
+           !(textContext == .profileName && hasLiteralTaggedDisplayLabel(text)),
            !((textContext == .libraryName || textContext == .seriesAddonName) && hasLiteralTaggedDisplayLabel(text)),
-           !((textContext == .libraryName || textContext == .seriesAddonName || textContext == .addonDisplayText) && hasTaggedDisplayTitle(text)) {
+           !((textContext == .libraryName || textContext == .seriesAddonName || textContext == .addonDisplayText || textContext == .profileName) && hasTaggedDisplayTitle(text)) {
             guard holding, [.libraryName, .seriesAddonName, .addonDisplayText, .profileName].contains(textContext) else {
                 throw rejected(.opaquePreference, path: path, diagnostics: diagnostics, carrier: .plainTextPrefix)
             }

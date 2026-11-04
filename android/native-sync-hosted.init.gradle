@@ -16,17 +16,23 @@ allprojects {
                 "com.vortx.android.sync.VortXSyncManagerBackupRevisionTest": 14L,
                 "com.vortx.android.sync.NativeAccountSyncTest": 19L,
                 "com.vortx.android.integrations.NativeProspectiveProviderTest": 2L,
+                "com.vortx.android.engine.NativeRepositoryMutationJniTest": 18L,
                 "com.vortx.android.engine.NativeOwnerHistoryJniTest": 5L,
                 "com.vortx.android.engine.NativeOwnerHistoryCompatibilityTest": 25L,
                 "com.vortx.android.engine.NativeRawHostPreferencesTest": 22L,
+                "com.vortx.android.engine.DetachedAccountFileKernelJniTest": 1L,
+                "com.vortx.android.sync.AccountBackupRepairJniTest": 1L,
             ]
+            def expectedTotal = expected.values().sum()
             def observed = [:].withDefault { 0L }
             def names = [] as Set
             def libraryPath = System.getenv("VORTX_JNI_LIBRARY")
             def receiptPath = System.getenv("VORTX_JNI_RECEIPT")
+            def librarySha = System.getenv("VORTX_JNI_EXPECTED_SHA256")
             if (System.getenv("VORTX_JNI_SYNC") != "1" ||
                     !libraryPath || !new File(libraryPath).isAbsolute() ||
-                    !receiptPath || !new File(receiptPath).isAbsolute())
+                    !receiptPath || !new File(receiptPath).isAbsolute() ||
+                    !(librarySha ==~ /[0-9a-f]{64}/))
                 throw new GradleException("Exact real host JNI, receipt, and native sync admission are required")
             maxParallelForks = 1
             forkEvery = 0
@@ -39,14 +45,13 @@ allprojects {
                 "-Dkotlinx.coroutines.scheduler.max.pool.size=2"
             environment "VORTX_JNI_SYNC", "1"
             environment "VORTX_JNI_LIBRARY", libraryPath
+            environment "VORTX_JNI_FILE_ADMISSION", "1"
+            environment "VORTX_JNI_SHA256", librarySha
             filter.failOnNoMatchingTests = true
             ignoreFailures = false
             outputs.upToDateWhen { false }
             outputs.cacheIf { false }
             def requireExactLibrary = {
-                def sha = System.getenv("VORTX_JNI_EXPECTED_SHA256")
-                if (!(sha ==~ /[0-9a-f]{64}/))
-                    throw new GradleException("Actual host JNI SHA is required")
                 def receipt = new groovy.json.JsonSlurper().parse(new File(receiptPath))
                 if (receipt.schema != 1 ||
                     receipt.engineSource != "2ea2e0f27dd2e53b7b28228435ca35a70f92831f" ||
@@ -55,7 +60,7 @@ allprojects {
                     receipt.features != "jni,server,resource-host" ||
                     receipt.toolchain != "nightly-2026-07-19" ||
                     receipt.hostTarget != "x86_64-unknown-linux-gnu" ||
-                    receipt.libraryPath != libraryPath || receipt.librarySha256 != sha ||
+                    receipt.libraryPath != libraryPath || receipt.librarySha256 != librarySha ||
                     !(receipt.sourceInputsSha256 ==~ /[0-9a-f]{64}/))
                     throw new GradleException("Host JNI provenance differs from the reviewed release lane")
                 def library = new File(libraryPath)
@@ -68,7 +73,7 @@ allprojects {
                     while ((count = input.read(bytes)) != -1) digest.update(bytes, 0, count)
                 }
                 def actual = digest.digest().collect { String.format("%02x", it & 0xff) }.join()
-                if (actual != sha) throw new GradleException("Host JNI bytes changed")
+                if (actual != librarySha) throw new GradleException("Host JNI bytes changed")
             }
             doFirst { requireExactLibrary() }
             afterTest { descriptor, result ->
@@ -80,10 +85,10 @@ allprojects {
             afterSuite { descriptor, result ->
                 if (descriptor.parent == null) {
                     requireExactLibrary()
-                    if (observed != expected || result.testCount != 87L ||
+                    if (observed != expected || result.testCount != expectedTotal ||
                             result.skippedTestCount != 0L || result.failedTestCount != 0L)
-                        throw new GradleException("Require exact BackupRevision14, NativeAccountSync19, ProspectiveProvider2, OwnerHistoryJni5, Compatibility25 and RawHost22; zero skips/failures")
-                    logger.lifecycle("Executed required 87-test roster with unchanged real host JNI; XML receipt distinguishes the real-JNI subset")
+                        throw new GradleException("Require exact ${expectedTotal}-test native sync host roster with zero skips/failures")
+                    logger.lifecycle("Executed required ${expectedTotal}-test roster with unchanged real host JNI; XML receipt distinguishes the real-JNI subset")
                 }
             }
         }

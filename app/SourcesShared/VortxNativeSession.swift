@@ -91,6 +91,20 @@ final class VortxNativeInstallationKeyFileStore: @unchecked Sendable {
         guard result == 0 else { throw VortxNativeError.unavailable }
         return Data(bytes.prefix(count))
     }
+    /// Existing-only inventory key lookup. No mkdir/chmod/fsync/key migration/publication.
+    func readExistingBytes() throws -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        let fd = Darwin.open(directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        if fd < 0 {
+            if errno == ENOENT { return try legacyRead() }
+            throw VortxNativeError.unavailable
+        }
+        defer { Darwin.close(fd) }
+        var info = stat()
+        guard Darwin.fstat(fd, &info) == 0, info.st_uid == geteuid(),
+              info.st_mode & mode_t(0o022) == 0 else { throw VortxNativeError.unavailable }
+        return try readFinal(fd) ?? legacyRead()
+    }
     func loadOrCreateBytes() throws -> Data {
         lock.lock(); defer { lock.unlock() }
         if let cached { return cached }
@@ -139,11 +153,11 @@ final class VortxNativeInstallationKeyFileStore: @unchecked Sendable {
 /// purged under storage pressure; the encrypted cloud account stays authoritative, so a purge only means
 /// the next launch re-adopts the account. The installation key stays in the tvOS Keychain.
 enum VortxNativeStorage {
-    static func root() throws -> URL {
+    static func root(create: Bool = true) throws -> URL {
         #if os(tvOS)
-        try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: create)
         #else
-        try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: create)
         #endif
     }
 }
@@ -174,6 +188,13 @@ enum VortxNativeInstallationKey {
         directory: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("VortX", isDirectory: true),
         legacyRead: { try readLegacy() }, randomBytes: { try randomBytes() })
     #endif
+    static func readExisting() throws -> SymmetricKey? {
+        #if os(macOS)
+        return try fileStore.readExistingBytes().map { SymmetricKey(data: $0) }
+        #else
+        return try readLegacy().map { SymmetricKey(data: $0) }
+        #endif
+    }
     static func loadOrCreate() throws -> SymmetricKey {
         #if os(macOS)
         return SymmetricKey(data: try fileStore.loadOrCreateBytes())
@@ -921,6 +942,47 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
             guard files.filter({ $0.lastPathComponent.hasPrefix("native-state-v1-") }).allSatisfy({ covered.contains($0.path) }) else { throw VortxNativeError.invalidSnapshot }
         }
         return checkpoint
+    }
+    /// The requested account's exact state/owner/draft paths must be absent. Existing installation
+    /// indexes distinguish other accounts WITHOUT opening their account-key ciphertext. Unindexed
+    /// or interrupted unattributed history remains unknown, never a positive absence receipt.
+    enum FileRestoreRefusal: Error { case currentNativeState, unverifiable }
+    func requireFileRestoreAbsence(scope: VortxAccountScope) throws {
+        try scope.validate()
+        var directoryInfo = stat()
+        if Darwin.lstat(directory.path, &directoryInfo) != 0 {
+            guard errno == ENOENT else { throw FileRestoreRefusal.unverifiable }
+            return // Only absence of the inventory DIRECTORY is proof of an empty store.
+        }
+        guard directoryInfo.st_mode & S_IFMT == S_IFDIR, directoryInfo.st_uid == geteuid(),
+              directoryInfo.st_mode & mode_t(0o022) == 0 else {
+            throw FileRestoreRefusal.unverifiable
+        }
+        for file in [url(scope), locatorURL(scope.account), indexURL(scope.account), migrationDraftURL(scope)] {
+            var info = stat()
+            if Darwin.lstat(file.path, &info) == 0 { throw FileRestoreRefusal.currentNativeState }
+            guard errno == ENOENT else { throw FileRestoreRefusal.unverifiable }
+        }
+        do {
+            guard try authenticatedCheckpoint(scope: scope) == nil else {
+                throw FileRestoreRefusal.currentNativeState
+            }
+            // Unknown siblings bearing this exact scope/account digest also refuse first import.
+            let names = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            let scopeDigest = url(scope).deletingPathExtension().lastPathComponent.replacingOccurrences(of: "native-state-v1-", with: "")
+            let accountDigest = locatorURL(scope.account).deletingPathExtension().lastPathComponent.replacingOccurrences(of: "native-account-v1-", with: "")
+            guard !names.contains(where: { $0.contains(scopeDigest) || $0.contains(accountDigest) }) else {
+                throw FileRestoreRefusal.currentNativeState
+            }
+            let covered = try authenticatedInventory(for: scope)
+            for name in names where name.hasPrefix("native-migration-draft-v1-") {
+                let stateName = name.replacingOccurrences(of: "native-migration-draft-v1-", with: "native-state-v1-")
+                guard covered.contains(directory.appendingPathComponent(stateName).path) else {
+                    throw FileRestoreRefusal.unverifiable
+                }
+            }
+        } catch let failure as FileRestoreRefusal { throw failure }
+        catch { throw FileRestoreRefusal.unverifiable }
     }
     private func open(_ data: Data, scope: VortxAccountScope) throws -> Envelope {
         let plain = try AES.GCM.open(AES.GCM.SealedBox(combined: accountCiphertext(data)), using: key, authenticating: scope.authenticatedData)
@@ -2253,6 +2315,18 @@ actor VortxNativeSession {
         try apply(candidate, action: String(decoding: JSONEncoder().encode(action), as: UTF8.self))
         guard let sync = try scope.validateSnapshot(candidate.stateJSON())["nativeSync"] else { throw VortxNativeError.invalidSnapshot }
         return sync
+    }
+    /// Complete cold generic validation for a selected file. No writer lease, store, source
+    /// observation, checkpoint or live handle is acquired. Caller retains original native bytes.
+    nonisolated static func detachedFileRestoreState(scope: VortxAccountScope,
+        nativeSync: VortxJSON, abi: any VortxRuntimeABI) throws -> VortxJSON {
+        try scope.validate()
+        let candidate = try VortxNativeRuntime(abi: abi, ownerID: scope.ownerProfileID, ownerName: "Owner")
+        defer { candidate.close() }
+        try bind(candidate, scope: scope)
+        let action = VortxJSON.object(["type": .string("merge_native_sync"), "document": nativeSync])
+        try apply(candidate, action: String(decoding: JSONEncoder().encode(action), as: UTF8.self))
+        return try scope.validateSnapshot(candidate.stateJSON())
     }
     /// Before durable reopen/adoption, prove the complete legacy material against a detached
     /// kernel candidate. Exact receipt replay is compatible with older artifacts; changed intent

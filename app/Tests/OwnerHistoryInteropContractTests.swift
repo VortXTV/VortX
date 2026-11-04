@@ -40,9 +40,17 @@ enum OwnerHistoryInteropContractTests {
               "mixed or over-limit peer carriers are retained rather than overwritten")
         check(!sync.contains("v[\"ownerHistory\"]"),
               "export never creates the incompatible top-level ownerHistory key")
-        let nativeRestore = body(sync, after: "func restoreNativeCheckpoint(", until: "    /// Shared account-owner epoch.")
+        let nativeRestore = body(sync, after: "private func restoreNativeCheckpointWithCloudRead(",
+                                 until: "    /// Shared account-owner epoch.")
+        let checkpointPull = body(sync, after: "private func pullNativeCheckpointCloudSource(",
+                                  until: "    private func hasPendingReceivedProviderApply(")
         check(nativeRestore.contains("guard isSignedIn, isCurrent(capture), case .account = capture.scope else") &&
-              nativeRestore.contains("pullDocVersionedResult(credentialCapture: capture)") &&
+              nativeRestore.contains("pullNativeCheckpointCloudSource(capture: capture, authority: cloudRead)") &&
+              nativeRestore.contains("guard let cloudAuthority = candidate.authority else") &&
+              checkpointPull.contains("guard let authority, authority.capture == capture, authority.isCurrent else") &&
+              checkpointPull.contains("let pulled = await pullDocVersionedResult(credentialCapture: capture)") &&
+              checkpointPull.contains("guard isCurrent(capture), account?.id == originalAccount, dataKey == originalKey,") &&
+              checkpointPull.contains("requireReceivedProviderCloudSource(pulled, authority: authority)") &&
               nativeRestore.contains("ProfileStore.shared.activeID == selectedProfile") &&
               nativeRestore.contains("authenticatedCheckpoint(scope: scope)"),
               "remote history restoration requires the captured authenticated native account, profile and checkpoint")

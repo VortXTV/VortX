@@ -60,7 +60,29 @@ if (facade.indexOf(drain) > once(facade, '                if let ownerOperation 
 const retire = 'let subtitleRetirement = CredentialPublicationOutbox.beginSubtitleRetirement(domain: nativeSubtitleDomain)';
 if (bridge.split(retire).length - 1 !== 2) throw Error('expected exact two actual retirement sites');
 once(bridge, 'let subtitle: CredentialPublicationOutbox.SubtitleRetirement');
-if (bridge.split('nativePlaybackReadLifetime.retire()').length - 1 !== 7 || bridge.split('nativePlaybackReadLifetime.completeRetirement(').length - 1 !== 7) throw Error('expected exact seven Bridge retirement/after-unlock drains');
+// Failed installation cleanup adds one exact-owner retirement and a distinct catch drain.
+// The successful bind consumes its pending retirement so the catch cannot drain it twice.
+if (bridge.split('nativePlaybackReadLifetime.retire()').length - 1 !== 8 || bridge.split('nativePlaybackReadLifetime.completeRetirement(').length - 1 !== 9) throw Error('expected exact eight Bridge retirements and nine after-unlock completion paths');
+const bridgeInstall = section(bridge, '    func installNativeSession(', '\n    /// A failed publication owns only');
+const bridgeFailedInstall = section(bridge, '    @MainActor private func retireFailedNativeInstallation(', '\n    @MainActor\n    func closeNativeSession()');
+once(bridgeInstall, `if let retirement = result.2 {
+                result.2 = nil
+                nativePlaybackReadLifetime.completeRetirement(retirement)
+            }`);
+once(bridgeInstall, `if result.0 {
+                if let retirement = result.2 { nativePlaybackReadLifetime.completeRetirement(retirement) }
+                result.1?.close()
+                retireFailedNativeInstallation(facade, installation: installGeneration, capture: capture)
+            } else { facade.close() }`);
+const failedOwner = once(bridgeFailedInstall, `let retirement = nativeFacadeLock.withLock { () -> CredentialPublicationOutbox.SubtitleRetirement? in
+            guard nativeFacadeStorage === facade, nativeInstallGeneration == installation,
+                  nativeCredentialCapture == capture else { return nil }
+            let retirement = nativePlaybackReadLifetime.retire()`);
+const failedUnlock = once(bridgeFailedInstall, `return retirement
+        }
+        guard let retirement else { return }`);
+const failedDrain = once(bridgeFailedInstall, 'nativePlaybackReadLifetime.completeRetirement(retirement)');
+if (!(failedOwner < failedUnlock && failedUnlock < failedDrain)) throw Error('failed-installation subtitle retirement must retain exact owner and drain after Bridge unlock');
 once(facade, 'lock.afterOutermostUnlock {\n            CredentialPublicationOutbox.drainSubtitleRenderers(retirement)');
 once(facade, 'CredentialPublicationOutbox.drainSubtitleRenderers(subtitleRetirement)\n        session.revoke()');
 const fixture = `import Foundation\nimport Darwin\nimport os\n

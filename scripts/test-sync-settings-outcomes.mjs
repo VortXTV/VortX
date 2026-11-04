@@ -46,6 +46,6 @@ writeFileSync(source, template
   .replace('        /* PRODUCTION_STAMP_RECOVERY */', recovery)
   .replace('    /* PRODUCTION_SYNC_NOW */', production.slice(methodStart, methodEnd + 6)));
 execFileSync('xcrun', ['swiftc', '-j', '1', '-num-threads', '1', '-parse-as-library', '-swift-version', '6', '-strict-concurrency=complete',
-  '-warnings-as-errors', source, '-o', join(directory, 'checks')], {stdio: 'inherit'});
+  '-warnings-as-errors', 'app/SourcesShared/AccountAuthenticationPresentation.swift', source, '-o', join(directory, 'checks')], {stdio: 'inherit'});
 execFileSync(join(directory, 'checks'), [], {stdio: 'inherit'});
 console.log(`Retained production settings-method fixture: ${resolve(directory)}`);

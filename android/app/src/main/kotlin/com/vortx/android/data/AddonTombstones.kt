@@ -3,6 +3,10 @@ package com.vortx.android.data
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
+import com.vortx.android.engine.AccountFileLocalPresence
+import com.vortx.android.profile.RestoreProfileDirectWriters
+import com.vortx.android.sync.RestoreTombstoneRows
+import java.util.UUID
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -118,10 +122,11 @@ class AddonTombstones internal constructor(
      * Record an add-on removal so it sticks across devices. Callers MUST guard PROTECTED before calling.
      * Returns true when the url becomes NEWLY effectively-removed.
      */
-    fun tombstone(transportUrl: String): Boolean = synchronized(PROCESS_LOCK) {
+    fun tombstone(transportUrl: String): Boolean = withDirectRestoreWrite {
+        noteRestoreWrite()
         val scope = currentScope()
         val key = normalize(transportUrl)
-        if (key.isEmpty() || key.length > MAX_ID_LENGTH) return false
+        if (key.isEmpty() || key.length > MAX_ID_LENGTH) return@withDirectRestoreWrite false
         val state = load(scope)
         val wasRemoved = isRemoved(key, state)
         state.removedAt[key] = maxOf(state.removedAt[key] ?: 0.0, nowMs())
@@ -133,10 +138,11 @@ class AddonTombstones internal constructor(
      * Forget a removal tombstone so an EXPLICIT fresh install of the same add-on is honored instead of being
      * suppressed forever by an old removal. Returns true when the url flips from removed to present.
      */
-    fun forget(transportUrl: String): Boolean = synchronized(PROCESS_LOCK) {
+    fun forget(transportUrl: String): Boolean = withDirectRestoreWrite {
+        noteRestoreWrite()
         val scope = currentScope()
         val key = normalize(transportUrl)
-        if (key.isEmpty() || key.length > MAX_ID_LENGTH) return false
+        if (key.isEmpty() || key.length > MAX_ID_LENGTH) return@withDirectRestoreWrite false
         val state = load(scope)
         val wasRemoved = isRemoved(key, state)
         state.addedAt[key] = maxOf(state.addedAt[key] ?: 0.0, nowMs())
@@ -157,10 +163,11 @@ class AddonTombstones internal constructor(
         legacyIds: List<String>,
         stamps: Map<String, Map<String, Double>>,
         webIds: List<String> = emptyList(),
-    ): Boolean = synchronized(PROCESS_LOCK) {
+    ): Boolean = withDirectRestoreWrite {
+        noteRestoreWrite()
         val scope = currentScope()
         // Cloud entries are account data. Never mint or fold them into the anonymous local-only namespace.
-        if (!scope.isSyncable) return@synchronized false
+        if (!scope.isSyncable) return@withDirectRestoreWrite false
         val state = load(scope)
         val before = effectiveRemoved(state)
         val futureThresholdMs = nowMs() + 48.0 * 60.0 * 60.0 * 1000.0
@@ -211,9 +218,10 @@ class AddonTombstones internal constructor(
      * currently-installed add-ons, so a stale pre-tombstone peer array cannot re-uninstall an add-on the user
      * demonstrably has. Skips any url whose folded removedAt is a real, post-epoch removal.
      */
-    fun baselineInstalled(transportUrls: List<String>) = synchronized(PROCESS_LOCK) {
+    fun baselineInstalled(transportUrls: List<String>) = withDirectRestoreWrite {
+        noteRestoreWrite()
         val scope = currentScope()
-        if (transportUrls.isEmpty()) return
+        if (transportUrls.isEmpty()) return@withDirectRestoreWrite
         val state = load(scope)
         val now = nowMs()
         for (raw in transportUrls) {
@@ -227,6 +235,10 @@ class AddonTombstones internal constructor(
     }
 
     // ---- State ----
+
+    private inline fun <T> withDirectRestoreWrite(action: () -> T): T = RestoreProfileDirectWriters.write {
+        synchronized(PROCESS_LOCK) { action() }
+    }
 
     private fun isRemoved(url: String, state: State): Boolean =
         (state.removedAt[url] ?: 0.0) > (state.addedAt[url] ?: 0.0)
@@ -328,12 +340,54 @@ class AddonTombstones internal constructor(
         private const val MAX_ID_LENGTH = 2048
         private val PROCESS_LOCK = Any()
 
-        @Volatile private var activeAccountScope: String? = null
+        private class ActiveAccount(val id: String?)
+        @Volatile private var activeAccount = ActiveAccount(null)
+        private val activeAccountScope: String? get() = activeAccount.id
 
         /** Session ownership comes only from VortXSyncManager. Signed-out state is device-local only. */
-        fun activateAccount(accountId: String?) {
-            activeAccountScope = accountId?.takeIf { it.isNotBlank() }
+        fun activateAccount(accountId: String?) = RestoreProfileDirectWriters.retirement {
+            activeAccount = ActiveAccount(accountId?.takeIf { it.isNotBlank() })
         }
+
+        @Volatile private var restoreWrites = 0L
+
+        private fun noteRestoreWrite() {
+            if (restoreWrites < Long.MAX_VALUE) restoreWrites++
+        }
+
+        internal fun captureRestoreOwner(accountId: String): (() -> Boolean)? = synchronized(PROCESS_LOCK) {
+            val owner = activeAccount.takeIf { it.id == accountId } ?: return@synchronized null
+            val original = restoreWrites.takeIf { it < Long.MAX_VALUE } ?: return@synchronized null
+            return@synchronized { activeAccount === owner && restoreWrites == original }
+        }
+
+        internal fun inspectRestoreRows(accountId: String, raw: Map<String, *>): AccountFileLocalPresence {
+            val scope = Scope(accountId)
+            var present = false
+            for (base in listOf(REMOVED_AT_KEY, ADDED_AT_KEY, LEGACY_DELETED_KEY)) {
+                val prefix = "$base.account.v2."
+                val target = scopedKey(base, scope)
+                val kind = if (base == LEGACY_DELETED_KEY) RestoreTombstoneRows.Kind.JSON_IDS else RestoreTombstoneRows.Kind.STAMPS
+                for ((key, value) in raw) {
+                    if (key != base && !key.startsWith("$base.")) continue
+                    if (key != base && key != target) {
+                        val foreign = key.removePrefix(prefix)
+                        if (!key.startsWith(prefix) || !isAccountUUID(foreign))
+                            return AccountFileLocalPresence.UNAVAILABLE
+                        continue // Older lowercased scopes cannot prove who owned the data.
+                    }
+                    val row = RestoreTombstoneRows.inspect(value, MAX_ENTRIES,
+                        { id -> id.isNotEmpty() && id.length <= MAX_ID_LENGTH && normalize(id) == id }, kind)
+                    if (row == AccountFileLocalPresence.UNAVAILABLE || key == base && row == AccountFileLocalPresence.PRESENT)
+                        return AccountFileLocalPresence.UNAVAILABLE
+                    present = present || row == AccountFileLocalPresence.PRESENT
+                }
+            }
+            return if (present) AccountFileLocalPresence.PRESENT else AccountFileLocalPresence.ABSENT
+        }
+
+        private fun isAccountUUID(id: String): Boolean =
+            runCatching { UUID.fromString(id).toString().equals(id, ignoreCase = true) }.getOrDefault(false)
 
         private fun scopedKey(key: String, scope: Scope): String =
             // The old namespace lowercased account IDs and cannot prove an exact owner. Keep it

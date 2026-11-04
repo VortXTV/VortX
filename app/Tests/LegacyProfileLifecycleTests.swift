@@ -22,6 +22,10 @@ private struct UserProfile {
 @MainActor
 private final class LegacyProfileLifecycleHarness {
     // INSERT ACTUAL LEGACY WATCH LIFECYCLE PROJECTION
+    // This legacy-only fixture has no manual picker. Its explicit inactive collaborator keeps
+    // the actual observer block intact; real manual retirement is exercised by the Combine suite.
+    private func beginManualPickerPublication(profiles: [UserProfile], activeID: UUID?) {}
+    private func endManualPickerPublication() {}
     var retirements = 0
     func retireLegacyHistoryNotices() { retirements += 1 }
     func replace(_ roster: [UserProfile]) { profiles = roster }

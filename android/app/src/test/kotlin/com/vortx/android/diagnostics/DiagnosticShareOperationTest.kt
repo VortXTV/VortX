@@ -1,6 +1,8 @@
 package com.vortx.android.diagnostics
 
 import java.io.IOException
+import com.vortx.android.profile.UserProfile
+import com.vortx.android.ui.profilepicker.pickerDiagnosticExportAllowed
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -10,6 +12,27 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DiagnosticShareOperationTest {
+    @Test fun preProfileAccountDiagnosticsKeepCurrentRosterPinAndFailurePolicyThroughStaging() = runBlocking {
+        val open = UserProfile(id = UserProfile.OWNER_ID, name = "Main", avatar = "M", isOwner = true)
+        val locked = open.copy(pin = UserProfile.pinHash("1234", open.id))
+        var roster: List<UserProfile>? = listOf(locked)
+        var staged = 0; var presented = 0
+        fun allowed() = pickerDiagnosticExportAllowed(roster)
+        assertEquals(DiagnosticShareOutcome.BLOCKED, performDiagnosticShare(
+            stage = { staged++; Any() }, present = { presented++; true }, mayShare = ::allowed))
+        assertEquals(0, staged); assertEquals(0, presented)
+        roster = listOf(open)
+        assertEquals(DiagnosticShareOutcome.SHARED, performDiagnosticShare(
+            stage = { staged++; Any() }, present = { presented++; true }, mayShare = ::allowed))
+        assertEquals(1, presented)
+        assertEquals(DiagnosticShareOutcome.BLOCKED, performDiagnosticShare(
+            stage = { roster = listOf(locked); Any() }, present = { presented++; true }, mayShare = ::allowed))
+        assertEquals(1, presented)
+        roster = null
+        assertFalse(allowed())
+        roster = emptyList()
+        assertFalse(allowed())
+    }
     @Test fun `locked admission never stages or shares`() = runBlocking {
         var staged = false
         var presented = false

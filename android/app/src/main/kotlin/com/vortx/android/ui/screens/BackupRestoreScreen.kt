@@ -34,9 +34,12 @@ import com.vortx.android.backup.SettingsBackup
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.localSettingsBackupInput
 import com.vortx.android.profile.withLocalSettingsRestoreAdmission
+import com.vortx.android.sync.NativeSettingsFence
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
@@ -114,7 +117,11 @@ fun BackupRestoreScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 val sourceKeys = SettingsBackup.decodeDomain(bytes)?.keys ?: error("That file is not a VortX settings backup.")
                 withContext(Dispatchers.IO) {
                     withLocalSettingsRestoreAdmission(true, sourceKeys) {
-                        applyRestore(prefs, values)
+                        ensureActive()
+                        NativeSettingsFence.tryFlatSettingsMutation {
+                            ensureActive()
+                            applyRestore(prefs, values)
+                        } ?: error("Account Restore is using local settings. Try this import again after it finishes.")
                     }
                 }
                 // Reload uses only the mounted native projection.
@@ -124,7 +131,10 @@ fun BackupRestoreScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 } else {
                     "Settings restored from your backup. Existing settings not in the file were left as they were."
                 }
-            }.getOrElse { "Import failed: ${it.message ?: "the file could not be read."}" }
+            }.getOrElse {
+                if (it is CancellationException) throw it
+                "Import failed: ${it.message ?: "the file could not be read."}"
+            }
             busy = false
         }
     }

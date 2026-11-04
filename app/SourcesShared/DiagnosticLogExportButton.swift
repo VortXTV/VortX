@@ -6,7 +6,11 @@ import UniformTypeIdentifiers
 
 /// Account-independent help: keep this outside profile/authentication admission and busy-state gates.
 /// Preparing a share copy or a LAN listener is user initiated, never work performed by a view body.
+@MainActor
 struct DiagnosticLogExportButton: View {
+    /// Nil keeps the account-independent component's existing unlocked-settings behavior.
+    /// Pre-profile routes pass their original credential and live PIN/failure admission.
+    var grant: ProfilePickerToolsDiagnosticGrant? = nil
     #if os(tvOS)
     @State private var showingExport = false
     #endif
@@ -18,15 +22,18 @@ struct DiagnosticLogExportButton: View {
         }
         .buttonStyle(ChipButtonStyle())
         .accessibilityIdentifier("pre-profile-diagnostic-export")
-        .fullScreenCover(isPresented: $showingExport) { DiagnosticLogExportSheet() }
+        .disabled(grant?.permitsExport == false)
+        .fullScreenCover(isPresented: $showingExport) { DiagnosticLogExportSheet(grant: grant) }
+
         #else
-        ShareLink(item: PreProfileDiagnosticLogTransfer(),
+        ShareLink(item: PreProfileDiagnosticLogTransfer(grant: grant),
                   preview: SharePreview("VortX diagnostic log")) {
             Label("Export diagnostic log", systemImage: "square.and.arrow.up")
         }
         .buttonStyle(ChipButtonStyle())
         .accessibilityIdentifier("pre-profile-diagnostic-export")
         .accessibilityHint("Save or share a troubleshooting log without signing in. Review the file before sharing.")
+        .disabled(grant?.permitsExport == false)
         #endif
     }
 }
@@ -36,14 +43,31 @@ struct DiagnosticLogExportButton: View {
 /// Never share the live cache file, consume its history, require logging to be enabled, or collect
 /// Keychain/account documents. Unique destinations prevent simultaneous shares replacing one another.
 private struct PreProfileDiagnosticLogTransfer: Transferable {
+    let grant: ProfilePickerToolsDiagnosticGrant?
+    private enum Failure: Error { case permissionChanged }
+    private static func require(_ grant: ProfilePickerToolsDiagnosticGrant?) async throws {
+        try Task.checkCancellation()
+        if let grant { try await grant.requireForExport() }
+    }
     static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(exportedContentType: .plainText) { _ in
+        FileRepresentation(exportedContentType: .plainText) { transfer in
+            try await require(transfer.grant)
+            let bytes = VXDiagExport.exportBody()
+            try await require(transfer.grant)
             let directory = FileManager.default.temporaryDirectory
                 .appendingPathComponent("vortx-diag-\(UUID().uuidString.lowercased())", isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
             let destination = directory.appendingPathComponent("vortx-diag.log")
-            try VXDiagExport.exportBody().write(to: destination, options: .atomic)
-            return SentTransferredFile(destination)
+            do {
+                try bytes.write(to: destination, options: .atomic)
+                try await require(transfer.grant)
+                return SentTransferredFile(destination)
+            } catch {
+                // Only this unique export directory and its own staged file are touched.
+                try? FileManager.default.removeItem(at: destination)
+                try? FileManager.default.removeItem(at: directory)
+                throw error
+            }
         }
     }
 }
@@ -54,14 +78,15 @@ private final class DiagnosticLogExportSession: ObservableObject {
     @Published private(set) var preparing = true
     private var exporter: VXDiagExport?
 
-    func prepare() async {
-        let owned = VXDiagExport.makeSession()
+    func prepare(grant: ProfilePickerToolsDiagnosticGrant?) async {
+        guard grant?.permitsExport != false else { stop(); return }
+        let owned = VXDiagExport.makeSession(deliveryAuthorization: { grant?.permitsExport != false })
         exporter?.stopOwnedSession()
         exporter = owned
         payload = nil
         preparing = true
         let result = await owned.startAsync()
-        guard !Task.isCancelled, exporter === owned else {
+        guard !Task.isCancelled, exporter === owned, grant?.permitsExport != false else {
             owned.stopOwnedSession()
             if exporter === owned { exporter = nil; preparing = false }
             return
@@ -80,6 +105,7 @@ private final class DiagnosticLogExportSession: ObservableObject {
 }
 
 private struct DiagnosticLogExportSheet: View {
+    let grant: ProfilePickerToolsDiagnosticGrant?
     @Environment(\.dismiss) private var dismiss
     @StateObject private var session = DiagnosticLogExportSession()
     @State private var retry = 0
@@ -91,7 +117,7 @@ private struct DiagnosticLogExportSheet: View {
                 Text("Export diagnostic log")
                     .font(Theme.Typography.screenTitle)
                     .foregroundStyle(Theme.Palette.textPrimary)
-                if let export = session.payload {
+                if let export = session.payload, grant?.permitsExport != false {
                     export.qr.resizable().interpolation(.none).scaledToFit()
                         .frame(width: 360, height: 360)
                         .padding(12).background(.white)
@@ -110,6 +136,7 @@ private struct DiagnosticLogExportSheet: View {
                         .font(Theme.Typography.body)
                         .foregroundStyle(Theme.Palette.textPrimary)
                     Button("Try again") { retry += 1 }
+                        .disabled(grant?.permitsExport == false)
                         .buttonStyle(ChipButtonStyle())
                 }
                 Text("Includes recent troubleshooting activity, even if Diagnostic logging was off. Review the file before sharing it.")
@@ -124,7 +151,14 @@ private struct DiagnosticLogExportSheet: View {
             .frame(maxWidth: .infinity)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        .task(id: retry) { await session.prepare() }
+        .task(id: retry) { await session.prepare(grant: grant) }
+        .task {
+            guard grant != nil else { return }
+            while !Task.isCancelled {
+                guard grant?.permitsExport != false else { session.stop(); return }
+                do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+            }
+        }
         .onAppear { closeFocused = true }
         .onExitCommand { dismiss() }
         .onDisappear { session.stop() }

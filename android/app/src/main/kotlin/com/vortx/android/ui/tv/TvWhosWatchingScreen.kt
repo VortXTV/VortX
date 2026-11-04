@@ -46,6 +46,7 @@ import com.vortx.android.profile.ProfileSelectionRequest
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.ui.profilepicker.ProfilePickerCinematicBackdrop
 import com.vortx.android.ui.profilepicker.ProfilePickerLayoutPolicy
+import com.vortx.android.ui.profilepicker.ProfilePickerAccountControl
 import com.vortx.android.ui.profilepicker.rememberProfilePickerLifecycleActive
 import com.vortx.android.ui.profilepicker.rememberProfilePickerMovie
 import com.vortx.android.ui.theme.VortXAccents
@@ -64,7 +65,7 @@ import kotlinx.coroutines.CancellationException
 /// Gating mirrors the phone and Apple TV exactly: [ProfileStore.needsPicker] is true for a real roster choice
 /// or an account handoff still awaiting host verification. `pickedThisLaunch` is a transient in-memory flag
 /// that resets every cold start; a pending handoff deliberately keeps the picker mounted even when only one
-/// profile remains. This screen is fail-soft: with no gateway or no pending choice it dismisses itself.
+/// profile remains. An unavailable gateway leaves account and Tools access on the picker.
 ///
 /// Every PIN-protected profile, including the already-active profile when Back is used, prompts for its PIN
 /// through a D-pad numeric keypad before selection (a TV has no reliable soft keyboard), so a Kids remote
@@ -76,18 +77,24 @@ import kotlinx.coroutines.CancellationException
 fun TvWhosWatching(
     onDone: () -> Unit,
     onSelected: (ProfileSelectionRequest) -> Unit,
+    accountControl: ProfilePickerAccountControl?,
     modifier: Modifier = Modifier,
 ) {
     val (gateway, loading) = rememberTvProfileGateway()
-    if (loading) {
-        Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("Opening profiles…", style = VortXTheme.type.body)
-        }
-        BackHandler(onBack = onDone)
-        return
-    }
     if (gateway == null) {
-        LaunchedEffect(Unit) { onDone() }
+        val backFocus = remember { FocusRequester() }
+        BackHandler(onBack = onDone)
+        Column(modifier.fillMaxSize().padding(TvDimens.edge),
+            verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
+            horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(if (loading) "Opening profiles…" else "Couldn't open profiles.", style = VortXTheme.type.body)
+            if (!loading) Text("Open Tools for backup recovery.", style = VortXTheme.type.label)
+            accountControl?.let { control ->
+                TvProfileButton(control.label, modifier = Modifier.width(320.dp), onClick = control.onClick)
+            }
+            TvProfileButton("Back", modifier = Modifier.width(320.dp).focusRequester(backFocus), onClick = onDone)
+        }
+        LaunchedEffect(backFocus) { withFrameNanos { }; runCatching { backFocus.requestFocus() } }
         return
     }
     val snapshot = gateway.read()
@@ -95,13 +102,14 @@ fun TvWhosWatching(
         LaunchedEffect(Unit) { onDone() }
         return
     }
-    TvProfilePicker(gateway, onDone, onSelected, modifier)
+    TvProfilePicker(gateway, onDone, accountControl, onSelected, modifier)
 }
 
 @Composable
 internal fun TvProfilePicker(
     gateway: TvProfileGateway,
     onDone: () -> Unit,
+    accountControl: ProfilePickerAccountControl?,
     onSelected: (ProfileSelectionRequest) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
@@ -299,6 +307,9 @@ internal fun TvProfilePicker(
                 }
             }
             pickerError?.let { Text(it, style = VortXTheme.type.label.copy(color = Color.White), textAlign = TextAlign.Center) }
+            accountControl?.let { control ->
+                TvProfileButton(control.label, modifier = Modifier.width(300.dp).testTag("profile-picker-account"), onClick = { if (pinTarget == null && managementRequest == null) control.onClick() })
+            }
         }
 
         pinTarget?.let { pending ->

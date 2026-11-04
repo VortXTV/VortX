@@ -3,7 +3,9 @@ package com.vortx.android.debrid
 import android.content.Context
 import android.util.AtomicFile
 import com.vortx.android.BuildConfig
+import com.vortx.android.engine.AccountFileLocalPresence
 import com.vortx.android.integrations.NativeProviderAccess
+import com.vortx.android.security.AccountFileProviderWriters
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
 import java.io.ByteArrayInputStream
@@ -185,6 +187,7 @@ internal object LegacyOwnerClaimCodec {
 internal interface DebridKeyValueStore {
     val adoptionDomain: Any get() = this
     fun snapshot(vararg keys: String): DebridStorageSnapshot
+    fun inspectExisting(vararg keys: String): AccountFileLocalPresence = AccountFileLocalPresence.UNAVAILABLE
     fun write(values: Map<String, String?>): Boolean
     fun legacyOwnerReservation(): LegacyOwnerReservation
     fun claimLegacyOwner(owner: String): Boolean
@@ -209,6 +212,8 @@ private class AndroidDebridKeyValueStore(context: Context) : DebridKeyValueStore
     private val legacyClaimStore =
         AtomicFile(File(context.noBackupFilesDir, DebridKeys.LEGACY_CLAIM_FILE))
 
+    override fun inspectExisting(vararg keys: String): AccountFileLocalPresence = store.inspectExisting(*keys)
+
     override fun snapshot(vararg keys: String): DebridStorageSnapshot {
         val snapshot = store.confirmedSnapshot(*keys)
         return DebridStorageSnapshot(
@@ -230,7 +235,12 @@ private class AndroidDebridKeyValueStore(context: Context) : DebridKeyValueStore
             store.set(values)
         }
 
-    override fun legacyOwnerReservation(): LegacyOwnerReservation {
+    override fun legacyOwnerReservation(): LegacyOwnerReservation =
+        AccountFileProviderWriters.withWriter<LegacyOwnerReservation>(LegacyOwnerReservation.InvalidOrUnavailable) {
+            readLegacyOwnerReservation()
+        }
+
+    private fun readLegacyOwnerReservation(): LegacyOwnerReservation {
         val bytes = try {
             // Always enter AtomicFile.openRead. On older Android releases it restores a valid backup before
             // opening the base file; checking baseFile first would misclassify that recoverable state as absent.
@@ -257,23 +267,21 @@ private class AndroidDebridKeyValueStore(context: Context) : DebridKeyValueStore
         return LegacyOwnerClaimCodec.decode(bytes)
     }
 
-    override fun claimLegacyOwner(owner: String): Boolean {
-        when (val existing = legacyOwnerReservation()) {
-            is LegacyOwnerReservation.Claimed -> return existing.owner == owner
-            LegacyOwnerReservation.InvalidOrUnavailable -> return false
-            LegacyOwnerReservation.Missing -> Unit
+    override fun claimLegacyOwner(owner: String): Boolean = AccountFileProviderWriters.withWriter(false) {
+        when (val existing = readLegacyOwnerReservation()) {
+            is LegacyOwnerReservation.Claimed -> existing.owner == owner
+            LegacyOwnerReservation.InvalidOrUnavailable -> false
+            LegacyOwnerReservation.Missing -> writeLegacyOwner(owner)
         }
-        return writeLegacyOwner(owner)
     }
 
-    override fun repairLegacyOwner(owner: String): Boolean {
-        when (val existing = legacyOwnerReservation()) {
-            is LegacyOwnerReservation.Claimed -> return existing.owner == owner
+    override fun repairLegacyOwner(owner: String): Boolean = AccountFileProviderWriters.withWriter(false) {
+        when (val existing = readLegacyOwnerReservation()) {
+            is LegacyOwnerReservation.Claimed -> existing.owner == owner
             LegacyOwnerReservation.InvalidOrUnavailable,
             LegacyOwnerReservation.Missing,
-            -> Unit
+            -> writeLegacyOwner(owner)
         }
-        return writeLegacyOwner(owner)
     }
 
     private fun writeLegacyOwner(owner: String): Boolean {
@@ -319,6 +327,12 @@ class DebridKeys private constructor(
         activeOwner = PROCESS_OWNER_BINDING::currentOwner,
         nativeMode = true,
     )
+
+    /** Exact account-qualified rollback slots used by native provider migration. No adoption. */
+    internal fun inspectQualifiedRestorePresence(account: String): AccountFileLocalPresence {
+        val scope = DebridOwnerScope.Account(account)
+        return store.inspectExisting(*DebridService.entries.map { it.storageKey(scope) }.toTypedArray())
+    }
 
     /// The stored key for [service], or an empty string when none is set.
     @Synchronized

@@ -91,6 +91,7 @@ struct iOSRootView: View {
     @State private var homeBrowse = false
     @State private var homeHasDestination = false
     @StateObject private var quickViewPresenter = CinemaQuickViewPresenter()
+    @StateObject private var profileAuthentication = AccountAuthenticationPresentation()
     /// Phase-0 seeding nag (com.vortx move): armed once per launch by MoveSeeding.armLaunchNag.
     @State private var showSeedingNag = false
     #if os(macOS)
@@ -159,12 +160,12 @@ struct iOSRootView: View {
         TabBarPrefs.migrateLegacyLiveKey()
     }
 
-    /// The launch "Who's watching?" picker is owed when the roster has more than one profile and none has
-    /// been chosen this launch (ProfileStore.needsPicker), with no fullscreen player up. The tvOS gate is
+    /// The "Who's watching?" picker is owed for the ordinary multi-profile launch or an explicit
+    /// Profiles & Tools request (ProfileStore.needsPicker), with no fullscreen player up. The tvOS gate is
     /// `splashDone && needsPicker && presenter.request == nil`; iOSRootView has no splash of its own (the
     /// brand splash lives one level up in VortXiOSApp), so per the shared design it gates on needsPicker
     /// alone here rather than inventing a splash flag.
-    private var pickerOwed: Bool { profiles.needsPicker && !playbackGate.playerActive }
+    private var pickerOwed: Bool { profileAuthentication.blocksDismissal || (profiles.needsPicker && !playbackGate.playerActive) }
 
     /// The main shell is visible only once a profile has settled: while the picker is owed it is hidden
     /// behind brand canvas so no main-profile content (Continue Watching, Library) shows before a viewer is
@@ -188,12 +189,15 @@ struct iOSRootView: View {
     }
 
     /// Presentation binding for the launch picker: shown while it is owed; dismissing it by any means marks
-    /// the launch as picked (pickedThisLaunch), so it never re-appears until Settings' Switch Profile asks.
+    /// the launch as picked (pickedThisLaunch), consuming the explicit request until Profiles & Tools asks.
     /// Mirrors tvOS RootView.pickerPresented.
     private var pickerPresented: Binding<Bool> {
         Binding(
             get: { pickerOwed },
-            set: { presented in if !presented { profiles.pickedThisLaunch = true } }
+            set: { presented in
+                guard !profileAuthentication.blocksDismissal else { return }
+                if !presented { profiles.pickedThisLaunch = true }
+            }
         )
     }
 
@@ -392,7 +396,7 @@ struct iOSRootView: View {
         }
         // Launch "Who's watching?" picker: a real modal at cold start when the roster has more than one
         // profile and none has been chosen this launch (ProfileStore.needsPicker), re-presented whenever
-        // Settings' Switch Profile flips pickedThisLaunch back to false. `.platformFullScreenCover` is a
+        // Profiles & Tools explicitly requests it, including an eligible zero/one-profile roster. It is a
         // real fullScreenCover on iPhone / iPad and a sheet on Mac (which has no fullScreenCover). The
         // shell is hidden behind canvas while it is owed (opacity gate above), so nothing of the main
         // profile leaks behind it, matching the tvOS RootView flow. Selecting a profile goes through
@@ -401,10 +405,10 @@ struct iOSRootView: View {
         // MacProfileCoverHost / MacRootProfileCoverOverlay) instead of a content-sized `.sheet` that
         // clipped the trailing Add Profile circle off the window's right edge. iPhone / iPad keep a real
         // `.fullScreenCover`. The shell behind stays hidden by the opacity gate above.
-        .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView() }
+        .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView(authentication: profileAuthentication, pickerPresentation: profiles.pickerPresentation()) }
         #else
         shellWithTabPreferenceRouting
-            .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView() }
+            .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView(authentication: profileAuthentication, pickerPresentation: profiles.pickerPresentation()) }
         #endif
     }
 
@@ -785,9 +789,10 @@ struct iOSRootView: View {
     private var overflowTabMenu: some View {
         let selected = compactTabLayout.overflow.contains(tab)
         return Menu {
-            Button { profiles.pickedThisLaunch = false } label: {
-                Label("Switch Profile", systemImage: "person.crop.circle")
+            Button { profiles.requestPicker() } label: {
+                Label("Profiles & Tools", systemImage: "person.crop.circle")
             }
+            .disabled(!profiles.canRequestPicker)
             Divider()
             ForEach(compactTabLayout.overflow, id: \.rawValue) { item in
                 Button { selectTab(item) } label: {
@@ -808,7 +813,7 @@ struct iOSRootView: View {
     /// A first-class profile affordance in the wide Cinema shell. It reuses the root's existing picker
     /// gate, preserving profile/session fencing instead of inventing a parallel account sheet.
     private var profileSwitchButton: some View {
-        Button { profiles.pickedThisLaunch = false } label: {
+        Button { profiles.requestPicker() } label: {
             Image(systemName: "person.crop.circle")
                 .font(.system(size: 19, weight: .semibold))
                 .foregroundStyle(Theme.Palette.textPrimary)
@@ -816,8 +821,9 @@ struct iOSRootView: View {
                 .vortxGlassDisc()
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Switch Profile")
-        .accessibilityHint("Opens profile selection")
+        .disabled(!profiles.canRequestPicker)
+        .accessibilityLabel("Profiles & Tools")
+        .accessibilityHint("Opens profile selection and backup tools")
     }
 
     private func compactTabLabel(title: String, icon: String, selected: Bool,

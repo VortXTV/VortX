@@ -6,6 +6,8 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import com.vortx.android.sync.SessionOwnerSnapshot
+import com.vortx.android.sync.NativeSettingsFence
+import java.util.concurrent.atomic.AtomicLong
 
 internal enum class PlaylistScopeTransition { PROJECTION_REFRESH, AUTHORITY_BOUNDARY }
 
@@ -40,7 +42,65 @@ internal class FixturePrefs {
         fun apply() { values.putAll(pending) }
     }
 }
+internal object RestoreProfileDirectWriters {
+    internal class Reservation {
+        @Volatile var revoked = false
+    }
+
+    private val lock = Any()
+    @Volatile private var held: Reservation? = null
+    private var activeWriters = 0
+
+    fun reserve(): Reservation? = synchronized(lock) {
+        if (held != null || activeWriters != 0) null else Reservation().also { held = it }
+    }
+
+    fun isHeld(): Boolean = held != null
+
+    fun requireCurrent(original: Reservation) {
+        check(held === original && !original.revoked) { "Local profile Restore exclusion retired" }
+    }
+
+    fun release(original: Reservation) = synchronized(lock) {
+        check(held === original) { "Local profile Restore reservation changed" }
+        held = null
+    }
+
+    fun begin(): Boolean = synchronized(lock) {
+        if (held != null) false else {
+            activeWriters++
+            true
+        }
+    }
+
+    fun end() = synchronized(lock) {
+        check(activeWriters > 0)
+        activeWriters--
+        Unit
+    }
+
+    inline fun <T> write(action: () -> T): T {
+        check(begin()) { "Local profile changes are busy during backup Restore" }
+        return try { action() } finally { end() }
+    }
+
+    /** Account retirement must complete. Revoke before publishing any transition, retaining the
+     * original reservation until its operation drains. The callback runs outside the gate monitor. */
+    fun <T> retirement(action: () -> T): T {
+        synchronized(lock) {
+            held?.revoked = true
+            activeWriters++
+        }
+        return try { action() } finally { end() }
+    }
+}
+
 internal class ExtractedBootstrapStore {
+    private val restoreProfileGeneration = AtomicLong()
+    private fun noteRestoreProfileWrite() {
+        restoreProfileGeneration.updateAndGet { if (it == Long.MAX_VALUE) it else it + 1 }
+    }
+
     val prefs = FixturePrefs()
     var profiles: List<UserProfile> = emptyList()
     var activeID: String? = null
@@ -77,8 +137,11 @@ internal class ExtractedBootstrapStore {
     private fun activateProfileState(profile:UserProfile,resetUnset:Boolean,playlistTransition: PlaylistScopeTransition = PlaylistScopeTransition.AUTHORITY_BOUNDARY) { applied++;onApply() }
     private val playlistScopeListeners = mutableListOf<(PlaylistScopeTransition) -> Unit>()
     private var nativeProjectionRequest = 0L
+        set(value) { noteRestoreProfileWrite(); field = value }
     private var nativeProjectionMount: Any? = null
+        set(value) { noteRestoreProfileWrite(); field = value }
     private var initialNativeMigrationProfile: UserProfile? = null
+        set(value) { noteRestoreProfileWrite(); field = value }
     private data class NativeProjectionBasis(
         val ownerRevision: Long,
         val profiles: List<UserProfile>, val activeID: String?,
@@ -100,12 +163,18 @@ internal class ExtractedBootstrapStore {
     )
 
     internal suspend fun attachNativeGateway(gateway: NativeProfileGateway, mountIdentity: Any, forceSettings: Boolean = false) {
+        check(RestoreProfileDirectWriters.begin()) { "Local profile changes are busy during backup Restore" }
+        try { attachNativeGatewayAsWriter(gateway, mountIdentity, forceSettings) }
+        finally { RestoreProfileDirectWriters.end() }
+    }
+
+    private suspend fun attachNativeGatewayAsWriter(gateway: NativeProfileGateway, mountIdentity: Any, forceSettings: Boolean) {
         val request = withContext(Dispatchers.Main) {
             ContinueWatchingOwnerGate.serialized {
                 if (nativeProjectionMount !== mountIdentity) {
                     val initial = nativeProjectionMount == null
                     if (initial) initialNativeMigrationProfile = active ?: initialNativeMigrationProfile
-                    clearNativeProjection(retireLegacy = !initial, retireMigration = !initial)
+                    clearNativeProjectionAsWriter(retireLegacy = !initial, retireMigration = !initial)
                 }
                 nativeGateway = gateway
                 nativeProjectionMount = mountIdentity
@@ -185,7 +254,7 @@ internal class ExtractedBootstrapStore {
         val guard = checkNotNull(captured?.first?.takeIf { captured.second == value }) {
             "Native provider authority is unavailable. Retry this account."
         }
-        val epoch = com.vortx.android.integrations.TraktAuth.currentSessionEpoch
+        val epoch = com.vortx.android.integrations.TraktAuth.profileProjectionEpoch(guard)
         var acknowledgement = previousAcknowledgement?.takeIf {
             it.account == guard.owner && it.traktEpoch == epoch && it.profileID == value.activeID && incoming?.discovery == it.discovery
         }
@@ -200,8 +269,7 @@ internal class ExtractedBootstrapStore {
             save = { edited -> com.vortx.android.integrations.NativeProviderAccess.guarded(guard) {
                 if (gateway.read() == value) gateway.save(edited, adding = false) else null
             } },
-            authorityIsCurrent = { com.vortx.android.integrations.NativeProviderAccess.current(guard) &&
-                com.vortx.android.integrations.TraktAuth.currentSessionEpoch == epoch },
+            authorityIsCurrent = { com.vortx.android.integrations.TraktAuth.profileProjectionEpochIsCurrent(guard, epoch) },
             readbackIsCurrent = { saved -> gateway.read() == saved },
         )?.let { saved ->
             acknowledgement = NativeLegacyAcknowledgement(guard.owner, saved.activeID, checkNotNull(epoch),
@@ -211,6 +279,7 @@ internal class ExtractedBootstrapStore {
         return NativeProjectionEffects(guard.owner, epoch, checkpoint.snapshot(), clearLegacy, providerRevision, acknowledgement)
     }
     private fun applyPreparedNativeProjection(value: NativeProfileGateway.Projection, effects: NativeProjectionEffects, forceSettings: Boolean) {
+        noteRestoreProfileWrite()
         val beforeBinding = captureActiveProfileBinding(profiles, activeID)
         val transition = playlistScopeTransition(
             playlistScopeEvidence(beforeBinding, acknowledgedNativeAccount, acknowledgedNativeTraktEpoch),
@@ -231,7 +300,10 @@ internal class ExtractedBootstrapStore {
         acknowledgedNativeAccount = effects.account; acknowledgedNativeTraktEpoch = effects.traktEpoch
         initialNativeMigrationProfile = null
     }
-    internal fun clearNativeProjection(retireLegacy: Boolean = true, retireMigration: Boolean = true) = ContinueWatchingOwnerGate.serialized {
+    internal fun clearNativeProjection(retireLegacy: Boolean = true, retireMigration: Boolean = true) =
+        RestoreProfileDirectWriters.retirement { clearNativeProjectionAsWriter(retireLegacy, retireMigration) }
+
+    private fun clearNativeProjectionAsWriter(retireLegacy: Boolean, retireMigration: Boolean) = ContinueWatchingOwnerGate.serialized {
         nativeProjectionRequest++
         nativeProjectionMount = null
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
@@ -240,7 +312,11 @@ internal class ExtractedBootstrapStore {
                 acknowledgedNativeAccount = null; acknowledgedNativeTraktEpoch = null
                 initialNativeMigrationProfile = null
             }
-            if (retireLegacy) prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
+            if (retireLegacy) NativeSettingsFence.capture {
+                val legacyKey = com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING
+                // An absent preference already means off. Keep a fresh settings backing untouched.
+                if (prefs.contains(legacyKey)) prefs.edit().putBoolean(legacyKey, false).apply()
+            }
             profiles = emptyList(); activeID = null; pickedThisLaunch = false
             notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(PlaylistScopeTransition.AUTHORITY_BOUNDARY)
             publishActiveProfile(); notifySwitchListeners()

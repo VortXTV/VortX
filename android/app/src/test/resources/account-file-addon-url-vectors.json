@@ -1,0 +1,205 @@
+{
+  "format": 1,
+  "cases": [
+    {
+      "name": "percent_ascii_host",
+      "url": "https://%65XAMPLE.com/Case?Cfg=AbC%2F"
+    },
+    {
+      "name": "unicode_host",
+      "url": "HTTPS://BÜCHER.example/Case?Cfg=AbC%2F"
+    },
+    {
+      "name": "percent_utf8_host",
+      "url": "https://B%C3%9CCHER.example/Case"
+    },
+    {
+      "name": "ace_host",
+      "url": "https://XN--BCHER-KVA.example/Case"
+    },
+    {
+      "name": "nontransitional_sharp_s",
+      "url": "https://faß.example/Case"
+    },
+    {
+      "name": "unicode_combining_host",
+      "url": "https://bücher.example/Case"
+    },
+    {
+      "name": "international_dot",
+      "url": "https://例え。テスト/Case"
+    },
+    {
+      "name": "bracketed_ipv6",
+      "url": "HTTPS://[2001:DB8:0:0:0:0:0:1]:443/Case?Cfg=AbC%2F"
+    },
+    {
+      "name": "bracketed_ipv6_compressed",
+      "url": "http://[2001:DB8::1]/"
+    },
+    {
+      "name": "bracketed_ipv6_zone",
+      "url": "http://[fe80::1%25En0]/Case"
+    },
+    {
+      "name": "percent_once",
+      "url": "https://%2565XAMPLE.com/Case?Cfg=%252F"
+    },
+    {
+      "name": "encoded_host_slash",
+      "url": "https://exa%2Fmple.com/Case"
+    },
+    {
+      "name": "encoded_host_backslash",
+      "url": "https://exa%5Cmple.com/Case"
+    },
+    {
+      "name": "encoded_host_at",
+      "url": "https://exa%40mple.com/Case"
+    },
+    {
+      "name": "encoded_host_colon",
+      "url": "https://exa%3Ample.com/Case"
+    },
+    {
+      "name": "encoded_host_question",
+      "url": "https://exa%3Fmple.com/Case"
+    },
+    {
+      "name": "encoded_host_hash",
+      "url": "https://exa%23mple.com/Case"
+    },
+    {
+      "name": "literal_percent_host",
+      "url": "https://exa%mple.com/Case"
+    },
+    {
+      "name": "malformed_percent_host",
+      "url": "https://exa%2Gmple.com/Case"
+    },
+    {
+      "name": "invalid_utf8_host",
+      "url": "https://exa%FFmple.com/Case"
+    },
+    {
+      "name": "encoded_ipv6",
+      "url": "https://%5B2001%3ADB8%3A%3A1%5D/Case"
+    },
+    {
+      "name": "host_plus",
+      "url": "https://EXAMPLE+alt.com/Case"
+    },
+    {
+      "name": "literal_userinfo",
+      "url": "https://name:password@example.com/Case"
+    },
+    {
+      "name": "encoded_userinfo",
+      "url": "https://na%6De:pa%73sword@example.com/Case"
+    },
+    {
+      "name": "empty_userinfo",
+      "url": "https://@example.com/Case"
+    },
+    {
+      "name": "fragment",
+      "url": "https://example.com/Case#part"
+    },
+    {
+      "name": "empty_fragment",
+      "url": "https://example.com/Case#"
+    },
+    {
+      "name": "https_default_port",
+      "url": "https://EXAMPLE.com:443/Case"
+    },
+    {
+      "name": "http_default_port",
+      "url": "http://EXAMPLE.com:80/Case"
+    },
+    {
+      "name": "leading_zero_port",
+      "url": "https://EXAMPLE.com:00443/Case"
+    },
+    {
+      "name": "empty_port",
+      "url": "https://EXAMPLE.com:/Case"
+    },
+    {
+      "name": "nondefault_port",
+      "url": "https://EXAMPLE.com:8443/Case"
+    },
+    {
+      "name": "no_path",
+      "url": "https://EXAMPLE.com"
+    },
+    {
+      "name": "trailing_slash",
+      "url": "https://EXAMPLE.com/"
+    },
+    {
+      "name": "query_without_path",
+      "url": "https://EXAMPLE.com?Cfg=AbC%2F"
+    },
+    {
+      "name": "empty_query",
+      "url": "https://EXAMPLE.com/Case?"
+    },
+    {
+      "name": "path_query_precomposed",
+      "url": "https://EXAMPLE.com/café/Case?Cfg=résumé"
+    },
+    {
+      "name": "path_query_decomposed",
+      "url": "https://EXAMPLE.com/café/Case?Cfg=résumé"
+    },
+    {
+      "name": "path_query_encoded",
+      "url": "https://EXAMPLE.com/caf%c3%a9/Case?Cfg=re%CC%81sum%C3%A9"
+    },
+    {
+      "name": "path_query_percent_once",
+      "url": "https://EXAMPLE.com/%252F/%2f?Cfg=%252F+AbC"
+    },
+    {
+      "name": "path_query_literal_percent",
+      "url": "https://EXAMPLE.com/100%/Case?Cfg=50%2G"
+    },
+    {
+      "name": "path_query_spaces",
+      "url": "https://EXAMPLE.com/Two Words?Cfg=Ab C"
+    },
+    {
+      "name": "path_backslash",
+      "url": "https://EXAMPLE.com/a\\b/Case?Cfg=A\\B"
+    },
+    {
+      "name": "dot_segments",
+      "url": "https://EXAMPLE.com/a/../Case?Cfg=A"
+    },
+    {
+      "name": "blank_host",
+      "url": "https:///Case"
+    },
+    {
+      "name": "non_http",
+      "url": "file://example.com/Case"
+    },
+    {
+      "name": "outer_whitespace",
+      "url": " \tHTTPS://EXAMPLE.com/Case?Cfg=AbC%2F\r\n"
+    },
+    {
+      "name": "unicode_nested_percent_once",
+      "url": "https://b%C3%BC%2563her.example/Case?Cfg=AbC%2F"
+    },
+    {
+      "name": "unicode_distinct_escapes_same_label",
+      "url": "https://b%C3%BC%2563her%2564.example/Case?Cfg=AbC%2F"
+    },
+    {
+      "name": "unicode_distinct_escapes_across_labels",
+      "url": "https://b%C3%BC%2564her.n%2563ame.example/Case?Cfg=%252F+AbC"
+    }
+  ]
+}

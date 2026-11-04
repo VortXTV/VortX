@@ -270,11 +270,19 @@ check(detachedSeed.contains("VortxNativeSession.detachedLegacySync")
       && !detachedSeed.contains("rememberAuthenticatedScope") && !detachedSeed.contains("installNativeSession"),
       "proven-empty seed is detached until create-only PUT and authenticated winner readback")
 let nativePush = section(syncSource, from: "private func mergeLocalIntoDoc", until: "private func foldDocTombstones(")
-let nativeExportReturn = guardedMetadata
-    ? nativePush.contains("return DerivedSyncDoc(document: doc, baseRevision: baseRevision, credentialCapture: capture,\n"
-        + "                              sourceIsCurrent: sourceIsCurrent, nativeDirtySettings: exportedDirtySettings)\n    }")
-    : nativePush.contains("return DerivedSyncDoc(document: doc, baseRevision: baseRevision, credentialCapture: capture,\n"
-        + "                              sourceIsCurrent: sourceIsCurrent, nativeDirtySettings: exportedDirtySettings)\n#else")
+let nativeExportReturn: Bool
+if bridge.contains("@MainActor var hasOwnerHistorySession: Bool {") {
+    nativeExportReturn = nativePush.contains("OwnerHistoryAccountExport(completeAccountPlaintext: originalPlaintext)")
+        && nativePush.contains(".projectingGenericHost(native: merged[\"nativeSync\"]!, host: receipt.rawHost,")
+        && nativePush.contains("OwnerHistoryRawAccountPreparation.projectingLocalProvider(account: account, provider: providers)")
+        && appearsBefore("rawExport = try account.encoded()", "guard let rawExport else { return nil }", in: nativePush)
+        && nativePush.contains("return DerivedSyncDoc(document: doc, baseRevision: baseRevision, credentialCapture: capture,\n"
+            + "                              sourceIsCurrent: sourceIsCurrent, plaintextData: rawExport, nativeDirtySettings: exportedDirtySettings)")
+} else {
+    let legacyReturn = "return DerivedSyncDoc(document: doc, baseRevision: baseRevision, credentialCapture: capture,\n"
+        + "                              sourceIsCurrent: sourceIsCurrent, nativeDirtySettings: exportedDirtySettings)"
+    nativeExportReturn = nativePush.contains(legacyReturn + (guardedMetadata ? "\n    }" : "\n#else"))
+}
 check(nativePush.contains("let conversion = nativeLegacyConversionDecision(doc, capture: capture)")
                 && nativePush.contains("var prepared: NativeLegacyPreparation?")
                 && nativePush.contains("if conversion.convert { prepared = try await prepareNativeLegacyMaterial(doc, capture: capture) }")
@@ -483,6 +491,20 @@ check(installAddon.contains("let mutationToken = capturePublicationToken()")
                 && !installAddon.contains("if usesNativeProfileState { AddonTombstones.forget(identityURL.absoluteString) }")
                 && installAddon.contains("AddonTombstones.forget(identityURL.absoluteString)"),
               "installer rechecks after awaits and atomically replaces without pre-uninstall or premature native tombstone changes")
+let addonFailurePresentation = member(bridge, "private func addonMutationFailureMessage(_ token:")
+let addonFailureClassification = member(bridge, "private static func addonMutationFailureMessage(publicationCurrent:")
+check(appearsBefore("let mutationCredential = CredentialScopeRegistry.shared.capture()", "await AddonURLGuard.fetch(url)", in: installAddon)
+      && installAddon.components(separatedBy: "message: addonMutationFailureMessage(mutationToken, credential: mutationCredential)").count == 8
+      && !installAddon.contains("message: Self.accountTransitionMessage")
+      && addonFailurePresentation.contains("publicationCurrent: publicationEpochMatches(token)")
+      && addonFailurePresentation.contains("operationCredentialCurrent: CredentialScopeRegistry.shared.isCurrent(credential)")
+      && addonFailurePresentation.contains("nativeCredentialCapture.map { CredentialScopeRegistry.shared.isCurrent($0) }")
+      && addonFailurePresentation.contains("available: nativeFacadeStorage?.isAvailable == true")
+      && addonFailurePresentation.contains("logoutPending: logoutAccountMutationPending")
+      && !addonFailurePresentation.contains("dispatchCtx") && !addonFailurePresentation.contains("await ")
+      && addonFailureClassification.contains("installedCredentialCurrent != false, !logoutPending else { return accountTransitionMessage }")
+      && addonFailureClassification.contains("guard nativeAvailable, installedCredentialCurrent != nil else { return profileUnavailableMessage }"),
+      "installer failure presentation retains original owner/epoch and distinguishes unavailable native data without granting mutation authority")
 check(hydrateAddons.contains("guard !owned.isEmpty, addonMutationStillAllowed(mutationToken) else { return }")
                 && hydrateAddons.contains("if dispatchCtx([\"action\": \"InstallAddonLocal\", \"args\": addon.installDescriptor])")
                 && hydrateAddons.contains("installedCount += 1"),

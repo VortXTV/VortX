@@ -26,6 +26,7 @@ on:
       - "test/apple-nzb-operation-http.py"
       - "scripts/test-tv-search-collections.sh"
       - "scripts/test-addon-selfhosted.sh"
+      - "scripts/test-addon-mutation-failure-presentation.sh"
       - "scripts/test-apple-parity-contracts.sh"
       - "scripts/test-source-title-match.sh"
       - "scripts/test-aether-playback-boundary.sh"
@@ -49,7 +50,26 @@ on:
       - "test/subtitle-mount-owner-fixture.cjs"
       - "scripts/test-subtitle-timing-policy.sh"
       - "scripts/test-sync-derived-document-revisions.sh"
+      - "scripts/test-sync-candidate-read-fence.mjs"
       - "scripts/test-native-bootstrap-archive.sh"
+      - "scripts/test-account-backup-file.sh"
+      - "scripts/test-account-file-access.sh"
+      - "scripts/test-profile-picker-account.sh"
+      - "scripts/test-profile-picker-tools.sh"
+      - "scripts/test-profile-picker-tools-transfer.sh"
+      - "scripts/test-profile-picker-tools-lan-adapter.sh"
+      - "scripts/test-profile-picker-tools-tv-composition.sh"
+      - "scripts/test-profile-picker-tools-ui-typecheck.py"
+      - "scripts/test-account-file-restore-manager.sh"
+      - "scripts/test-account-file-local-adoption.sh"
+      - "scripts/test-account-provider-sync-settlement.sh"
+      - "scripts/run-account-provider-sync-settlement.py"
+      - "test/account-provider-sync-settlement-inputs.cjs"
+      - "scripts/run-account-file-local-adoption.py"
+      - "test/account-file-local-adoption-inputs.cjs"
+      - "scripts/run-account-file-restore-manager.py"
+      - "test/account-file-restore-manager-inputs.cjs"
+      - "scripts/test-account-authentication-lifecycle.sh"
       - "scripts/test-profile-roster-propagation.sh"
       - "scripts/test-profile-picker-public-seed.sh"
       - "test/android-profile-picker-startup.test.mjs"
@@ -123,6 +143,7 @@ on:
       - "test/apple-nzb-operation-http.py"
       - "scripts/test-tv-search-collections.sh"
       - "scripts/test-addon-selfhosted.sh"
+      - "scripts/test-addon-mutation-failure-presentation.sh"
       - "scripts/test-apple-parity-contracts.sh"
       - "scripts/test-source-title-match.sh"
       - "scripts/test-aether-playback-boundary.sh"
@@ -146,7 +167,26 @@ on:
       - "test/subtitle-mount-owner-fixture.cjs"
       - "scripts/test-subtitle-timing-policy.sh"
       - "scripts/test-sync-derived-document-revisions.sh"
+      - "scripts/test-sync-candidate-read-fence.mjs"
       - "scripts/test-native-bootstrap-archive.sh"
+      - "scripts/test-account-backup-file.sh"
+      - "scripts/test-account-file-access.sh"
+      - "scripts/test-profile-picker-account.sh"
+      - "scripts/test-profile-picker-tools.sh"
+      - "scripts/test-profile-picker-tools-transfer.sh"
+      - "scripts/test-profile-picker-tools-lan-adapter.sh"
+      - "scripts/test-profile-picker-tools-tv-composition.sh"
+      - "scripts/test-profile-picker-tools-ui-typecheck.py"
+      - "scripts/test-account-file-restore-manager.sh"
+      - "scripts/test-account-file-local-adoption.sh"
+      - "scripts/test-account-provider-sync-settlement.sh"
+      - "scripts/run-account-provider-sync-settlement.py"
+      - "test/account-provider-sync-settlement-inputs.cjs"
+      - "scripts/run-account-file-local-adoption.py"
+      - "test/account-file-local-adoption-inputs.cjs"
+      - "scripts/run-account-file-restore-manager.py"
+      - "test/account-file-restore-manager-inputs.cjs"
+      - "scripts/test-account-authentication-lifecycle.sh"
       - "scripts/test-profile-roster-propagation.sh"
       - "scripts/test-profile-picker-public-seed.sh"
       - "test/android-profile-picker-startup.test.mjs"
@@ -229,7 +269,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Ensure ripgrep is available
-        id: apple_prerequisites
+        id: apple_tools
         shell: bash
         run: |
           set -euo pipefail
@@ -237,8 +277,35 @@ jobs:
             HOMEBREW_NO_AUTO_UPDATE=1 brew install ripgrep
           fi
           rg --version
-      - run: bash scripts/test-release-orchestration-contracts.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - name: Check release orchestration with a bounded process group
+        id: release_orchestration
+        if: ${{ !cancelled() && steps.apple_tools.outcome == 'success' }}
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "c83153feedd91bee93000305604d68772d4b7164716749f0a04605bbb2253f62  test/mpv-bounded-child.mjs" | shasum -a 256 --check
+          receipt_dir="$(mktemp -d "$RUNNER_TEMP/release-orchestration.XXXXXX")"
+          echo "receipt=$receipt_dir/supervisor.json" >> "$GITHUB_OUTPUT"
+          status=0
+          node test/mpv-bounded-child.mjs run 300 "$receipt_dir/supervisor.json" -- \
+            /bin/bash scripts/test-release-orchestration-contracts.sh || status=$?
+          node test/mpv-bounded-child.mjs check "$receipt_dir/supervisor.json" "$status"
+          echo "slot_confirmed=true" >> "$GITHUB_OUTPUT"
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
+          node test/mpv-bounded-child.mjs check "$receipt_dir/supervisor.json" 0 normal-exit
+      - name: Retain release orchestration process receipt
+        if: ${{ !cancelled() && steps.release_orchestration.outputs.receipt != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-orchestration-process-receipt
+          path: ${{ steps.release_orchestration.outputs.receipt }}
+          if-no-files-found: error
+          retention-days: 30
+      - name: Confirm the runner is ready for Apple policy checks
+        id: apple_prerequisites
+        if: ${{ !cancelled() && steps.apple_tools.outcome == 'success' && steps.release_orchestration.outputs.slot_confirmed == 'true' }}
+        run: echo "Release orchestration process group is quiescent."
       - run: ruby scripts/test-native-apple-project.rb
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-cinema-rail-layout.sh
@@ -257,6 +324,9 @@ jobs:
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-addon-selfhosted.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-addon-mutation-failure-presentation.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+        timeout-minutes: 2
       - run: bash scripts/test-episode-source-isolation.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - name: Fetch immutable public next-episode cancellation baseline
@@ -320,7 +390,40 @@ jobs:
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-sync-derived-document-revisions.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: node scripts/test-sync-candidate-read-fence.mjs
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+        timeout-minutes: 2
       - run: bash scripts/test-native-bootstrap-archive.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-account-backup-file.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-account-file-access.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-profile-picker-account.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-profile-picker-tools.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-profile-picker-tools-transfer.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-profile-picker-tools-lan-adapter.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-profile-picker-tools-tv-composition.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py --ios
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py --tvos-full
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py --tvos-lite
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-account-file-restore-manager.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-account-file-local-adoption.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-account-provider-sync-settlement.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-account-authentication-lifecycle.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-profile-roster-propagation.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}

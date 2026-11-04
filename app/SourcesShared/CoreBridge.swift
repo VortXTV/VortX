@@ -486,13 +486,20 @@ final class CoreBridge: ObservableObject {
     func mergeNativeAccountDocumentReceipt(_ remote: VortxJSON?, hostRemote: VortxJSON?, capture: CredentialScopeRegistry.Capture,
                                     legacyMaterial: Data?, hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [VortxJSON] = [], websiteAddonEvents: [VortxJSON] = [],
                                     legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]] = [:],
-                                    sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil, hostRemoteRaw: Data? = nil) async throws -> VortxNativeCoreFacade.HostAccountReceipt {
+                                    sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil,
+                                    hostRemoteRaw: Data? = nil, publicationSource: (any VortxMutationAuthority)? = nil) async throws -> VortxNativeCoreFacade.HostAccountReceipt {
+        try publicationSource?.withActive {}
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               let facade = nativeFacadeLock.withLock({ nativeCredentialCapture == capture ? nativeFacadeStorage : nil }) else { throw VortxNativeError.closed }
         let baseline = try VortxNativeProfileEditHost.baselines(nativeProfileBaseline)
-        let document = try await facade.mergeAccountDocumentReceipt(remote, hostRemote: hostRemote, legacyMaterial: legacyMaterial,
-            hostEdits: hostEdits, websiteEvents: websiteEvents, websiteAddonEvents: websiteAddonEvents, legacyWatchlists: legacyWatchlists, websiteBaseline: baseline,
-            sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive, hostRemoteRaw: hostRemoteRaw)
+        let cloudCommit = publicationSource.map { VortxNativeHostFieldCommitLatch(source: sourceAuthority ?? $0) }
+        let commitSource: (any VortxMutationAuthority)? = cloudCommit.map { $0 as any VortxMutationAuthority } ?? sourceAuthority
+        let document = try await withTaskCancellationHandler {
+            try await facade.mergeAccountDocumentReceipt(remote, hostRemote: hostRemote, legacyMaterial: legacyMaterial,
+                hostEdits: hostEdits, websiteEvents: websiteEvents, websiteAddonEvents: websiteAddonEvents, legacyWatchlists: legacyWatchlists, websiteBaseline: baseline,
+                sourceAuthority: commitSource, authenticatedSourceArchive: authenticatedSourceArchive, hostRemoteRaw: hostRemoteRaw)
+        } onCancel: { cloudCommit?.cancel() }
+        try publicationSource?.withActive {}
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeCredentialCapture == capture }) else { throw VortxNativeError.superseded }
         try refreshNativeProfiles()
@@ -1057,13 +1064,17 @@ final class CoreBridge: ObservableObject {
     func installNativeSession(_ session: VortxNativeSession, registry: [VortxResourceAddon],
                               capture: CredentialScopeRegistry.Capture, hostProfiles: [UserProfile] = [],
                               initialProfileID: UUID? = nil,
-                              initialProfileSource: (any VortxMutationAuthority)? = nil) async throws {
+                              initialProfileSource: (any VortxMutationAuthority)? = nil,
+                              installationSource: (any VortxMutationAuthority)? = nil) async throws {
+        try installationSource?.withActive {}
         let subtitleRetirement = CredentialPublicationOutbox.beginSubtitleRetirement(domain: nativeSubtitleDomain)
         defer { CredentialPublicationOutbox.finishSubtitleRetirement(subtitleRetirement) }
         await CredentialPublicationOutbox.waitForSubtitleRetirement(subtitleRetirement)
         try Task.checkCancellation()
+        try installationSource?.withActive {}
         _ = ProfileStore.shared
         activateNativePresentationBoundary()
+        try installationSource?.withActive {}
         let installGeneration = UUID()
         let installSubtitleRetirement = nativeFacadeLock.withLock {
             let retirement = nativePlaybackReadLifetime.retire()
@@ -1081,10 +1092,13 @@ final class CoreBridge: ObservableObject {
         guard CredentialScopeRegistry.shared.isCurrent(capture), session.scope.account == capture.namespace else {
             session.revoke(); throw VortxNativeError.invalidSnapshot
         }
+        try installationSource?.withActive {}
         let callback = makeNativeSourceCallback(installation: installGeneration, credential: capture)
         let facade = try await VortxNativeCoreFacade.create(session: session, registry: registry,
             progressAccepted: {}, sourceEvent: callback, changed: { _ in })
+        var result: (Bool, VortxNativeCoreFacade?, CredentialPublicationOutbox.SubtitleRetirement?) = (false, nil, nil)
         do {
+            try installationSource?.withActive {}
             if let requested = initialProfileID {
                 guard let saved = facade.watchlistBinding else { throw VortxNativeError.unavailable }
                 if saved.profileID != requested.uuidString {
@@ -1100,49 +1114,106 @@ final class CoreBridge: ObservableObject {
                     try await facade.mutateProfiles([action], hostEdits: [], expectedProfileID: saved.profileID,
                         expectedAccountGeneration: saved.accountGeneration, sourceAuthority: initialProfileSource)
                     try initialProfileSource.withActive {}
+                    try installationSource?.withActive {}
                     guard facade.watchlistBinding?.profileID == requested.uuidString,
                           facade.registryBinding?.profileID == requested.uuidString else {
                         throw VortxNativeError.superseded
                     }
                 }
             }
-        } catch { facade.close(); throw error }
-        let result = nativeFacadeLock.withLock { () -> (Bool, VortxNativeCoreFacade?, CredentialPublicationOutbox.SubtitleRetirement?) in
-            guard CredentialScopeRegistry.shared.isCurrent(capture), nativeInstallGeneration == installGeneration else { return (false, nil, nil) }
+            func bindFacade() -> (Bool, VortxNativeCoreFacade?, CredentialPublicationOutbox.SubtitleRetirement?) {
+                nativeFacadeLock.withLock {
+                    guard CredentialScopeRegistry.shared.isCurrent(capture), nativeInstallGeneration == installGeneration else { return (false, nil, nil) }
+                    let retirement = nativePlaybackReadLifetime.retire()
+                    nativeMetadataAdmissionFence.retireInstallation()
+                    let old = nativeFacadeStorage; nativeFacadeStorage = facade; nativeCredentialCapture = capture
+                    nativeCallbackLifetime.bind(installGeneration, credential: capture, sourceID: facade.sourceID)
+                    return (true, old, retirement)
+                }
+            }
+            // Cloud validity encloses the actual synchronous bind. Nil preserves local/offline
+            // installation, and initialProfileSource still authorizes only a real profile switch.
+            if let installationSource {
+                try installationSource.withActive { result = bindFacade() }
+            } else { result = bindFacade() }
+            guard result.0 else { throw VortxNativeError.superseded }
+            if let retirement = result.2 {
+                result.2 = nil
+                nativePlaybackReadLifetime.completeRetirement(retirement)
+            }
+            let origin = nativeInstalledSourceOrigin(producer: facade,
+                installation: installGeneration, credential: capture)
+            let displaced = result.1
+            result.1 = nil
+            displaced?.close()
+            try installationSource?.withActive {}
+            guard let installOrigin = origin, nativeCallbackOriginIsCurrent(installOrigin) else {
+                throw VortxNativeError.superseded
+            }
+            nativeAccountEditRequests.removeAll()
+            nativePublishedCredentialSlot = nil
+            let publishedSubtitleRetirement = nativeFacadeLock.withLock { () -> CredentialPublicationOutbox.SubtitleRetirement? in
+                var retirement: CredentialPublicationOutbox.SubtitleRetirement?
+                if nativePublishedAccountGeneration != nil {
+                    retirement = nativePlaybackReadLifetime.retire()
+                    nativeMetadataAdmissionFence.retireInstallation()
+                }
+                nativePublishedAccountGeneration = nil
+                return retirement
+            }
+            if let publishedSubtitleRetirement { nativePlaybackReadLifetime.completeRetirement(publishedSubtitleRetirement) }
+            try installationSource?.withActive {}
+            guard nativeCallbackOriginIsCurrent(installOrigin) else { throw VortxNativeError.superseded }
+            nativeProfileBaseline = hostProfiles
+            try refreshNativeProfiles()
+            try installationSource?.withActive {}
+            // Native ctx is descriptor-only: never synthesize a Stremio login/token receipt.
+            guard seedNativeInstalledSource(installOrigin) else { throw VortxNativeError.superseded }
+            try installationSource?.withActive {}
+            guard nativeCallbackOriginIsCurrent(installOrigin) else { throw VortxNativeError.superseded }
+            loadBoard()
+            try installationSource?.withActive {}
+            guard nativeCallbackOriginIsCurrent(installOrigin) else { throw VortxNativeError.superseded }
+            loadLibrary()
+            try installationSource?.withActive {}
+            guard nativeCallbackOriginIsCurrent(installOrigin) else { throw VortxNativeError.superseded }
+            nativePlaylistChangeRevision &+= 1
+        } catch {
+            if result.0 {
+                if let retirement = result.2 { nativePlaybackReadLifetime.completeRetirement(retirement) }
+                result.1?.close()
+                retireFailedNativeInstallation(facade, installation: installGeneration, capture: capture)
+            } else { facade.close() }
+            throw error
+        }
+    }
+
+    /// A failed publication owns only the facade it just bound. Retire that exact installation
+    /// before any cancellation callback, and never enter the account-wide session revoke path.
+    @MainActor private func retireFailedNativeInstallation(_ facade: VortxNativeCoreFacade,
+        installation: UUID, capture: CredentialScopeRegistry.Capture) {
+        let retirement = nativeFacadeLock.withLock { () -> CredentialPublicationOutbox.SubtitleRetirement? in
+            guard nativeFacadeStorage === facade, nativeInstallGeneration == installation,
+                  nativeCredentialCapture == capture else { return nil }
             let retirement = nativePlaybackReadLifetime.retire()
             nativeMetadataAdmissionFence.retireInstallation()
-            let old = nativeFacadeStorage; nativeFacadeStorage = facade; nativeCredentialCapture = capture
-            nativeCallbackLifetime.bind(installGeneration, credential: capture, sourceID: facade.sourceID)
-            return (true, old, retirement)
-        }
-        if let retirement = result.2 { nativePlaybackReadLifetime.completeRetirement(retirement) }
-        guard result.0 else { facade.close(); throw VortxNativeError.superseded }
-        guard let installOrigin = nativeInstalledSourceOrigin(producer: facade,
-            installation: installGeneration, credential: capture) else {
-            facade.close(); throw VortxNativeError.superseded
-        }
-        result.1?.close()
-        guard nativeCallbackOriginIsCurrent(installOrigin) else { throw VortxNativeError.superseded }
-        nativeAccountEditRequests.removeAll()
-        nativePublishedCredentialSlot = nil
-        let publishedSubtitleRetirement = nativeFacadeLock.withLock { () -> CredentialPublicationOutbox.SubtitleRetirement? in
-            var retirement: CredentialPublicationOutbox.SubtitleRetirement?
-            if nativePublishedAccountGeneration != nil {
-                retirement = nativePlaybackReadLifetime.retire()
-                nativeMetadataAdmissionFence.retireInstallation()
-            }
-            nativePublishedAccountGeneration = nil
+            nativeInstallGeneration = UUID(); nativeCallbackGeneration = UUID()
+            nativeCallbackLifetime.retire()
+            nativeFacadeStorage = nil; nativeCredentialCapture = nil; nativePublishedAccountGeneration = nil
             return retirement
         }
-        if let publishedSubtitleRetirement { nativePlaybackReadLifetime.completeRetirement(publishedSubtitleRetirement) }
-        nativeProfileBaseline = hostProfiles
-        try refreshNativeProfiles()
-        // Native ctx is descriptor-only: never synthesize a Stremio login/token receipt.
-        guard seedNativeInstalledSource(installOrigin) else { throw VortxNativeError.superseded }
-        loadBoard()
-        guard nativeCallbackOriginIsCurrent(installOrigin) else { throw VortxNativeError.superseded }
-        loadLibrary()
+        guard let retirement else { return }
+        nativeAccountEditRequests.removeAll()
+        nativePublishedCredentialSlot = nil
+        nativeProfileBaseline = []
+        let clear = invalidatePublicationEpoch()
+        facade.close()
+        nativePlaybackReadLifetime.completeRetirement(retirement)
+        guard let clear, let completed = clearNativePublishedState(authority: clear),
+              originalMetadataClearAuthorityIsCurrent(completed) else { return }
         nativePlaylistChangeRevision &+= 1
+        guard originalMetadataClearAuthorityIsCurrent(completed) else { return }
+        NotificationCenter.default.post(name: Self.xperienceContextChangedNote, object: nil)
     }
     @MainActor
     func closeNativeSession() async {
@@ -1483,6 +1554,7 @@ final class CoreBridge: ObservableObject {
     private static let manifestCacheTTL: TimeInterval = 60
     private static let manifestCacheCap = 64
     private static let accountTransitionMessage = String(localized: "Your account is switching or signing out. Try again in a moment.")
+    private static let profileUnavailableMessage = String(localized: "Your profile data is unavailable right now. Try opening your profile again. If this continues, export diagnostic logs from the profile picker.")
     private var started = false
     /// Coalesces the Home-board rebuild. The engine emits a BURST of `board` events during launch and while a
     /// catalog page lands (one per catalog settling), and each event used to trigger a full `buildBoardRows()`
@@ -1918,8 +1990,9 @@ final class CoreBridge: ObservableObject {
     func installAddonConfirmed(urlString: String, replacingExisting: Bool = false,
                                replacingDescriptor: CoreDescriptor? = nil) async -> AddonInstallOutcome {
         let mutationToken = capturePublicationToken()
+        let mutationCredential = CredentialScopeRegistry.shared.capture()
         guard addonMutationStillAllowed(mutationToken) else {
-            return .failed(retryable: true, message: Self.accountTransitionMessage)
+            return .failed(retryable: true, message: addonMutationFailureMessage(mutationToken, credential: mutationCredential))
         }
         // A /configure PAGE is not an installable manifest (it mints a per-user manifest only after sign-in +
         // debrid key). Normalizing it to /configure/manifest.json fetches a valid-shaped but DEAD default from
@@ -1949,7 +2022,7 @@ final class CoreBridge: ObservableObject {
         } else {
             let fetchResult = await AddonURLGuard.fetch(url)
             guard addonMutationStillAllowed(mutationToken) else {
-                return .failed(retryable: true, message: Self.accountTransitionMessage)
+                return .failed(retryable: true, message: addonMutationFailureMessage(mutationToken, credential: mutationCredential))
             }
             switch fetchResult {
             case .failure(let rejection):
@@ -2013,7 +2086,7 @@ final class CoreBridge: ObservableObject {
         let action: [String: Any]
         if let replacingDescriptor {
             guard let old = rawAddonsByUrl[replacingDescriptor.transportUrl] else {
-                return .failed(retryable: true, message: Self.accountTransitionMessage)
+                return .failed(retryable: true, message: addonMutationFailureMessage(mutationToken, credential: mutationCredential))
             }
             action = ["action": addonMutationAction("ReplaceAddon", local: "ReplaceAddonLocal"),
                       "args": ["old": old, "new": descriptor]]
@@ -2022,7 +2095,7 @@ final class CoreBridge: ObservableObject {
                 // Existing native membership is updated by the kernel's atomic replacement,
                 // which retains its slot and deletion receipts. Install rejects a duplicate URL.
                 guard let old = rawAddonsByUrl[identity] else {
-                    return .failed(retryable: true, message: Self.accountTransitionMessage)
+                    return .failed(retryable: true, message: addonMutationFailureMessage(mutationToken, credential: mutationCredential))
                 }
                 action = ["action": "ReplaceAddonLocal", "args": ["old": old, "new": descriptor]]
             } else {
@@ -2035,13 +2108,13 @@ final class CoreBridge: ObservableObject {
             AddonTombstones.forget(identityURL.absoluteString)
         }
         guard addonMutationStillAllowed(mutationToken), dispatchCtx(action, beforeDispatch: clearTombstoneBeforeDispatch) else {
-            return .failed(retryable: true, message: Self.accountTransitionMessage)
+            return .failed(retryable: true, message: addonMutationFailureMessage(mutationToken, credential: mutationCredential))
         }
 
         let installConfirmed = await awaitAddonInstalled(identity, replacingManifest: previousManifest,
                                                          expectedManifest: manifest)
         guard addonMutationStillAllowed(mutationToken) else {
-            return .failed(retryable: true, message: Self.accountTransitionMessage)
+            return .failed(retryable: true, message: addonMutationFailureMessage(mutationToken, credential: mutationCredential))
         }
         guard installConfirmed else {
             return .failed(retryable: true, message: "Install did not confirm. Check your connection and try again.")
@@ -2052,7 +2125,7 @@ final class CoreBridge: ObservableObject {
             // view that can lag or omit disabled membership.
             if usesNativeProfileState { return .installed }
             guard addonMutationStillAllowed(mutationToken) else {
-                return .failed(retryable: true, message: Self.accountTransitionMessage)
+                return .failed(retryable: true, message: addonMutationFailureMessage(mutationToken, credential: mutationCredential))
             }
             // Distinct URLs must prove the old descriptor disappeared. A pre-existing target alone cannot
             // acknowledge a rejected replace action; preserving old/order is safer than tombstoning data.
@@ -5372,6 +5445,36 @@ final class CoreBridge: ObservableObject {
         signedOutRepairRequestState.withLock { $0 != nil }
     }
 
+    /// Presentation only: a missing native session is not proof of an account transition.
+    /// The original owner/epoch still wins over unavailable storage after any installer await.
+    @MainActor
+    private func addonMutationFailureMessage(_ token: PublicationToken,
+                                             credential: CredentialScopeRegistry.Capture) -> String {
+        let native = nativeFacadeLock.withLock {
+            (available: nativeFacadeStorage?.isAvailable == true,
+             credentialCurrent: nativeCredentialCapture.map { CredentialScopeRegistry.shared.isCurrent($0) })
+        }
+        return Self.addonMutationFailureMessage(
+            publicationCurrent: publicationEpochMatches(token),
+            operationCredentialCurrent: CredentialScopeRegistry.shared.isCurrent(credential),
+            installedCredentialCurrent: native.credentialCurrent,
+            logoutPending: logoutAccountMutationPending,
+            nativeAvailable: native.available)
+    }
+
+    /// Kept separate from mutation admission: changing a message never grants permission to dispatch.
+    private static func addonMutationFailureMessage(publicationCurrent: Bool,
+                                                    operationCredentialCurrent: Bool,
+                                                    installedCredentialCurrent: Bool?,
+                                                    logoutPending: Bool,
+                                                    nativeAvailable: Bool) -> String {
+        guard publicationCurrent, operationCredentialCurrent,
+              installedCredentialCurrent != false, !logoutPending else { return accountTransitionMessage }
+        guard nativeAvailable, installedCredentialCurrent != nil else { return profileUnavailableMessage }
+        // Preserve the existing response for other dispatch/replacement refusals in this narrow change.
+        return accountTransitionMessage
+    }
+
     /// Add-on operations have local tombstone side effects, so they require the same immutable
     /// publication context as their eventual Ctx write, not only the central dispatch gate.
     @MainActor
@@ -6580,7 +6683,9 @@ extension CoreBridge {
 
     @MainActor func mergeNativeOwnerHistoryPeer(_ prepared: OwnerHistoryPeerPreparation,
         original: NativeOwnerHistoryRead, capture: CredentialScopeRegistry.Capture,
-        hostEdits: [VortxNativeHostPreferences.Edit] = []) async throws -> PlaybackMutationTarget {
+        hostEdits: [VortxNativeHostPreferences.Edit] = [],
+        publicationSource: (any VortxMutationAuthority)? = nil) async throws -> PlaybackMutationTarget {
+        try publicationSource?.withActive {}
         guard original.owner.owner.credential == capture,
               prepared.acknowledged.originalRead === original.acknowledged.originalRead,
               nativeWatchlistTargetIsCurrent(original.owner),
@@ -6589,6 +6694,7 @@ extension CoreBridge {
         // Continuation publication precedes the member's defer/finish. Wait for that
         // actual task to settle before taking an export read; never race its running slot.
         await original.owner.facade.settleNativeMutations()
+        try publicationSource?.withActive {}
         // The accepted transaction may itself delete the initiating profile. Do not
         // require the old profile binding after its own real native publication; also
         // never substitute another facade/installation to make a failed merge succeed.

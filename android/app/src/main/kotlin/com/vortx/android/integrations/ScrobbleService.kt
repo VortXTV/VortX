@@ -78,18 +78,21 @@ object ScrobbleService {
     /// point (the player scrobble hook, the Integrations screen).
     fun init(context: Context) {
         val app = context.applicationContext
-        if (togglePrefs == null) {
-            synchronized(this) {
-                if (togglePrefs == null) {
-                    togglePrefs = app.getSharedPreferences(TOGGLE_PREFS_FILE, Context.MODE_PRIVATE)
-                }
-            }
-        }
+        watchlistPreferences(app)
         TraktAuth.init(app)
         SIMKLAuth.init(app)
         TraktRatingsSync.init(app)
         startTraktSessionWatcher()
     }
+
+    /** The library mirror only needs its existing toggle store. */
+    internal fun watchlistEnabled(context: Context, key: String): Boolean =
+        watchlistPreferences(context.applicationContext).getBoolean(key, true)
+
+    private fun watchlistPreferences(app: Context): SharedPreferences =
+        togglePrefs ?: synchronized(this) {
+            togglePrefs ?: app.getSharedPreferences(TOGGLE_PREFS_FILE, Context.MODE_PRIVATE).also { togglePrefs = it }
+        }
 
     private fun startTraktSessionWatcher() {
         if (traktSessionWatcherStarted) return

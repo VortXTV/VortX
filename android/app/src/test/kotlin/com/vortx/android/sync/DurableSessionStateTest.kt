@@ -15,6 +15,84 @@ import kotlin.concurrent.thread
 
 class DurableSessionStateTest {
 
+    @Test fun pickerSignOutChecksOriginalAuthorityBeforeAndAfterUiRetirement() {
+        var current = true
+        var retired = 0
+        var cleared = 0
+        val staleAfterUi = runPickerSignOut({ current }, { retired++; current = false }, { cleared++; PickerSignOutResult.SIGNED_OUT })
+        assertEquals(PickerSignOutResult.STALE, staleAfterUi)
+        assertEquals(1, retired); assertEquals(0, cleared)
+        val staleBeforeUi = runPickerSignOut({ false }, { retired++ }, { cleared++; PickerSignOutResult.SIGNED_OUT })
+        assertEquals(PickerSignOutResult.STALE, staleBeforeUi)
+        assertEquals(1, retired); assertEquals(0, cleared)
+        current = true
+        assertEquals(PickerSignOutResult.SIGNED_OUT, runPickerSignOut({ current }, { retired++ }, { cleared++; PickerSignOutResult.SIGNED_OUT }))
+        assertEquals(2, retired); assertEquals(1, cleared)
+    }
+
+    @Test fun pickerGuardedClearRetainsOriginalOnStorageFailureAndReleasesSessionMonitorBeforeClear() {
+        for (reject in listOf(true, false)) {
+            val backend = FakeSessionBackend("account-a").apply { rejectClear = reject }
+            val state = backend.open()
+            val operations = SessionOperationCoordinator()
+            val captured = operations.snapshotAuthority { a, s -> a to s }
+            val ownerEpoch = state.ownerEpoch
+            val result = operations.invalidateIfAuthorityCurrent(captured.first, captured.second,
+                validate = { state.serialized { state.value == "account-a" && state.ownerEpoch == ownerEpoch } }) {
+                state.clear()
+            }
+            assertEquals(SessionMutationResult.Applied(!reject), result)
+            if (reject) {
+                assertEquals("account-a", state.value); assertEquals("account-a", backend.durableValue)
+                assertEquals(ownerEpoch, state.ownerEpoch)
+            } else {
+                assertNull(state.value); assertNull(backend.durableValue)
+                assertEquals(ownerEpoch + 1, state.ownerEpoch)
+            }
+        }
+    }
+
+    @Test fun pickerGuardedCancellationCallbacksRunOutsideTheOperationsMonitor() {
+        val operations = SessionOperationCoordinator()
+        val captured = operations.snapshotAuthority { a, s -> a to s }
+        val call = checkNotNull(operations.acquireSessionCallPermit(captured.second) { true })
+        var cancellations = 0
+        assertTrue(call.attachCancellation {
+            val observed = CountDownLatch(1)
+            val reader = thread { operations.snapshot { observed.countDown() } }
+            assertTrue(observed.await(2, TimeUnit.SECONDS))
+            reader.join(2_000)
+            cancellations++
+        })
+        assertEquals(SessionMutationResult.Applied(true),
+            operations.invalidateIfAuthorityCurrent(captured.first, captured.second, { true }) { true })
+        assertEquals(1, cancellations)
+        assertFalse(call.isCurrent())
+    }
+
+    @Test fun pickerAtomicSignOutRejectsAuthIntentAndSessionAbaWithoutRetiringPlayback() {
+        val operations = SessionOperationCoordinator()
+        val first = operations.snapshotAuthority { a, s -> a to s }
+        operations.beginAuth() // A new intent alone must revoke a pending confirmation.
+        val playback = checkNotNull(com.vortx.android.player.PlaybackOwnerEpoch.capture())
+        var mutations = 0
+        assertEquals(SessionMutationResult.Stale,
+            operations.invalidateIfAuthorityCurrent(first.first, first.second, { true }) { mutations++; true })
+        assertTrue(com.vortx.android.player.PlaybackOwnerEpoch.isCurrent(playback))
+        assertEquals(0, mutations)
+        val next = operations.snapshotAuthority { a, s -> a to s }
+        assertEquals(SessionMutationResult.Stale,
+            operations.invalidateIfAuthorityCurrent(next.first, next.second, { false }) { mutations++; true })
+        assertTrue(com.vortx.android.player.PlaybackOwnerEpoch.isCurrent(playback))
+        assertEquals(SessionMutationResult.Applied(true),
+            operations.invalidateIfAuthorityCurrent(next.first, next.second, { true }) { mutations++; true })
+        assertEquals(1, mutations)
+        assertFalse(com.vortx.android.player.PlaybackOwnerEpoch.isCurrent(playback))
+        assertEquals(SessionMutationResult.Stale,
+            operations.invalidateIfAuthorityCurrent(next.first, next.second, { true }) { mutations++; true })
+        assertEquals(1, mutations)
+    }
+
     @Test
     fun pendingSyncRetriesAfterFailureAndCompletesOnlyAfterSuccess() = runBlocking {
         val waits = mutableListOf<Long>()

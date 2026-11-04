@@ -142,6 +142,7 @@ struct RootView: View {
     private var core: CoreBridge { CoreBridge.shared }   // actions only; not observed, so engine events do not re-render it
     @ObservedObject private var router = DeepLinkRouter.shared   // parked `vortx://` destination (Top Shelf taps)
     @State private var splashDone = false
+    @StateObject private var profileAuthentication = AccountAuthenticationPresentation()
     @ObservedObject private var playbackQueue = PlaybackTitleQueue.shared
     @State private var presentedShellCover: ShellCover?
     /// Snapshot the exact item that the current cover acknowledged. SwiftUI may nil the binding before calling
@@ -258,7 +259,9 @@ struct RootView: View {
                     .zIndex(10)
             }
         }
-        .fullScreenCover(isPresented: pickerPresented) { ProfilePickerView() }
+        .fullScreenCover(isPresented: pickerPresented) {
+            ProfilePickerView(authentication: profileAuthentication, pickerPresentation: profiles.pickerPresentation())
+        }
         .onAppear { syncShellCover() }
         .onChange(of: splashDone) { _, _ in syncShellCover() }
         .onChange(of: playbackQueue.change) { _, _ in syncShellCover() }
@@ -296,13 +299,16 @@ struct RootView: View {
     /// than one profile, none chosen this launch) the shell is invisible, so nothing
     /// of the main profile leaks out before the picker arrives.
     private var shellVisible: Bool {
-        presenter.request == nil && !profiles.needsPicker
+        presenter.request == nil && !profiles.needsPicker && !profileAuthentication.blocksDismissal
     }
 
     private var pickerPresented: Binding<Bool> {
         Binding(
-            get: { splashDone && profiles.needsPicker && presenter.request == nil },
-            set: { presented in if !presented { profiles.pickedThisLaunch = true } }
+            get: { profileAuthentication.blocksDismissal || (splashDone && profiles.needsPicker && presenter.request == nil) },
+            set: { presented in
+                guard !profileAuthentication.blocksDismissal else { return }
+                if !presented { profiles.pickedThisLaunch = true }
+            }
         )
     }
 

@@ -51,6 +51,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -70,7 +71,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
@@ -117,6 +121,16 @@ import com.vortx.android.profile.ProfileStore
 import com.vortx.android.BuildConfig
 import com.vortx.android.profile.ProfileSelectionHandoff
 import com.vortx.android.ui.profilepicker.ProfileSelectionSurface
+import com.vortx.android.ui.profilepicker.PickerFileRecoveryLanding
+import com.vortx.android.ui.profilepicker.PickerRestoreStatusLanding
+import com.vortx.android.ui.profilepicker.pickerRestoreStatusEntryAction
+import com.vortx.android.ui.profilepicker.pickerRestoreStatusEntryCurrent
+import com.vortx.android.ui.profilepicker.ProfilePickerAccountHost
+import com.vortx.android.ui.profilepicker.rememberPickerAccountModel
+import com.vortx.android.ui.profilepicker.rememberPickerFileRecoveryPause
+import com.vortx.android.ui.profilepicker.currentPickerDiagnosticExportAllowed
+import com.vortx.android.ui.profilepicker.ProfilePickerToolsHost
+import com.vortx.android.ui.viewmodel.rememberPickerToolsModel
 import com.vortx.android.ui.profilepicker.ProfileSelectionOrigin
 import com.vortx.android.ui.profilepicker.ProfileSelectionPresentation
 import com.vortx.android.ui.randompick.RandomTitlePlayRequest
@@ -200,7 +214,10 @@ import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.launch
 
@@ -255,6 +272,8 @@ fun VortXApp(
     syncManager: VortXSyncManager? = null,
     deepLinkEvent: VortXDeepLinkEvent? = null,
 ) {
+    val liveFileRecoveryPause = syncManager?.pickerFileRecoveryPaused
+    val fileRecoveryPausedNow = rememberPickerFileRecoveryPause(liveFileRecoveryPause)
     val appContext = LocalContext.current.applicationContext
     // VortXApplication binds the persistence-backed owner before either the phone or TV launcher creates
     // consumers. Compose only reads the shared binding; it must never redefine process ownership.
@@ -279,13 +298,6 @@ fun VortXApp(
     val tabBarPrefs = remember(appContext) { TabBarPrefs(appContext) }
     val appearance by appearancePrefs.state.collectAsStateWithLifecycle()
     val hiddenTabs by tabBarPrefs.state.collectAsStateWithLifecycle()
-
-    LaunchedEffect(activeProfile) {
-        appearancePrefs.applyProfile(activeProfile)
-        // Drain any offline Trakt/SIMKL watchlist pushes that failed earlier. No-ops for an overlay
-        // profile and when the queue is empty; runs on the main profile at launch and on each switch back.
-        AccountLibrarySync.drainPending(appContext)
-    }
 
     val accentId = activeProfile?.accentID ?: appearance.accentId
     val oled = activeProfile?.oled ?: appearance.oled
@@ -321,30 +333,6 @@ fun VortXApp(
             val homeMode = route.homeMode
             val visibleSlots = cinemaVisibleTabs(hiddenTabs, mergeHomeDiscover, mergeDiscoverSearch)
             val visibleTabs = Tab.entries.filter { it.slot in visibleSlots }
-            DisposableEffect(homeDiscoverPrefs) {
-                val stop = homeDiscoverPrefs.observeChanges {
-                    val nextHomeMerge = homeDiscoverPrefs.mergeHomeDiscover
-                    if (nextHomeMerge != mergeHomeDiscover) {
-                        val currentRoute = cinemaTabRoute(
-                            cinemaStoredTabSlot(savedTabName),
-                            CinemaHomeMode.entries.firstOrNull { it.name == savedHomeModeName } ?: CinemaHomeMode.FEATURED,
-                            tabBarPrefs.state.value, mergeHomeDiscover, mergeDiscoverSearch,
-                        )
-                        val nextRoute = cinemaRouteAfterHomeMergeChange(currentRoute, nextHomeMerge,
-                            homeDiscoverPrefs.mergeDiscoverSearch, tabBarPrefs.state.value)
-                        savedTabName = Tab.entries.first { it.slot == nextRoute.tab }.name
-                        savedHomeModeName = nextRoute.homeMode.name
-                    }
-                    mergeDiscoverSearch = homeDiscoverPrefs.mergeDiscoverSearch
-                    mergeHomeDiscover = nextHomeMerge
-                    cinemaQuickView = homeDiscoverPrefs.cinemaQuickView
-                }
-                onDispose { stop() }
-            }
-            LaunchedEffect(route) {
-                savedTabName = tab.name
-                savedHomeModeName = homeMode.name
-            }
         // WHY audit R02: save only the stable route strings, then rehydrate through the deep-link target hook.
         var savedDetailId by rememberSaveable { mutableStateOf<String?>(null) }
         var savedDetailType by rememberSaveable { mutableStateOf<String?>(null) }
@@ -390,11 +378,12 @@ fun VortXApp(
         var showPlaybackQueue by remember { mutableStateOf(false) }
         var savedPlaylistOwner by remember { mutableStateOf<ContinueWatchingOwner?>(null) }
         var savedPlaylistStore by remember { mutableStateOf<com.vortx.android.playlists.SavedPlaylistStore?>(null) }
-        val openDetail: (MetaItem?) -> Unit = open@{ item ->
-            if (item?.continueWatchingAdmission?.isCurrent() == false) return@open
+        val openDetail: (MetaItem?) -> Boolean = open@{ item ->
+            if (fileRecoveryPausedNow()) return@open false
+            if (item?.continueWatchingAdmission?.isCurrent() == false) return@open false
             if (item?.continueWatchingUnavailableMessage != null) {
                 unavailableContinueWatching = "${item.name}\n\n${item.continueWatchingUnavailableMessage}"
-                return@open
+                return@open false
             }
             // Every ordinary Detail route revokes any previous one-shot direct-resume request. Direct
             // Continue Watching callers install their exact target immediately after opening it.
@@ -415,11 +404,7 @@ fun VortXApp(
             savedDetailEpisodeSeason = saveableHint?.season
             savedDetailEpisodeNumber = saveableHint?.episode
             savedDetailEpisodeIdentity = saveableHint?.videoIdentity
-        }
-        unavailableContinueWatching?.let { message ->
-            androidx.compose.material3.AlertDialog(onDismissRequest = { unavailableContinueWatching = null },
-                title = { Text("Continue Watching") }, text = { Text(message) },
-                confirmButton = { androidx.compose.material3.TextButton(onClick = { unavailableContinueWatching = null }) { Text("OK") } })
+            true
         }
         var detailGeneration by remember { mutableStateOf(0L) }
         var playing by remember { mutableStateOf<Playable?>(null) }
@@ -512,36 +497,30 @@ fun VortXApp(
         // reactive @AppStorage. When it turns ON while the (now-dropped) Search tab is selected, heal
         // selection to Discover -- or Home if Discover itself is hidden -- exactly like Apple's
         // `.onChange(of: mergeDiscoverSearch)` healer.
-        LaunchedEffect(showHomeDiscover) {
-            if (!showHomeDiscover) {
-                mergeDiscoverSearch = homeDiscoverPrefs.mergeDiscoverSearch
-                mergeHomeDiscover = homeDiscoverPrefs.mergeHomeDiscover
-                cinemaQuickView = homeDiscoverPrefs.cinemaQuickView
-            }
-        }
         // SD-6: per-tab re-tap tokens. The shell bumps one when the ALREADY-active tab is re-tapped, and the
         // active screen scrolls its list to the top in response (Apple `TabScrollToTop`).
         var searchReselect by remember { mutableStateOf(0) }
         var discoverReselect by remember { mutableStateOf(0) }
-        LaunchedEffect(repo, profileStore, activeProfile) {
-            repo.ctxUpdates().onStart { emit(Unit) }.collect {
-                val request = pendingRandomTitlePlayRequest ?: return@collect
-                if (!request.isCurrent(
-                        currentOwner = repo.continueWatchingOwner(),
-                        currentProfile = profileStore?.active,
-                        needsPicker = profileStore?.needsPicker != false,
-                        currentType = MediaType.entries.firstOrNull { it.id == savedDetailType },
-                        currentId = savedDetailId,
-                        currentDetailGeneration = detailGeneration,
-                    )
-                ) {
-                    pendingRandomTitlePlayRequest = null
-                }
-            }
-        }
-        LaunchedEffect(deepLinkEvent) {
+        var handledDeepLinkSequence by remember { mutableStateOf(Long.MIN_VALUE) }
+        val latestDeepLinkEvent by rememberUpdatedState(deepLinkEvent)
+        LaunchedEffect(deepLinkEvent, fileRecoveryPausedNow) {
             val event = deepLinkEvent ?: return@LaunchedEffect
-            val target = event.target
+            if (event.sequence <= handledDeepLinkSequence) return@LaunchedEffect
+            // Intent targets have no profile admission or unavailable-message branch. A false
+            // openDetail result here means the live recovery pause won the final route check.
+            val target = event.target.toMetaItem()
+            while (true) {
+                if (fileRecoveryPausedNow()) {
+                    val livePause = liveFileRecoveryPause ?: return@LaunchedEffect
+                    // Either source can wake the wait. Re-read the combined predicate at delivery.
+                    combine(livePause, snapshotFlow(fileRecoveryPausedNow)) { _, _ -> fileRecoveryPausedNow() }
+                        .first { !it }
+                }
+                ensureActive()
+                if (latestDeepLinkEvent != event || event.sequence <= handledDeepLinkSequence) return@LaunchedEffect
+                if (openDetail(target)) break
+            }
+            handledDeepLinkSequence = event.sequence
             playing = null
             playingMeta = null
             showGallery = false
@@ -582,13 +561,13 @@ fun VortXApp(
             showTabBar = false
             showPlayLink = false
             detailGeneration += 1
-            openDetail(target.toMetaItem())
         }
         val onItem: (MetaItem) -> Unit = {
             detailGeneration += 1
             openDetail(it)
         }
         val onRandomLibraryPlay: (MetaItem) -> Unit = randomPlay@{ item ->
+            if (fileRecoveryPausedNow()) return@randomPlay
             val store = profileStore ?: return@randomPlay
             val profile = store.active ?: return@randomPlay
             val owner = repo.continueWatchingOwner()
@@ -612,7 +591,8 @@ fun VortXApp(
                 )
             }
         }
-        val onCinemaItem: (MetaItem) -> Unit = { item ->
+        val onCinemaItem: (MetaItem) -> Unit = cinemaItem@{ item ->
+            if (fileRecoveryPausedNow()) return@cinemaItem
             if (com.vortx.android.ui.components.cinemaCardOpensQuickView(item, cinemaQuickView)) {
                 quickViewItem = item
             } else {
@@ -622,24 +602,179 @@ fun VortXApp(
         // A scope tied to the whole shell (not the player overlay), so the end-of-playback engine write
         // (final progress tick + Player unload) still runs after the player leaves composition.
         val appScope = rememberCoroutineScope()
+        val queueDeparture = remember { PlaybackQueueRouteRetirement() }
+        // The cold-launch profile picker sits ABOVE everything: on a shared account it answers "who is
+        // watching" before any content renders. It self-dismisses when the store has nothing to pick.
+        val pickerAccountModel = rememberPickerAccountModel(syncManager)
+        val restoreExclusion = (appContext as? com.vortx.android.VortXApplication)
+            ?.pickerAccountFileRestoreExclusion(syncManager)
+        val pickerToolsModel = rememberPickerToolsModel(syncManager, externalRestore = restoreExclusion)
+        val pickerToolsState by pickerToolsModel.state.collectAsStateWithLifecycle()
+        val pickerFileRecoveryPaused = fileRecoveryPausedNow()
+        LaunchedEffect(pickerFileRecoveryPaused) {
+            if (!pickerFileRecoveryPaused) return@LaunchedEffect
+            queueDeparture.retire()
+            unavailableContinueWatching = null
+            showPlaybackQueue = false
+            savedPlaylistOwner = null
+            savedPlaylistStore = null
+            pendingRandomTitlePlayRequest = null
+            pendingQueueToken = null
+            pendingQueueAccepted = false
+            pendingQueueAutomatic = false
+        }
+        val pickerAccountOpen by (pickerAccountModel?.pickerPresentationOpen?.collectAsStateWithLifecycle()
+            ?: remember { mutableStateOf(false) })
+        // A clean zero/one-profile launch may skip the ordinary picker. Give it an explicit cold entry.
+        var dismissedFileRecoveryEntry by rememberSaveable(syncManager) { mutableStateOf(false) }
+        val showFileRecoveryEntry = !dismissedFileRecoveryEntry && !showWhosWatching &&
+            pickerToolsModel.controller.restoreAvailable && vortxSessionUi == VortXSyncManager.SessionUiState.SignedOut
+        LaunchedEffect(syncManager, vortxSessionUi) {
+            if (vortxSessionUi is VortXSyncManager.SessionUiState.SignedIn) dismissedFileRecoveryEntry = true
+        }
+        val restoreStatusOwner by pickerToolsModel.restoreStatusOwner.collectAsStateWithLifecycle()
+        restoreStatusOwner?.let { original ->
+            val statusAdmission = {
+                pickerToolsModel.restoreStatusOwner.value === original && pickerToolsModel.controller.restoreAvailable &&
+                    !fileRecoveryPausedNow() && pickerRestoreStatusEntryCurrent(syncManager, original)
+            }
+            if (statusAdmission()) {
+                ProfilePickerToolsHost(pickerToolsModel, isTv = false,
+                    diagnosticAdmission = ::currentPickerDiagnosticExportAllowed,
+                    recoveryLanding = true, statusOnlyOwner = original, statusOnlyAdmission = statusAdmission) {
+                    PickerRestoreStatusLanding(isTv = false) {
+                        pickerToolsModel.closeRestoreStatus(original)
+                    }
+                }
+            } else LaunchedEffect(original) {
+                pickerToolsModel.closeRestoreStatus(original)
+            }
+            return@VortXTheme
+        }
+        var profileSelection by remember(pickerFileRecoveryPaused) { mutableStateOf<ProfileSelectionPresentation?>(null) }
+        if (!pickerFileRecoveryPaused) profileSelection?.let { presentation ->
+            val request = presentation.request
+            val handoff = remember(request, auth) { ProfileSelectionHandoff(auth, native = true) }
+            ProfileSelectionSurface(request, handoff,
+                onComplete = { profileSelection = null; showWhosWatching = false },
+                onChooseAgain = { profileSelection = null; showWhosWatching = true },
+                origin = presentation.origin,
+                onReturnToProfiles = { showProfiles = true })
+            return@VortXTheme
+        }
+        if (showWhosWatching || pickerAccountOpen || (pickerToolsState.open && pickerToolsModel.state.value.open) ||
+            pickerFileRecoveryPaused || showFileRecoveryEntry) {
+            ProfilePickerAccountHost(syncManager, pickerAccountModel, diagnosticAdmission = ::currentPickerDiagnosticExportAllowed, retirePickerUi = { profileSelection = null },
+                fileRecoveryPaused = pickerFileRecoveryPaused,
+                accountScreen = { model, closeAccount, requestSignOut, diagnosticAdmission, notice ->
+                    com.vortx.android.ui.screens.VortXAccountScreen(model, onBack = closeAccount,
+                        onSignOutRequest = requestSignOut, diagnosticAdmission = diagnosticAdmission, dismissalNotice = notice)
+                }) { control ->
+                ProfilePickerToolsHost(pickerToolsModel, isTv = false,
+                    diagnosticAdmission = ::currentPickerDiagnosticExportAllowed,
+                    recoveryPaused = pickerFileRecoveryPaused,
+                    recoveryLanding = pickerFileRecoveryPaused || showFileRecoveryEntry,
+                    openRecoverySignIn = pickerAccountModel?.let { it::openPickerFileRecoverySignIn },
+                    resumeRecoverySync = syncManager?.let { it::resumePickerFileRecovery }) {
+                    if (pickerFileRecoveryPaused || showFileRecoveryEntry) {
+                        PickerFileRecoveryLanding(isTv = false, accountControl = control,
+                            onContinue = if (pickerFileRecoveryPaused) null else ({ dismissedFileRecoveryEntry = true }))
+                    } else WhosWatchingScreen(onDone = { showWhosWatching = false }, onSelected = {
+                        profileSelection = ProfileSelectionPresentation(it,
+                            if (showProfiles) ProfileSelectionOrigin.PROFILE_MANAGEMENT else ProfileSelectionOrigin.PICKER)
+                    }, accountControl = control)
+                }
+            }
+            return@VortXTheme
+        }
+
+        LaunchedEffect(activeProfile, fileRecoveryPausedNow) {
+            if (fileRecoveryPausedNow()) return@LaunchedEffect
+            appearancePrefs.applyProfile(activeProfile)
+        }
+        val watchlistLifecycle = LocalLifecycleOwner.current.lifecycle
+        LaunchedEffect(watchlistLifecycle, activeProfile?.id, syncManager, vortxSessionUi) {
+            watchlistLifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                if (!fileRecoveryPausedNow()) AccountLibrarySync.drainPending(appContext)
+            }
+        }
+
+        DisposableEffect(homeDiscoverPrefs) {
+            val stop = homeDiscoverPrefs.observeChanges {
+                if (fileRecoveryPausedNow()) return@observeChanges
+                val nextHomeMerge = homeDiscoverPrefs.mergeHomeDiscover
+                if (nextHomeMerge != mergeHomeDiscover) {
+                    val currentRoute = cinemaTabRoute(
+                        cinemaStoredTabSlot(savedTabName),
+                        CinemaHomeMode.entries.firstOrNull { it.name == savedHomeModeName } ?: CinemaHomeMode.FEATURED,
+                        tabBarPrefs.state.value, mergeHomeDiscover, mergeDiscoverSearch,
+                    )
+                    val nextRoute = cinemaRouteAfterHomeMergeChange(currentRoute, nextHomeMerge,
+                        homeDiscoverPrefs.mergeDiscoverSearch, tabBarPrefs.state.value)
+                    savedTabName = Tab.entries.first { it.slot == nextRoute.tab }.name
+                    savedHomeModeName = nextRoute.homeMode.name
+                }
+                mergeDiscoverSearch = homeDiscoverPrefs.mergeDiscoverSearch
+                mergeHomeDiscover = nextHomeMerge
+                cinemaQuickView = homeDiscoverPrefs.cinemaQuickView
+            }
+            onDispose { stop() }
+        }
+        LaunchedEffect(route, fileRecoveryPausedNow) {
+            if (fileRecoveryPausedNow()) return@LaunchedEffect
+            savedTabName = tab.name
+            savedHomeModeName = homeMode.name
+        }
+        LaunchedEffect(showHomeDiscover) {
+            if (!fileRecoveryPausedNow() && !showHomeDiscover) {
+                mergeDiscoverSearch = homeDiscoverPrefs.mergeDiscoverSearch
+                mergeHomeDiscover = homeDiscoverPrefs.mergeHomeDiscover
+                cinemaQuickView = homeDiscoverPrefs.cinemaQuickView
+            }
+        }
+        LaunchedEffect(repo, profileStore, activeProfile, fileRecoveryPausedNow) {
+            if (fileRecoveryPausedNow()) return@LaunchedEffect
+            repo.ctxUpdates().onStart { emit(Unit) }.collect {
+                if (fileRecoveryPausedNow()) return@collect
+                val request = pendingRandomTitlePlayRequest ?: return@collect
+                if (!request.isCurrent(
+                        currentOwner = repo.continueWatchingOwner(),
+                        currentProfile = profileStore?.active,
+                        needsPicker = profileStore?.needsPicker != false,
+                        currentType = MediaType.entries.firstOrNull { it.id == savedDetailType },
+                        currentId = savedDetailId,
+                        currentDetailGeneration = detailGeneration,
+                    )
+                ) {
+                    pendingRandomTitlePlayRequest = null
+                }
+            }
+        }
+        if (!fileRecoveryPausedNow()) unavailableContinueWatching?.let { message ->
+            androidx.compose.material3.AlertDialog(onDismissRequest = { unavailableContinueWatching = null },
+                title = { Text("Continue Watching") }, text = { Text(message) },
+                confirmButton = { androidx.compose.material3.TextButton(onClick = { unavailableContinueWatching = null }) { Text("OK") } })
+        }
         val playbackQueue = remember(appContext) {
             (appContext as? com.vortx.android.VortXApplication)?.playbackQueue
         }
         val queueState by (playbackQueue?.state?.collectAsStateWithLifecycle()
             ?: remember { mutableStateOf(PlaybackQueueState()) })
-        val queueDeparture = remember { PlaybackQueueRouteRetirement() }
         var queuePolicyEpoch by remember(repo) { mutableStateOf(0L) }
         val queuePolicyForComposition = queuePolicyEpoch
         val queueProfileForComposition = profileStore?.active
         val queueOwnerIsSelected: (ContinueWatchingOwner) -> Boolean = { owner ->
             val store = profileStore
-            store != null && !store.needsPicker && store.active?.id == owner.profileId &&
+            !fileRecoveryPausedNow() && store != null && !store.needsPicker && store.active?.id == owner.profileId &&
                 store.active == queueProfileForComposition && queuePolicyEpoch == queuePolicyForComposition &&
                 !showWhosWatching && runCatching { repo.continueWatchingOwner() }.getOrNull() == owner
         }
-        val queueOwner = runCatching { repo.continueWatchingOwner() }.getOrNull()?.takeIf(queueOwnerIsSelected)
-        LaunchedEffect(repo, playbackQueue, activeProfile, vortxSessionUi, queueState.revision) {
+        val queueOwner = if (fileRecoveryPausedNow()) null
+        else runCatching { repo.continueWatchingOwner() }.getOrNull()?.takeIf(queueOwnerIsSelected)
+        LaunchedEffect(repo, playbackQueue, activeProfile, vortxSessionUi, queueState.revision, fileRecoveryPausedNow) {
+            if (fileRecoveryPausedNow()) return@LaunchedEffect
             repo.ctxUpdates().onStart { emit(Unit) }.collect {
+                if (fileRecoveryPausedNow()) return@collect
                 queuePolicyEpoch = Math.incrementExact(queuePolicyEpoch)
                 val owner = runCatching { repo.continueWatchingOwner() }.getOrNull()
                 if (owner == null) playbackQueue?.invalidate() else playbackQueue?.bindOwner(owner)
@@ -648,6 +783,7 @@ fun VortXApp(
         val visibleQueueState = rememberPlaybackQueuePresentation(queueState, repo, queueOwner,
             queueProfileForComposition, queuePolicyForComposition)
         val openQueuePlay: (PlaybackQueueToken, Boolean) -> Boolean = queuePlay@{ token, automatic ->
+            if (fileRecoveryPausedNow()) return@queuePlay false
             val queue = playbackQueue ?: return@queuePlay false
             val store = profileStore ?: return@queuePlay false
             val profile = store.active ?: return@queuePlay false
@@ -656,6 +792,7 @@ fun VortXApp(
                 visibleQueueState?.let { it.ready && it.owner == token.owner && it.revision == token.revision &&
                     it.entries.any { entry -> entry == token.entry } } != true || repo.continueWatchingOwner() != token.owner
             ) return@queuePlay false
+            if (fileRecoveryPausedNow()) return@queuePlay false
             queueDeparture.retire()
             playing = null
             playingMeta = null
@@ -674,14 +811,14 @@ fun VortXApp(
             }
             admitted
         }
-        if (showPlaybackQueue && !showWhosWatching && profileStore?.needsPicker == false) {
+        if (!fileRecoveryPausedNow() && showPlaybackQueue && !showWhosWatching && profileStore?.needsPicker == false) {
             val visibleQueue = visibleQueueState ?: PlaybackQueueState()
             PlaybackQueueSheet(
                 state = visibleQueue,
                 onDismiss = { showPlaybackQueue = false },
                 onManageSavedPlaylists = queueOwner?.let { owner ->
                     {
-                        if (queueOwner == owner) {
+                        if (queueOwnerIsSelected(owner)) {
                             val app = appContext as? com.vortx.android.VortXApplication
                             val controller = app?.savedPlaylistStore
                             if (controller != null) {
@@ -713,12 +850,13 @@ fun VortXApp(
             restoreDebridServicesFocus = true
         }
 
-        LaunchedEffect(showDebridKeys, restoreDebridServicesFocus, tab) {
-            if (!showDebridKeys && restoreDebridServicesFocus && tab == Tab.SETTINGS) {
+        LaunchedEffect(showDebridKeys, restoreDebridServicesFocus, tab, fileRecoveryPausedNow) {
+            if (!fileRecoveryPausedNow() && !showDebridKeys && restoreDebridServicesFocus && tab == Tab.SETTINGS) {
                 var focused = false
                 repeat(3) {
                     if (!focused) {
                         withFrameNanos { }
+                        if (fileRecoveryPausedNow()) return@LaunchedEffect
                         focused = runCatching {
                             debridServicesFocusRequester.requestFocus()
                         }.getOrDefault(false)
@@ -726,27 +864,6 @@ fun VortXApp(
                 }
                 if (focused) restoreDebridServicesFocus = false
             }
-        }
-
-        // The cold-launch profile picker sits ABOVE everything: on a shared account it answers "who is
-        // watching" before any content renders. It self-dismisses when the store has nothing to pick.
-        var profileSelection by remember { mutableStateOf<ProfileSelectionPresentation?>(null) }
-        profileSelection?.let { presentation ->
-            val request = presentation.request
-            val handoff = remember(request, auth) { ProfileSelectionHandoff(auth, native = true) }
-            ProfileSelectionSurface(request, handoff,
-                onComplete = { profileSelection = null; showWhosWatching = false },
-                onChooseAgain = { profileSelection = null; showWhosWatching = true },
-                origin = presentation.origin,
-                onReturnToProfiles = { showProfiles = true })
-            return@VortXTheme
-        }
-        if (showWhosWatching) {
-            WhosWatchingScreen(onDone = { showWhosWatching = false }, onSelected = {
-                profileSelection = ProfileSelectionPresentation(it,
-                    if (showProfiles) ProfileSelectionOrigin.PROFILE_MANAGEMENT else ProfileSelectionOrigin.PICKER)
-            })
-            return@VortXTheme
         }
 
         // The once-per-launch "update available" popup (sideloaded Android has no store channel). A Dialog,
@@ -1200,7 +1317,8 @@ fun VortXApp(
                             // consent + a per-title/day dedup INSIDE [WatchSignalClient], independent of the
                             // auto-add-to-Library setting, so the same latch that guards the add covers it once
                             // per playback. A `tmdb:` hub/catalog id resolves to its `tt` identity first
-                            // (fire-and-forget); a `tt` id pings inline. Never blocks and fully fail-soft.
+                            // in the same admitted background job as the ping. Optional telemetry can be
+                            // refused during account Restore without retrying an old playback tick.
                             WatchSignalClient.pingResolvingTmdb(
                                 context = appContext,
                                 contentId = meta.id,
@@ -2072,6 +2190,8 @@ fun VortXApp(
                         }
                     },
                     onProfilesClick = { showProfiles = true },
+                    onOpenProfilePickerTools = pickerRestoreStatusEntryAction(syncManager,
+                        pickerToolsModel.controller.restoreAvailable, fileRecoveryPausedNow, pickerToolsModel::openRestoreStatus),
                     onAppearanceScreenClick = { showAppearance = true },
                     onTabBarScreenClick = { showTabBar = true },
                     onAccountClick = { showAccount = true },

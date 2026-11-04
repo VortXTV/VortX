@@ -59,6 +59,7 @@ object UpdateChecker {
 
     /** Apple's exact keys, shared with every platform in the same prefs file. */
     const val LAST_CHECKED_KEY = "stremiox.update.lastChecked"
+    private const val UPDATE_OBSERVATIONS_PREFS = "vortx_update_observations"
     const val DISMISSED_KEY = "stremiox.update.dismissedVersion"
 
     private const val TAG = "UpdateChecker"
@@ -266,7 +267,8 @@ object UpdateChecker {
         checkMutex.withLock {
             val manifestText = fetchManifest() ?: return@withLock
             // Only a successful fetch stamps the clock, so a network blip does not silence notices.
-            prefs(context).edit().putLong(LAST_CHECKED_KEY, System.currentTimeMillis()).apply()
+            context.applicationContext.getSharedPreferences(UPDATE_OBSERVATIONS_PREFS, Context.MODE_PRIVATE)
+                .edit().putLong(LAST_CHECKED_KEY, System.currentTimeMillis()).apply()
 
             when (val decision = UpdatePolicy.evaluateFeed(
                 manifestText = manifestText,

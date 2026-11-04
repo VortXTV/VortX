@@ -1,5 +1,6 @@
 package com.vortx.android.integrations
 
+import com.vortx.android.sync.SessionOwnerSnapshot
 import android.content.Context
 import android.util.Log
 import com.vortx.android.BuildConfig
@@ -117,6 +118,34 @@ object SIMKLAuth {
         get() = tokenMutations.snapshot {
             currentSessionEpoch() to (tokenStore?.connectionState == CredentialConnectionState.CONNECTED)
         }.value.let { (epoch, connected) -> epoch.takeIf { isConfigured && connected } }
+
+    internal fun watchlistEpoch(expected: SessionOwnerSnapshot.Account): Long? {
+        if (!isConfigured) return null
+        return tokenMutations.snapshotForOwner(expected) {
+            currentSessionEpoch().takeIf { it > 0 && tokenStore?.connectionState == CredentialConnectionState.CONNECTED }
+        }?.value
+    }
+
+    internal fun captureDurableWatchlistCredential(
+        expected: SessionOwnerSnapshot.Account,
+        persistedOwnerEpoch: Long,
+        dataKey: ByteArray,
+    ): DurableProviderMirrorCredential? = tokenMutations.snapshotRetryForOwner(
+        expected, persistedOwnerEpoch, dataKey, ProviderRetryCredentialProof.Provider.SIMKL,
+    ) { captured ->
+        val expiry = captured.expiresAtSeconds
+        isConfigured && (expiry == 0L || System.currentTimeMillis() / 1000L < expiry)
+    }
+
+    internal fun validWatchlistCredential(expected: SessionOwnerSnapshot.Account, epoch: Long): ProviderMirrorCredential? {
+        val snapshot = tokenMutations.snapshotForOwner(expected) {
+            if (currentSessionEpoch() == epoch) tokenStore?.validToken() else null
+        } ?: return null
+        val token = snapshot.value ?: return null
+        return ProviderMirrorCredential(token, snapshot.operation) {
+            currentSessionEpoch() == epoch && tokenStore?.validToken() == token
+        }
+    }
 
     /// A live access token, or throws [SIMKLException.NotSignedIn]. SIMKL tokens are long-lived and do not
     /// refresh; a recorded expiry in the past (rare) throws so the UI can re-prompt.

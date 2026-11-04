@@ -64,14 +64,13 @@ object ArtworkPreferences {
      * unset. Read on demand (cheap encrypted read); used only for the ERDB `?fk=` fanart-poster query value
      * and by [FanartClient]. Never logged, never placed in a URL PATH.
      */
-    fun fanartKey(): String? = appContext?.let { ctx ->
-        MetadataProviderKeys(ctx).value(MetadataProviderKeys.Slot.FANART).trim().takeIf { it.isNotEmpty() }
-    }
+    fun fanartKey(): String? = providerKey(MetadataProviderKeys.Slot.FANART)
 
     /** The user's TMDB key from the secure metadata store (Apple `ApiKeys.tmdbKey`), or null when unset. */
-    fun tmdbKey(): String? = appContext?.let { ctx ->
-        MetadataProviderKeys(ctx).value(MetadataProviderKeys.Slot.TMDB).trim().takeIf { it.isNotEmpty() }
-    }
+    fun tmdbKey(): String? = providerKey(MetadataProviderKeys.Slot.TMDB)
+
+    private fun providerKey(slot: MetadataProviderKeys.Slot): String? =
+        if (appContext == null) null else MetadataProviderKeys.currentValue(slot).trim().takeIf { it.isNotEmpty() }
 
     /** Percent-encode a query VALUE the way Apple's `.urlQueryAllowed` set does (spaces, reserved chars). */
     internal fun encodeQuery(value: String): String =

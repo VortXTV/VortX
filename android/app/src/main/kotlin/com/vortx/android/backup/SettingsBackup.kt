@@ -112,6 +112,8 @@ object SettingsBackup {
         "vortx.downloads.maxConcurrent",
         "vortx.moveSeeding.launchNagDismissedBuild",
         "vortx.subtitleOffsetMemory.v1",
+        // A device's updater check time is operational metadata, including its historical flat location.
+        "stremiox.update.lastChecked",
         // Settings > Effects and performance: chosen for THIS device's hardware (Apple twin lists the same).
         "vortx.effects.backdrop",
         "vortx.effects.glass",

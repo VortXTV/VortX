@@ -15,7 +15,7 @@ import Foundation
 
 private var failures = 0
 
-private func check(_ condition: Bool, _ name: String) {
+@MainActor private func check(_ condition: Bool, _ name: String) {
     if condition {
         print("PASS  \(name)")
     } else {
@@ -76,11 +76,10 @@ check(!violations(in: replayingFixture).isEmpty, "gate rejects the pre-fix repla
 func nativeQRHandoffViolations(_ source: String) -> [String] {
     let executable = executableSource(source)
     guard let signedIn = executable.range(of: "case .signedIn(let email):\n                status = .signedIn(email)"),
-          let native = executable[signedIn.upperBound...].range(of: "#if VORTX_NATIVE_DATA_ENGINE"),
-          let legacy = executable[native.upperBound...].range(of: "#else") else {
+          let callback = executable[signedIn.upperBound...].range(of: "onSignedIn()") else {
         return ["native QR authentication handoff is absent"]
     }
-    let handoff = executable[native.upperBound..<legacy.lowerBound]
+    let handoff = executable[signedIn.upperBound..<callback.upperBound]
     var found: [String] = []
     if !handoff.contains("onSignedIn()") { found.append("authenticated QR sheet does not close") }
     if handoff.contains("await ") { found.append("authenticated QR sheet waits for restore instead of handing off") }
@@ -95,23 +94,30 @@ guard let joiner = try? String(contentsOfFile: joinerPath, encoding: .utf8),
     exit(1)
 }
 let signInExecutable = executableSource(production)
-check(signInExecutable.contains("SyncSettingsView(onSignedIn: { dismiss() })"),
-      "typed sign-in explicitly closes the outer sign-in sheet")
+check(signInExecutable.contains("SyncSettingsView(onSignedIn: { dismissIfAllowed() }, authentication: vortxAuthentication)"),
+      "typed sign-in closes through its shared synchronous acknowledgement protection")
+check(!signInExecutable.contains(".onValueChange(of: vortxSync.isSignedIn)"),
+      "account publication cannot dismiss before recovery-code acknowledgement")
+check(signInExecutable.contains("guard !showVortXEmail, !vortxAuthentication.blocksDismissal,"),
+      "incidental Stremio publication cannot dismiss the typed VortX route")
 let qrViolations = nativeQRHandoffViolations(joiner)
 check(qrViolations.isEmpty, "native QR sign-in closes before account restoration")
 for violation in qrViolations { print("      \(violation)") }
 let settingsExecutable = executableSource(settings)
-let callback = "if let onSignedIn {\n                onSignedIn()\n                return"
-check(settingsExecutable.contains(callback), "typed authentication callback returns before a second restore")
-check(settingsExecutable.contains("showQRSignIn = false\n                    onSignedIn?()"),
-      "QR success also closes the embedding recovery sign-in surface")
+let callback = "if let onSignedIn {\n            guard authentication.finishCompletion(owner, accountID: sync.account?.id),"
+check(settingsExecutable.contains(callback) && settingsExecutable.contains("onSignedIn() // adopt() owns"),
+      "typed callback requires owned completion and returns before a second restore")
+check(settingsExecutable.contains("completeQR(attempt: attempt)") &&
+      settingsExecutable.contains("guard authentication.endQR(attempt: attempt) else { return }") &&
+      settingsExecutable.contains("onSignedIn?() // The joiner's unchanged protocol"),
+      "QR success closes through its exact presentation attempt")
 let profilesPath = URL(fileURLWithPath: root).appendingPathComponent("app/SourcesShared/ProfilesView.swift").path
 guard let profiles = try? String(contentsOfFile: profilesPath, encoding: .utf8) else {
     print("FAIL  could not read profile recovery sign-in source")
     exit(1)
 }
-check(executableSource(profiles).contains("SyncSettingsView(onSignedIn: { dismiss() })"),
-      "profile recovery closes after typed or QR authentication without requiring Escape")
+check(executableSource(profiles).contains("onSignedIn: { dismissIfAllowed() }, authentication: authentication)"),
+      "profile recovery shares synchronous code acknowledgement and confirmed completion")
 let waitingQRFixture = """
 case .signedIn(let email):
                 status = .signedIn(email)

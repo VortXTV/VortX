@@ -1,5 +1,7 @@
 package com.vortx.android.integrations
 
+import com.vortx.android.engine.AccountFileLocalPresence
+import com.vortx.android.security.AccountFileProviderWriters
 import com.vortx.android.security.PersistentCredentialAvailability
 import com.vortx.android.security.PersistentCredentialSnapshot
 import com.vortx.android.sync.SessionOwnerSnapshot
@@ -8,8 +10,13 @@ import org.junit.After
 import org.junit.Assert.*
 import org.junit.Test
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 internal class NativeProviderTestStore : CredentialStoreAccess {
     val values = linkedMapOf<String, String?>()
@@ -19,6 +26,10 @@ internal class NativeProviderTestStore : CredentialStoreAccess {
     override fun confirmedSnapshot(vararg keys: String) = PersistentCredentialSnapshot(
         if (unavailable) PersistentCredentialAvailability.UNAVAILABLE else PersistentCredentialAvailability.AVAILABLE,
         if (unavailable) emptyMap() else keys.associateWith(values::get))
+    override fun inspectExisting(key: String, isInert: (String) -> Boolean): AccountFileLocalPresence =
+        if (unavailable) AccountFileLocalPresence.UNAVAILABLE
+        else if (values[key]?.let { !isInert(it) } == true) AccountFileLocalPresence.PRESENT
+        else AccountFileLocalPresence.ABSENT
     override fun set(key: String, value: String?) = set(mapOf(key to value))
     override fun set(values: Map<String, String?>): Boolean {
         if (failWrite || unavailable) return false
@@ -104,6 +115,163 @@ class NativeProviderCredentialsTest {
     }
     private fun bind(store: NativeProviderTestStore, owner: Owner) = NativeProviderAccess.bind(NativeProviderVault(store), owner) {}
 
+    @Test fun `Restore excludes lazy provider bootstrap direct writes and binding replacement`() {
+        val account = SessionOwnerSnapshot.Account(id, 1)
+        val owner = Owner(account)
+        val store = NativeProviderTestStore()
+        var legacyReads = 0
+        var changed = 0
+        val vault = NativeProviderVault(store) { legacyReads++; JSONObject() }
+        NativeProviderAccess.bind(vault, owner) { changed++ }
+        val replacement = NativeProviderVault(NativeProviderTestStore())
+
+        val reservation = checkNotNull(AccountFileProviderWriters.tryReserve())
+        try {
+            assertNull(NativeProviderAccess.read(setOf("tmdb")))
+            assertNull(NativeProviderAccess.captureProspective(account))
+            assertNull(NativeProviderAccess.capture(setOf("tmdb")) { error("Guarded read must not run") })
+            assertFalse(NativeProviderAccess.authorize("tmdb", "synthetic", 0) { error("Issue must not run") })
+            assertNull(NativeProviderAccess.merge(account, JSONObject()))
+            assertNull(NativeProviderAccess.hasPending(account))
+            assertFalse(NativeProviderAccess.edit(mapOf("tmdb" to "synthetic")))
+            assertFalse(NativeProviderAccess.acknowledge(account, JSONObject()))
+            val oauth = NativeProviderAccess.oauthStore("simkl")
+            assertFalse(oauth.set(mapOf("vortx.simkl.accessToken" to "synthetic", "vortx.simkl.expiresAt" to "2000000000")))
+            assertEquals(PersistentCredentialAvailability.UNAVAILABLE,
+                oauth.confirmedSnapshot("vortx.simkl.accessToken").availability)
+            NativeProviderAccess.bind(replacement, owner) { error("Replacement must not publish") }
+            NativeProviderAccess.unbindForTest()
+            assertEquals(AccountFileLocalPresence.ABSENT, NativeProviderAccess.inspectRestoreVaultPresence(account, vault))
+            assertEquals(AccountFileLocalPresence.UNAVAILABLE,
+                NativeProviderAccess.inspectRestoreVaultPresence(account, replacement))
+            assertEquals(AccountFileLocalPresence.UNAVAILABLE,
+                NativeProviderAccess.inspectRestoreVaultPresence(account.copy(generation = 2), vault))
+            assertTrue(AccountFileProviderWriters.isCurrent(reservation))
+            assertTrue(store.values.isEmpty())
+            assertEquals(0, legacyReads)
+            assertEquals(0, changed)
+        } finally {
+            AccountFileProviderWriters.release(reservation)
+        }
+        assertNotNull(NativeProviderAccess.read(setOf("tmdb")))
+        assertEquals(1, legacyReads)
+        assertTrue(NativeProviderAccess.edit(mapOf("tmdb" to "synthetic")))
+        assertEquals(1, changed)
+    }
+
+    @Test fun `provider physical carriers are counted before binding and refused during reservation`() {
+        val carriers = listOf("vortx_native_provider_credentials", "vortx_debrid_keys", "vortx_metadata_credentials")
+        for (carrier in carriers) {
+            assertTrue(AccountFileProviderWriters.withCarrierWriter(carrier, false) {
+                assertNull(AccountFileProviderWriters.tryReserve())
+                true
+            })
+        }
+        val reservation = checkNotNull(AccountFileProviderWriters.tryReserve())
+        try {
+            for (carrier in carriers) {
+                assertFalse(AccountFileProviderWriters.withCarrierWriter(carrier, false) {
+                    error("Direct physical provider opener/writer must not run")
+                })
+            }
+            assertTrue(AccountFileProviderWriters.withCarrierWriter("synthetic-unrelated-store", false) { true })
+            assertTrue(AccountFileProviderWriters.isCurrent(reservation))
+        } finally { AccountFileProviderWriters.release(reservation) }
+        assertTrue(AccountFileProviderWriters.withCarrierWriter(carriers.first(), false) { true })
+    }
+
+    @Test fun `native one-shot publication holds provider writer through await and publish`() = runBlocking {
+        val account = SessionOwnerSnapshot.Account(id, 1)
+        val owner = Owner(account)
+        bind(NativeProviderTestStore(), owner)
+        val operation = CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[1]).operation()
+        val entered = CompletableDeferred<Unit>()
+        val finish = CompletableDeferred<Unit>()
+        var requests = 0
+        val response = async {
+            operation.publishAfter(
+                awaitValue = {
+                    requests++
+                    entered.complete(Unit)
+                    finish.await()
+                    "synthetic-token"
+                },
+                publish = { token ->
+                    assertNull(AccountFileProviderWriters.tryReserve())
+                    NativeProviderAccess.oauthStore("simkl").set(
+                        mapOf("vortx.simkl.accessToken" to token, "vortx.simkl.expiresAt" to "0"),
+                    )
+                },
+            )
+        }
+        try {
+            entered.await()
+            assertNull(AccountFileProviderWriters.tryReserve())
+            finish.complete(Unit)
+            assertEquals(CredentialMutationResult.Applied(true), response.await())
+            assertEquals(1, requests)
+            val next = CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[1]).operation()
+            val restore = checkNotNull(AccountFileProviderWriters.tryReserve())
+            try {
+                val refused = next.publishAfter(
+                    awaitValue = { requests++; "must not issue" },
+                    publish = { error("Must not publish under Restore") },
+                )
+                assertSame(CredentialMutationResult.Stale, refused)
+                assertEquals(1, requests)
+            } finally {
+                AccountFileProviderWriters.release(restore)
+            }
+
+            val pending = next.publishAfter(
+                awaitValue = { requests++; "pending" },
+                publish = { it },
+            )
+            assertEquals(CredentialMutationResult.Applied("pending"), pending)
+            val afterPending = checkNotNull(AccountFileProviderWriters.tryReserve())
+            AccountFileProviderWriters.release(afterPending)
+            assertEquals(2, requests)
+        } finally {
+            finish.complete(Unit)
+            response.cancelAndJoin()
+        }
+    }
+
+    @Test fun `native publication retains provider writer during cancellation cleanup`() = runBlocking {
+        bind(NativeProviderTestStore(), Owner(SessionOwnerSnapshot.Account(id, 1)))
+        val operation = CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[0]).operation()
+        val entered = CompletableDeferred<Unit>()
+        val cleaning = CompletableDeferred<Unit>()
+        val cleanupComplete = CompletableDeferred<Unit>()
+        val response = async {
+            operation.publishAfter(
+                awaitValue = {
+                    entered.complete(Unit)
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        withContext(NonCancellable) {
+                            cleaning.complete(Unit)
+                            cleanupComplete.await()
+                        }
+                    }
+                },
+                publish = { error("Cancelled response must not publish") },
+            )
+        }
+        try {
+            entered.await()
+            response.cancel()
+            cleaning.await()
+            assertNull(AccountFileProviderWriters.tryReserve())
+        } finally {
+            cleanupComplete.complete(Unit)
+            response.cancelAndJoin()
+        }
+        val restore = checkNotNull(AccountFileProviderWriters.tryReserve())
+        AccountFileProviderWriters.release(restore)
+    }
+
     @Test fun `actual OAuth persistence commits tuple and intent atomically and secure failure changes neither`() {
         val store = NativeProviderTestStore(); val owner = Owner(SessionOwnerSnapshot.Account(id, 1)); bind(store, owner)
         val persistence = SIMKLAuth.TokenPersistence(NativeProviderAccess.oauthStore("simkl")) { 100L }
@@ -118,6 +286,121 @@ class NativeProviderCredentialsTest {
         val exported = NativeProviderAccess.merge(owner.current!!, JSONObject())!!.getJSONObject("nativeProviderCredentials")
         assertTrue(exported.getJSONObject("fields").getJSONObject("simklAccess").isNull("value"))
         assertEquals(exported.getJSONObject("fields").getJSONObject("simklAccess").getLong("clock"), exported.getJSONObject("fields").getJSONObject("simklExpiry").getLong("clock"))
+    }
+
+    @Test fun `original provider snapshot never reads successor bearer or falls back after refusal`() {
+        val original = SessionOwnerSnapshot.Account(id, 1)
+        val replacement = SessionOwnerSnapshot.Account("00000000-0000-0000-0000-000000000999", 2)
+        val store = NativeProviderTestStore()
+        val owner = Owner(original)
+        bind(store, owner)
+        for ((index, provider) in listOf("trakt", "simkl").withIndex()) {
+            owner.current = original
+            val oauth = NativeProviderAccess.oauthStore(provider)
+            val tokenKey = "vortx.$provider.accessToken"
+            val values = if (provider == "trakt")
+                mapOf(tokenKey to "fixture-original", "vortx.trakt.refreshToken" to "fixture-refresh",
+                    "vortx.trakt.expiresAt" to "2000000000", "vortx.trakt.createdAt" to "100")
+            else mapOf(tokenKey to "fixture-original", "vortx.simkl.expiresAt" to "0")
+            assertTrue(oauth.set(values))
+            val coordinator = CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[index])
+            val capture = checkNotNull(coordinator.snapshotForOwner(original) { oauth.string(tokenKey) })
+            assertEquals("fixture-original", capture.value)
+            owner.current = replacement
+            assertTrue(oauth.set(values + (tokenKey to "fixture-successor")))
+            assertNull(coordinator.snapshotForOwner(original) { fail("Refused owner performed a token read") })
+            assertEquals("fixture-successor", checkNotNull(coordinator.snapshotForOwner(replacement) { oauth.string(tokenKey) }).value)
+            assertSame(CredentialMutationResult.Stale, capture.operation.mutate { fail("Original operation ran for successor") })
+            owner.current = original.copy(generation = 3)
+            assertNull(coordinator.snapshotForOwner(original) { fail("Same ID with a new epoch performed a token read") })
+        }
+    }
+
+    @Test fun `retired prestart stays refused while claimed status zero and HTTP failure stay attempted`() {
+        val failure = IntegrationsHttp.Response(0, "")
+        val rejected = ProviderCallTicket {}
+        rejected.retire()
+        rejected.close()
+        assertFalse(rejected.claim())
+        assertSame(ProviderMirrorResponse.Refused, rejected.outcome(failure))
+        assertEquals(ProviderMirrorResult.REFUSED, rejected.outcome(failure).result())
+
+        val claimed = ProviderCallTicket {}
+        assertTrue(claimed.claim())
+        assertFalse(claimed.claim())
+        claimed.retire()
+        claimed.close()
+        assertEquals(ProviderMirrorResponse.Started(failure), claimed.outcome(failure))
+        assertEquals(ProviderMirrorResult.ATTEMPTED_FAILURE, claimed.outcome(failure).result())
+        val unauthorized = IntegrationsHttp.Response(401, "")
+        assertEquals(ProviderMirrorResponse.Started(unauthorized), claimed.outcome(unauthorized))
+        assertEquals(ProviderMirrorResult.ATTEMPTED_FAILURE, claimed.outcome(unauthorized).result())
+        assertEquals(ProviderMirrorResult.SUCCEEDED, claimed.outcome(IntegrationsHttp.Response(200, "")).result())
+    }
+
+    @Test fun `first IO tickets retire on exact provider change but not an unrelated edit`() = runBlocking {
+        val account = SessionOwnerSnapshot.Account(id, 1)
+        val owner = Owner(account)
+        bind(NativeProviderTestStore(), owner)
+        assertTrue(NativeProviderAccess.edit(tuple("fixture"), mapOf("traktCreated" to "100")))
+        assertTrue(NativeProviderAccess.edit(mapOf("simklAccess" to "fixture-simkl", "simklExpiry" to "0")))
+        val trakt = checkNotNull(CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[0])
+            .snapshotForOwner(account) { true }).operation
+        val simkl = checkNotNull(CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[1])
+            .snapshotForOwner(account) { true }).operation
+        val canceled = List(3) { CompletableDeferred<Unit>() }
+        val started = ProviderCallTicket { canceled[0].complete(Unit) }
+        val pending = ProviderCallTicket { canceled[1].complete(Unit) }
+        val other = ProviderCallTicket { canceled[2].complete(Unit) }
+        try {
+            assertTrue(trakt.attachOutbound(started))
+            assertTrue(trakt.attachOutbound(pending))
+            assertTrue(simkl.attachOutbound(other))
+            assertTrue(trakt.claimOutbound(started, started::claim))
+            assertFalse(trakt.claimOutbound(started, started::claim))
+            assertTrue(NativeProviderAccess.edit(mapOf("tmdb" to "unrelated")))
+            assertTrue(simkl.claimOutbound(other, other::claim))
+            assertTrue(NativeProviderAccess.edit(mapOf("tmdb" to "same-provider-events"), mapOf("traktCreated" to "101")))
+            assertFalse(trakt.claimOutbound(pending) { fail("Retired refresh lineage reached first IO"); true })
+            withTimeout(3_000) { canceled[0].await(); canceled[1].await() }
+            assertFalse(canceled[2].isCompleted)
+            assertTrue(NativeProviderAccess.edit(mapOf("simklAccess" to "successor", "simklExpiry" to "0")))
+            withTimeout(3_000) { canceled[2].await() }
+        } finally {
+            trakt.closeOutbound(started)
+            trakt.closeOutbound(pending)
+            simkl.closeOutbound(other)
+            listOf(started, pending, other).forEach(ProviderCallTicket::close)
+        }
+    }
+
+    @Test fun `binding replacement and failed local provider invalidation cancel prepared calls`() = runBlocking {
+        val account = SessionOwnerSnapshot.Account(id, 1)
+        val owner = Owner(account)
+        val store = NativeProviderTestStore()
+        bind(store, owner)
+        assertTrue(NativeProviderAccess.edit(tuple("fixture")))
+        val coordinator = CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[0])
+        val started = checkNotNull(coordinator.snapshotForOwner(account) { true }).operation
+        val canceled = CompletableDeferred<Unit>()
+        val first = ProviderCallTicket { canceled.complete(Unit) }
+        try {
+            assertTrue(started.attachOutbound(first))
+            assertTrue(started.claimOutbound(first, first::claim))
+            assertThrows(IllegalStateException::class.java) { coordinator.invalidate { error("Synthetic failed provider mutation") } }
+            withTimeout(3_000) { canceled.await() }
+            assertFalse(started.claimOutbound(first, first::claim))
+        } finally { started.closeOutbound(first); first.close() }
+
+        val pending = checkNotNull(coordinator.snapshotForOwner(account) { true }).operation
+        val rebindCanceled = CompletableDeferred<Unit>()
+        val second = ProviderCallTicket { rebindCanceled.complete(Unit) }
+        try {
+            assertTrue(pending.attachOutbound(second))
+            bind(store, owner)
+            assertFalse(pending.claimOutbound(second) { fail("Retired binding reached first IO"); true })
+            withTimeout(3_000) { rebindCanceled.await() }
+        } finally { pending.closeOutbound(second); second.close() }
     }
 
     @Test fun `captured OAuth operation rejects newer remote intent and same-account reopen ABA`() {
@@ -210,10 +493,13 @@ class NativeProviderCredentialsTest {
             }
         }
         entered.await()
+        assertNull(AccountFileProviderWriters.tryReserve())
         val follower = async { TraktAuth.refreshAfterSerialization(waiting, persistence) { error("Second refresh must reuse the winner") } }
         release.complete(Unit)
         assertEquals("fresh", winner.await().accessToken); assertEquals("fresh", follower.await().accessToken)
         assertEquals(1, requests)
+        val restore = checkNotNull(AccountFileProviderWriters.tryReserve())
+        AccountFileProviderWriters.release(restore)
         val obsolete = coordinator.operation()
         owner.current = SessionOwnerSnapshot.Account(id, 2)
         var rejected = false

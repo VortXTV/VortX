@@ -16,10 +16,25 @@ private struct UserProfile: Sendable {
     var isOwner: Bool
     var usesOwnAccount: Bool
     var discovery: Discovery? = nil
+    var pin: String? = nil
+    var isKids = false
+    // PRODUCTION_PROFILE_PIN_PRESENCE
+}
+
+// Explicit in-memory account-epoch collaborator; these cases exercise actual profile publication,
+// not credential persistence or PIN verification (the picker routing suite owns verifier coverage).
+@MainActor private final class CredentialScopeRegistry {
+    struct Capture: Equatable, Sendable { let generation: Int }
+    static let shared = CredentialScopeRegistry()
+    private let generation = 0
+    func capture() -> Capture { .init(generation: generation) }
+    func isCurrent(_ capture: Capture) -> Bool { capture.generation == generation }
 }
 
 @MainActor private final class SelectionHarness: ObservableObject {
     // PRODUCTION_PROFILE_SELECTION_OBSERVERS
+    // PRODUCTION_MANUAL_PICKER_STATE
+    // PRODUCTION_PICKER_REQUIREMENT
     var retirements = 0
     var onRetire: (() -> Void)?
     var initializationReadsWereUnavailable = true
@@ -149,6 +164,92 @@ private struct UserProfile: Sendable {
         check(ProfileSelectionRead.snapshot() == harness.storedSnapshot(), "selection A-B-A carries current values, not new target authority")
         check(notifications > 0, "actual mutation-end notification path exercised")
         NotificationCenter.default.removeObserver(note)
-        print("Profile selection: \(checks) checks passed with actual Combine publication/reentry, initializer finish and checked worker reads. Full owner/native integration remains separate.")
+
+        // Actual Published setters and original manual request code. Direct capability activation
+        // is fixture setup only; actual PIN input/verification remains in the routing suite.
+        var protected = first; protected.pin = "fixture-stored-pin"
+        harness.replace([protected]); harness.select(a); harness.requestPicker()
+        let metadataGrant = harness.pickerPresentation()
+        check(metadataGrant.unlockPIN?() == true, "setup protected original request")
+        var metadata = protected; metadata.name = "Cosmetic rename"
+        metadata.discovery = .init(continueWatchingSource: "trakt", continueWatchingWindow: "90")
+        harness.update(metadata)
+        check(metadataGrant.permitsPresentation() && metadataGrant.permitsTools(),
+              "name and discovery metadata retain the exact unlocked manual request")
+
+        for change in ["pin", "removed-pin", "kids", "active", "removed-profile", "roster-count"] {
+            harness.replace([protected]); harness.select(a); harness.requestPicker()
+            let original = harness.pickerPresentation()
+            check(original.unlockPIN?() == true && original.permitsTools(), "fresh protected request before ABA")
+            var invalid = protected
+            // No grant/root/UI reads occur between the two actual setter publications.
+            switch change {
+            case "pin":
+                invalid.pin = "fixture-other-pin"; harness.update(invalid); harness.update(protected)
+            case "removed-pin":
+                invalid.pin = nil; harness.update(invalid); harness.update(protected)
+            case "kids":
+                invalid.isKids = true; harness.update(invalid); harness.update(protected)
+            case "active":
+                harness.select(b); harness.select(a)
+            case "removed-profile":
+                harness.replace([]); harness.replace([protected])
+            case "roster-count":
+                harness.replace([protected, second]); harness.replace([protected])
+            default: preconditionFailure()
+            }
+            check(!original.permitsPresentation() && !original.permitsTools() && original.unlockPIN?() == false,
+                  "actual publication retires unobserved eligible-ineligible-eligible " + change)
+            check(!harness.needsPicker, "revoked manual route cannot fall back to ordinary mode")
+            harness.requestPicker()
+            let fresh = harness.pickerPresentation()
+            check(fresh.permitsPresentation() && fresh.unlockPIN?() == true && fresh.permitsTools()
+                  && !original.permitsTools(), "only a fresh explicit request can retry after " + change)
+        }
+
+        harness.replace([first]); harness.select(a); harness.requestPicker()
+        let unprotectedGrant = harness.pickerPresentation()
+        harness.update(protected); harness.update(first)
+        check(!unprotectedGrant.permitsTools(), "adding then removing a PIN retires an unprotected manual route")
+        harness.replace([]); harness.select(nil); harness.requestPicker()
+        let emptyGrant = harness.pickerPresentation()
+        harness.select(a); harness.select(nil)
+        check(!emptyGrant.permitsTools(), "empty route cannot revive after transient stale active ID")
+
+        harness.replace([protected]); harness.select(a); harness.requestPicker()
+        let publicationGrant = harness.pickerPresentation()
+        check(publicationGrant.unlockPIN?() == true, "setup subscriber boundary")
+        var subscriberRan = false
+        let manualObserver = harness.$profiles.dropFirst().sink { _ in
+            guard !subscriberRan else { return }
+            subscriberRan = true
+            check(harness.profiles.first?.pin == protected.pin,
+                  "real Published callback still sees outgoing stored values")
+            check(!publicationGrant.permitsTools(), "invalid proposal retires before synchronous subscriber use")
+            harness.requestPicker()
+            check(!harness.pickerPresentation().permitsPresentation(),
+                  "subscriber cannot mint a replacement from intermediate outgoing values")
+        }
+        var changedPIN = protected; changedPIN.pin = "fixture-published-pin"
+        harness.update(changedPIN)
+        manualObserver.cancel()
+        harness.update(protected)
+        check(subscriberRan && !publicationGrant.permitsTools(), "subscriber boundary remains retired after ABA")
+        harness.requestPicker()
+        let nestedGrant = harness.pickerPresentation()
+        check(nestedGrant.unlockPIN?() == true, "publication depth balanced for a fresh request")
+        var nestedManualSelection = false
+        let nestedManualObserver = harness.$profiles.dropFirst().sink { _ in
+            guard !nestedManualSelection else { return }
+            nestedManualSelection = true
+            harness.select(b); harness.select(a)
+        }
+        harness.update(metadata)
+        nestedManualObserver.cancel()
+        check(nestedManualSelection && !nestedGrant.permitsTools(),
+              "nested active-ID ABA retires original during a cosmetic outer publication")
+        harness.requestPicker()
+        check(harness.pickerPresentation().permitsPresentation(), "nested publication releases only its own depth")
+        print("Profile selection: \(checks) checks passed with actual Combine publication/reentry, manual request retirement, initializer finish and checked worker reads. Full owner/native integration remains separate.")
     }
 }

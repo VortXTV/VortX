@@ -73,6 +73,7 @@ final class ConnectivityMonitor: ObservableObject {
         guard !started else { return }
         started = true
         monitor.pathUpdateHandler = { [weak self] path in
+            VXLocalLANAddress.update(from: path)
             let offline = path.status != .satisfied
             DispatchQueue.main.async { self?.apply(offline: offline) }
         }

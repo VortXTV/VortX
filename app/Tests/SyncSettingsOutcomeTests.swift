@@ -5,11 +5,15 @@ import Foundation
 @MainActor final class CredentialScopeRegistry {
     static let shared = CredentialScopeRegistry()
     var generation = 1
-    func capture() -> Int { generation }
-    func isCurrent(_ value: Int) -> Bool { generation == value }
+    struct Capture: Equatable, Sendable { let generation: Int }
+    func capture() -> Capture { Capture(generation: generation) }
+    func isCurrent(_ value: Capture) -> Bool { generation == value.generation }
 }
 enum Conflict { case conflict, unreachable, noConflict }
 @MainActor final class TestSync {
+    struct Account { let id: String }
+    var account: Account? = Account(id: "synthetic-account-A")
+    var isSignedIn = true
     var restored = true
     var conflict = Conflict.noConflict
     var pushed = true
@@ -28,6 +32,8 @@ enum Conflict { case conflict, unreachable, noConflict }
 }
 @MainActor final class TestView {
     let sync = TestSync()
+    let authentication = AccountAuthenticationPresentation()
+    var password = "", totp = "", recoveryCodeInput = ""
     var syncing = false
     var syncNote: String?
     var showConflict = false
@@ -77,6 +83,7 @@ enum Conflict { case conflict, unreachable, noConflict }
             check(replaced.sync.continuation != nil, "reached awaited stage")
             CredentialScopeRegistry.shared.generation += 1
             replaced.receivedScopeChange()
+            check(!replaced.authentication.blocksDismissal, "scope notification retires the exact manual sync hold")
             replaced.sync.continuation?.resume(); replaced.sync.continuation = nil
             await settle()
             check(replaced.syncNote == nil && !replaced.syncing && !replaced.showConflict,
@@ -85,6 +92,7 @@ enum Conflict { case conflict, unreachable, noConflict }
         }
         let expired = TestView(); expired.begin()
         CredentialScopeRegistry.shared.generation += 1
+        expired.receivedScopeChange()
         await settle()
         check(expired.sync.reached == 0 && !expired.syncing, "account replacement before task start is fenced")
         let stamp = TestView(); stamp.syncNote = "current failure"
