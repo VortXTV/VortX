@@ -50,23 +50,32 @@ struct ProfilePickerToolsView: View {
                             .foregroundStyle(Theme.Palette.textSecondary)
                     }
                     .toolsFocusSection()
-                    Button("Back") { close() }
-                        .buttonStyle(ChipButtonStyle())
-                        .accessibilityIdentifier("profile-tools-back")
-                        .accessibilityHint("Return to the profile picker. Any pending file action is cancelled.")
-                        #if os(macOS)
-                        .keyboardShortcut(.cancelAction)
-                        #endif
-                        #if os(tvOS)
-                        .focused($focused, equals: .back)
-                        #endif
+                    #if !os(macOS)
+                    backButton
+                    #endif
                 }
                 .padding(Theme.Space.xl)
                 .frame(maxWidth: 760, alignment: .leading)
                 .frame(maxWidth: .infinity)
+                #if !os(macOS)
                 .frame(minHeight: geometry.size.height, alignment: .top)
+                #endif
             }
+            #if os(macOS)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                backButton
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, Theme.Space.xl)
+                    .padding(.vertical, Theme.Space.sm)
+                    .background(Theme.Palette.canvas)
+            }
+            #endif
         }
+        #if os(macOS)
+        // A sheet sizes itself from this view. The flexible reader and scroll view
+        // need a viewport that fits inside the smallest supported app window.
+        .frame(width: 640, height: 520)
+        #endif
         .background(Theme.Palette.canvas.ignoresSafeArea())
         // Explicit Back always remains available, including while a provider ignores cancellation.
         .interactiveDismissDisabled(true)
@@ -106,6 +115,18 @@ struct ProfilePickerToolsView: View {
         }
         .onExitCommand { close() }
         #endif
+    }
+
+    private var backButton: some View {
+        Button("Back") { close() }
+            .buttonStyle(ChipButtonStyle())
+            .accessibilityIdentifier("profile-tools-back")
+            .accessibilityHint("Return to the profile picker. Any pending file action is cancelled.")
+            #if os(macOS)
+            .keyboardShortcut(.cancelAction)
+            #elseif os(tvOS)
+            .focused($focused, equals: .back)
+            #endif
     }
 
     private var accountFileActions: some View {
