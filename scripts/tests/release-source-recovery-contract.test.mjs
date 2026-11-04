@@ -395,8 +395,8 @@ test('normal and historical native selection wiring rejects scoped workflow muta
 
 test('only the Apple build job receives the extended CI wall-clock budget', () => {
   const build = workflow.split('  build-tvos:\n')[1].split('  attach-release:\n')[0];
-  assert.match(build, /^    timeout-minutes: 150$/m);
-  assert.equal((workflow.match(/^    timeout-minutes: 150$/gm) ?? []).length, 1);
+  assert.match(build, /^    timeout-minutes: 210$/m);
+  assert.equal((workflow.match(/^    timeout-minutes: 210$/gm) ?? []).length, 1);
   assert.match(workflow.split('  attach-release:\n')[1], /^    timeout-minutes: 35$/m);
 });
 

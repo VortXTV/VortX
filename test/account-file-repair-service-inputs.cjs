@@ -42,7 +42,7 @@ function compose(root, directory) {
     {literal: pieces[0]},
     {source:'app/SourcesShared/VortXSyncManager.swift', kind:'between',
       start:'    // MARK: - File-only account repair\n',
-      end:'    // MARK: - Dedicated encrypted account file restore\n'},
+      end:'    // MARK: - Historical completion of a selected-file restore\n'},
     {literal: pieces[1]}
   ]});
   const managerBytes = fs.readFileSync(path.join(root, 'app/SourcesShared/VortXSyncManager.swift'));
