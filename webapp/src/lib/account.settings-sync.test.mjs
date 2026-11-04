@@ -533,6 +533,61 @@ test("API-key-only account documents support deletion and hydrate missing keys a
   assert.equal(getSettings().mdblistKey, "", "a remote missing key must clear the hydrated local value");
 });
 
+// Mirrors VortXSyncManager.mergedNativeProviderState: every mirror of a register must equal its value.
+function assertAppAdmitsProviderKeys(doc, label) {
+  const keys = doc.apiKeys ?? {};
+  const metadata = keys.metadata ?? {};
+  for (const [key, event] of Object.entries(doc.nativeProviderCredentials.fields)) {
+    const aliases = [keys[key], ["tmdb", "mdblist", "fanart"].includes(key) ? metadata[key] : undefined]
+      .filter((alias) => alias !== undefined);
+    if (typeof event.value === "string") {
+      assert.ok(aliases.length && aliases.every((alias) => alias === event.value), `${label}: ${key} mirrors its register`);
+    } else {
+      assert.equal(aliases.length, 0, `${label}: cleared ${key} has no mirror`);
+    }
+  }
+}
+
+test("API-key edits on an app-managed account write the native register the apps validate", async () => {
+  const accountSession = makeAccountSession("acct-native-provider-keys");
+  const appActor = "0f2d3c4b-5a69-4788-9abc-def012345678";
+  const remote = {
+    apiKeys: { tmdb: "app-tmdb", mdblist: "app-mdblist", metadata: { tmdb: "app-tmdb", mdblist: "app-mdblist" } },
+    nativeProviderCredentials: {
+      schemaVersion: 1,
+      scope: "acct-native-provider-keys",
+      fields: {
+        tmdb: { clock: 4, actor: appActor, value: "app-tmdb" },
+        mdblist: { clock: 7, actor: appActor, value: "app-mdblist" },
+      },
+    },
+  };
+  await adoptSession(accountSession);
+  applySyncDoc(remote);
+  const server = await installSyncServer(accountSession, remote);
+
+  updateSettings({ tmdbKey: "web-tmdb" });
+  await waitUntil(() => server.puts.length === 1, "API key edit PUT");
+  const edited = await server.readDoc();
+  const tmdb = edited.nativeProviderCredentials.fields.tmdb;
+  assert.equal(tmdb.value, "web-tmdb");
+  assert.ok(tmdb.clock > 7, "the web register must win over every existing register");
+  assert.match(tmdb.actor, /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+  assert.deepEqual(edited.nativeProviderCredentials.fields.mdblist, remote.nativeProviderCredentials.fields.mdblist,
+    "an unchanged key keeps its register");
+  assert.equal(edited.nativeProviderCredentials.scope, "acct-native-provider-keys");
+  assertAppAdmitsProviderKeys(edited, "edit");
+
+  updateSettings({ mdblistKey: "" });
+  await waitUntil(() => server.puts.length === 2, "API key clear PUT");
+  const cleared = await server.readDoc();
+  assert.equal(cleared.nativeProviderCredentials.fields.mdblist.value, null);
+  assert.ok(cleared.nativeProviderCredentials.fields.mdblist.clock > tmdb.clock);
+  assert.equal(Object.hasOwn(cleared.apiKeys, "mdblist"), false);
+  assert.equal(Object.hasOwn(cleared.apiKeys.metadata, "mdblist"), false);
+  assertAppAdmitsProviderKeys(cleared, "clear");
+});
+
 test("settings writes preserve the effective web roster, tombstones, fields, and library references", async () => {
   const accountSession = makeAccountSession("acct-effective-web-roster");
   const remote = settingsDoc();
