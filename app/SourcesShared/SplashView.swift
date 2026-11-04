@@ -151,10 +151,10 @@ struct SplashView: View {
             VortexMark(size: 200, trim: ribbonTrim, dotScale: dotIn ? 1 : 0.01)
         }
         .frame(width: 220, height: 220)
-        // Premium focus-in, no spin: the mark resolves from a soft blur and settles in scale
-        // (ease-out-expo) while the ribbons draw themselves along the curve, reading as the vortex
-        // forming and coming into focus rather than two bars whirling in.
+        // Keep the ribbon draw and scale on Mac without re-blurring the entire mark each frame.
+        #if !os(macOS)
         .blur(radius: markIn || reduceMotion ? 0 : 16)
+        #endif
         .scaleEffect(markIn ? 1 : (reduceMotion ? 1 : 0.86))
         .opacity(markIn ? 1 : 0)
     }

@@ -36,9 +36,12 @@ final class MacSearchBridge: ObservableObject {
 /// by one on top of this shell.
 @main
 struct VortXiOSApp: App {
+    #if os(macOS)
+    // Initialized only when the Mac window mounts its real shell.
+    private static let macAccount = StremioAccount()
+    #else
     @StateObject private var account = StremioAccount()
-    @StateObject private var core = CoreBridge.shared
-    @StateObject private var sync = VortXSyncManager.shared
+    #endif
     @Environment(\.scenePhase) private var scenePhase
     /// Launch splash gate (the brand pinwheel animation), matching Apple TV. Cleared when it finishes;
     /// it covers the engine + embedded-server boot moment on iPhone, iPad, and Mac too.
@@ -120,18 +123,28 @@ struct VortXiOSApp: App {
         // Publish whether the user has their own usenet provider configured, so bare-NZB rows are tappable
         // from launch (before the Settings screen is ever opened). One Keychain read; no-op if unset.
         UsenetProviderStore.refreshAvailability()
+        #if !os(macOS)
+        startCore()
+        #endif
+    }
+
+    private func startCore() {
         CoreBridge.shared.start()
         NSLog("%@", "[StremioX-iOS] stremio-core schema version = \(CoreBridge.shared.schemaVersion)")
     }
 
-    var body: some Scene {
-        WindowGroup {
-            iOSRootView(launchReady: splashDone)
+    private struct WindowShell: View {
+        let launchReady: Bool
+        let scenePhase: ScenePhase
+        @ObservedObject var account: StremioAccount
+        @StateObject private var core = CoreBridge.shared
+        @StateObject private var sync = VortXSyncManager.shared
+
+        var body: some View {
+            iOSRootView(launchReady: launchReady)
                 // ScenePhase's initial value does not necessarily emit a change on cold launch. Starting here
                 // closes that gap; UpdateChecker makes repeated root/scene calls idempotent and single-flight.
                 .onAppear { UpdateChecker.shared.startMonitoring() }
-                // Infuse reporting where the viewer stopped (its x-success callback to vortx://).
-                .onOpenURL { _ = InfuseReturnCoordinator.handle($0) }
                 .onValueChange(of: scenePhase) { phase in   // preserves the iOS 16 deployment floor
                     // Termination evidence: keep the receipt's last-known phase current so the next
                     // launch can distinguish a backgrounded jetsam kill from a foreground kill.
@@ -210,6 +223,9 @@ struct VortXiOSApp: App {
                     // the first real foreground transition. Idempotent (guards isSignedIn + !realtimeActive)
                     // and it already performs an immediate syncDown().
                     VortXSyncManager.shared.startRealtime()
+                    #if os(macOS)
+                    InfuseReturnCoordinator.applyReturned()
+                    #endif
                     DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
                         ProfileStore.shared.bootstrapSync()
                     }
@@ -266,41 +282,70 @@ struct VortXiOSApp: App {
                 // sheet. See MacRootProfileCoverOverlay / MacProfileCoverHost in PlatformModifiers.
                 .modifier(MacRootProfileCoverOverlay())
                 #endif
-                // Brand launch splash on top of everything (incl. the macOS player overlay) until its
-                // animation finishes, the iPhone/iPad/Mac twin of the tvOS RootTabView splash.
-                .overlay {
-                    if !splashDone {
-                        SplashView { splashDone = true }
-                            .ignoresSafeArea()
-                            .zIndex(100)
-                    }
-                }
                 .environmentObject(account)
                 .environmentObject(core)
                 .environmentObject(ThemeManager.shared)
                 .environmentObject(ProfileStore.shared)
                 .environmentObject(VortXSyncManager.shared)
-                .preferredColorScheme(.dark)
                 // Tint the whole scene so system chrome inside separately-presented sheets (SignIn /
                 // OpenLink) and the ProfileEditor cover renders the app accent, not system blue.
                 .tint(Theme.Palette.accent)
-                // Without a min frame the macOS WindowGroup adopts the root's tiny intrinsic size and
-                // opens as a postage-stamp window; pin a sensible minimum so it can't collapse. (iOS /
-                // iPadOS ignore this; their windows are managed by the system, not content size.)
-                #if os(macOS)
-                .frame(minWidth: 900, minHeight: 600)
-                // Resolve the single shared NSToolbar as hidden so updateLocations has nothing to
-                // insert into. Combined with .windowStyle(.hiddenTitleBar) below this removes the
-                // toolbar OBJECT the NSToolbar-insert crash requires, not just each item source.
-                .toolbar(.hidden, for: .windowToolbar)
-                // Traffic lights: hiddenTitleBar + the hidden window toolbar can leave the close /
-                // minimize / zoom buttons hidden with the collapsed titlebar host. This accessor keeps
-                // `.titled` in the styleMask and explicitly unhides the three standard buttons (and
-                // their container) so they float over the top-left of the full-size content, with NO
-                // NSToolbar ever attached.
-                .background(MacWindowChrome())
-                #endif
         }
+    }
+
+    private func windowContent() -> some View {
+        launchContent {
+            #if os(macOS)
+            WindowShell(launchReady: splashDone, scenePhase: scenePhase, account: Self.macAccount)
+            #else
+            WindowShell(launchReady: splashDone, scenePhase: scenePhase, account: account)
+            #endif
+        }
+        // Keep the URL receiver active while the Mac shell is still unmounted.
+        .onOpenURL { url in
+            #if os(macOS)
+            _ = InfuseReturnCoordinator.handle(url, applyImmediately: splashDone)
+            #else
+            _ = InfuseReturnCoordinator.handle(url)
+            #endif
+        }
+        .preferredColorScheme(.dark)
+        #if os(macOS)
+        .frame(minWidth: 900, minHeight: 600)
+        // Keep the existing hidden-toolbar workaround and traffic lights during both launch phases.
+        .toolbar(.hidden, for: .windowToolbar)
+        .background(MacWindowChrome())
+        #endif
+    }
+
+    @ViewBuilder private func launchContent<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        #if os(macOS)
+        if splashDone {
+            content()
+        } else {
+            // Account initialization and checkpoint restoration can do synchronous work on the
+            // main actor. Start the core and mount the account-backed shell after the splash.
+            SplashView {
+                guard !splashDone else { return }
+                startCore()
+                splashDone = true
+            }
+            .ignoresSafeArea()
+            .visualEffectsRoot()
+        }
+        #else
+        content().overlay {
+            if !splashDone {
+                SplashView { splashDone = true }
+                    .ignoresSafeArea()
+                    .zIndex(100)
+            }
+        }
+        #endif
+    }
+
+    var body: some Scene {
+        WindowGroup { windowContent() }
         // macOS opens the window at a real default size (the deployment target is macOS 14, so
         // .defaultSize / .windowResizability, macOS 13+, are available), and .contentMinSize lets
         // the user shrink it only down to the root's min frame above, never to nothing.
