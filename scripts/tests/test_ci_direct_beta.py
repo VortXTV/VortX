@@ -429,7 +429,7 @@ class NativeBeta11Contract(NativeBeta7Contract):
 
 class NativeBeta12Contract(unittest.TestCase):
     tag = "v0.5.6-beta.12"
-    candidate = "v0.5.6-beta.12-candidate.1"
+    candidate = "v0.5.6-beta.12-candidate.2"
     source = "a" * 40
     pointer = {"runId": 5, "attempt": 1, "artifactId": 8}
 
@@ -441,7 +441,7 @@ class NativeBeta12Contract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exact cross-platform build"):
             MODULE.source_versions(NativeBeta11Contract.project(build="282"),
                 NativeBeta11Contract.gradle(build="282"), "0.5.6", self.tag)
-        for tag in (self.candidate, "v0.5.6-beta.12-candidate.2", "v0.5.6-beta.13"):
+        for tag in (self.candidate, "v0.5.6-beta.12-candidate.1", "v0.5.6-beta.13"):
             with self.subTest(tag=tag), self.assertRaises(ValueError):
                 MODULE.expected_engine(tag)
 

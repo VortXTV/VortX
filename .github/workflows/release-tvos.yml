@@ -833,7 +833,7 @@ jobs:
           ruby ../scripts/native-apple-swift6-policy.rb VortX.xcodeproj native
 
       - name: Resolve pinned Apple Aether release packages
-        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.1'
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.2'
         run: |
           set -euo pipefail
           jq -e '.inputs == {
@@ -1277,7 +1277,7 @@ jobs:
           fi
 
       - name: Verify packaged Apple Aether linkage
-        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.1'
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.2'
         run: |
           set -euo pipefail
           check_app() {
@@ -1539,7 +1539,7 @@ jobs:
           fi
 
       - name: Upload protected Apple Aether release evidence
-        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.1'
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.2'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-Apple-Aether-release-evidence
