@@ -84,8 +84,8 @@ struct VortXWordmark: View {
 }
 
 /// Animated launch splash: the VortX vortex mark draws in with a wind-up spin and an ember
-/// shockwave, the eye pops, and the "Everything. VortXed." line rises. It covers the engine and
-/// embedded-server boot moment, and honors Reduce Motion with a static beat instead of movement.
+/// shockwave, the eye pops, and the "Everything. VortXed." line rises. It honors Reduce Motion
+/// with a static beat instead of movement.
 ///
 /// Colors are the fixed VortX brand palette (gold on obsidian), NOT Theme.Palette: this is the
 /// brand moment, so it reads as VortX regardless of the accent the viewer has chosen.
@@ -101,7 +101,7 @@ struct SplashView: View {
     @State private var taglineIn = false
     @State private var fadingOut = false
 
-    private static let canvas = Color(red: 0x0F / 255, green: 0x0D / 255, blue: 0x0A / 255)
+    static let canvas = Color(red: 0x0F / 255, green: 0x0D / 255, blue: 0x0A / 255)
     private static let ember = Color(red: 0xC2 / 255, green: 0x44 / 255, blue: 0x0F / 255)
     private static let cream = VortexMark.cream
     private static let gold = VortexMark.goldBright
@@ -151,10 +151,6 @@ struct SplashView: View {
             VortexMark(size: 200, trim: ribbonTrim, dotScale: dotIn ? 1 : 0.01)
         }
         .frame(width: 220, height: 220)
-        // Keep the ribbon draw and scale on Mac without re-blurring the entire mark each frame.
-        #if !os(macOS)
-        .blur(radius: markIn || reduceMotion ? 0 : 16)
-        #endif
         .scaleEffect(markIn ? 1 : (reduceMotion ? 1 : 0.86))
         .opacity(markIn ? 1 : 0)
     }
@@ -168,7 +164,7 @@ struct SplashView: View {
         // Ease-out-expo: a fast, confident start that glides to a long, graceful rest, the premium feel.
         let expo = Animation.timingCurve(0.16, 1, 0.3, 1, duration: 1.1)
         withAnimation(.easeOut(duration: 0.9)) { glowIn = true }              // ember bloom
-        withAnimation(expo) { markIn = true }                                 // blur -> sharp + scale settle + fade
+        withAnimation(expo) { markIn = true }                                 // scale settle + fade
         withAnimation(.easeInOut(duration: 1.05)) { ribbonTrim = 1 }          // ribbons draw along the curve
         withAnimation(.spring(response: 0.5, dampingFraction: 0.62).delay(0.85)) { dotIn = true }  // eye pops
         withAnimation(.easeOut(duration: 0.85).delay(0.9)) { ringOut = true } // single shockwave bloom

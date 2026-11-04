@@ -20,9 +20,9 @@ final class DeepLinkRouter: ObservableObject {
 
     /// Handle an inbound URL. Ignores anything that is not one of ours, so an unrelated URL handed to
     /// `onOpenURL` is a no-op.
-    func handle(_ url: URL) {
+    func handle(_ url: URL, applyInfuseImmediately: Bool) {
         // Infuse reporting where the viewer stopped (its x-success callback).
-        if InfuseReturnCoordinator.handle(url) { return }
+        if InfuseReturnCoordinator.handle(url, applyImmediately: applyInfuseImmediately) { return }
         guard let link = TopShelfSnapshot.parse(url) else {
             DiagnosticsLog.log("deeplink", "ignored (not ours): \(url.scheme ?? "-")://\(url.host ?? "-")")
             return
