@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing tag for the draft release, for example v0.3.14-beta.28-android
+        description: Existing draft release tag, or the exact v0.5.6-beta.12-candidate.1 artifact-only tag
         required: true
         type: string
       publish_release:
@@ -45,6 +45,12 @@ jobs:
           if [ "$source_commit" != "$tag_commit" ]; then
             echo "::error::checked-out source does not match the requested release tag"
             exit 1
+          fi
+          candidate="v0.5.6-beta.12-candidate.1"
+          if [[ "$RELEASE_TAG" == "$candidate" || "$GITHUB_REF" == "refs/tags/$candidate" ]]; then
+            [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REPOSITORY" == VortXTV/VortX &&
+               "$GITHUB_REF" == "refs/tags/$candidate" && "$RELEASE_TAG" == "$candidate" &&
+               "$GITHUB_SHA" == "$source_commit" ]] || { echo '::error::Beta 12 candidate ref and input must match'; exit 1; }
           fi
           echo "SOURCE_COMMIT=$source_commit" >> "$GITHUB_ENV"
           echo "RELEASE_TAG_COMMIT=$tag_commit" >> "$GITHUB_ENV"
@@ -332,6 +338,7 @@ jobs:
           retention-days: 90
 
       - name: Create or append to the draft release
+        if: github.ref != 'refs/tags/v0.5.6-beta.12-candidate.1' && inputs.release_tag != 'v0.5.6-beta.12-candidate.1'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}

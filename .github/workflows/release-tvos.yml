@@ -832,6 +832,29 @@ jobs:
           xcodegen generate --spec .native-project.yml
           ruby ../scripts/native-apple-swift6-policy.rb VortX.xcodeproj native
 
+      - name: Resolve pinned Apple Aether release packages
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.1'
+        run: |
+          set -euo pipefail
+          jq -e '.inputs == {
+            native_only:true, publish_release:false, publish_existing_055:false,
+            tvos_test_only:false, apple_only:false, release_tag:"", recovery_source_commit:"",
+            resume_handoff:"", mpvkit_artifacts_url:"", mpvkit_artifacts_sha256:"", release_id:"", altstore_note:""
+          }' out/native-ci-dispatch.json >/dev/null
+          test "$BUILD_SOURCE_SHA" = "$GITHUB_SHA"
+          PACKAGES="$(mktemp -d "$RUNNER_TEMP/aether-protected-packages.XXXXXXXX")"
+          EVIDENCE="$(mktemp -d "$RUNNER_TEMP/aether-protected-evidence.XXXXXXXX")"
+          LOCK=app/VortX.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          xcodebuild -resolvePackageDependencies -project app/VortX.xcodeproj -scheme VortXTV \
+            -clonedSourcePackagesDirPath "$PACKAGES"
+          python3 scripts/verify-protected-apple-aether.py --packages "$PACKAGES" --lock "$LOCK" \
+            --output "$EVIDENCE/aether-resolved.json"
+          {
+            printf 'AETHER_RELEASE_PACKAGES=%s\n' "$PACKAGES"
+            printf 'AETHER_RELEASE_EVIDENCE=%s\n' "$EVIDENCE"
+            printf 'AETHER_RELEASE_LOCK=%s\n' "$LOCK"
+          } >> "$GITHUB_ENV"
+
       - name: Capture exact native SDK and player inputs before app compilation
         env:
           TVOS_TEST_ONLY: ${{ inputs.tvos_test_only }}
@@ -1010,6 +1033,9 @@ jobs:
           echo "selected tvOS $SIM_RUNTIME simulator: $SIM_NAME ($SIM_UDID)"
 
           xcodebuild -project app/VortX.xcodeproj -scheme VortXTV \
+            ${AETHER_RELEASE_PACKAGES:+-clonedSourcePackagesDirPath} ${AETHER_RELEASE_PACKAGES:+"$AETHER_RELEASE_PACKAGES"} \
+            ${AETHER_RELEASE_PACKAGES:+-disableAutomaticPackageResolution} ${AETHER_RELEASE_PACKAGES:+-onlyUsePackageVersionsFromResolvedFile} \
+            ${AETHER_RELEASE_PACKAGES:+LD_GENERATE_MAP_FILE=YES} \
             -configuration Release -destination "platform=tvOS Simulator,id=$SIM_UDID" \
             -derivedDataPath "$SMOKE_DERIVED" CODE_SIGNING_ALLOWED=NO \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
@@ -1028,6 +1054,13 @@ jobs:
             --app "$SIM_APP" --platform tvos-sim \
             --link-map "$SMOKE_DERIVED/Build/Intermediates.noindex/VortX.build/Release-appletvsimulator/VortXTV.build/VortXTV-arm64.map" \
             --receipt out/native-tvos-simulator.json
+
+          if [ -n "${AETHER_RELEASE_PACKAGES:-}" ]; then
+            python3 scripts/verify-protected-apple-aether.py --packages "$AETHER_RELEASE_PACKAGES" \
+              --lock "$AETHER_RELEASE_LOCK" --resolution-receipt "$AETHER_RELEASE_EVIDENCE/aether-resolved.json" \
+              --key tvos-simulator --app "$SIM_APP" --derived "$SMOKE_DERIVED" \
+              --native-receipt out/native-tvos-simulator.json --output "$AETHER_RELEASE_EVIDENCE/aether-tvos-simulator.json"
+          fi
 
           xcrun simctl shutdown "$SIM_UDID" >/dev/null 2>&1 || true
           xcrun simctl boot "$SIM_UDID"
@@ -1098,6 +1131,9 @@ jobs:
       - name: Build tvOS (Full)
         run: |
           xcodebuild -project app/VortX.xcodeproj -scheme VortXTV \
+            ${AETHER_RELEASE_PACKAGES:+-clonedSourcePackagesDirPath} ${AETHER_RELEASE_PACKAGES:+"$AETHER_RELEASE_PACKAGES"} \
+            ${AETHER_RELEASE_PACKAGES:+-disableAutomaticPackageResolution} ${AETHER_RELEASE_PACKAGES:+-onlyUsePackageVersionsFromResolvedFile} \
+            ${AETHER_RELEASE_PACKAGES:+LD_GENERATE_MAP_FILE=YES} \
             -configuration Release -destination 'generic/platform=tvOS' \
             -derivedDataPath app/build/ci CODE_SIGNING_ALLOWED=NO \
             VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" \
@@ -1110,6 +1146,9 @@ jobs:
         if: inputs.tvos_test_only != true
         run: |
           xcodebuild -project app/VortX.xcodeproj -scheme VortXTVLite \
+            ${AETHER_RELEASE_PACKAGES:+-clonedSourcePackagesDirPath} ${AETHER_RELEASE_PACKAGES:+"$AETHER_RELEASE_PACKAGES"} \
+            ${AETHER_RELEASE_PACKAGES:+-disableAutomaticPackageResolution} ${AETHER_RELEASE_PACKAGES:+-onlyUsePackageVersionsFromResolvedFile} \
+            ${AETHER_RELEASE_PACKAGES:+LD_GENERATE_MAP_FILE=YES} \
             -configuration Release -destination 'generic/platform=tvOS' \
             -derivedDataPath app/build/ci-lite CODE_SIGNING_ALLOWED=NO \
             VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" \
@@ -1122,6 +1161,9 @@ jobs:
         if: inputs.tvos_test_only != true
         run: |
           xcodebuild -project app/VortX.xcodeproj -scheme VortXiOSNative \
+            ${AETHER_RELEASE_PACKAGES:+-clonedSourcePackagesDirPath} ${AETHER_RELEASE_PACKAGES:+"$AETHER_RELEASE_PACKAGES"} \
+            ${AETHER_RELEASE_PACKAGES:+-disableAutomaticPackageResolution} ${AETHER_RELEASE_PACKAGES:+-onlyUsePackageVersionsFromResolvedFile} \
+            ${AETHER_RELEASE_PACKAGES:+LD_GENERATE_MAP_FILE=YES} \
             -configuration Release -destination 'generic/platform=iOS' \
             -derivedDataPath app/build/ci-ios CODE_SIGNING_ALLOWED=NO \
             VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" \
@@ -1142,6 +1184,9 @@ jobs:
           set -euo pipefail
           LOG="$RUNNER_TEMP/ios-sim-dsym.log"
           xcodebuild -project app/VortX.xcodeproj -scheme VortXiOSNative \
+            ${AETHER_RELEASE_PACKAGES:+-clonedSourcePackagesDirPath} ${AETHER_RELEASE_PACKAGES:+"$AETHER_RELEASE_PACKAGES"} \
+            ${AETHER_RELEASE_PACKAGES:+-disableAutomaticPackageResolution} ${AETHER_RELEASE_PACKAGES:+-onlyUsePackageVersionsFromResolvedFile} \
+            ${AETHER_RELEASE_PACKAGES:+LD_GENERATE_MAP_FILE=YES} \
             -configuration Release -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath app/build/ci-ios-sim CODE_SIGNING_ALLOWED=NO \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=YES DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
@@ -1166,6 +1211,13 @@ jobs:
             --app app/build/ci-ios-sim/Build/Products/Release-iphonesimulator/VortXiOSNative.app --platform ios-sim \
             --link-map app/build/ci-ios-sim/Build/Intermediates.noindex/VortX.build/Release-iphonesimulator/VortXiOSNative.build/VortXiOSNative-arm64.map \
             --receipt out/native-ios-simulator.json
+          if [ -n "${AETHER_RELEASE_PACKAGES:-}" ]; then
+            python3 scripts/verify-protected-apple-aether.py --packages "$AETHER_RELEASE_PACKAGES" \
+              --lock "$AETHER_RELEASE_LOCK" --resolution-receipt "$AETHER_RELEASE_EVIDENCE/aether-resolved.json" \
+              --key ios-simulator --app app/build/ci-ios-sim/Build/Products/Release-iphonesimulator/VortXiOSNative.app \
+              --derived app/build/ci-ios-sim --native-receipt out/native-ios-simulator.json \
+              --output "$AETHER_RELEASE_EVIDENCE/aether-ios-simulator.json"
+          fi
           # Reclaim the simulator build tree at once; the disk-tight IPA/DMG legs below do not need it.
           rm -rf app/build/ci-ios-sim
           echo "iOS-simulator link + dSYM gate passed: no newer-minOS, no missing-OSO"
@@ -1178,6 +1230,9 @@ jobs:
           # x86_64 leg fails to link ("Undefined symbols for architecture x86_64"). Force arm64 to match the
           # Apple Silicon runner and the local build recipe.
           xcodebuild -project app/VortX.xcodeproj -scheme VortXMac \
+            ${AETHER_RELEASE_PACKAGES:+-clonedSourcePackagesDirPath} ${AETHER_RELEASE_PACKAGES:+"$AETHER_RELEASE_PACKAGES"} \
+            ${AETHER_RELEASE_PACKAGES:+-disableAutomaticPackageResolution} ${AETHER_RELEASE_PACKAGES:+-onlyUsePackageVersionsFromResolvedFile} \
+            ${AETHER_RELEASE_PACKAGES:+LD_GENERATE_MAP_FILE=YES} \
             -configuration Release -destination 'platform=macOS,arch=arm64' \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
             -derivedDataPath app/build/ci-mac CODE_SIGNING_ALLOWED=NO \
@@ -1220,6 +1275,22 @@ jobs:
               --link-map app/build/ci-mac/Build/Intermediates.noindex/VortX.build/Release/VortXMac.build/VortX-arm64.map \
               --receipt out/native-macos.json
           fi
+
+      - name: Verify packaged Apple Aether linkage
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.1'
+        run: |
+          set -euo pipefail
+          check_app() {
+            local key="$1" derived="$2" app="$3"
+            python3 scripts/verify-protected-apple-aether.py --packages "$AETHER_RELEASE_PACKAGES" \
+              --lock "$AETHER_RELEASE_LOCK" --resolution-receipt "$AETHER_RELEASE_EVIDENCE/aether-resolved.json" \
+              --key "$key" --app "$derived/Build/Products/$app" --derived "$derived" \
+              --native-receipt "out/native-$key.json" --output "$AETHER_RELEASE_EVIDENCE/aether-$key.json"
+          }
+          check_app tvos app/build/ci Release-appletvos/VortXTV.app
+          check_app tvos-lite app/build/ci-lite Release-appletvos/VortXTVLite.app
+          check_app ios app/build/ci-ios Release-iphoneos/VortXiOSNative.app
+          check_app macos app/build/ci-mac Release/VortX.app
 
       - name: Verify tvOS device artifact metadata (fail closed)
         env:
@@ -1457,6 +1528,23 @@ jobs:
           python3 "$NATIVE_PACKAGE_VERIFIER_DIR"/verify-native-apple-package.py verify-archive --app-receipt out/native-macos.json \
             --artifact out/VortX-macOS-ci.dmg --platform macos --receipt out/native-package-macos.json
           shasum -a 256 out/VortX-tvOS-ci.ipa out/VortX-tvOS-lite-ci.ipa out/VortX-iOS-ci.ipa out/VortX-macOS-ci.dmg | tee out/SHA256SUMS-ci.txt
+          if [ -n "${AETHER_RELEASE_PACKAGES:-}" ]; then
+            shopt -s dotglob nullglob
+            entries=("$AETHER_RELEASE_EVIDENCE"/*)
+            [ "${#entries[@]}" -eq 7 ] || { echo "::error::unexpected Apple Aether evidence roster"; exit 1; }
+            for key in resolved tvos-simulator ios-simulator tvos tvos-lite ios macos; do
+              entry="$AETHER_RELEASE_EVIDENCE/aether-$key.json"
+              [ -f "$entry" ] && [ ! -L "$entry" ] && [ -s "$entry" ] || { echo "::error::missing or invalid Apple Aether evidence $key"; exit 1; }
+            done
+          fi
+
+      - name: Upload protected Apple Aether release evidence
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: VortX-Apple-Aether-release-evidence
+          path: ${{ env.AETHER_RELEASE_EVIDENCE }}/aether-*.json
+          if-no-files-found: error
 
       # Build the feed from the exact immutable tag checkout while this job still has read-only
       # authority. The later release-write job receives only these bytes and never executes a

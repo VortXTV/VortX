@@ -4,6 +4,28 @@ Notable VortX changes, newest first. VortX is Apple TV first, with iPhone/iPad, 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.5.6 beta 12 - Profile recovery tools and AetherEngine fixes
+
+Build **283** for Apple TV, iPhone, iPad, Mac, and Android. This beta adds recovery tools where you need them most, on the profile picker, and improves how AetherEngine resumes playback and handles subtitles.
+
+### Recover an account before opening a profile
+
+- **Tools** on the profile picker brings backup download, repair, restore and diagnostic export together. The actions available depend on your device and profile. **Sign in** and **Sign out** stay separate.
+- **Repair saves a separate encrypted file.** It checks a supported legacy backup for the signed-in account and prepares a new copy for you to review and save. Keep the original file as a fallback.
+- **Restore asks before replacing the account’s cloud backup.** If the response is uncertain, use the verification action to check the earlier attempt. The app keeps track of that attempt so you can return to it.
+- **On Apple TV**, choose a backup action in Tools, then scan its QR code with a phone on the same trusted local network to move a backup file. Review and confirm any restore on the TV. On Android, file actions use the system file picker where available. To start a restore on an eligible Android 14 or later device, choose **Sign in for backup recovery** in Tools.
+- **Tools and account controls stay available during profile loading.** The Android TV picker keeps Tools and the account button available while profiles are loading or unavailable. Existing profile PIN and diagnostic-sharing rules still apply.
+
+### Playback and sources
+
+- **AetherEngine on Apple** can be selected from the player settings. It carries your resume point when opening or switching players, and its subtitle selection and rendering now use the current playback session.
+- **Subtitle add-ons on Apple** can be retried when a request fails. Available results from successful add-ons stay visible while a failed one retries.
+- **Optional title matching** on Apple and Android can filter the source list by how closely a release name matches the title you opened. Leave it off to keep the usual list. [Issue #172](https://github.com/VortXTV/VortX/issues/172).
+
+### Downloads
+
+Apple TV comes in **Full** and **Lite**. Apple IPAs need compatible sideload signing. The Mac build is for Apple silicon. Android comes in **Full** with mpv and **Play** with Media3. Update with the same platform and variant to keep the app identity.
+
 ## 0.5.6 beta 11 - AetherEngine on every Apple device and Trakt that stays signed in
 
 Build **282** for Apple TV, iPhone, iPad and Mac. The AetherEngine player to try now comes to iPhone, iPad and Mac, Trakt stays signed in on every device you use, and Trakt Continue Watching reaches the Apple TV Top Shelf after re-signing. Android stays on its 0.5.6 beta 7 packages for now: its release build stopped at an account-sync check, and it ships once that passes.
