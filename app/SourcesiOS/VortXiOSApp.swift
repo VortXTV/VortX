@@ -36,16 +36,12 @@ final class MacSearchBridge: ObservableObject {
 /// by one on top of this shell.
 @main
 struct VortXiOSApp: App {
-    #if os(macOS)
-    // Initialized only when the Mac window mounts its real shell.
-    private static let macAccount = StremioAccount()
-    #else
-    @StateObject private var account = StremioAccount()
-    #endif
+    // Initialized only when the window mounts its account-backed shell.
+    private static let account = StremioAccount()
     @Environment(\.scenePhase) private var scenePhase
-    /// Launch splash gate (the brand pinwheel animation), matching Apple TV. Cleared when it finishes;
-    /// it covers the engine + embedded-server boot moment on iPhone, iPad, and Mac too.
-    @State private var splashDone = false
+    /// The account-backed shell mounts after the launch splash.
+    @State private var splashFinished = false
+    @State private var shellReady = false
 
     // macOS only: the embedded streaming server runs as a `node` CHILD PROCESS (MacNodeServer),
     // and Foundation does NOT kill that child when the app quits; it would be reparented to
@@ -123,14 +119,22 @@ struct VortXiOSApp: App {
         // Publish whether the user has their own usenet provider configured, so bare-NZB rows are tappable
         // from launch (before the Settings screen is ever opened). One Keychain read; no-op if unset.
         UsenetProviderStore.refreshAvailability()
-        #if !os(macOS)
-        startCore()
-        #endif
     }
 
     private func startCore() {
         CoreBridge.shared.start()
         NSLog("%@", "[StremioX-iOS] stremio-core schema version = \(CoreBridge.shared.schemaVersion)")
+    }
+
+    private func startShellIfReady(_ phase: ScenePhase) {
+        guard splashFinished, !shellReady else { return }
+        #if os(macOS)
+        guard phase != .background else { return }
+        #else
+        guard phase == .active else { return }
+        #endif
+        startCore()
+        shellReady = true
     }
 
     private struct WindowShell: View {
@@ -146,14 +150,6 @@ struct VortXiOSApp: App {
                 // closes that gap; UpdateChecker makes repeated root/scene calls idempotent and single-flight.
                 .onAppear { UpdateChecker.shared.startMonitoring() }
                 .onValueChange(of: scenePhase) { phase in   // preserves the iOS 16 deployment floor
-                    // Termination evidence: keep the receipt's last-known phase current so the next
-                    // launch can distinguish a backgrounded jetsam kill from a foreground kill.
-                    switch phase {
-                    case .active: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseActive)
-                    case .inactive: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseInactive)
-                    case .background: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseBackground)
-                    @unknown default: break
-                    }
                     if phase == .active {
                         UpdateChecker.shared.startMonitoring()
                         InfuseReturnCoordinator.applyReturned()   // a position Infuse reported before VortX was ready
@@ -165,11 +161,6 @@ struct VortXiOSApp: App {
                         // per 30 minutes inside the actor, detached so it cannot delay this hook, and
                         // fail-soft by construction (refresh never throws and keeps last-good on any error).
                         Task.detached(priority: .utility) { await RemoteConfig.shared.refreshIfForegroundDue() }
-                        #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
-                        // The in-process engine server stops on background (below), so foreground restarts
-                        // it on a fresh ephemeral port; the player follows via StremioServer.embeddedPort.
-                        VortxNativeServer.startIfNeeded()
-                        #endif
                         Task {
                             await VortXSyncManager.shared.syncDown()      // pull other devices' changes on foreground
                             // Account-owns-everything: if the engine is degraded (no stream add-on),
@@ -185,11 +176,6 @@ struct VortXiOSApp: App {
                         UpdateChecker.shared.stopMonitoring()
                     }
                     if phase == .background {
-                        #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
-                        // Phase 8: stop the flag-gated in-process engine server on background (graceful
-                        // rqbit shutdown off-main); .active above restarts it. No-op while the flag is off.
-                        VortxNativeServer.stopOnBackground()
-                        #endif
                         // Drop the memoized YouTube-trailer range-proxy listener: iOS can reclaim its bound
                         // loopback port across a suspension, and the proxy caches the port once, so every hero
                         // preview trailer fails after a resume until it rebinds. proxied() rebinds lazily on the
@@ -223,9 +209,7 @@ struct VortXiOSApp: App {
                     // the first real foreground transition. Idempotent (guards isSignedIn + !realtimeActive)
                     // and it already performs an immediate syncDown().
                     VortXSyncManager.shared.startRealtime()
-                    #if os(macOS)
                     InfuseReturnCoordinator.applyReturned()
-                    #endif
                     DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
                         ProfileStore.shared.bootstrapSync()
                     }
@@ -295,19 +279,27 @@ struct VortXiOSApp: App {
 
     private func windowContent() -> some View {
         launchContent {
-            #if os(macOS)
-            WindowShell(launchReady: splashDone, scenePhase: scenePhase, account: Self.macAccount)
-            #else
-            WindowShell(launchReady: splashDone, scenePhase: scenePhase, account: account)
-            #endif
+            WindowShell(launchReady: shellReady, scenePhase: scenePhase, account: Self.account)
         }
-        // Keep the URL receiver active while the Mac shell is still unmounted.
+        // Keep the URL receiver active while the shell is still unmounted.
         .onOpenURL { url in
-            #if os(macOS)
-            _ = InfuseReturnCoordinator.handle(url, applyImmediately: splashDone)
-            #else
-            _ = InfuseReturnCoordinator.handle(url)
+            _ = InfuseReturnCoordinator.handle(url, applyImmediately: shellReady)
+        }
+        .onValueChange(of: splashFinished) { _ in startShellIfReady(scenePhase) }
+        .onValueChange(of: scenePhase) { phase in
+            // Keep termination evidence current even while the splash is on screen.
+            switch phase {
+            case .active: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseActive)
+            case .inactive: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseInactive)
+            case .background: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseBackground)
+            @unknown default: break
+            }
+            #if os(iOS) && !VORTX_NO_EMBEDDED_SERVER
+            // The in-process server starts before the shell, so handle suspension here as well.
+            if phase == .active { VortxNativeServer.startIfNeeded() }
+            if phase == .background { VortxNativeServer.stopOnBackground() }
             #endif
+            startShellIfReady(phase)
         }
         .preferredColorScheme(.dark)
         #if os(macOS)
@@ -319,29 +311,19 @@ struct VortXiOSApp: App {
     }
 
     @ViewBuilder private func launchContent<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        #if os(macOS)
-        if splashDone {
+        if shellReady {
             content()
+        } else if splashFinished {
+            SplashView.canvas.ignoresSafeArea()
         } else {
             // Account initialization and checkpoint restoration can do synchronous work on the
             // main actor. Start the core and mount the account-backed shell after the splash.
             SplashView {
-                guard !splashDone else { return }
-                startCore()
-                splashDone = true
+                splashFinished = true
             }
             .ignoresSafeArea()
             .visualEffectsRoot()
         }
-        #else
-        content().overlay {
-            if !splashDone {
-                SplashView { splashDone = true }
-                    .ignoresSafeArea()
-                    .zIndex(100)
-            }
-        }
-        #endif
     }
 
     var body: some Scene {
