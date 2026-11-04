@@ -108,7 +108,14 @@ private struct SymmetricKey { init(data: Data) {} }
     func isCurrent(_ capture: CredentialScopeRegistry.Capture) -> Bool { capture == credentialAuthority.capture() }
     static func resolveRoster(from document: [String: Any], fullOnly: Bool) -> ProfileRosterSnapshot? {
         precondition(fullOnly, "admission must never accept a lossy summary")
-        return resolvedRoster // Decoder is a dependency aperture; the production owner-count gate is real.
+        // Decoder is a dependency aperture; the production owner-count gate is real.
+        if let resolvedRoster { return resolvedRoster }
+        guard let rows = (document["vortx"] as? [String: Any])?["roster"] as? [[String: Any]] else { return nil }
+        return .init(profiles: rows.compactMap { row in
+            guard let id = (row["id"] as? String).flatMap(UUID.init(uuidString:)), let name = row["name"] as? String,
+                  let isOwner = row["isOwner"] as? Bool else { return nil }
+            return UserProfile(id: id, name: name, avatar: "", isOwner: isOwner)
+        })
     }
     private func publishDetachedNativeSeed(_ value: [String: Any], capture: CredentialScopeRegistry.Capture, cloudAuthority: ReceivedProviderCloudAuthority) async throws -> [String: Any]? {
         seedCalls += 1
@@ -138,6 +145,11 @@ private struct SymmetricKey { init(data: Data) {} }
     }
     // Declared no-pending-provider aperture; actual source epoch runs in local-adoption checks.
     private struct ReceivedProviderCloudAuthority { var isCurrent: Bool { true } }
+    // Reconnect-prompt bookkeeping is outside admission; the pull only clears it on an authenticated reply.
+    var accountReconnectFailureCapture: CredentialScopeRegistry.Capture?
+    func clearAccountReconnectFailure(for capture: CredentialScopeRegistry.Capture) {
+        if accountReconnectFailureCapture == capture { accountReconnectFailureCapture = nil }
+    }
     /* PRODUCTION_DECLARATIONS */
 
     static var checks = 0
@@ -249,7 +261,27 @@ private struct SymmetricKey { init(data: Data) {} }
         check(accepted.document["preserved"] as? String == "exact" && accepted.owners.count == 1, "valid document admitted without rewriting")
         check(accepted.plaintext == original, "admission retains original authenticated plaintext independently of the host projection")
         let old = fresh(); old.lastSyncedVersion = 2; await old.expectAdmission(.staleDocument)
-        let missing = fresh(); resolvedRoster = nil; await missing.expectAdmission(.rosterUnavailable)
+        let missing = fresh(); resolvedRoster = nil
+        await missing.expectAdmission(.rosterUnavailable, pulled: .doc(doc: ["settings": "unreadable"], version: 1, plaintext: Data("{}".utf8), observation: nil))
+        let webOriginal = Data(#"{"addons":[{"transportUrl":"https://addon.test/manifest.json"}],"apiKeys":{"tmdb":"k"},"vortx":{"deletedAddons":["x"]}}"#.utf8)
+        let webDocument = try JSONSerialization.jsonObject(with: webOriginal) as! [String: Any]
+        let web = fresh(); resolvedRoster = nil
+        let adopted = try await web.nativeRestoreDocument(.doc(doc: webDocument, version: 1, plaintext: webOriginal, observation: nil),
+            capture: web.credentialAuthority.capture(), selectedProfile: ProfileStore.shared.activeID, generation: web.nativeCheckpointGeneration, cloudAuthority: .init())
+        check(adopted.owners.count == 1 && adopted.owners[0].id == UserProfile.ownerID && adopted.owners[0].name == "Main",
+              "website-only account is admitted with the constant Main owner")
+        let adoptedVortx = adopted.document["vortx"] as? [String: Any]
+        check(adoptedVortx?["rosterModified"] as? Int == 0 && adoptedVortx?["deletedAddons"] as? [String] == ["x"]
+              && (adopted.document["addons"] as? [Any])?.count == 1 && (adopted.document["apiKeys"] as? [String: Any])?["tmdb"] as? String == "k",
+              "seeded roster keeps every website-written sibling")
+        check(adopted.plaintext == webOriginal && web.seedCalls == 0, "website adoption retains authenticated bytes and publishes no seed")
+        check(DiagnosticsLog.messages.contains("native-profiles:restore admission=web_only_owner_seeded"), "website adoption is diagnosed")
+        for carrier in [["vortx": ["profiles": [["id": "summary"]]]], ["vortx": ["roster": "undecodable"]], ["vortx": ["rosterModified": 1]],
+                        ["vortx": "not-an-object"], ["nativeAccountBootstrap": "authenticated-empty-v1"]] as [[String: Any]] {
+            let kept = fresh(); resolvedRoster = nil
+            await kept.expectAdmission(.rosterUnavailable, pulled: .doc(doc: carrier, version: 1, plaintext: Data("{}".utf8), observation: nil))
+            check(!DiagnosticsLog.messages.contains { $0.hasSuffix("web_only_owner_seeded") }, "existing roster carrier is never replaced")
+        }
         let noKey = fresh(); noKey.dataKey = nil; await noKey.expectAdmission(.keyUnavailable)
         let short = fresh(); short.dataKey = Data(count: 31); await short.expectAdmission(.invalidKey)
         let noOwner = fresh(); resolvedRoster = .init(profiles: []); await noOwner.expectAdmission(.ownersUnavailable)

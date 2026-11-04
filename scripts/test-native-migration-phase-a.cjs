@@ -170,7 +170,8 @@ function extractRestoreAdmission() {
     const credential = captured.get('app/SourcesShared/CredentialScope.swift').toString('utf8');
     const methods = [
         '    private func nativeBackupHistory(', '    private func rememberNativeBackup(',
-        '    private func nativeEmptyAccountDocument(', '    private enum NativeRestoreAdmissionFailure:',
+        '    private func nativeEmptyAccountDocument(', '    private static func nativeWebOnlyAccountDocument(',
+        '    private enum NativeRestoreAdmissionFailure:',
         '    private struct NativeRestoreDocument {', '    private func nativeRestoreDocument(',
         '    private enum VersionedPull {', '    private func pullDocVersionedResult('
     ].map(signature => ({ signature, bytes: extractDeclaration(manager, signature) }));
@@ -194,7 +195,7 @@ function extractRestoreAdmission() {
         exclusions: ['full native mount', 'OS Keychain/entitlements', 'device login', 'HTTP absence contract']
     }, null, 2) + '\n');
     // Outer-task diagnostics are source wiring checks, not a second implemented restore algorithm.
-    const restore = extractDeclaration(manager, '    func restoreNativeCheckpoint(');
+    const restore = extractDeclaration(manager, '    private func restoreNativeCheckpointWithCloudRead(');
     for (const required of ['restore result=joined reason=in_flight', 'restore result=joined_complete',
         'restore result=not_started reason=backoff', 'restore result=not_started reason=superseded',
         'stage=offline_restore reason=checkpoint_unavailable', 'self.nativeRestoreDocument(pulled,',

@@ -1393,6 +1393,23 @@ final class VortXSyncManager: ObservableObject {
         return ["nativeAccountBootstrap": "authenticated-empty-v1", "vortx": ["roster": roster, "rosterModified": 0]]
     }
 
+    /// An account created on the website has add-ons, keys and progress but no roster: the website never
+    /// writes `vortx.roster`, and no app has imported it yet (an imported account is typed owner history).
+    /// Admit it as the first device would with the same constant Main owner as an authenticated-empty seed,
+    /// so the legacy import runs. Any roster carrier, even an undecodable one, is never given a substitute.
+    private static func nativeWebOnlyAccountDocument(_ document: [String: Any]) throws -> [String: Any]? {
+        guard document["settings"] == nil, document["nativeSync"] == nil, document["nativeAccountBootstrap"] == nil,
+              document["vortx"] == nil || document["vortx"] is [String: Any] else { return nil }
+        var vortx = (document["vortx"] as? [String: Any]) ?? [:]
+        guard vortx["roster"] == nil, vortx["rosterModified"] == nil, vortx["profiles"] == nil else { return nil }
+        let owner = UserProfile(id: UserProfile.ownerID, name: "Main", avatar: "🍿", isOwner: true)
+        guard let roster = ProfileRosterSnapshot.wire([owner]) else { throw VortxNativeError.invalidSnapshot }
+        vortx["roster"] = roster; vortx["rosterModified"] = 0
+        var adopted = document
+        adopted["vortx"] = vortx
+        return adopted
+    }
+
     /// Never install a provisional owner before the server accepts its create-only seed. A
     /// rejected/ambiguous PUT is followed by authenticated readback, not a higher-version retry.
     private func publishDetachedNativeSeed(_ baseline: [String: Any], capture: CredentialScopeRegistry.Capture,
@@ -1581,7 +1598,11 @@ final class VortXSyncManager: ObservableObject {
         switch pulled {
         case .doc(let value, let version, let original, let observed):
             guard version >= lastSyncedVersion else { throw NativeRestoreAdmissionFailure.staleDocument }
-            document = value; plaintext = original; observation = observed
+            if let adopted = try Self.nativeWebOnlyAccountDocument(value) {
+                DiagnosticsLog.log("native-profiles", "restore admission=web_only_owner_seeded")
+                document = adopted
+            } else { document = value }
+            plaintext = original; observation = observed
         case .empty:
             let value: [String: Any]
             do { value = try nativeEmptyAccountDocument(capture: capture) }
