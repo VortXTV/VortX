@@ -97,6 +97,8 @@ class VortXBackupCasContractTest {
             .put("nativeSync", JSONObject().put("scope", "account.${account.id}").put("fixture", true))
         val bases = mutableListOf<Long?>()
         val versions = mutableListOf<Long>()
+        val writtenV2 = mutableListOf<Boolean>()
+        var cloudUsesV2 = true
         var puts = 0
         var gets = 0
         var beforePut: (suspend (Int) -> Unit)? = null
@@ -107,17 +109,20 @@ class VortXBackupCasContractTest {
                 if (method == "GET") {
                     gets++
                     revision?.let { version -> 200 to JSONObject().put("version", version).put("document",
-                        VortXCrypto.sealDocument(key, cloud.toString().toByteArray(), account.id, version, true)) } ?: (404 to null)
+                        VortXCrypto.sealDocument(key, cloud.toString().toByteArray(), account.id, version, cloudUsesV2)) } ?: (404 to null)
                 } else {
                     val request = requireNotNull(body)
                     check(request.has("baseRevision"))
                     val base = if (request.isNull("baseRevision")) null else request.getLong("baseRevision")
                     val version = request.getLong("version")
+                    val sealed = request.getString("document")
+                    val usesV2 = sealed.startsWith(VortXCrypto.DOC_V2_PREFIX)
+                    writtenV2 += usesV2
                     bases += base; versions += version; puts++
                     beforePut?.invoke(puts)
                     failPut ?: if (base == revision && version == BackupRevisionPolicy.next(base)) {
-                        cloud = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key,
-                            request.getString("document"), account.id, version))))
+                        cloud = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key, sealed, account.id, version))))
+                        cloudUsesV2 = usesV2
                         revision = version
                         if (loseAcceptedResponse) { loseAcceptedResponse = false; 0 to null }
                         else 200 to JSONObject().put("accepted", true)
@@ -130,6 +135,27 @@ class VortXBackupCasContractTest {
         suspend fun close() { manager.cancelSyncTestWork(); NativeProviderAccess.unbindForTest() }
     }
 
+    @Test fun `ordinary writes preserve the authenticated head format for this account`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        val versionBound = Fixture()
+        try {
+            assertTrue(versionBound.manager.syncUp())
+            assertEquals(listOf(true), versionBound.writtenV2)
+            assertTrue(versionBound.manager.syncUp())
+            assertEquals(listOf(true, true), versionBound.writtenV2)
+            versionBound.revision = null
+            assertFalse(versionBound.manager.syncUp())
+            assertEquals(listOf(true, true), versionBound.writtenV2)
+        } finally { versionBound.close(); Dispatchers.resetMain() }
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        val legacy = Fixture()
+        try {
+            legacy.cloudUsesV2 = false
+            assertTrue(legacy.manager.syncUp())
+            assertEquals(listOf(false), legacy.writtenV2)
+        } finally { legacy.close(); Dispatchers.resetMain() }
+    }
+
     @Test fun `native create and concurrent absent race retain exact existence witness`() = runBlocking {
         Dispatchers.setMain(UnconfinedTestDispatcher())
         val fixture = Fixture()
@@ -139,6 +165,7 @@ class VortXBackupCasContractTest {
             fixture.beforePut = { if (it == 1) { fixture.revision = 0; fixture.cloud.put("seedWinner", "keep") } }
             assertTrue(fixture.manager.syncUp())
             assertEquals(listOf(null, 0L), fixture.bases); assertEquals(listOf(0L, 1L), fixture.versions)
+            assertEquals(listOf(false, true), fixture.writtenV2)
             assertEquals("keep", fixture.cloud.getString("seedWinner"))
             assertEquals(1, fixture.gateway.acknowledgments)
         } finally { fixture.close(); Dispatchers.resetMain() }

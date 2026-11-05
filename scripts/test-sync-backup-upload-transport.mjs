@@ -26,17 +26,27 @@ const source = join(directory, 'ProductionUpload.swift');
 const readStart = manager.indexOf('    private func pullDocVersionedResult(');
 const readEnd = manager.indexOf('\n    }', readStart);
 assert(readStart >= 0 && readEnd > readStart);
-const readVerdict = manager.split('\n').find(line => line.includes('private enum VersionedPull'));
+function extractMethod(marker) {
+  const start = manager.indexOf(marker);
+  const end = manager.indexOf('\n    }', start);
+  assert(start >= 0 && end > start, marker);
+  return manager.slice(start, end + 6);
+}
+const readVerdict = extractMethod('    private enum VersionedPull {');
 const observation = xperienceInputs.observationProperty(manager);
 const observationSources = xperienceInputs.observationInputs(readFileSync(xperienceInputs.observationInputList, 'utf8'));
 writeFileSync(source, template.replace('    /* PRODUCTION_UPLOAD */', observation + '\n' + verdict + '\n' + manager.slice(start, end + 6)
-  + '\n' + readVerdict + '\n' + manager.slice(readStart, readEnd + 6)));
+  + '\n' + readVerdict + '\n' + manager.slice(readStart, readEnd + 6)
+  + '\n' + extractMethod('    private func openSyncDocument(')
+  + '\n' + extractMethod('    private static func decodeDecryptedSyncDocument(')));
 for (const native of [true, false]) {
   const binary = join(directory, native ? 'native-checks' : 'lite-checks');
   execFileSync('/usr/bin/nice', ['-n', '15', 'xcrun', 'swiftc', '-j', '1', '-num-threads', '1', '-whole-module-optimization', '-parse-as-library', '-swift-version', '6', '-strict-concurrency=complete',
     '-warnings-as-errors', ...(native ? ['-D', 'VORTX_NATIVE_DATA_ENGINE'] : []),
     ...observationSources,
     'app/SourcesShared/SyncBackupUploadFailure.swift', 'app/SourcesShared/SyncDocumentRevisionPolicy.swift',
+    'app/SourcesShared/VortXSyncCrypto.swift', 'app/SourcesShared/VortxNativeOwnerHistoryIngress.swift',
+    'app/SourcesShared/OwnerHistoryExactJSON.swift', 'app/SourcesShared/VortxProfileOverlayWitness.swift',
     source, '-o', binary], {stdio: 'inherit'});
   execFileSync(binary, [], {stdio: 'inherit'});
 }
