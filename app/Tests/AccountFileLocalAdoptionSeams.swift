@@ -335,6 +335,7 @@ enum SyncBackupUploadFailure { case upgradeRequired, other
     }
     private func rememberNativeBackup(capture: CredentialScopeRegistry.Capture) -> Bool { preconditionFailure("push acknowledgment entered") }
     private func acknowledgeNativeProviders(_ doc: [String: Any], capture: CredentialScopeRegistry.Capture) throws { preconditionFailure("push acknowledgment entered") }
+    private static func sawDocV2(_ account: String) -> Bool { false }
     private static func markSawDocV2(_ account: String) { preconditionFailure("push stamp entered") }
     private static func documentVersion(_ value: Any?) -> Int? { preconditionFailure("push rejection entered") }
     // @@ACTUAL_LOCAL_ADOPTION_MANAGER@@
