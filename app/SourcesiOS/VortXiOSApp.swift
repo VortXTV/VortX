@@ -36,13 +36,12 @@ final class MacSearchBridge: ObservableObject {
 /// by one on top of this shell.
 @main
 struct VortXiOSApp: App {
-    @StateObject private var account = StremioAccount()
-    @StateObject private var core = CoreBridge.shared
-    @StateObject private var sync = VortXSyncManager.shared
+    // Initialized only when the window mounts its account-backed shell.
+    private static let account = StremioAccount()
     @Environment(\.scenePhase) private var scenePhase
-    /// Launch splash gate (the brand pinwheel animation), matching Apple TV. Cleared when it finishes;
-    /// it covers the engine + embedded-server boot moment on iPhone, iPad, and Mac too.
-    @State private var splashDone = false
+    /// The account-backed shell mounts after the launch splash.
+    @State private var splashFinished = false
+    @State private var shellReady = false
 
     // macOS only: the embedded streaming server runs as a `node` CHILD PROCESS (MacNodeServer),
     // and Foundation does NOT kill that child when the app quits; it would be reparented to
@@ -120,27 +119,37 @@ struct VortXiOSApp: App {
         // Publish whether the user has their own usenet provider configured, so bare-NZB rows are tappable
         // from launch (before the Settings screen is ever opened). One Keychain read; no-op if unset.
         UsenetProviderStore.refreshAvailability()
+    }
+
+    private func startCore() {
         CoreBridge.shared.start()
         NSLog("%@", "[StremioX-iOS] stremio-core schema version = \(CoreBridge.shared.schemaVersion)")
     }
 
-    var body: some Scene {
-        WindowGroup {
-            iOSRootView(launchReady: splashDone)
+    private func startShellIfReady(_ phase: ScenePhase) {
+        guard splashFinished, !shellReady else { return }
+        #if os(macOS)
+        guard phase != .background else { return }
+        #else
+        guard phase == .active else { return }
+        #endif
+        startCore()
+        shellReady = true
+    }
+
+    private struct WindowShell: View {
+        let launchReady: Bool
+        let scenePhase: ScenePhase
+        @ObservedObject var account: StremioAccount
+        @StateObject private var core = CoreBridge.shared
+        @StateObject private var sync = VortXSyncManager.shared
+
+        var body: some View {
+            iOSRootView(launchReady: launchReady)
                 // ScenePhase's initial value does not necessarily emit a change on cold launch. Starting here
                 // closes that gap; UpdateChecker makes repeated root/scene calls idempotent and single-flight.
                 .onAppear { UpdateChecker.shared.startMonitoring() }
-                // Infuse reporting where the viewer stopped (its x-success callback to vortx://).
-                .onOpenURL { _ = InfuseReturnCoordinator.handle($0) }
                 .onValueChange(of: scenePhase) { phase in   // preserves the iOS 16 deployment floor
-                    // Termination evidence: keep the receipt's last-known phase current so the next
-                    // launch can distinguish a backgrounded jetsam kill from a foreground kill.
-                    switch phase {
-                    case .active: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseActive)
-                    case .inactive: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseInactive)
-                    case .background: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseBackground)
-                    @unknown default: break
-                    }
                     if phase == .active {
                         UpdateChecker.shared.startMonitoring()
                         InfuseReturnCoordinator.applyReturned()   // a position Infuse reported before VortX was ready
@@ -152,11 +161,6 @@ struct VortXiOSApp: App {
                         // per 30 minutes inside the actor, detached so it cannot delay this hook, and
                         // fail-soft by construction (refresh never throws and keeps last-good on any error).
                         Task.detached(priority: .utility) { await RemoteConfig.shared.refreshIfForegroundDue() }
-                        #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
-                        // The in-process engine server stops on background (below), so foreground restarts
-                        // it on a fresh ephemeral port; the player follows via StremioServer.embeddedPort.
-                        VortxNativeServer.startIfNeeded()
-                        #endif
                         Task {
                             await VortXSyncManager.shared.syncDown()      // pull other devices' changes on foreground
                             // Account-owns-everything: if the engine is degraded (no stream add-on),
@@ -172,11 +176,6 @@ struct VortXiOSApp: App {
                         UpdateChecker.shared.stopMonitoring()
                     }
                     if phase == .background {
-                        #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
-                        // Phase 8: stop the flag-gated in-process engine server on background (graceful
-                        // rqbit shutdown off-main); .active above restarts it. No-op while the flag is off.
-                        VortxNativeServer.stopOnBackground()
-                        #endif
                         // Drop the memoized YouTube-trailer range-proxy listener: iOS can reclaim its bound
                         // loopback port across a suspension, and the proxy caches the port once, so every hero
                         // preview trailer fails after a resume until it rebinds. proxied() rebinds lazily on the
@@ -210,6 +209,7 @@ struct VortXiOSApp: App {
                     // the first real foreground transition. Idempotent (guards isSignedIn + !realtimeActive)
                     // and it already performs an immediate syncDown().
                     VortXSyncManager.shared.startRealtime()
+                    InfuseReturnCoordinator.applyReturned()
                     DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
                         ProfileStore.shared.bootstrapSync()
                     }
@@ -266,41 +266,68 @@ struct VortXiOSApp: App {
                 // sheet. See MacRootProfileCoverOverlay / MacProfileCoverHost in PlatformModifiers.
                 .modifier(MacRootProfileCoverOverlay())
                 #endif
-                // Brand launch splash on top of everything (incl. the macOS player overlay) until its
-                // animation finishes, the iPhone/iPad/Mac twin of the tvOS RootTabView splash.
-                .overlay {
-                    if !splashDone {
-                        SplashView { splashDone = true }
-                            .ignoresSafeArea()
-                            .zIndex(100)
-                    }
-                }
                 .environmentObject(account)
                 .environmentObject(core)
                 .environmentObject(ThemeManager.shared)
                 .environmentObject(ProfileStore.shared)
                 .environmentObject(VortXSyncManager.shared)
-                .preferredColorScheme(.dark)
                 // Tint the whole scene so system chrome inside separately-presented sheets (SignIn /
                 // OpenLink) and the ProfileEditor cover renders the app accent, not system blue.
                 .tint(Theme.Palette.accent)
-                // Without a min frame the macOS WindowGroup adopts the root's tiny intrinsic size and
-                // opens as a postage-stamp window; pin a sensible minimum so it can't collapse. (iOS /
-                // iPadOS ignore this; their windows are managed by the system, not content size.)
-                #if os(macOS)
-                .frame(minWidth: 900, minHeight: 600)
-                // Resolve the single shared NSToolbar as hidden so updateLocations has nothing to
-                // insert into. Combined with .windowStyle(.hiddenTitleBar) below this removes the
-                // toolbar OBJECT the NSToolbar-insert crash requires, not just each item source.
-                .toolbar(.hidden, for: .windowToolbar)
-                // Traffic lights: hiddenTitleBar + the hidden window toolbar can leave the close /
-                // minimize / zoom buttons hidden with the collapsed titlebar host. This accessor keeps
-                // `.titled` in the styleMask and explicitly unhides the three standard buttons (and
-                // their container) so they float over the top-left of the full-size content, with NO
-                // NSToolbar ever attached.
-                .background(MacWindowChrome())
-                #endif
         }
+    }
+
+    private func windowContent() -> some View {
+        launchContent {
+            WindowShell(launchReady: shellReady, scenePhase: scenePhase, account: Self.account)
+        }
+        // Keep the URL receiver active while the shell is still unmounted.
+        .onOpenURL { url in
+            _ = InfuseReturnCoordinator.handle(url, applyImmediately: shellReady)
+        }
+        .onValueChange(of: splashFinished) { _ in startShellIfReady(scenePhase) }
+        .onValueChange(of: scenePhase) { phase in
+            // Keep termination evidence current even while the splash is on screen.
+            switch phase {
+            case .active: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseActive)
+            case .inactive: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseInactive)
+            case .background: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseBackground)
+            @unknown default: break
+            }
+            #if os(iOS) && !VORTX_NO_EMBEDDED_SERVER
+            // The in-process server starts before the shell, so handle suspension here as well.
+            if phase == .active { VortxNativeServer.startIfNeeded() }
+            if phase == .background { VortxNativeServer.stopOnBackground() }
+            #endif
+            startShellIfReady(phase)
+        }
+        .preferredColorScheme(.dark)
+        #if os(macOS)
+        .frame(minWidth: 900, minHeight: 600)
+        // Keep the existing hidden-toolbar workaround and traffic lights during both launch phases.
+        .toolbar(.hidden, for: .windowToolbar)
+        .background(MacWindowChrome())
+        #endif
+    }
+
+    @ViewBuilder private func launchContent<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        if shellReady {
+            content()
+        } else if splashFinished {
+            SplashView.canvas.ignoresSafeArea()
+        } else {
+            // Account initialization and checkpoint restoration can do synchronous work on the
+            // main actor. Start the core and mount the account-backed shell after the splash.
+            SplashView {
+                splashFinished = true
+            }
+            .ignoresSafeArea()
+            .visualEffectsRoot()
+        }
+    }
+
+    var body: some Scene {
+        WindowGroup { windowContent() }
         // macOS opens the window at a real default size (the deployment target is macOS 14, so
         // .defaultSize / .windowResizability, macOS 13+, are available), and .contentMinSize lets
         // the user shrink it only down to the root's min frame above, never to nothing.
