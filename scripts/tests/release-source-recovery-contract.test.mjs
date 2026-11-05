@@ -420,7 +420,7 @@ ${script(acceptance)}`], { encoding: 'utf8', env: { ...process.env, TVOS_TEST_ON
 codesign() { return 99; }
 python3() { printf '%s\\n' "$@"; }
 ${script(signing)}`], { encoding: 'utf8', env: { ...process.env, GITHUB_EVENT_NAME: 'workflow_dispatch',
-    GITHUB_REF: 'refs/tags/v0.5.6-beta.12-candidate.3', AETHER_RELEASE_PACKAGES: '/fixture packages',
+    GITHUB_REF: 'refs/tags/v0.5.6-startup-tools-test.1', AETHER_RELEASE_PACKAGES: '/fixture packages',
     AETHER_RELEASE_LOCK: '/fixture lock', AETHER_RELEASE_EVIDENCE: '/fixture evidence',
     AETHER_MACOS_SIGNING_PROOF: '/private proof/receipt.json' } });
   assert.equal(candidate.status, 0, candidate.stderr);

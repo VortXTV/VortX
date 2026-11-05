@@ -834,7 +834,7 @@ jobs:
           ruby ../scripts/native-apple-swift6-policy.rb VortX.xcodeproj native
 
       - name: Resolve pinned Apple Aether release packages
-        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3'
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-startup-tools-test.1'
         run: |
           set -euo pipefail
           jq -e '.inputs == {
@@ -1252,7 +1252,7 @@ jobs:
           # Signing can change normalized Mach-O load commands as well as signature blobs.
           # The accepted receipt must describe this final app; no later step may re-sign it.
           MAC_APP="app/build/ci-mac/Build/Products/Release/VortX.app"
-          if [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ] && [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.12-candidate.3 ]; then
+          if [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ] && [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-startup-tools-test.1 ]; then
             python3 scripts/verify-protected-apple-aether.py --sign-macos --key macos \
               --packages "$AETHER_RELEASE_PACKAGES" --lock "$AETHER_RELEASE_LOCK" \
               --resolution-receipt "$AETHER_RELEASE_EVIDENCE/aether-resolved.json" \
@@ -1287,7 +1287,7 @@ jobs:
           fi
 
       - name: Verify packaged Apple Aether linkage
-        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3'
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-startup-tools-test.1'
         run: |
           set -euo pipefail
           check_app() {
@@ -1550,7 +1550,7 @@ jobs:
           fi
 
       - name: Upload protected Apple Aether release evidence
-        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3'
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-startup-tools-test.1'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-Apple-Aether-release-evidence

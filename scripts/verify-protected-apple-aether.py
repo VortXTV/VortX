@@ -75,7 +75,7 @@ def identity():
     run_id = os.environ["GITHUB_RUN_ID"]
     attempt = os.environ["GITHUB_RUN_ATTEMPT"]
     require(os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch" and
-            ref == "refs/tags/v0.5.6-beta.12-candidate.3" and
+            ref == "refs/tags/v0.5.6-startup-tools-test.1" and
             re.fullmatch(r"[0-9a-f]{40}", source) and source == workflow == run("git", "rev-parse", "HEAD") and
             all(re.fullmatch(r"[1-9][0-9]*", value) for value in (run_id, attempt)),
             "Aether evidence requires the exact candidate workflow and checkout")
