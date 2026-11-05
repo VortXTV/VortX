@@ -36,21 +36,10 @@ struct ProfilePickerToolsView: View {
                         .font(Theme.Typography.body)
                         .foregroundStyle(Theme.Palette.textSecondary)
                     accountFileActions
-                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                        Text("Export diagnostic logs").font(Theme.Typography.eyebrow)
-                        DiagnosticLogExportButton(grant: route.diagnostics)
-                            .disabled(!route.diagnostics.permitsExport)
-                            #if os(tvOS)
-                            .focused($focused, equals: .diagnostics)
-                            #endif
-                        Text(route.diagnostics.permitsExport
-                            ? "Save a troubleshooting log to share with support. Review the file before sharing."
-                            : "Unlock a profile to export logs. This remains available when profiles fail to open.")
-                            .font(Theme.Typography.label)
-                            .foregroundStyle(Theme.Palette.textSecondary)
-                    }
-                    .toolsFocusSection()
-                    #if !os(macOS)
+                    #if !os(tvOS)
+                    diagnosticsSection
+                    #endif
+                    #if os(iOS)
                     backButton
                     #endif
                 }
@@ -61,7 +50,21 @@ struct ProfilePickerToolsView: View {
                 .frame(minHeight: geometry.size.height, alignment: .top)
                 #endif
             }
-            #if os(macOS)
+            #if os(tvOS)
+            // Keep diagnostics beside Back and directly above the first backup action. A remote
+            // should never have to cross a long stretch of nonfocusable instructions to get out.
+            .safeAreaInset(edge: .top, spacing: 0) {
+                HStack(spacing: Theme.Space.md) {
+                    backButton
+                    diagnosticsButton
+                }
+                .frame(maxWidth: 760, alignment: .leading)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, Theme.Space.sm)
+                .focusSection()
+                .background(Theme.Palette.canvas)
+            }
+            #elseif os(macOS)
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 backButton
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -116,6 +119,28 @@ struct ProfilePickerToolsView: View {
         .onExitCommand { close() }
         #endif
     }
+
+    private var diagnosticsButton: some View {
+        DiagnosticLogExportButton(grant: route.diagnostics)
+            .disabled(!route.diagnostics.permitsExport)
+            #if os(tvOS)
+            .focused($focused, equals: .diagnostics)
+            #endif
+    }
+
+    #if !os(tvOS)
+    private var diagnosticsSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            Text("Export diagnostic logs").font(Theme.Typography.eyebrow)
+            diagnosticsButton
+            Text(route.diagnostics.permitsExport
+                ? "Save a troubleshooting log to share with support. Review the file before sharing."
+                : "Unlock a profile to export logs. This remains available when profiles fail to open.")
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textSecondary)
+        }
+    }
+    #endif
 
     private var backButton: some View {
         Button("Back") { close() }

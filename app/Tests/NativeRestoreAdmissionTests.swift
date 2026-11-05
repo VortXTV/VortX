@@ -94,6 +94,7 @@ private struct SymmetricKey { init(data: Data) {} }
     var lastSyncedVersion = 0
     var account: Int? = 1
     var dataKey: Data? = Data(count: 32)
+    private var accountReconnectFailureCapture: CredentialScopeRegistry.Capture?
     static let owner = UserProfile(id: UserProfile.ownerID, name: "Fixture", avatar: "x", isOwner: true)
     static var resolvedRoster: ProfileRosterSnapshot? = .init(profiles: [owner])
     var seedCalls = 0
@@ -303,7 +304,9 @@ private struct SymmetricKey { init(data: Data) {} }
             (200, ["document": ""], "document_missing"),
             (200, ["document": encoded, "version": true], "version_invalid"),
             (200, ["document": encoded, "version": 0.5], "version_invalid"),
-            (200, ["document": "not-base64", "version": 1], "document_authentication_or_decode"),
+            (200, ["document": "not-base64", "version": 1], "document_open_refused"),
+            (200, ["document": Data(#"{"nativeSync":null}"#.utf8).base64EncodedString(), "version": 1],
+                "owner_history_admission_failed"),
             (304, nil, "conditional_response_invalid")]
         for (status, body, reason) in cases {
             let f = fresh(); f.reply = (status, body)

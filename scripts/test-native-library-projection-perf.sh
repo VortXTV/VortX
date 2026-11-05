@@ -95,6 +95,9 @@ const combined = (genreFacts + '\n' + fixture)
   .replace('// PRODUCTION_SOURCE_CHANGED_DELIVERY', sourceChangedHook[0] + '\n' + sourceHostChangeHook[0])
   .replace('// PRODUCTION_CURRENT_PUBLICATION', [member(current, 'private func makeChangeReceipt('),
     member(current, 'private func stageChanged('), member(current, 'private func publish(')].join('\n'))
+  .replace('// PRODUCTION_LIBRARY_LOAD', member(current, 'if name == "Load", model == "LibraryWithFilters", field == "library"'))
+  .replace('// PRODUCTION_LIBRARY_RECEIPT', ['private func begin(', 'private func fail(', 'func captureHostChange(',
+    'func acceptsChange('].map(marker => member(current, marker)).join('\n'))
   .replace('// PRODUCTION_CURRENT_MANAGEMENT', managementHelpers)
   .replace('// PRODUCTION_PRESENTATION_FIELDS', presentationFields[0])
   .replace('// PRODUCTION_CURRENT', markers.map(m => member(current, m)).join('\n'))

@@ -82,11 +82,19 @@ struct LibraryView: View {
     /// Active client-side type segment (Movies / TV / Anime); `.all` keeps the flat, mixed grid.
     @State private var segment: LibrarySegment = .all
     @State private var showAccountRecovery = false
+    @State private var libraryRetry = UUID()
+    @State private var unavailableLibraryRequest: LibraryLoadRequest?
     /// Active client-side smart filters (Unwatched / In Progress / Watched / Short); empty = no filtering.
     /// Multi-select and AND-combined; applied on top of the type segment and the engine's sort.
     @State private var activeFilters: Set<LibrarySmartFilter> = []
     @State private var genreChoice: LibraryGenreFilter.Choice = .all
     @State private var genreOwner: PlaybackMutationTarget?
+
+    private struct LibraryLoadRequest: Equatable {
+        let profileID: UUID?
+        let credential: CredentialScopeRegistry.Capture
+        let retry: UUID
+    }
 
     // BEGIN RANDOM PICK LIBRARY STATE
     @State private var randomLibrarySession = RandomPickPolicy.Session()
@@ -188,8 +196,7 @@ struct LibraryView: View {
                                 .padding(Theme.Space.xxl)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                             } else if account.isSignedIn || vortxSync.isSignedIn {
-                                BigSpinner()
-                                    .padding(Theme.Space.xxl).frame(maxWidth: .infinity)
+                                libraryLoadStatus
                             } else {
                                 CoreEmptyState.signedOut
                             }
@@ -277,9 +284,44 @@ struct LibraryView: View {
         // END RANDOM PICK LIBRARY LIFECYCLE
         // Reload while empty: the library syncs from the API asynchronously after sign-in, so the
         // first load can land before ctx.library is populated. Revisiting the tab refills it.
-        .onAppear { resetGenreOwnerIfNeeded(); if core.library?.catalog.isEmpty != false { core.loadLibrary() }; seed() }
+        .onAppear { resetGenreOwnerIfNeeded(); if core.library?.catalog.isEmpty == true { core.loadLibrary() }; seed() }
         .onChange(of: core.library?.catalog.first?.id) { seed() }
         .onChange(of: profiles.activeID) { seed() }
+    }
+
+    private var libraryLoadStatus: some View {
+        let request = LibraryLoadRequest(profileID: profiles.activeID,
+            credential: CredentialScopeRegistry.shared.capture(), retry: libraryRetry)
+        return Group {
+            if unavailableLibraryRequest == request {
+                VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                    Text("Library hasn’t loaded yet.").font(Theme.Typography.body.weight(.semibold))
+                    Button("Retry library") { libraryRetry = UUID() }.buttonStyle(ChipButtonStyle())
+                    Button("Account settings") { showAccountRecovery = true }.buttonStyle(ChipButtonStyle())
+                    DiagnosticLogExportButton()
+                }
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                BigSpinner().frame(maxWidth: .infinity)
+            }
+        }
+        .padding(Theme.Space.xxl)
+        .task(id: request) {
+            // A read can land before the native account projection is mounted. Retry once
+            // within the same profile and credential instead of spinning until the tab is left.
+            for _ in 0..<2 {
+                guard !Task.isCancelled, request.retry == libraryRetry,
+                      request.profileID == profiles.activeID,
+                      CredentialScopeRegistry.shared.isCurrent(request.credential) else { return }
+                await core.loadLibraryAndAwait()
+                if core.library != nil { return }
+            }
+            guard !Task.isCancelled, request.retry == libraryRetry,
+                  request.profileID == profiles.activeID,
+                  CredentialScopeRegistry.shared.isCurrent(request.credential) else { return }
+            unavailableLibraryRequest = request
+        }
     }
 
 
