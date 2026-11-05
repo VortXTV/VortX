@@ -69,7 +69,7 @@ let stremioCard = source("SourcesShared/StremioConnectCard.swift")
 let accountSource = source("SourcesShared/StremioAccount.swift")
 let syncSource = source("SourcesShared/VortXSyncManager.swift")
 let nativeIngress = section(syncSource, from: "private static func decodeDecryptedSyncDocument", until: "/// DEPRECATED single-state pull")
-check(nativeIngress.contains("VortxProfileOverlayWitness.decodeObject(json: plaintext)")
+check(nativeIngress.contains("VortxProfileOverlayWitness.decodeAccountObject(json: plaintext)")
       && syncSource.components(separatedBy: "Self.decodeDecryptedSyncDocument(pt)").count == 4,
       "all decrypted native pull paths reject original duplicate/unsafe numeric JSON before Foundation projection")
 let profileSource = source("SourcesShared/Profiles.swift")

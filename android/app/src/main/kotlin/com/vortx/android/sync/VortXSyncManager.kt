@@ -2492,7 +2492,6 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                     lease.accountId,
                     maxOf(version, syncState.lastVersion(lease.accountId)),
                 )
-            if (persisted && writeSyncDocV2) markSawDocV2(lease.accountId)
         } && persisted
     }
 
@@ -3172,12 +3171,16 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         if (!candidateHealthIsCurrent(lease, candidate) || requiresUpgrade(lease)) return PushOutcome.Error
         val version = BackupRevisionPolicy.next(candidate.witness.baseRevision) ?: return PushOutcome.Error
         val plaintext = candidate.plaintext.toByteArray(Charsets.UTF_8)
+        // An authenticated v2 head stays v2 even while upgrades of legacy accounts are disabled.
+        val requiresV2 = sawDocV2(lease.accountId)
+        if (requiresV2 && candidate.witness.baseRevision == null) return PushOutcome.Error
+        val writeV2 = writeSyncDocV2 || requiresV2
         val ciphertext = VortXCrypto.sealDocument(
             lease.dataKeyCopy(),
             plaintext,
             lease.accountId,
             version,
-            writeSyncDocV2,
+            writeV2,
         )
             ?: return PushOutcome.Error
         if (!candidateHealthIsCurrent(lease, candidate)) return PushOutcome.Error
@@ -3190,7 +3193,10 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             body,
             bearerToken = lease.token,
             callPermit = callPermit,
-            candidateCurrent = { candidateIsCurrent(lease, candidate) },
+            candidateCurrent = {
+                candidateIsCurrent(lease, candidate) &&
+                    (!sawDocV2(lease.accountId) || (writeV2 && candidate.witness.baseRevision != null))
+            },
         )
         if (!candidateHealthIsCurrent(lease, candidate)) return PushOutcome.Error
         // The terminal status remains authoritative even if its error body was lost/malformed.
@@ -3204,7 +3210,10 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         if (accepted) {
             var remembered = false
             if (withCandidateSession(candidate) { publishIfSyncLeaseCurrent(lease) {
-                if (candidateIsCurrent(lease, candidate)) remembered = syncState.markNativeBackupSeen(lease.accountId)
+                if (candidateIsCurrent(lease, candidate)) {
+                    if (writeV2) markSawDocV2(lease.accountId)
+                    remembered = syncState.markNativeBackupSeen(lease.accountId)
+                }
             } } != true || !remembered) return PushOutcome.Error
             // Native acceptance is not yet a completed local transaction (seed apply, host and
             // credential receipts can still fail). Its caller stamps only after those all succeed.
