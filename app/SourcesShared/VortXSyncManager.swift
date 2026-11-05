@@ -4440,6 +4440,9 @@ final class VortXSyncManager: ObservableObject {
             case documentMissing = "document_missing"
             case versionInvalid = "version_invalid"
             case backupMarkerUnavailable = "backup_marker_unavailable"
+            case documentOpenRefused = "document_open_refused"
+            case ownerHistoryAdmissionFailed = "owner_history_admission_failed"
+            case legacyDocumentDecodeFailed = "legacy_document_decode_failed"
         }
         func failed(_ reason: FailureReason) -> VersionedPull {
             DiagnosticsLog.log("sync", "operation=pull result=failed reason=\(reason.rawValue)")
@@ -4487,8 +4490,7 @@ final class VortXSyncManager: ObservableObject {
         // A doc we cannot open is NOT an empty account. Refusing it (rather than falling through to a nil that
         // reads as "nothing there") is what keeps a decrypt-miss / ratchet refusal from being pushed over.
         guard let pt = openSyncDocument(docStr, version: version) else {
-            DiagnosticsLog.log("sync", "operation=pull result=failed reason=document_authentication_or_decode")
-            return .failed(retryable: false)
+            return failed(.documentOpenRefused)
         }
         do {
             if try await VortxNativeOwnerHistoryIngress.shared.requiresTypedRoute(pt) {
@@ -4498,13 +4500,11 @@ final class VortXSyncManager: ObservableObject {
                 return .ownerHistory(plaintext: pt, version: version, observation: observation)
             }
         } catch {
-            DiagnosticsLog.log("sync", "operation=pull result=failed reason=document_authentication_or_decode")
-            return .failed(retryable: false)
+            return failed(.ownerHistoryAdmissionFailed)
         }
         guard isCurrent(capture), dataKey == originalKey else { return failed(.superseded) }
         guard let obj = try? Self.decodeDecryptedSyncDocument(pt) else {
-            DiagnosticsLog.log("sync", "operation=pull result=failed reason=document_authentication_or_decode")
-            return .failed(retryable: false)
+            return failed(.legacyDocumentDecodeFailed)
         }
         guard rememberNativeBackup(capture: capture) else { return failed(.backupMarkerUnavailable) }
         return .doc(doc: obj, version: version, plaintext: pt, observation: observation)

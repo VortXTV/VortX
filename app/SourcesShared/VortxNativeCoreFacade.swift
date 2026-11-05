@@ -1805,9 +1805,14 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         }
         if name == "Load", model == "LibraryWithFilters", field == "library" {
             let request = action["args"]?["args"]?["request"]
-            guard let state = values["native_state"], let value = libraryProjection(state: state, request: request),
-                  let ticket = begin(field) else { return fail("unsupported_library_filter") }
+            guard let state = values["native_state"], let value = libraryProjection(state: state, request: request) else {
+                return fail("unsupported_library_filter")
+            }
+            // An equal read must leave the original host receipt current. The bridge decodes
+            // that receipt off-main, and an equal replacement emits no legacy field callback.
             libraryRequest = request
+            if values[field] == value { failure = nil; return true }
+            guard let ticket = begin(field) else { return fail("unsupported_library_filter") }
             publish([field: value], field: field, ticket: ticket); return true
         }
         if name == "Load", model == "LocalSearch", field == "local_search" {
