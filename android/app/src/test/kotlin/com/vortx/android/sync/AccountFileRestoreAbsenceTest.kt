@@ -4,6 +4,7 @@ import com.vortx.android.engine.AccountFileLocalPresence
 import com.vortx.android.engine.VortxAccountScope
 import com.vortx.android.engine.VortxEncryptedCheckpointStore
 import com.vortx.android.engine.boundedCompleteRestoreAliases
+import com.vortx.android.engine.readVettedNamedCheckpointKey
 import com.vortx.android.engine.supportsCompleteRestoreAliasInventory
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.security.CredentialBackend
@@ -143,6 +144,123 @@ class AccountFileRestoreAbsenceTest {
         val uncertain = File(directory, "native-checkpoint-staged.pending").apply { writeBytes(ByteArray(28)) }
         assertEquals(AccountFileLocalPresence.UNAVAILABLE, store.inspectRestoreAbsence(target, { appAliases }) { null })
         assertTrue(uncertain.isFile)
+    }
+
+    @Test fun websiteRosterNamedKeyProbeRejectsUnknownProvidersAndLookupErrors() = withDirectory { directory ->
+        val store = store(directory)
+        val provider = "android.security.keystore2.AndroidKeyStoreProvider"
+        val service = "android.security.keystore2.AndroidKeyStoreSpi"
+        var directReads = 0
+        var metadataReads = 0
+        fun inspect(sdk: Int, providerClass: String?, spi: String?,
+                    direct: () -> java.security.Key?, metadata: () -> Boolean = { false }) =
+            store.inspectWebsiteRosterAbsence(target) {
+                readVettedNamedCheckpointKey(sdk, providerClass, spi,
+                    directGetKey = { directReads++; direct() }, aliasPresent = { metadataReads++; metadata() })
+            }
+        for ((sdk, providerClass, spi) in listOf(
+            Triple(30, provider, service),
+            Triple(31, "android.security.keystore.AndroidKeyStoreProvider", service),
+            Triple(34, provider, "unverified.KeyStoreSpi"),
+            Triple(34, null, null),
+        )) {
+            assertEquals(AccountFileLocalPresence.UNAVAILABLE, inspect(sdk, providerClass, spi, { null }))
+        }
+        assertEquals(0, directReads)
+        assertEquals(0, metadataReads)
+        val unavailable = java.security.UnrecoverableKeyException("synthetic service failure")
+        assertEquals(AccountFileLocalPresence.UNAVAILABLE, inspect(31, provider, service, { throw unavailable }))
+        assertEquals(1, directReads)
+        assertEquals(0, metadataReads)
+        assertEquals(AccountFileLocalPresence.UNAVAILABLE, inspect(31, provider, service, { null }, { true }))
+        assertEquals(1, metadataReads)
+        assertEquals(AccountFileLocalPresence.UNAVAILABLE,
+            inspect(31, provider, service, { SecretKeySpec(ByteArray(32), "HmacSHA256") }))
+        assertEquals(AccountFileLocalPresence.PRESENT, inspect(31, provider, service, { key }))
+        assertEquals(AccountFileLocalPresence.ABSENT, inspect(31, provider, service, { null }))
+        assertTrue(directory.listFiles()!!.isEmpty())
+    }
+
+    @Test fun websiteRosterChecksKnownTargetKeysTwiceWithoutCreatingStorage() = withDirectory { parent ->
+        val path = File(parent, "website-native-state")
+        val store = store(path)
+        val expected = setOf(target, target.copy(ownerProfileID = target.ownerProfileID.lowercase()),
+            locatorDomain(target), preflightDomain(target))
+        val lookups = mutableListOf<VortxAccountScope>()
+        assertEquals(AccountFileLocalPresence.ABSENT, store.inspectWebsiteRosterAbsence(target) {
+            lookups += it
+            null
+        })
+        assertEquals(expected, lookups.toSet())
+        assertEquals(expected.size * 2, lookups.size)
+        assertTrue(expected.all { scope -> lookups.count { it == scope } == 2 })
+        assertFalse(path.exists())
+        for (occupied in expected) {
+            assertEquals(AccountFileLocalPresence.PRESENT,
+                store.inspectWebsiteRosterAbsence(target) { if (it == occupied) key else null })
+        }
+        assertEquals(AccountFileLocalPresence.UNAVAILABLE,
+            store.inspectWebsiteRosterAbsence(target) { error("synthetic key unavailable") })
+        var reads = 0
+        assertEquals(AccountFileLocalPresence.PRESENT, store.inspectWebsiteRosterAbsence(target) {
+            if (it == target && ++reads == 2) key else null
+        })
+        assertFalse(path.exists())
+    }
+
+    @Test fun websiteRosterRefusesTargetFilesInterruptedStorageAndSymlinks() = withDirectory { directory ->
+        val store = store(directory)
+        for (name in listOf(stateFile(target), locatorFile(target), preflightFile(target), "unknown-${target.digest}.old")) {
+            val file = File(directory, name).apply { writeBytes(byteArrayOf(1)) }
+            assertEquals(AccountFileLocalPresence.PRESENT, store.inspectWebsiteRosterAbsence(target) {
+                throw AssertionError("Target file must refuse before key lookup")
+            })
+            assertTrue(file.delete())
+        }
+        for (name in listOf("native-checkpoint-incomplete.pending", "unknown-entry", stateFile(foreign))) {
+            val file = File(directory, name).apply { writeBytes(ByteArray(28)) }
+            assertEquals(AccountFileLocalPresence.UNAVAILABLE, store.inspectWebsiteRosterAbsence(target) { null })
+            assertTrue(file.delete())
+        }
+        val link = File(directory, locatorFile(foreign)).toPath()
+        Files.createSymbolicLink(link, File(directory, "missing-file").toPath())
+        assertEquals(AccountFileLocalPresence.UNAVAILABLE, store.inspectWebsiteRosterAbsence(target) { null })
+        assertTrue(Files.deleteIfExists(link))
+    }
+
+    @Test fun websiteRosterAuthenticatesForeignFilesAndRefusesAChangedInventory() = withDirectory { directory ->
+        val store = store(directory)
+        val checkpoint = File(directory, stateFile(foreign))
+        val locator = File(directory, locatorFile(foreign))
+        val preflight = File(directory, preflightFile(foreign))
+        val locatorScope = locatorDomain(foreign)
+        val preflightScope = preflightDomain(foreign)
+        val lookup: (VortxAccountScope) -> SecretKey? = { if (it in setOf(foreign, locatorScope, preflightScope)) key else null }
+        val owner = foreign.ownerProfileID
+        val state = """{"roster":{"profiles":{"$owner":{"id":"$owner","owner":true,"deleted":false}}},"activeProfileId":"$owner","libraries":{"$owner":{}},"nativeSync":{"schemaVersion":1,"scope":"${foreign.accountID}","ownerProfileId":"$owner","profiles":{},"addons":{},"libraries":{},"watches":{}}}"""
+        val inner = """{"format":"vortx-native-preflight-v1","id":"44444444-4444-4444-4444-444444444444","scope":"${foreign.accountID}","ownerProfileId":"$owner","hostArchive":{"document":{},"excludedCredentialPaths":[]},"ownCandidates":[]}"""
+        fun preflightEnvelope(raw: ByteArray): ByteArray {
+            val payload = Base64.getEncoder().encodeToString(raw)
+            return seal(preflightScope, descriptor(foreign).dropLast(1) + ""","sealedPayload":"$payload"}""", key)
+        }
+        locator.writeBytes(seal(locatorScope, descriptor(foreign), key))
+        checkpoint.writeBytes(seal(foreign, state, key))
+        preflight.writeBytes(preflightEnvelope(seal(foreign, inner, key)))
+        assertEquals(AccountFileLocalPresence.ABSENT, store.inspectWebsiteRosterAbsence(target, lookup))
+        assertEquals(AccountFileLocalPresence.UNAVAILABLE,
+            store.inspectWebsiteRosterAbsence(target) { if (it == foreign) null else lookup(it) })
+        checkpoint.writeBytes(seal(foreign, "{}", key))
+        assertEquals(AccountFileLocalPresence.UNAVAILABLE, store.inspectWebsiteRosterAbsence(target, lookup))
+        checkpoint.writeBytes(seal(foreign, state, key))
+        preflight.writeBytes(preflightEnvelope(ByteArray(28)))
+        assertEquals(AccountFileLocalPresence.UNAVAILABLE, store.inspectWebsiteRosterAbsence(target, lookup))
+        preflight.writeBytes(preflightEnvelope(seal(foreign, inner, key)))
+        val intervening = File(directory, "native-checkpoint-intervening.pending")
+        assertEquals(AccountFileLocalPresence.UNAVAILABLE, store.inspectWebsiteRosterAbsence(target) {
+            if (it == foreign) intervening.writeBytes(ByteArray(28))
+            lookup(it)
+        })
+        assertTrue(intervening.isFile)
     }
 
     @Test fun securePresenceOnlyWaivesInertRecordsThatMatchObservedBacking() {
