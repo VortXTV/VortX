@@ -174,7 +174,7 @@ function extractRestoreAdmission() {
         '    private func authorizedWebsiteAccountAdoption(', '    private enum NativeRestoreAdmissionFailure:',
         '    private struct NativeRestoreDocument {', '    private func nativeRestoreDocument(',
         '    private enum VersionedPull {', '    private func pullDocVersionedResult(',
-        '    private func clearAccountReconnectFailure('
+        '    private func clearAccountReconnectFailure(', '    enum AccountDataProbe:', '    func accountHasSyncData('
     ].map(signature => ({ signature, bytes: extractDeclaration(manager, signature) }));
     const propertiesStart = manager.indexOf('    private static let nativeObservedBackupAccountLimit =');
     const propertiesEnd = manager.indexOf('    private func nativeBackupHistory(', propertiesStart);

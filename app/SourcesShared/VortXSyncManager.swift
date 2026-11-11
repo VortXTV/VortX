@@ -6564,21 +6564,20 @@ final class VortXSyncManager: ObservableObject {
 
     enum SignInReconcile: Equatable { case seededFromDevice, hasAccountData, unreachable }
 
-    /// Tri-state probe: does the account already hold synced data (so a sign-in is a merge/conflict,
-    /// not a seed)? Built on pullSyncDocResult() instead of the nil-collapsing pullSyncDoc() so "the
-    /// pull FAILED" surfaces as a distinct `.unreachable`: the old Bool collapsed a network blip into
-    /// "no data", which routed reconcileAfterSignIn into `.seededFromDevice`, whose syncUp could push
-    /// this device over an account doc that was never actually read.
+    /// Only an authenticated absence can enter the sign-in seed path. Website accounts can hold
+    /// add-ons and progress before the first app publishes a profile roster or settings.
     enum AccountDataProbe: Equatable { case hasData, empty, unreachable }
     func accountHasSyncData() async -> AccountDataProbe {
         let capture = credentialAuthority.capture()
         guard isSignedIn, isCurrent(capture) else { return .unreachable }
-        switch await pullSyncDocResult(credentialCapture: capture) {
-        case .failed: return .unreachable
-        case .empty: return isCurrent(capture) ? .empty : .unreachable
-        case .doc(let doc):
-            guard isCurrent(capture) else { return .unreachable }
-            return (doc["settings"] != nil || doc["apiKeys"] != nil) ? .hasData : .empty
+        let key = dataKey
+        let pulled = await pullDocVersionedResult(credentialCapture: capture)
+        guard isCurrent(capture), dataKey == key, !Task.isCancelled else { return .unreachable }
+        switch pulled {
+        case .doc(_, let revision, _, _), .ownerHistory(_, let revision, _):
+            return revision >= lastSyncedVersion ? .hasData : .unreachable
+        case .empty: return .empty
+        case .failed, .unchanged: return .unreachable
         }
     }
 

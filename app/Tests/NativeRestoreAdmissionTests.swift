@@ -103,6 +103,7 @@ private struct VortxAccountScope {
     var nativeCheckpointGeneration = UUID()
     var lastSyncedVersion = 0
     var account: Int? = 1
+    var isSignedIn: Bool { account != nil }
     var dataKey: Data? = Data(count: 32)
     private var accountReconnectFailureCapture: CredentialScopeRegistry.Capture?
     static let owner = UserProfile(id: UserProfile.ownerID, name: "Fixture", avatar: "x", isOwner: true)
@@ -437,8 +438,40 @@ private struct VortxAccountScope {
             check(typed.seedCalls == 0, "typed response cannot enter a generic mount or empty seed fallback")
         } else { preconditionFailure("typed route was not retained") }
     }
+    static func accountDataProbeCases() async {
+        let storedDocuments = [#"{"addons":[]}"#, #"{"webProgress":{"owner":[]}}"#,
+            #"{"vortx":{"roster":[]}}"#, "{}",
+            #"{"nativeSync":{"schemaVersion":6,"ownerHistory":{}}}"#]
+        for document in storedDocuments {
+            let f = fresh()
+            f.reply = (200, ["document": Data(document.utf8).base64EncodedString(), "version": 7])
+            let probe = await f.accountHasSyncData()
+            check(probe == .hasData && f.requests == 1 && f.seedCalls == 0,
+                  "authenticated stored account data takes the existing-account path")
+        }
+        let absent = fresh()
+        let absentProbe = await absent.accountHasSyncData()
+        check(absentProbe == .empty && absent.requests == 1, "authenticated absence can seed")
+        for status in [0, 304, 401, 500] {
+            let f = fresh(); f.reply = (status, nil)
+            let probe = await f.accountHasSyncData()
+            check(probe == .unreachable, "failed or unsolicited conditional response cannot seed")
+        }
+        let stale = fresh(); stale.lastSyncedVersion = 8
+        stale.reply = (200, ["document": Data("{}".utf8).base64EncodedString(), "version": 7])
+        let staleProbe = await stale.accountHasSyncData()
+        check(staleProbe == .unreachable, "older stored account revision is not sign-in evidence")
+        let replaced = fresh()
+        replaced.whileReading = { replaced.credentialAuthority.replace("other") }
+        let replacedProbe = await replaced.accountHasSyncData()
+        check(replacedProbe == .unreachable, "absence cannot seed a replacement sign-in")
+        let rekeyed = fresh()
+        rekeyed.whileReading = { rekeyed.dataKey = Data(repeating: 1, count: 32) }
+        let rekeyedProbe = await rekeyed.accountHasSyncData()
+        check(rekeyedProbe == .unreachable, "absence cannot seed using a replacement data key")
+    }
     static func run() async throws {
-        markerCases(); try await admissionCases(); await pullCases()
+        markerCases(); try await admissionCases(); await pullCases(); await accountDataProbeCases()
         print("Native restore admission: \(checks) focused checks passed; no device/login or full mount proof")
     }
 }
