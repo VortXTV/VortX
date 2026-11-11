@@ -1,587 +1,74 @@
-name: Source and subtitle contracts
-on:
-  pull_request:
-    paths:
-      - "app/**"
-      - "webapp/**"
-      - "scripts/test-subtitle-source-contracts.sh"
-      - "scripts/test-apple-playback-recovery.sh"
-      - "scripts/test-playback-title-queue.sh"
-      - "scripts/test-native-qr-join.cjs"
-      - "scripts/native-migration-supervisor.cjs"
-      - "scripts/test-profile-selection-read.sh"
-      - "scripts/test-native-facade-lock.sh"
-      - "test/native-facade-lock.mjs"
-      - "scripts/test-legacy-profile-recovery.sh"
-      - "scripts/test-native-playback-snapshot.sh"
-      - "scripts/test-native-library-projection-perf.sh"
-      - "scripts/test-avplayer-recovery-settlement.sh"
-      - "scripts/test-player-skip-chrome.sh"
-      - "scripts/test-apple-playback-profile-lifecycle.sh"
-      - "scripts/test-landscape-backdrop-cache.sh"
-      - "scripts/test-native-transport.sh"
-      - "scripts/test-apple-usenet-admission.sh"
-      - "scripts/test-apple-nzb-operation.sh"
-      - "test/native-transport-redirect.py"
-      - "test/apple-nzb-operation-http.py"
-      - "scripts/test-tv-search-collections.sh"
-      - "scripts/test-addon-selfhosted.sh"
-      - "scripts/test-addon-mutation-failure-presentation.sh"
-      - "scripts/test-apple-parity-contracts.sh"
-      - "scripts/test-source-title-match.sh"
-      - "scripts/test-aether-playback-boundary.sh"
-      - "scripts/test-aether-engine-picker.sh"
-      - "scripts/embed-aether-frameworks.sh"
-      - "scripts/tests/test_embed_aether_permissions.py"
-      - "scripts/build-aether-dovi-tv-simulator.sh"
-      - "scripts/aether-dovi-provider.py"
-      - "scripts/verify-aether-dovi-processed.py"
-      - "scripts/tests/test_aether_dovi_provider.py"
-      - "test/fixtures/source-title-match.json"
-      - "scripts/test-apple-player-timeline.sh"
-      - "scripts/test-issue240-playback-failures.sh"
-      - "scripts/test-source-continuity-and-seek-intent.sh"
-      - "scripts/test-hls-seek-producer-gate.sh"
-      - "scripts/test-hls-startup-reservation.sh"
-      - "scripts/test-mpv-seek-settlement.sh"
-      - "scripts/test-mpv-manual-subtitle-retirement.sh"
-      - "scripts/test-avplayer-subtitle-clock.sh"
-      - "scripts/test-subtitle-mount-owner.sh"
-      - "test/subtitle-mount-owner-fixture.cjs"
-      - "scripts/test-subtitle-timing-policy.sh"
-      - "scripts/test-sync-derived-document-revisions.sh"
-      - "scripts/test-sync-candidate-read-fence.mjs"
-      - "scripts/test-native-bootstrap-archive.sh"
-      - "scripts/test-account-backup-file.sh"
-      - "scripts/test-account-file-access.sh"
-      - "scripts/test-profile-picker-account.sh"
-      - "scripts/test-profile-picker-tools.sh"
-      - "scripts/test-profile-picker-tools-transfer.sh"
-      - "scripts/test-profile-picker-tools-lan-adapter.sh"
-      - "scripts/test-profile-picker-tools-tv-composition.sh"
-      - "scripts/test-profile-picker-tools-ui-typecheck.py"
-      - "scripts/test-account-file-restore-manager.sh"
-      - "scripts/test-account-file-local-adoption.sh"
-      - "scripts/test-account-provider-sync-settlement.sh"
-      - "scripts/run-account-provider-sync-settlement.py"
-      - "test/account-provider-sync-settlement-inputs.cjs"
-      - "scripts/run-account-file-local-adoption.py"
-      - "test/account-file-local-adoption-inputs.cjs"
-      - "scripts/run-account-file-restore-manager.py"
-      - "test/account-file-restore-manager-inputs.cjs"
-      - "scripts/test-account-authentication-lifecycle.sh"
-      - "scripts/test-profile-roster-propagation.sh"
-      - "scripts/test-profile-picker-public-seed.sh"
-      - "test/android-profile-picker-startup.test.mjs"
-      - "scripts/test-cw-service-selection.sh"
-      - "scripts/test-home-cw-selection.sh"
-      - "scripts/test-cw-worker-currentness.sh"
-      - "scripts/test-series-sticky-ownership.sh"
-      - "scripts/test-loopback-playback-assertion.sh"
-      - "scripts/test-addon-stream-publication.sh"
-      - "scripts/test-native-preference-acknowledgement.sh"
-      - "scripts/test-binge-language-continuity.sh"
-      - "scripts/test-ranking-cache-concurrency.sh"
-      - "test/mpv-bounded-child.mjs"
-      - "test/cw-worker-currentness.mjs"
-      - "test/cw-profile-fixture.cjs"
-      - "test/xperience-harness-inputs.cjs"
-      - "scripts/test-episode-source-isolation.sh"
-      - "scripts/test-next-preparation-attempt.sh"
-      - "test/apple-player-timeline-boundaries.test.js"
-      - "test/apple-session-renewal/**"
-      - "test/native-callback-generation.mjs"
-      - "scripts/test-release-orchestration-contracts.sh"
-      - "scripts/test-android-native-release-contracts.sh"
-      - "scripts/test-android-native-sync-host.sh"
-      - "android/native-sync-hosted.init.gradle"
-      - "scripts/test-android-native-selection.sh"
-      - "scripts/fixtures/android-native-selection.gradle"
-      - "scripts/build-stub-engine-xcframeworks.sh"
-      - "scripts/verify-native-engine-abi.sh"
-      - "scripts/verify-native-android-artifacts.sh"
-      - "scripts/tests/release-source-recovery-contract.test.mjs"
-      - "scripts/generate-native-apple-project.rb"
-      - "scripts/native-apple-swift6-policy.rb"
-      - "scripts/test-native-apple-project.rb"
-      - "scripts/verify-native-apple-package.py"
-      - "scripts/tests/test_native_apple_package.py"
-      - "scripts/build-ffi-xcframework.sh"
-      - "scripts/build-mac-server.sh"
-      - "scripts/tests/test_native_builder_startup.py"
-      - "scripts/tests/test_release_native_snapshot_argv.py"
-      - "scripts/verify-android-release-version.sh"
-      - "scripts/tests/test_android_release_version.py"
-      - "scripts/tests/test_tv_hidden_up_reveal.py"
-      - "workers/vortx-appcast/**"
-      - "android/**/*.gradle.kts"
-      - ".github/workflows/**"
-  push:
-    branches: [main]
-    paths:
-      - "app/**"
-      - "webapp/**"
-      - "scripts/test-subtitle-source-contracts.sh"
-      - "scripts/test-apple-playback-recovery.sh"
-      - "scripts/test-playback-title-queue.sh"
-      - "scripts/test-native-qr-join.cjs"
-      - "scripts/native-migration-supervisor.cjs"
-      - "scripts/test-profile-selection-read.sh"
-      - "scripts/test-native-facade-lock.sh"
-      - "test/native-facade-lock.mjs"
-      - "scripts/test-legacy-profile-recovery.sh"
-      - "scripts/test-native-playback-snapshot.sh"
-      - "scripts/test-native-library-projection-perf.sh"
-      - "scripts/test-avplayer-recovery-settlement.sh"
-      - "scripts/test-player-skip-chrome.sh"
-      - "scripts/test-apple-playback-profile-lifecycle.sh"
-      - "scripts/test-landscape-backdrop-cache.sh"
-      - "scripts/test-native-transport.sh"
-      - "scripts/test-apple-usenet-admission.sh"
-      - "scripts/test-apple-nzb-operation.sh"
-      - "test/native-transport-redirect.py"
-      - "test/apple-nzb-operation-http.py"
-      - "scripts/test-tv-search-collections.sh"
-      - "scripts/test-addon-selfhosted.sh"
-      - "scripts/test-addon-mutation-failure-presentation.sh"
-      - "scripts/test-apple-parity-contracts.sh"
-      - "scripts/test-source-title-match.sh"
-      - "scripts/test-aether-playback-boundary.sh"
-      - "scripts/test-aether-engine-picker.sh"
-      - "scripts/embed-aether-frameworks.sh"
-      - "scripts/tests/test_embed_aether_permissions.py"
-      - "scripts/build-aether-dovi-tv-simulator.sh"
-      - "scripts/aether-dovi-provider.py"
-      - "scripts/verify-aether-dovi-processed.py"
-      - "scripts/tests/test_aether_dovi_provider.py"
-      - "test/fixtures/source-title-match.json"
-      - "scripts/test-apple-player-timeline.sh"
-      - "scripts/test-issue240-playback-failures.sh"
-      - "scripts/test-source-continuity-and-seek-intent.sh"
-      - "scripts/test-hls-seek-producer-gate.sh"
-      - "scripts/test-hls-startup-reservation.sh"
-      - "scripts/test-mpv-seek-settlement.sh"
-      - "scripts/test-mpv-manual-subtitle-retirement.sh"
-      - "scripts/test-avplayer-subtitle-clock.sh"
-      - "scripts/test-subtitle-mount-owner.sh"
-      - "test/subtitle-mount-owner-fixture.cjs"
-      - "scripts/test-subtitle-timing-policy.sh"
-      - "scripts/test-sync-derived-document-revisions.sh"
-      - "scripts/test-sync-candidate-read-fence.mjs"
-      - "scripts/test-native-bootstrap-archive.sh"
-      - "scripts/test-account-backup-file.sh"
-      - "scripts/test-account-file-access.sh"
-      - "scripts/test-profile-picker-account.sh"
-      - "scripts/test-profile-picker-tools.sh"
-      - "scripts/test-profile-picker-tools-transfer.sh"
-      - "scripts/test-profile-picker-tools-lan-adapter.sh"
-      - "scripts/test-profile-picker-tools-tv-composition.sh"
-      - "scripts/test-profile-picker-tools-ui-typecheck.py"
-      - "scripts/test-account-file-restore-manager.sh"
-      - "scripts/test-account-file-local-adoption.sh"
-      - "scripts/test-account-provider-sync-settlement.sh"
-      - "scripts/run-account-provider-sync-settlement.py"
-      - "test/account-provider-sync-settlement-inputs.cjs"
-      - "scripts/run-account-file-local-adoption.py"
-      - "test/account-file-local-adoption-inputs.cjs"
-      - "scripts/run-account-file-restore-manager.py"
-      - "test/account-file-restore-manager-inputs.cjs"
-      - "scripts/test-account-authentication-lifecycle.sh"
-      - "scripts/test-profile-roster-propagation.sh"
-      - "scripts/test-profile-picker-public-seed.sh"
-      - "test/android-profile-picker-startup.test.mjs"
-      - "scripts/test-cw-service-selection.sh"
-      - "scripts/test-home-cw-selection.sh"
-      - "scripts/test-cw-worker-currentness.sh"
-      - "scripts/test-series-sticky-ownership.sh"
-      - "scripts/test-loopback-playback-assertion.sh"
-      - "scripts/test-addon-stream-publication.sh"
-      - "scripts/test-native-preference-acknowledgement.sh"
-      - "scripts/test-binge-language-continuity.sh"
-      - "scripts/test-ranking-cache-concurrency.sh"
-      - "test/mpv-bounded-child.mjs"
-      - "test/cw-worker-currentness.mjs"
-      - "test/cw-profile-fixture.cjs"
-      - "test/xperience-harness-inputs.cjs"
-      - "scripts/test-episode-source-isolation.sh"
-      - "scripts/test-next-preparation-attempt.sh"
-      - "test/apple-player-timeline-boundaries.test.js"
-      - "test/apple-session-renewal/**"
-      - "test/native-callback-generation.mjs"
-      - "scripts/test-release-orchestration-contracts.sh"
-      - "scripts/test-android-native-release-contracts.sh"
-      - "scripts/test-android-native-sync-host.sh"
-      - "android/native-sync-hosted.init.gradle"
-      - "scripts/test-android-native-selection.sh"
-      - "scripts/fixtures/android-native-selection.gradle"
-      - "scripts/build-stub-engine-xcframeworks.sh"
-      - "scripts/verify-native-engine-abi.sh"
-      - "scripts/verify-native-android-artifacts.sh"
-      - "scripts/tests/release-source-recovery-contract.test.mjs"
-      - "scripts/generate-native-apple-project.rb"
-      - "scripts/native-apple-swift6-policy.rb"
-      - "scripts/test-native-apple-project.rb"
-      - "scripts/verify-native-apple-package.py"
-      - "scripts/tests/test_native_apple_package.py"
-      - "scripts/build-ffi-xcframework.sh"
-      - "scripts/build-mac-server.sh"
-      - "scripts/tests/test_native_builder_startup.py"
-      - "scripts/tests/test_release_native_snapshot_argv.py"
-      - "scripts/verify-android-release-version.sh"
-      - "scripts/tests/test_android_release_version.py"
-      - "scripts/tests/test_tv_hidden_up_reveal.py"
-      - "workers/vortx-appcast/**"
-      - "android/**/*.gradle.kts"
-      - ".github/workflows/**"
-  workflow_dispatch:
-    inputs:
-      apple_hotfix_checks:
-        description: Run only the focused Apple crash and account recovery regressions
-        type: boolean
-        default: false
-      native_media_candidates:
-        description: Build only the reviewed secretless native-media candidates
-        type: boolean
-        default: false
-      native_media_apple:
-        description: Include Apple in a manual native-media candidate run
-        type: boolean
-        default: true
-      native_media_android:
-        description: Include Android in a manual native-media candidate run
-        type: boolean
-        default: true
+name: Verify Android downloaded playback and ownership
 
-# Pure source/HTTP fixtures only: no private engine checkout, signing credentials or publication.
+on: workflow_dispatch
+
 permissions:
   contents: read
-concurrency:
-  group: source-contracts-${{ github.workflow }}-${{ github.ref }}${{ inputs.native_media_candidates && format('-native-media-{0}-{1}', inputs.native_media_apple, inputs.native_media_android) || '' }}
-  cancel-in-progress: ${{ !inputs.native_media_candidates }}
+
 jobs:
-  apple-policies:
-    if: ${{ !inputs.native_media_candidates && !inputs.apple_hotfix_checks }}
-    # The production SwiftUI views use SDK 26 glass APIs; exercise them on the same
-    # runner generation as Apple packaging instead of the older default SDK.
-    runs-on: macos-26-intel
-    # The serial Intel roster takes over 20 minutes; retain time for every final check.
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Ensure ripgrep is available
-        id: apple_tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! command -v rg >/dev/null 2>&1; then
-            HOMEBREW_NO_AUTO_UPDATE=1 brew install ripgrep
-          fi
-          rg --version
-      - name: Check release orchestration with a bounded process group
-        id: release_orchestration
-        if: ${{ !cancelled() && steps.apple_tools.outcome == 'success' }}
-        timeout-minutes: 6
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "c83153feedd91bee93000305604d68772d4b7164716749f0a04605bbb2253f62  test/mpv-bounded-child.mjs" | shasum -a 256 --check
-          receipt_dir="$(mktemp -d "$RUNNER_TEMP/release-orchestration.XXXXXX")"
-          echo "receipt=$receipt_dir/supervisor.json" >> "$GITHUB_OUTPUT"
-          status=0
-          node test/mpv-bounded-child.mjs run 300 "$receipt_dir/supervisor.json" -- \
-            /bin/bash scripts/test-release-orchestration-contracts.sh || status=$?
-          node test/mpv-bounded-child.mjs check "$receipt_dir/supervisor.json" "$status"
-          echo "slot_confirmed=true" >> "$GITHUB_OUTPUT"
-          if [ "$status" -ne 0 ]; then exit "$status"; fi
-          node test/mpv-bounded-child.mjs check "$receipt_dir/supervisor.json" 0 normal-exit
-      - name: Retain release orchestration process receipt
-        if: ${{ !cancelled() && steps.release_orchestration.outputs.receipt != '' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: release-orchestration-process-receipt
-          path: ${{ steps.release_orchestration.outputs.receipt }}
-          if-no-files-found: error
-          retention-days: 30
-      - name: Confirm the runner is ready for Apple policy checks
-        id: apple_prerequisites
-        if: ${{ !cancelled() && steps.apple_tools.outcome == 'success' && steps.release_orchestration.outputs.slot_confirmed == 'true' }}
-        run: echo "Release orchestration process group is quiescent."
-      - run: ruby scripts/test-native-apple-project.rb
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-cinema-rail-layout.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-avplayer-recovery-settlement.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-player-skip-chrome.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-apple-playback-profile-lifecycle.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-landscape-backdrop-cache.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-native-transport.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-tv-search-collections.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-addon-selfhosted.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-addon-mutation-failure-presentation.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-        timeout-minutes: 2
-      - run: bash scripts/test-episode-source-isolation.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - name: Fetch immutable public next-episode cancellation baseline
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-        run: git fetch --no-tags --depth=1 origin f9c45518ba6b8d779343c076da9f0dbcda129a30
-      - run: bash scripts/test-next-preparation-attempt.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: python3 scripts/tests/test_native_builder_startup.py
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: python3 scripts/tests/test_aether_dovi_provider.py
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: python3 scripts/tests/test_native_apple_package.py
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: python3 scripts/tests/test_release_native_snapshot_argv.py
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: python3 scripts/tests/test_android_release_version.py
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: python3 scripts/tests/test_tv_hidden_up_reveal.py
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: node --test workers/vortx-appcast/test/index.test.mjs
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-subtitle-source-contracts.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-apple-playback-recovery.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: node scripts/test-native-qr-join.cjs
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-profile-selection-read.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-native-facade-lock.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-legacy-profile-recovery.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - name: Fetch immutable public playback snapshot baseline
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-        run: git fetch --no-tags --depth=1 origin 57e1a98806d99b1ba074a455791b20aaea33894a
-      - run: bash scripts/test-native-playback-snapshot.sh working-tree --focused
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - name: Fetch immutable public Library projection oracle
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-        run: git fetch --no-tags --depth=1 origin 82cc8387222469d36dfbb7fc09881c375e36de45
-      - run: bash scripts/test-native-library-projection-perf.sh working-tree --functional-only
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-issue240-playback-failures.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-source-continuity-and-seek-intent.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-hls-seek-producer-gate.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-hls-startup-reservation.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-mpv-seek-settlement.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-mpv-manual-subtitle-retirement.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-avplayer-subtitle-clock.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-subtitle-mount-owner.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-subtitle-timing-policy.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-sync-derived-document-revisions.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: node scripts/test-sync-candidate-read-fence.mjs
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-        timeout-minutes: 2
-      - run: bash scripts/test-native-bootstrap-archive.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-account-backup-file.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-account-file-access.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-profile-picker-account.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-profile-picker-tools.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-profile-picker-tools-transfer.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-profile-picker-tools-lan-adapter.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-profile-picker-tools-tv-composition.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py --ios
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py --tvos-full
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py --tvos-lite
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-account-file-restore-manager.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-account-file-local-adoption.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-account-provider-sync-settlement.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-account-authentication-lifecycle.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-profile-roster-propagation.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: node --test test/android-profile-picker-startup.test.mjs
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - name: Fetch immutable public Continue Watching regression baselines
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-        run: |
-          git fetch --no-tags --depth=1 origin 0e196c586ebe95810476be8efde84fb0c061ca12
-          git fetch --no-tags --depth=1 origin 01a0ec988205781d345d94ec2c30a65d1f1bca8c
-      - run: bash scripts/test-cw-service-selection.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-home-cw-selection.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-cw-worker-currentness.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-series-sticky-ownership.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-loopback-playback-assertion.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-addon-stream-publication.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-native-preference-acknowledgement.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-apple-parity-contracts.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-source-title-match.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-ranking-cache-concurrency.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-binge-language-continuity.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: python3 scripts/tests/test_embed_aether_permissions.py
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-aether-playback-boundary.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-aether-engine-picker.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: node test/native-callback-generation.mjs
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: bash scripts/test-apple-player-timeline.sh
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: swift app/Tests/MacSettingsShellContractTests.swift
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-      - run: swiftc -parse-as-library app/SourcesShared/TabBarPrefs.swift app/Tests/CompactNavigationPolicyTests.swift -o /tmp/compact-navigation-test && /tmp/compact-navigation-test
-        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
-  web:
-    if: ${{ !inputs.native_media_candidates && !inputs.apple_hotfix_checks }}
+  android:
+    if: >-
+      github.event_name == 'workflow_dispatch' && github.repository == 'VortXTV/VortX' &&
+      github.actor == 'mamaclapper' && github.ref == 'refs/heads/beta-offline-playback-android-proof-20261111'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22.23.3"
-          cache: npm
-          cache-dependency-path: webapp/package-lock.json
-      - run: npm install --global npm@12.2.0
-      - working-directory: webapp
-        run: npm ci --ignore-scripts --no-audit --no-fund
-      - working-directory: webapp
-        run: npm run typecheck && npm test && npm run build
-
-  apple-hotfix-checks:
-    if: github.event_name == 'workflow_dispatch' && inputs.apple_hotfix_checks && !inputs.native_media_candidates
-    runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 2
           persist-credentials: false
-      - name: Ensure focused test prerequisites
+      - name: Verify the exact source and operation
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v rg >/dev/null 2>&1; then
-            HOMEBREW_NO_AUTO_UPDATE=1 brew install ripgrep
-          fi
-          rg --version
-      - name: Focused Apple recovery regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 scripts/tests/test_native_builder_startup.py
-          python3 scripts/tests/test_ci_beta8_apple_hotfix.py
-          bash scripts/test-native-profile-picker-routing.sh
-          mkdir -p app/build/auth-recovery
-          echo "c83153feedd91bee93000305604d68772d4b7164716749f0a04605bbb2253f62  test/mpv-bounded-child.mjs" | shasum -a 256 --check
-          auth_status=0
-          nice -n 15 node test/mpv-bounded-child.mjs run 300 "$PWD/app/build/auth-recovery/supervisor.json" -- \
-            /bin/zsh test/apple-auth-recovery/test-auth-recovery.sh "$PWD" "$PWD/app/build/auth-recovery" \
-            > app/build/auth-recovery/run.log 2>&1 || auth_status=$?
-          cat app/build/auth-recovery/run.log
-          node test/mpv-bounded-child.mjs check "$PWD/app/build/auth-recovery/supervisor.json" "$auth_status"
-          test "$auth_status" -eq 0
-          node test/mpv-bounded-child.mjs check "$PWD/app/build/auth-recovery/supervisor.json" 0 normal-exit
-          bash scripts/test-xperience-export-contracts.sh
-      - name: Session renewal and credential storage regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p app/build/session-renewal-receipts
-          echo "c83153feedd91bee93000305604d68772d4b7164716749f0a04605bbb2253f62  test/mpv-bounded-child.mjs" | shasum -a 256 --check
-          renewal_status=0
-          nice -n 15 node test/mpv-bounded-child.mjs run 600 "$PWD/app/build/session-renewal-receipts/supervisor.json" -- \
-            /bin/bash test/apple-session-renewal/run-hosted.sh "$PWD/app/SourcesShared" \
-            "$PWD/test/apple-session-renewal/source-pins.json" "$PWD" "$PWD/app/build/session-renewal-receipts/scratch" \
-            > app/build/session-renewal-receipts/run.log 2>&1 || renewal_status=$?
-          printf '%s\n' "$renewal_status" > app/build/session-renewal-receipts/status.txt
-          cat app/build/session-renewal-receipts/run.log
-          node test/mpv-bounded-child.mjs check "$PWD/app/build/session-renewal-receipts/supervisor.json" "$renewal_status"
-          test "$renewal_status" -eq 0
-          node test/mpv-bounded-child.mjs check "$PWD/app/build/session-renewal-receipts/supervisor.json" 0 normal-exit
-      - name: Verify bootstrap, Library and diagnostic installer fixes
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p app/build/local-installer-checks
-          echo "c83153feedd91bee93000305604d68772d4b7164716749f0a04605bbb2253f62  test/mpv-bounded-child.mjs" | shasum -a 256 --check
-          if ! git cat-file -e 82cc8387222469d36dfbb7fc09881c375e36de45^{commit}; then
-            git -c gc.auto=0 fetch --no-tags --depth=1 origin 82cc8387222469d36dfbb7fc09881c375e36de45
-          fi
-          # Real native OAuth runs under the protected real-SDK live-ABI parent before app builds.
-          for local_check in bootstrap library diagnostics; do
-            case "$local_check" in
-              bootstrap) local_command=(/bin/bash scripts/test-native-bootstrap-archive.sh) ;;
-              library) local_command=(/bin/bash scripts/test-native-library-projection-perf.sh working-tree --functional-only) ;;
-              diagnostics) local_command=(/usr/bin/env node scripts/test-pre-profile-diagnostic-export.mjs) ;;
-            esac
-            local_status=0
-            nice -n 15 node test/mpv-bounded-child.mjs run 600 "$PWD/app/build/local-installer-checks/$local_check.supervisor.json" -- \
-              "${local_command[@]}" > "app/build/local-installer-checks/$local_check.log" 2>&1 || local_status=$?
-            printf '%s\n' "$local_status" > "app/build/local-installer-checks/$local_check.status.txt"
-            cat "app/build/local-installer-checks/$local_check.log"
-            node test/mpv-bounded-child.mjs check "$PWD/app/build/local-installer-checks/$local_check.supervisor.json" "$local_status"
-            test "$local_status" -eq 0
-            node test/mpv-bounded-child.mjs check "$PWD/app/build/local-installer-checks/$local_check.supervisor.json" 0 normal-exit
-          done
-      - name: Retain focused regression outputs and failure receipts
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+          test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
+          test "$GITHUB_WORKFLOW_REF" = 'VortXTV/VortX/.github/workflows/source-contracts.yml@refs/heads/beta-offline-playback-android-proof-20261111'
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = '86b19107c8bb23cb2c0a3cf80cb6d4f42d7ed151'
+          test "$(git diff --name-only HEAD^ HEAD)" = .github/workflows/source-contracts.yml
+          test -z "$(git status --porcelain)"
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
-          name: Apple-hotfix-regression-receipts
-          path: |
-            app/build/auth-recovery/**
-            app/build/session-renewal-receipts/**
-            app/build/local-installer-checks/**
-            app/build/native-migration-bootstrap.*/**
-            app/build/native-library-projection.*/**
-            app/build/pre-profile-diagnostic-export.*/**
-            app/build/profile-picker-routing.*/**
-            app/build/xperience-export-contracts.*/**
-          if-no-files-found: warn
-          retention-days: 30
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-read-only: true
+      - name: Select the pinned Android NDK
+        run: sdkmanager 'ndk;30.0.16248370'
+      - name: Compile the app and exercise downloaded playback identity
+        working-directory: android
+        run: >-
+          ./gradlew :app:testPlayDebugUnitTest --no-daemon --max-workers=2
+          -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true
+          --tests com.vortx.android.downloads.OfflinePlaybackIdentityTest
+          --tests com.vortx.android.downloads.DownloadPlaybackRoutingTest
+          --tests com.vortx.android.player.PlaybackOwnerWiringTest
+          --tests com.vortx.android.player.PlaybackIntentControllerTest
+      - name: Require every focused regression to run
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
 
-  native-media-candidates:
-    if: github.event_name == 'workflow_dispatch' && inputs.native_media_candidates
-    uses: ./.github/workflows/native-media-candidates.yml
-    with:
-      apple: ${{ inputs.native_media_apple }}
-      android: ${{ inputs.native_media_android }}
+          expected = {
+              'com.vortx.android.downloads.OfflinePlaybackIdentityTest': 13,
+              'com.vortx.android.downloads.DownloadPlaybackRoutingTest': 15,
+              'com.vortx.android.player.PlaybackOwnerWiringTest': 13,
+              'com.vortx.android.player.PlaybackIntentControllerTest': 20,
+          }
+          root = Path('android/app/build/test-results/testPlayDebugUnitTest')
+          paths = set(root.glob('TEST-*.xml'))
+          assert paths == {root / ('TEST-' + name + '.xml') for name in expected}
+          for name, cases in expected.items():
+              suite = ET.parse(root / ('TEST-' + name + '.xml')).getroot()
+              assert suite.tag == 'testsuite' and suite.get('name') == name
+              assert len(suite.findall('testcase')) == int(suite.get('tests', '-1')) == cases
+              assert all(suite.get(field) == '0' for field in ('failures', 'errors', 'skipped'))
+              assert all(not suite.findall('.//' + field) for field in ('failure', 'error', 'skipped'))
+              print(f'{name}: {cases} passed')
+          PY
