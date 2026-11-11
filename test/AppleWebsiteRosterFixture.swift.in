@@ -1,0 +1,340 @@
+// Fixture host additions. The extractor inserts production manager methods in the same file.
+// BEGIN MANAGER STORAGE
+    private var websiteFixtureSession: VortxNativeSession?
+// END MANAGER STORAGE
+
+// BEGIN MANAGER ENVIRONMENT
+extension VortXSyncManager {
+    // Account absence and typed owner-history recovery have their own fixture lanes.
+    private func restoreOwnerHistoryCheckpoint(_ checkpoint: VortxEncryptedCheckpointStore.OwnerHistoryRecovery,
+        store: VortxEncryptedCheckpointStore, capture: CredentialScopeRegistry.Capture,
+        selectedProfile: UUID, generation: UUID, offline: Bool,
+        cloudAuthority: ReceivedProviderCloudAuthority? = nil) async throws -> Bool {
+        throw VortxNativeError.unavailable
+    }
+
+    private func makeOwnerHistoryLocalCheckpointPreparation(capture: CredentialScopeRegistry.Capture,
+        scope: VortxAccountScope) -> VortxNativeSession.OwnerHistoryLocalCheckpointPreparation {
+        { _, _, _ in throw VortxNativeError.unavailable }
+    }
+
+    // This fixture runs the same explicit syncUp as the debouncer. Park the timer only
+    // after the real queue has had a main-queue turn to record pending intent.
+    func parkWebsiteFixtureTimer() async {
+        await AppleSyncReceivePublicationPeer.drainMainQueue()
+        let worker = pendingSync
+        worker?.cancel()
+        await worker?.value
+    }
+
+    func websiteFixtureOfflineOpen() async -> Bool {
+        await restoreOfflineNativeCheckpoint(capture: credentialAuthority.capture(),
+            selectedProfile: ProfileStore.shared.activeID, generation: nativeCheckpointGeneration)
+    }
+
+    func websiteFixtureStop() async {
+        await parkWebsiteFixtureTimer()
+        let deferred = deferredLegacyConversion
+        deferred?.cancel()
+        await deferred?.value
+        let watched = nativeWatchedPendingTask
+        watched?.cancel()
+        await watched?.value
+        await CoreBridge.shared.closeNativeSession()
+    }
+
+    func rememberWebsiteFixtureSession(_ session: VortxNativeSession?) {
+        websiteFixtureSession = session
+    }
+
+    func websiteFixtureState(witness: Data?) async throws -> [String: Any] {
+        let capture = credentialAuthority.capture()
+        let scope = VortxAccountScope(account: capture.namespace, ownerProfileID: UserProfile.ownerID.uuidString)
+        let directory = try VortxNativeStorage.root()
+            .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
+        let store = try VortxEncryptedCheckpointStore(directory: directory,
+            key: SymmetricKey(data: AppleSyncReceivePublicationPeer.key),
+            installationKey: VortxNativeInstallationKey.loadOrCreate())
+        let checkpoint = try store.authenticatedCheckpoint(scope: scope)
+        let recovery = try store.recovery(account: capture.namespace)
+        var result = fixtureState()
+        result["applied"] = hasAppliedAccountDoc
+        result["mounted"] = CoreBridge.shared.hasCertifiedNativeSession(capture: capture,
+            profileID: ProfileStore.shared.activeID)
+        result["checkpoint"] = checkpoint != nil
+        result["witness"] = try witness.map {
+            try store.permitsWebsiteRosterAdoption(scope: scope, witness: $0, requiringCheckpoint: true)
+        } ?? false
+        result["archivedRoster"] = false
+        result["installedAddons"] = [String]()
+        if let checkpoint {
+            result["checkpointSHA256"] = SHA256.hash(data: Data(checkpoint.utf8))
+                .map { String(format: "%02x", $0) }.joined()
+        }
+        if let recovery {
+            let archive = try JSONSerialization.jsonObject(with: recovery.bootstrap) as? [String: Any]
+            let host = archive?["hostDocument"] as? [String: Any]
+            let vortx = host?["vortx"] as? [String: Any]
+            result["archivedRoster"] = vortx?["roster"] != nil
+            if let progress = host?["webProgress"] { result["archivedWebProgress"] = progress }
+        }
+        if let session = websiteFixtureSession {
+            result["native"] = try JSONSerialization.jsonObject(with: Data(try await session.stateJSON().utf8))
+            result["installedAddons"] = try await session.resourceRegistry().map(\.transportUrl).sorted()
+        }
+        return result
+    }
+}
+// END MANAGER ENVIRONMENT
+
+// BEGIN KEYCHAIN ENVIRONMENT
+    private static let websiteReceipt = OSAllocatedUnfairLock(initialState: false)
+    static func confirmedString(_ key: String) -> CredentialDurableReadResult {
+        if key == "vortx.native.hostActor." + AppleSyncReceivePublicationPeer.account {
+            return .value(WebsiteFixtureDisk.actor)
+        }
+        if key == "vortx.native.backupSeen." + AppleSyncReceivePublicationPeer.account {
+            return websiteReceipt.withLock { $0 ? .value("1") : .missing }
+        }
+        return .missing
+    }
+    static func set(_ value: String, for key: String) -> CredentialMutationResult {
+        guard key == "vortx.native.backupSeen." + AppleSyncReceivePublicationPeer.account,
+              value == "1" else { preconditionFailure("Unexpected fixture credential mutation") }
+        websiteReceipt.withLock { $0 = true }
+        return .success
+    }
+// END KEYCHAIN ENVIRONMENT
+
+// BEGIN PROFILE ENVIRONMENT
+    static let primaryTokenAccount = "unavailable.website-fixture"
+    static func legacyKeychainAccount(for profile: UserProfile) -> String {
+        preconditionFailure("The website fixture does not admit an independently linked profile")
+    }
+    func mergeInRoster(_ incoming: [UserProfile], incomingModified: Date?) {
+        // The real manager decides when the legacy UI mirror sees a roster. This
+        // empty test sink supplies no independent account or checkpoint authority.
+        precondition(incoming.count == 1 && incoming.first?.id == UserProfile.ownerID &&
+                     incoming.first?.isOwner == true, "Unexpected generic fixture roster")
+        profiles = incoming
+    }
+    func applyLocalTombstones() {} // The isolated fixture has no local UI tombstones.
+// END PROFILE ENVIRONMENT
+
+// BEGIN CORE ENVIRONMENT
+extension CoreBridge {
+    @MainActor func addonOrderDidChange() {} // The loopback fixture has no catalog UI to invalidate.
+    @MainActor func captureNativeResourceRestore(capture: CredentialScopeRegistry.Capture,
+        profileID: UUID) -> UUID? { nil }
+    @MainActor func replayNativeResourceRestore(_ receipt: UUID?, target: PlaybackMutationTarget) {
+        precondition(receipt == nil, "Unexpected active resource")
+    }
+    static func stageNativeCredential(token: String, source: VortxLegacyBootstrapMaterial.OwnAccountSource,
+        transactionID: String?, capture: CredentialScopeRegistry.Capture,
+        authority: any VortxMutationAuthority) throws {
+        preconditionFailure("The website fixture cannot stage an external credential")
+    }
+
+    @MainActor func installNativeSession(_ session: VortxNativeSession, registry: [VortxResourceAddon],
+        capture: CredentialScopeRegistry.Capture, hostProfiles: [UserProfile],
+        installationSource: (any VortxMutationAuthority)? = nil) async throws {
+        try installationSource?.withActive {}
+        guard CredentialScopeRegistry.shared.isCurrent(capture), session.scope.account == capture.namespace,
+              nativeFacade == nil else { throw VortxNativeError.superseded }
+        let installation = UUID()
+        nativeInstallGeneration = installation
+        nativeCallbackGeneration = installation
+        let facade = try await VortxNativeCoreFacade.create(session: session, registry: registry,
+            mutationAccepted: {
+                Task { @MainActor in VortXSyncManager.shared.nativeMutationDidCommit(credentialCapture: capture) }
+            }, sourceEvent: makeHistorySourceCallbackForFixture(), changed: { _ in })
+        do {
+            func bind() { installHistoryFacadeForFixture(facade) }
+            if let installationSource { try installationSource.withActive { bind() } } else { bind() }
+            try installationSource?.withActive {}
+            nativeProfileBaseline = hostProfiles
+            nativePublishedAccountGeneration = facade.accountGeneration
+            try refreshProfilesForFixture()
+            VortXSyncManager.shared.rememberWebsiteFixtureSession(session)
+        } catch {
+            if nativeFacade === facade { await closeNativeSession() } else { await facade.shutdown() }
+            throw error
+        }
+    }
+
+    @MainActor func closeNativeSession() async {
+        let previous = nativeFacadeLock.withLock {
+            let previous = nativeFacadeStorage
+            nativeFacadeStorage = nil
+            nativeCredentialCapture = nil
+            nativePublishedAccountGeneration = nil
+            nativeInstallGeneration = UUID()
+            nativeCallbackGeneration = nativeInstallGeneration
+            nativeCallbackLifetime.retire()
+            return previous
+        }
+        VortXSyncManager.shared.rememberWebsiteFixtureSession(nil)
+        await previous?.shutdown()
+    }
+}
+
+enum RemoteConfig {
+    struct Snapshot {
+        func isFeatureOn(_ name: String, default fallback: Bool) -> Bool {
+            precondition(name == "localFirstOpen", "Unexpected fixture remote config feature")
+            return fallback
+        }
+    }
+    static let snapshot = Snapshot()
+}
+// END CORE ENVIRONMENT
+
+// BEGIN HERMETIC STORAGE
+private enum WebsiteFixtureDisk {
+    private struct CommandPath: Decodable { let directory: String }
+    static let directory: URL = {
+        let arguments = CommandLine.arguments
+        guard arguments.count == 2,
+              let rootPath = ProcessInfo.processInfo.environment["VORTX_WEBSITE_FIXTURE_ROOT"],
+              rootPath.hasPrefix("/"),
+              let command = try? JSONDecoder().decode(CommandPath.self,
+                  from: Data(contentsOf: URL(fileURLWithPath: arguments[1]))),
+              command.directory.hasPrefix("/") else {
+            preconditionFailure("Expected an explicit owned website fixture directory")
+        }
+        let root = URL(fileURLWithPath: rootPath, isDirectory: true).resolvingSymlinksInPath()
+        let directory = URL(fileURLWithPath: command.directory, isDirectory: true).resolvingSymlinksInPath()
+        guard directory.path.hasPrefix(root.path + "/"), directory.lastPathComponent != "." else {
+            preconditionFailure("Website fixture directory escaped the owned test root")
+        }
+        return directory
+    }()
+    static var installationKey: SymmetricKey {
+        SymmetricKey(data: Data(SHA256.hash(data: Data(("fixture.website.installation." + directory.path).utf8))))
+    }
+    static var actor: String {
+        let bytes = Array(SHA256.hash(data: Data(("fixture.website.host-actor." + directory.path).utf8)).prefix(16))
+        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15])).uuidString.lowercased()
+    }
+}
+enum VortxNativeStorage {
+    static func root(create: Bool = true) throws -> URL {
+        let directory = WebsiteFixtureDisk.directory
+        if create { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
+        return directory
+    }
+}
+enum VortxNativeInstallationKey {
+    static func readExisting() throws -> SymmetricKey? { WebsiteFixtureDisk.installationKey }
+    static func loadOrCreate() throws -> SymmetricKey { WebsiteFixtureDisk.installationKey }
+}
+// END HERMETIC STORAGE
+
+// BEGIN NO RESOURCE TRANSPORT
+final class VortxCResourceTransport: VortxResourceTransport, Sendable {
+    init() throws {}
+    func makeCancellation() throws -> any VortxResourceCancellation {
+        preconditionFailure("Provider resources are outside the website fixture")
+    }
+    func load(_ requestJSON: String, cancellation: any VortxResourceCancellation) throws -> String {
+        preconditionFailure("Provider resources are outside the website fixture")
+    }
+}
+// END NO RESOURCE TRANSPORT
+
+// BEGIN NO WATCHED TRANSPORT
+enum VortxLegacyWatchedMetadataTransport {
+    static func fetch(_ request: LegacyWatchedBitfieldMigrationEvidence.MetadataRequest)
+        async throws -> LegacyWatchedBitfieldMigrationEvidence.MetadataResponse {
+        preconditionFailure("Opaque watched metadata is outside the website fixture")
+    }
+}
+// END NO WATCHED TRANSPORT
+
+// BEGIN EXECUTABLE
+@main @MainActor enum AppleWebsiteRosterFixture {
+    struct Command: Decodable {
+        let mode: String
+        let directory: String
+        let baseURL: String
+        let websiteWitness: String?
+    }
+    struct Instruction: Decodable {
+        let action: String
+    }
+
+    nonisolated static func nextLine() async -> String? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async { continuation.resume(returning: readLine()) }
+        }
+    }
+
+    static func run() async throws {
+        guard CommandLine.arguments.count == 2 else { throw VortxNativeError.invalidResponse }
+        let command = try JSONDecoder().decode(Command.self,
+            from: Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1])))
+        guard ["website-cold", "website-restart", "website-peer"].contains(command.mode),
+              let base = URL(string: command.baseURL),
+              base.scheme == "http", base.host == "127.0.0.1", base.port != nil,
+              base.user == nil, base.password == nil, base.query == nil, base.fragment == nil,
+              base.path.isEmpty || base.path == "/" else { throw VortxNativeError.invalidResponse }
+
+        let witness: Data?
+        if let hex = command.websiteWitness {
+            guard hex.utf8.count == 64, hex.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) })
+            else { throw VortxNativeError.invalidResponse }
+            let bytes = Array(hex.utf8)
+            witness = Data(stride(from: 0, to: bytes.count, by: 2).map { index in
+                func digit(_ byte: UInt8) -> UInt8 { byte < 58 ? byte - 48 : byte - 87 }
+                return 16 * digit(bytes[index]) + digit(bytes[index + 1])
+            })
+        } else { witness = nil }
+
+        let directory = try VortxNativeStorage.root()
+        let manager = VortXSyncManager(directory: directory, baseURL: base)
+        ProfileStore.shared.activeID = UserProfile.ownerID
+        manager.fixtureBaseline()
+        do {
+            try AppleSyncReceivePublicationPeer.emit(["ready": true, "actor": WebsiteFixtureDisk.actor,
+                "role": command.mode, "owner": UserProfile.ownerID.uuidString])
+            while let line = await nextLine() {
+                let instruction = try JSONDecoder().decode(Instruction.self, from: Data(line.utf8))
+                if instruction.action == "close" { break }
+                var extra: [String: Any] = [:]
+                switch instruction.action {
+                case "pull":
+                    var outcome = VortXSyncManager.ConflictResolutionOutcome.failed
+                    extra["restored"] = await manager.syncDown(reportOutcome: { outcome = $0 })
+                    extra["outcome"] = outcome.rawValue
+                case "push":
+                    extra["accepted"] = await manager.syncUp()
+                case "offline":
+                    let reopened = await manager.websiteFixtureOfflineOpen()
+                    extra["restored"] = reopened
+                    extra["outcome"] = reopened ? "completed" : "failed"
+                case "snapshot": break
+                default: throw VortxNativeError.invalidResponse
+                }
+                await manager.parkWebsiteFixtureTimer()
+                var snapshot = try await manager.websiteFixtureState(witness: witness)
+                extra.forEach { snapshot[$0.key] = $0.value }
+                try AppleSyncReceivePublicationPeer.emit(snapshot)
+            }
+        } catch {
+            await manager.websiteFixtureStop()
+            throw error
+        }
+        await manager.websiteFixtureStop()
+    }
+
+    static func main() async {
+        do { try await run() }
+        catch {
+            let code = VortxNativeError.diagnosticCode(error)
+            FileHandle.standardError.write(Data("Website roster fixture failed: \(code)\n".utf8))
+            exit(1)
+        }
+    }
+}
+// END EXECUTABLE
