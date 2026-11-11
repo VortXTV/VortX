@@ -286,8 +286,11 @@ internal class VortxEncryptedCheckpointStore(
         // this storage layer does not turn an interpretation-only JSONObject into its raw source.
         require(snapshot.toByteArray(Charsets.UTF_8).size <= MAX_BYTES - 28)
         retireCheckpointRead(scope)
-        replace(scope, file(scope), snapshot, replaceExisting = current != null)
-        val accepted = captureCheckpoint(scope)
+        val sealed = replace(scope, file(scope), snapshot, replaceExisting = current != null)
+        // An independent writer can re-encrypt the same plaintext between the first
+        // install and a fresh capture. Only the exact staged ciphertext can issue our receipt.
+        val accepted = if (current == null) NativeCheckpointRead(snapshot, readIssuer, scope,
+            checkpointGeneration(scope), sealed) else captureCheckpoint(scope)
         check(accepted.plaintext == snapshot) { "Native checkpoint readback failed" }
         return accepted
     }
@@ -490,7 +493,7 @@ internal class VortxEncryptedCheckpointStore(
             NativeOwnerHistoryCoordinator.decodeEnvelope(snapshot.toByteArray(Charsets.UTF_8), scope)
         } else scope.validateSnapshot(snapshot)
     }
-    private fun replace(scope: VortxAccountScope, target: File, snapshot: String, replaceExisting: Boolean = true) {
+    private fun replace(scope: VortxAccountScope, target: File, snapshot: String, replaceExisting: Boolean = true): ByteArray {
         val sealed = seal(scope, snapshot)
         Files.createDirectories(directory.toPath())
         val pending = Files.createTempFile(directory.toPath(), "native-checkpoint-", ".pending")
@@ -503,7 +506,12 @@ internal class VortxEncryptedCheckpointStore(
                 Files.createLink(target.toPath(), pending)
             }
             FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) }
-            check(open(scope, Files.readAllBytes(target.toPath())) == snapshot) { "Native sealed readback failed" }
+            val installed = Files.readAllBytes(target.toPath())
+            if (!replaceExisting) {
+                check(MessageDigest.isEqual(installed, sealed)) { "First native checkpoint ciphertext changed" }
+            }
+            check(open(scope, installed) == snapshot) { "Native sealed readback failed" }
+            return sealed
         } finally { Files.deleteIfExists(pending) }
     }
     companion object {
@@ -735,6 +743,11 @@ internal class VortxNativeSession private constructor(
             scope.rejectCredentials(initialHostArchive)
             bootstrapActions.forEach(scope::rejectCredentials)
             val stored = store.readRetained(scope)
+            val firstCheckpointAbsence = if (stored == null && store.supportsCheckpointAuthority) {
+                store.captureCheckpoint(scope).also {
+                    check(it.plaintext == null) { "Native checkpoint appeared during open" }
+                }
+            } else null
             // Capture the encrypted plaintext slice BEFORE JSONObject/hydration normalization.
             val storedRawHost = stored?.takeUnless(NativeOwnerHistorySessionAdapter::isEnvelope)?.let {
                 OHJson.Obj(it.toByteArray(Charsets.UTF_8))["nativeHostPreferenceState"]
@@ -837,7 +850,15 @@ internal class VortxNativeSession private constructor(
                 val snapshot = NativeRawHostPreferences.snapshot(snapshotProjection, rawHostState)
                 scope.validateSnapshot(snapshot)
                 verifyCandidate?.invoke(runtime)
-                store.commit(scope, snapshot)
+                val firstCommit = if (firstCheckpointAbsence != null) {
+                    // Candidate preparation can outlive the original account or file absence.
+                    // Use the same store's absent receipt and its create-only install.
+                    check(isAccountCurrent()) { "Native account changed" }
+                    store.compareAndCommitCheckpoint(scope, firstCheckpointAbsence, snapshot)
+                } else {
+                    store.commit(scope, snapshot)
+                    null
+                }
                 check(store.read(scope) == snapshot) { "Native checkpoint readback failed" }
                 check(isAccountCurrent()) { "Native account changed" }
                 return VortxNativeSession(scope, bindings, store, transport, runtime, isAccountCurrent, JSONObject(hostProfiles.toString()), hostPending, hostState,
@@ -849,8 +870,11 @@ internal class VortxNativeSession private constructor(
                     .also {
                         it.heldLegacyReconciliation = heldBootstrapReason
                         if (store.supportsCheckpointAuthority) {
-                            it.acknowledgedCheckpoint = store.captureCheckpoint(scope).also { read ->
+                            // Keep the exact accepted first-install receipt rather than
+                            // granting authority from another file with the same plaintext.
+                            it.acknowledgedCheckpoint = (firstCommit ?: store.captureCheckpoint(scope)).also { read ->
                                 check(read.plaintext == snapshot) { "Native checkpoint changed after admission" }
+                                if (firstCommit != null) store.requireCurrentCheckpoint(scope, read)
                             }
                         }
                     }

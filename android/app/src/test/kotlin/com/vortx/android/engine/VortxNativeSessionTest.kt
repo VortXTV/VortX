@@ -221,6 +221,68 @@ class VortxNativeSessionTest {
             val target = directory.listFiles()!!.single()
             val bytes = target.readBytes(); bytes[bytes.lastIndex] = (bytes.last().toInt() xor 1).toByte(); target.writeBytes(bytes)
             assertTrue(runCatching { store.captureCheckpoint(scope) }.isFailure)
+
+            val racedDirectory = Files.createTempDirectory(directory.toPath(), "intervening-winner-").toFile()
+            try {
+                val contender = VortxEncryptedCheckpointStore(racedDirectory) { key }
+                val winnerStore = VortxEncryptedCheckpointStore(racedDirectory) { key }
+                val winner = JSONObject(original).put("activeProfileId", "guest").toString()
+                val contenderRuntime = Runtime()
+                var winnerBytes: ByteArray? = null
+                val failed = runCatching {
+                    VortxNativeSession.open(scope, "Owner", contenderRuntime, contender, Transport(),
+                        allowNewAccount = true, verifyCandidate = {
+                            winnerStore.commit(scope, winner)
+                            winnerBytes = racedDirectory.listFiles()!!.single().readBytes()
+                        }).use { }
+                }.exceptionOrNull()
+                assertEquals("Native checkpoint changed", failed?.message)
+                assertTrue(contenderRuntime.values.isEmpty())
+                assertArrayEquals(requireNotNull(winnerBytes), racedDirectory.listFiles()!!.single().readBytes())
+                assertEquals(winner, contender.read(scope))
+            } finally { racedDirectory.deleteRecursively() }
+
+            val resealedDirectory = Files.createTempDirectory(directory.toPath(), "resealed-first-").toFile()
+            try {
+                val resealedTarget = File(resealedDirectory, "native-state-v1-${scope.digest}.sealed")
+                val independent = VortxEncryptedCheckpointStore(resealedDirectory) { key }
+                var keyReads = 0
+                var stagedCiphertext: ByteArray? = null
+                var winnerCiphertext: ByteArray? = null
+                var exactPlaintext: String? = null
+                val contender = VortxEncryptedCheckpointStore(resealedDirectory) {
+                    keyReads++
+                    if (keyReads == 2) {
+                        // The first key read sealed the candidate. The second decrypts
+                        // its readback after the destination bytes have been read.
+                        stagedCiphertext = resealedTarget.readBytes()
+                        exactPlaintext = requireNotNull(independent.read(scope))
+                        independent.commit(scope, requireNotNull(exactPlaintext))
+                        winnerCiphertext = resealedTarget.readBytes()
+                    }
+                    key
+                }
+                val contenderRuntime = Runtime()
+                val failure = runCatching {
+                    VortxNativeSession.open(scope, "Owner", contenderRuntime, contender, Transport(), allowNewAccount = true).use { }
+                }.exceptionOrNull()
+                assertEquals("Native checkpoint changed", failure?.message)
+                assertTrue(contenderRuntime.values.isEmpty())
+                assertFalse(requireNotNull(stagedCiphertext).contentEquals(requireNotNull(winnerCiphertext)))
+                assertArrayEquals(requireNotNull(winnerCiphertext), resealedTarget.readBytes())
+                assertEquals(exactPlaintext, independent.read(scope))
+            } finally { resealedDirectory.deleteRecursively() }
+
+            val retired = VortxEncryptedCheckpointStore(File(directory, "retired-first")) { key }
+            val retiredRuntime = Runtime()
+            var current = true
+            val refused = runCatching {
+                VortxNativeSession.open(scope, "Owner", retiredRuntime, retired, Transport(),
+                    allowNewAccount = true, verifyCandidate = { current = false }, isAccountCurrent = { current }).use { }
+            }.exceptionOrNull()
+            assertEquals("Native account changed", refused?.message)
+            assertNull(retired.captureCheckpoint(scope).plaintext)
+            assertTrue(retiredRuntime.values.isEmpty())
         } finally { directory.listFiles()?.forEach { it.delete() }; directory.delete() }
     }
     @Test fun `AES GCM checkpoint survives cold read and rejects tamper wrong key wrong account`() {
