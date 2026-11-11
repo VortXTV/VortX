@@ -4823,6 +4823,16 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     private class SyncStateStore(appContext: Context) {
         private val prefs: SharedPreferences =
             appContext.getSharedPreferences(STATE_FILE, Context.MODE_PRIVATE)
+        private val websiteRosterReceipts = NativeWebsiteRosterReceiptStore(prefs)
+
+        fun loadWebsiteRosterReceipt(accountId: String, dataKey: ByteArray): NativeWebsiteRosterReceiptStore.State =
+            websiteRosterReceipts.load(accountId, dataKey)
+
+        fun retainFirstWebsiteRosterReceipt(
+            accountId: String,
+            dataKey: ByteArray,
+            receipt: NativeWebsiteRosterDenialReceipt,
+        ): NativeWebsiteRosterReceiptStore.State = websiteRosterReceipts.retainFirst(accountId, dataKey, receipt)
 
         fun captureRestoreBacking(): (() -> Boolean)? =
             NativeSettingsFence.capturePristineRestoreBacking(prefs, NativeSettingsFence.RestoreAuxiliaryBacking.SYNC_STATE)
