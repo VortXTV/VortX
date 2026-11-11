@@ -55,7 +55,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: vortx-beta13-protected-draft-operations
+  group: vortx-beta13-protected-draft-recovery
   cancel-in-progress: false
 
 jobs:
@@ -63,7 +63,7 @@ jobs:
     name: Beta 13 exact draft ${{ inputs.phase }}
     if: >-
       github.event_name == 'workflow_dispatch' && github.repository == 'VortXTV/VortX' &&
-      github.actor == 'mamaclapper' && github.ref == 'refs/tags/vortx-beta13-release-ops-20261111'
+      github.actor == 'mamaclapper' && github.ref == 'refs/tags/vortx-beta13-release-recovery-20261111'
     environment: release-approval
     runs-on: macos-26
     timeout-minutes: 65
@@ -74,7 +74,7 @@ jobs:
       contents: write
     env:
       FROZEN_SOURCE: 4d3ef04324b887038da4ff4cf3e822cd07cf101e
-      OPS_HELPER_SHA: f279df7220e7ef571c57eca7ada775f193285cd14a95eac43485be4033057a12
+      OPS_HELPER_SHA: 0528cba2177bfb673bdb68cbf656f5daecdb7fc03dcce70868a5cd138bdca9e8
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Check out exact reviewed operations source
@@ -162,6 +162,7 @@ jobs:
 
       - name: Retain sanitized prepared provenance and checksum only
         if: inputs.phase == 'prepare'
+        timeout-minutes: 5
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-Beta13-prepared-proof
@@ -174,6 +175,7 @@ jobs:
 
       - name: Retain sanitized verified draft receipt and checksum only
         if: inputs.phase == 'attach'
+        timeout-minutes: 5
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-Beta13-draft-verified
