@@ -155,6 +155,15 @@ struct DetailView: View {
         return initialVideoID
     }
 
+    @ObservedObject private var detailDownloads = DownloadStore.shared
+    @State private var downloadLaunchID: UUID?
+
+    private func playDownloadedCopy(_ candidate: AppleDownloadedPlayback) {
+        let launchID = UUID()
+        downloadLaunchID = launchID
+        presenter.presentDownloaded(candidate, core: core) { downloadLaunchID == launchID }
+    }
+
     private var newerPlaybackVideoID: String? {
         let entry = LastStreamStore.entry(for: fencedMeta?.id ?? metaRequestID, profileID: profiles.activeID)
         return DetailEpisodeTargetPolicy.newerPlaybackID(
@@ -162,6 +171,8 @@ struct DetailView: View {
     }
 
     var body: some View {
+        let offlineCopies = fencedMeta == nil && !LiveTypes.contains(type)
+            ? detailDownloads.playableDownloads(libraryID: id, type: type) : []
         Group {
             if let meta = fencedMeta {
                 // Live (tv / channel / events) gets its own stripped-down page BEFORE the movie
@@ -180,6 +191,9 @@ struct DetailView: View {
                 } else {
                     moviePage(meta)
                 }
+            } else if !offlineCopies.isEmpty {
+                DownloadedTitleChoices(copies: offlineCopies, onPlay: playDownloadedCopy)
+                .padding(Theme.Space.screenEdge)
             } else if !LiveTypes.contains(type), type != "series", metaRequestID.hasPrefix("tt"),
                       let placeholder = CoreMetaItem.placeholder(id: metaRequestID, type: type, name: "") {
                 // Cinemeta meta is nil for this tt (a new/unreleased title: tt at TMDB, not yet in Cinemeta).
@@ -240,7 +254,10 @@ struct DetailView: View {
         .onChange(of: effectiveType, initial: false) { _, _ in clearRandomEpisodePick() }
         // Page disappearance also happens when an accepted episode/player covers it.
         // Only dismiss an uncommitted preview here; route pop clears the full receipt.
-        .onDisappear { if randomEpisodeRoute == nil { clearRandomEpisodePick() } }
+        .onDisappear {
+            downloadLaunchID = nil
+            if randomEpisodeRoute == nil { clearRandomEpisodePick() }
+        }
         // END RANDOM PICK EPISODE LIFECYCLE
         // BEGIN TV RANDOM PLAY DETAIL LIFECYCLE
         .navigationDestination(isPresented: Binding(get: { randomSeriesPlayRoute != nil }, set: {
@@ -1260,6 +1277,7 @@ struct DetailView: View {
         // a 2000-video series meant one full sort per row per D-pad press. One array, computed here.
         let ordered = videos.orderedBySeasonEpisode
         let primary = seriesPrimaryEpisode(ordered: ordered, watched: watched, localWatched: localWatched, metaID: meta.id)
+        let offlineCopies = detailDownloads.playableDownloads(libraryID: meta.id, type: meta.type)
         let primaryProgress = primary.map { episodeProgress($0.video, metaID: meta.id) } ?? 0
         let primaryResumeSeconds = primary.flatMap {
             if $0.video.id == validInitialVideoID, let validInitialResumeSeconds {
@@ -1285,6 +1303,9 @@ struct DetailView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.xl) {
                         Color.clear.frame(height: 0).id(DetailFocusAnchor.top)
+                        if !offlineCopies.isEmpty {
+                            DownloadedTitleChoices(copies: offlineCopies, onPlay: playDownloadedCopy)
+                        }
                         hero(meta, primaryEpisode: primary?.video, primaryIsResume: primary?.isResume == true,
                              primaryResumeSeconds: primaryResumeSeconds,
                              primaryProgress: primaryProgress,
@@ -3361,6 +3382,7 @@ struct CoreStreamList: View {
     // affordances (Download / Downloading / Downloaded) the same way iOS does. Device-local only; nothing
     // here syncs or touches the account library.
     @ObservedObject private var downloads = DownloadStore.shared
+    @State private var downloadLaunchID: UUID?
     /// Once the user has confirmed (and dismissed) the storage-eviction warning the first time, never show
     /// it again. Per device (a plain @AppStorage bool), not synced.
     @AppStorage("stremiox.downloadEvictionAck") private var downloadEvictionAck = false
@@ -3582,6 +3604,21 @@ struct CoreStreamList: View {
             // the source state changes from loading -> ready -> failed, so its focus target never disappears.
             TVDetailActionRow(accessibilityLabel: String(localized: "Playback and source actions"),
                               onMoveCommand: sourceMoveHandler(from: .primary, state: actionState)) {
+                if let meta, !isLive, let copy = downloads.playableDownload(for: meta) {
+                    Button {
+                        let launchID = UUID()
+                        let generation = episodeTargetGeneration
+                        let videoID = episodeStreamId
+                        downloadLaunchID = launchID
+                        randomPlayIntent?.revoke()
+                        presenter.presentDownloaded(copy, core: core) {
+                            downloadLaunchID == launchID && targetIsCurrent(videoID: videoID, generation: generation)
+                        }
+                    } label: {
+                        Label("Play downloaded", systemImage: "play.fill")
+                    }
+                    .buttonStyle(ChipButtonStyle())
+                }
                 if let best {
                     // Restored 0.3.13 semantics (reverses the Beta 25 diag-6 experiment): the Watch button is
                     // gated on full add-on settlement again, so the single primary action can no longer be
@@ -3904,7 +3941,10 @@ struct CoreStreamList: View {
         .onChange(of: sourceFilter, initial: false) { _, _ in randomPlayIntent?.revoke() }
         .onChange(of: sourcePin, initial: false) { _, _ in randomPlayIntent?.revoke() }
         .onChange(of: sourceList.sessionAudioLanguages, initial: false) { _, _ in randomPlayIntent?.revoke() }
-        .onDisappear { randomPlayIntent?.revoke() }
+        .onDisappear {
+            downloadLaunchID = nil
+            randomPlayIntent?.revoke()
+        }
         // END TV RANDOM PLAY SOURCE LIFECYCLE
         // Smart Source Selection (Lane A): auto-pick my best source, scoped to a SERIES episode page (meta
         // type "series"), which is only ever reached by pushing CoreEpisodeStreams. The inline movie / live

@@ -15,6 +15,7 @@ import SwiftUI
 struct TVDownloadsView: View {
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation (play-from-local)
     @ObservedObject private var store = DownloadStore.shared
+    @State private var downloadLaunchID: UUID?
     private let manager = DownloadManager.shared
 
     var body: some View {
@@ -41,6 +42,7 @@ struct TVDownloadsView: View {
             }
             .padding(.horizontal, Theme.Space.screenEdge)
         }
+        .onDisappear { downloadLaunchID = nil }
     }
 
     /// Section title + the total storage used by completed downloads, right-aligned.
@@ -224,8 +226,9 @@ struct TVDownloadsView: View {
             if record.state == .completed { manager.cancel(id: record.id) }   // file gone -> clean up the stale row
             return
         }
-        let url = store.fileURL(for: record)
-        presenter.request = PlaybackRequest(url: url, title: record.displayTitle, meta: record.playbackMeta,
-                                            sourceHint: record.qualityText, torrent: false)
+        guard let playback = store.playableDownload(id: record.id, expected: record.playbackMeta) else { return }
+        let launchID = UUID()
+        downloadLaunchID = launchID
+        presenter.presentDownloaded(playback, core: CoreBridge.shared) { downloadLaunchID == launchID }
     }
 }

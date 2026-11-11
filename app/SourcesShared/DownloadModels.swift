@@ -165,6 +165,59 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
         return a.addedAt < b.addedAt
     }
 
+    static func isManagedProgressiveFilename(_ filename: String, id: UUID) -> Bool {
+        let name = filename as NSString
+        return !filename.contains("/") && !filename.contains("\\")
+            && UUID(uuidString: name.deletingPathExtension) == id
+            && !name.pathExtension.isEmpty
+            && name.pathExtension.unicodeScalars.allSatisfy {
+                (48...57).contains($0.value) || (65...90).contains($0.value) || (97...122).contains($0.value)
+            }
+    }
+
+    static func isSafeHLSPackageRelativePath(_ path: String) -> Bool {
+        (path as NSString).pathExtension.lowercased() == "movpkg"
+            && path.split(separator: "/", omittingEmptySubsequences: false)
+                .allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
+    }
+
+    /// Play only the exact durable title and video. Coordinates protect against stale ID reuse.
+    func matchesPlayback(_ target: PlaybackMeta) -> Bool {
+        contentId == target.libraryId && videoId == target.videoId
+            && type == target.type
+            && season == target.season && episode == target.episode
+    }
+
+    /// A missing local file cannot block another completed copy of the same exact video.
+    static func playableCopy(
+        of target: PlaybackMeta, in records: [Self], fileExists: (Self) -> Bool
+    ) -> Self? {
+        records.first { $0.state == .completed && $0.matchesPlayback(target) && fileExists($0) }
+    }
+
+    /// Gate the local handoff after its player has admitted a genuine EOF event.
+    static func permitsDownloadedAdvance(position: Double?, duration: Double) -> Bool {
+        guard let position, position.isFinite, position > 0,
+              duration.isFinite, duration > 0 else { return false }
+        return position >= duration * 0.9
+    }
+
+    /// A download list is partial. Only an unambiguous same-season E+1 is known to be adjacent.
+    static func playableSuccessor(
+        after current: PlaybackMeta, in records: [Self], fileExists: (Self) -> Bool
+    ) -> Self? {
+        guard current.usesSeriesLifecycle, let season = current.season, season >= 0,
+              let episode = current.episode, episode >= 0, episode < Int.max else { return nil }
+        let candidates = records.filter {
+            $0.state == .completed && $0.usesSeriesLifecycle && $0.contentId == current.libraryId
+                && $0.videoId != current.videoId && $0.season == season && $0.episode == episode + 1
+                && fileExists($0)
+        }
+        // If two distinct video identities claim the successor coordinate, don't guess a provider alias.
+        guard Set(candidates.map(\.videoId)).count == 1 else { return nil }
+        return candidates.first
+    }
+
     /// 0...1 download progress; 0 until a total is known (a torrent's total is unknown up front).
     var fractionComplete: Double {
         guard bytesTotal > 0 else { return 0 }

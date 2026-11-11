@@ -3699,25 +3699,12 @@ struct iOSDownloadsScreen: View {
             guard !Task.isCancelled, downloadLaunchRequest == request,
                   ProfileStore.shared.activeID == activeProfileID,
                   owner.stillOwnsCurrentContext(core: core) else { return }
-            // Match by library/episode ID, not whichever unrelated detail is still resident.
-            let engine = core.engineResumeSecondsByLibraryId(for: meta)
-            let resume: Double
-            if let engine, engine.isFinite, engine > 5 {
-                resume = engine
-            } else {
-                resume = await account.resumeOffset(for: meta)
-            }
-            guard !Task.isCancelled, downloadLaunchRequest == request,
+            guard let candidate = DownloadStore.shared.playableDownload(id: record.id, expected: meta),
+                  let prepared = await candidate.prepareForPlayback(core: core),
+                  !Task.isCancelled, downloadLaunchRequest == request,
                   ProfileStore.shared.activeID == activeProfileID,
-                  owner.stillOwnsCurrentContext(core: core),
-                  let current = DownloadStore.shared.records.first(where: { $0.id == record.id }),
-                  current.state == .completed, current.playbackMeta == meta,
-                  DownloadStore.shared.fileExists(for: current) else { return }
-            downloadPlayer = iOSPlayerLaunch(
-                url: DownloadStore.shared.fileURL(for: current), title: current.displayTitle,
-                headers: nil, resume: resume.isFinite ? max(0, resume) : 0, meta: meta,
-                qualityText: current.qualityText, isTorrent: false
-            )
+                  owner.stillOwnsCurrentContext(core: core) else { return }
+            downloadPlayer = iOSPlayerLaunch.downloaded(prepared.copy, resume: prepared.resume)
             downloadLaunchTask = nil
             downloadLaunchRequest = nil
         }
@@ -4946,6 +4933,14 @@ struct iOSPlayerLaunch: Identifiable {
     /// yt-direct adaptive pair (pasted YouTube links): the separate AUDIO stream mpv mounts alongside the
     /// video-only `url` (`--audio-file` sidecar). Forces the libmpv engine in PlayerScreen.
     var audioSidecarURL: URL? = nil
+    var downloadedPlayback: AppleDownloadedPlayback? = nil
+
+    static func downloaded(_ playback: AppleDownloadedPlayback, resume: Double) -> Self {
+        .init(url: playback.url, title: playback.record.displayTitle,
+              resume: resume.isFinite ? max(0, resume) : 0, meta: playback.record.playbackMeta,
+              qualityText: playback.record.qualityText, isTorrent: false, wasExplicitPick: true,
+              downloadedPlayback: playback)
+    }
 }
 
 extension View {
@@ -4980,7 +4975,24 @@ extension View {
                 // item.meta here attributed every in-player binge advance's saves to the LAUNCH episode.
                 onProgress: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
                 onSeek: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
+                downloadedPlayback: item.downloadedPlayback,
+                ownsDownloadedPresentation: { launch.wrappedValue?.id == item.id },
+                onDownloadedAdvance: { candidate, onFailure in
+                    guard launch.wrappedValue?.id == item.id else { return }
+                    core.unloadEnginePlayer()
+                    Task { @MainActor in
+                        let prepared = await candidate.prepareForPlayback(core: core)
+                        guard launch.wrappedValue?.id == item.id else { return }
+                        guard let prepared else {
+                            onFailure()
+                            launch.wrappedValue = nil
+                            return
+                        }
+                        launch.wrappedValue = .downloaded(prepared.copy, resume: prepared.resume)
+                    }
+                },
                 onClose: {
+                    guard launch.wrappedValue?.id == item.id else { return }
                     item.cancelNextEpisodePreparation?()
                     core.unloadEnginePlayer()
                     launch.wrappedValue = nil

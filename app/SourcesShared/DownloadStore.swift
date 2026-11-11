@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 /// Device-local persistence for offline downloads. The index is a JSON file at
 /// `Application Support/Downloads/index.json`; the media files sit alongside it at
@@ -129,6 +130,69 @@ final class DownloadStore: ObservableObject {
 
     func record(id: UUID) -> DownloadRecord? { records.first { $0.id == id } }
 
+    func playableDownload(id: UUID, expected: PlaybackMeta) -> AppleDownloadedPlayback? {
+        guard let current = record(id: id), current.state == .completed,
+              current.playbackMeta == expected, let url = validatedPlaybackURL(for: current) else { return nil }
+        return AppleDownloadedPlayback(record: current, url: url)
+    }
+
+    // The index cannot reconstruct the source facts required by the Kids stream filters.
+    func playableDownload(for target: PlaybackMeta) -> AppleDownloadedPlayback? {
+        guard ProfileStore.shared.active?.isKids != true else { return nil }
+        return DownloadRecord.playableCopy(of: target, in: records, fileExists: hasValidPlaybackFile)
+            .flatMap { playableDownload(id: $0.id, expected: $0.playbackMeta) }
+    }
+
+    func playableDownloads(libraryID: String, type: String) -> [AppleDownloadedPlayback] {
+        guard ProfileStore.shared.active?.isKids != true else { return [] }
+        var seen = Set<String>()
+        return records.filter {
+            $0.contentId == libraryID && $0.type == type && $0.state == .completed
+                && ($0.usesSeriesLifecycle || $0.videoId == libraryID) && hasValidPlaybackFile($0)
+                && seen.insert($0.videoId).inserted
+        }.sorted(by: DownloadRecord.episodeOrder)
+            .compactMap { playableDownload(id: $0.id, expected: $0.playbackMeta) }
+    }
+
+    func nextPlayableDownload(after current: PlaybackMeta) -> AppleDownloadedPlayback? {
+        guard ProfileStore.shared.active?.isKids != true else { return nil }
+        return DownloadRecord.playableSuccessor(after: current, in: records, fileExists: hasValidPlaybackFile)
+            .flatMap { playableDownload(id: $0.id, expected: $0.playbackMeta) }
+    }
+
+    private func hasValidPlaybackFile(_ record: DownloadRecord) -> Bool {
+        validatedPlaybackURL(for: record) != nil
+    }
+
+    private func validatedPlaybackURL(for record: DownloadRecord) -> URL? {
+        if let relative = record.hlsRelativePath {
+            #if os(iOS)
+            guard DownloadRecord.isSafeHLSPackageRelativePath(relative) else { return nil }
+            let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).resolvingSymlinksInPath()
+            let candidate = fileURL(for: record)
+            let resolved = candidate.resolvingSymlinksInPath()
+            guard resolved.path.hasPrefix(home.path + "/"), resolved.pathExtension.lowercased() == "movpkg",
+                  let attributes = try? candidate.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                  attributes.isDirectory == true, attributes.isSymbolicLink == false,
+                  fileManager.isReadableFile(atPath: resolved.path) else { return nil }
+            return resolved
+            #else
+            return nil
+            #endif
+        }
+        guard DownloadRecord.isManagedProgressiveFilename(record.localFilename, id: record.id) else { return nil }
+        let candidate = fileURL(for: record)
+        let resolved = candidate.resolvingSymlinksInPath()
+        let managedDirectory = directory.resolvingSymlinksInPath()
+        guard resolved.deletingLastPathComponent().path == managedDirectory.path,
+              resolved.lastPathComponent == record.localFilename,
+              let attributes = try? candidate.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]),
+              attributes.isRegularFile == true, attributes.isSymbolicLink == false,
+              let size = attributes.fileSize, size > 0,
+              fileManager.isReadableFile(atPath: resolved.path) else { return nil }
+        return resolved
+    }
+
     /// True when a completed (or in-flight) download already exists for this exact video; drives the
     /// "Downloaded" / "Downloading" state on a source row so a user can't queue a title twice.
     func hasDownload(videoId: String) -> Bool {
@@ -253,6 +317,78 @@ final class DownloadStore: ObservableObject {
         }
     }
 
+}
+
+/// One admitted physical download. Paths are derived from the current store at each launch.
+struct AppleDownloadedPlayback {
+    let record: DownloadRecord
+    let url: URL
+    var consecutiveAutoAdvances = 0
+    var macWasFullScreenAtOpen: Bool?
+    private let profileID: UUID?
+    private let isKids: Bool
+    private let owner: PlaybackMutationTarget
+
+    @MainActor init(record: DownloadRecord, url: URL) {
+        self.record = record
+        self.url = url
+        profileID = ProfileStore.shared.activeID
+        isKids = ProfileStore.shared.active?.isKids == true
+        owner = PlaybackMutationTarget.capture(core: CoreBridge.shared)
+    }
+
+    @MainActor func ownsCurrentContext(core: CoreBridge) -> Bool {
+        profileID == ProfileStore.shared.activeID
+            && isKids == (ProfileStore.shared.active?.isKids == true)
+            && owner.stillOwnsCurrentContext(core: core)
+    }
+
+    @MainActor func revalidated() -> Self? {
+        guard ownsCurrentContext(core: CoreBridge.shared),
+              var current = DownloadStore.shared.playableDownload(id: record.id, expected: record.playbackMeta)
+        else { return nil }
+        current.consecutiveAutoAdvances = consecutiveAutoAdvances
+        current.macWasFullScreenAtOpen = macWasFullScreenAtOpen
+        return current
+    }
+
+    @MainActor func prepareForPlayback(core: CoreBridge) async -> (copy: Self, resume: Double)? {
+        guard !Task.isCancelled, let current = revalidated() else { return nil }
+        let meta = current.record.playbackMeta
+        let resume: Double
+        if let cached = core.engineResumeSecondsByLibraryId(for: meta), cached.isFinite, cached > 5 {
+            resume = cached
+        } else if core.usesNativeProfileState {
+            resume = await core.nativeResumeSeconds(for: meta, target: current.owner)
+        } else {
+            resume = ProfileStore.shared.resumeOffset(for: meta)
+        }
+        guard !Task.isCancelled, let final = current.revalidated() else { return nil }
+        return (final, resume.isFinite ? max(0, resume) : 0)
+    }
+}
+
+/// Offline entry choices when a title route exists but its catalog metadata cannot be loaded.
+struct DownloadedTitleChoices: View {
+    let copies: [AppleDownloadedPlayback]
+    let onPlay: (AppleDownloadedPlayback) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal) {
+            LazyHStack(spacing: Theme.Space.sm) {
+                ForEach(copies, id: \.record.id) { copy in
+                    Button { onPlay(copy) } label: {
+                        if let season = copy.record.season, let episode = copy.record.episode {
+                            Label("Play download · S\(season)E\(episode)", systemImage: "play.fill")
+                        } else {
+                            Label("Play downloaded", systemImage: "play.fill")
+                        }
+                    }
+                    .buttonStyle(ChipButtonStyle())
+                }
+            }
+        }
+    }
 }
 
 /// A virtual "folder" of downloads for one show (all episodes of a series) or a single movie, derived from
