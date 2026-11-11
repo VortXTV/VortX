@@ -7,6 +7,8 @@ import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 
 const workflow = readFileSync(new URL('../../.github/workflows/release-tvos.yml', import.meta.url), 'utf8');
+const androidWorkflow = readFileSync(new URL('../../.github/workflows/android-release.yml', import.meta.url), 'utf8');
+const beta13 = 'v0.5.6-beta.13', beta13Candidate = beta13 + '-candidate.1';
 const source = '844782d29a93ae51991bfadc639d50bc3619d40b', code = 'a'.repeat(40), tag = 'v0.5.0-beta.1';
 const normalNative = '2ea2e0f27dd2e53b7b28228435ca35a70f92831f';
 // Desktop is outside the seven mobile/Apple release assets; adoption remains a separate gate. f08bb89b9 adopted
@@ -395,8 +397,8 @@ test('normal and historical native selection wiring rejects scoped workflow muta
 
 test('only the Apple build job receives the extended CI wall-clock budget', () => {
   const build = workflow.split('  build-tvos:\n')[1].split('  attach-release:\n')[0];
-  assert.match(build, /^    timeout-minutes: 150$/m);
-  assert.equal((workflow.match(/^    timeout-minutes: 150$/gm) ?? []).length, 1);
+  assert.match(build, /^    timeout-minutes: 210$/m);
+  assert.equal((workflow.match(/^    timeout-minutes: 210$/gm) ?? []).length, 1);
   assert.match(workflow.split('  attach-release:\n')[1], /^    timeout-minutes: 35$/m);
 });
 
@@ -416,7 +418,88 @@ ${script(acceptance)}`], { encoding: 'utf8', env: { ...process.env, TVOS_TEST_ON
   assert.match(result.stdout, /^codesign:--force --deep --sign - .*VortX.app\ncodesign:--verify --deep --strict .*VortX.app\naccept:/);
   assert(result.stdout.includes('--receipt out/native-macos.json'));
   assert.equal((workflow.match(/codesign --force --deep --sign -/g) ?? []).length, 1);
+  for (const candidateTag of ['v0.5.6-beta.12-candidate.3', beta13Candidate]) {
+    const candidate = spawnSync('/bin/bash', ['-c', `
+codesign() { return 99; }
+python3() { printf '%s\\n' "$@"; }
+${script(signing)}`], { encoding: 'utf8', env: { ...process.env, GITHUB_EVENT_NAME: 'workflow_dispatch',
+      GITHUB_REF: 'refs/tags/' + candidateTag, AETHER_RELEASE_PACKAGES: '/fixture packages',
+      AETHER_RELEASE_LOCK: '/fixture lock', AETHER_RELEASE_EVIDENCE: '/fixture evidence',
+      AETHER_MACOS_SIGNING_PROOF: '/private proof/receipt.json' } });
+    assert.equal(candidate.status, 0, candidate.stderr);
+    assert.deepEqual(candidate.stdout.trimEnd().split('\n'), ['scripts/verify-protected-apple-aether.py',
+      '--sign-macos', '--key', 'macos', '--packages', '/fixture packages', '--lock', '/fixture lock',
+      '--resolution-receipt', '/fixture evidence/aether-resolved.json', '--app',
+      'app/build/ci-mac/Build/Products/Release/VortX.app', '--derived', 'app/build/ci-mac',
+      '--output', '/private proof/receipt.json']);
+  }
 }));
+
+test('Beta 13 Apple guard refuses final refs, unreviewed candidates, and all non-artifact inputs', () => fixture(dir => {
+  mkdirSync(join(dir, 'out'));
+  const receipt = join(dir, 'out/native-ci-dispatch.json');
+  const inputs = { native_only: true, publish_release: false, publish_existing_055: false,
+    tvos_test_only: false, apple_only: false, release_tag: '', recovery_source_commit: '',
+    resume_handoff: '', mpvkit_artifacts_url: '', mpvkit_artifacts_sha256: '', release_id: '', altstore_note: '' };
+  const run = (overrides = {}, actual = inputs) => {
+    writeFileSync(receipt, JSON.stringify({ inputs: actual }));
+    return spawnSync('/bin/bash', ['-c', script('Verify protected Beta 13 artifact-only dispatch')], {
+      cwd: dir, encoding: 'utf8', env: { ...process.env, GITHUB_EVENT_NAME: 'workflow_dispatch',
+        GITHUB_REPOSITORY: 'VortXTV/VortX', GITHUB_REF: 'refs/tags/' + beta13Candidate,
+        BUILD_SOURCE_SHA: code, GITHUB_SHA: code, RELEASE_TAG: '', ...overrides }
+    });
+  };
+  assert.equal(run().status, 0);
+  assert.equal(run({ GITHUB_REF: 'refs/heads/main', GITHUB_EVENT_NAME: 'push' }).status, 0);
+  for (const env of [{ GITHUB_REF: 'refs/tags/' + beta13 },
+    { GITHUB_REF: 'refs/tags/' + beta13 + '-candidate.2' }, { RELEASE_TAG: beta13 },
+    { GITHUB_REF: 'refs/heads/main', RELEASE_TAG: beta13Candidate }, { GITHUB_SHA: source },
+    { GITHUB_REPOSITORY: 'fork/VortX' }, { GITHUB_EVENT_NAME: 'push' }]) {
+    assert.notEqual(run(env).status, 0, JSON.stringify(env));
+  }
+  for (const [key, value] of Object.entries(inputs)) {
+    const wrong = typeof value === 'boolean' ? !value : 'unexpected';
+    assert.notEqual(run({}, { ...inputs, [key]: wrong }).status, 0, key);
+  }
+  const writeAdmission = workflow.split('  attach-release:\n')[1].split('    concurrency:')[0];
+  assert(writeAdmission.includes(`github.ref != 'refs/tags/${beta13}' && inputs.release_tag != '${beta13}'`));
+  assert(writeAdmission.includes(`!startsWith(github.ref, 'refs/tags/${beta13}-candidate.')`));
+  assert(writeAdmission.includes(`!startsWith(inputs.release_tag, '${beta13}-candidate.')`));
+}));
+
+test('Android accepts only exact protected candidate ref/input pairs and excludes them from draft writes', () => {
+  const binder = script('Bind the build to the requested release tag (fail closed)', androidWorkflow);
+  const run = (tag, ref = 'refs/tags/' + tag, overrides = {}) => spawnSync('/bin/bash', ['-c', `
+git() {
+  case "$1" in
+    check-ref-format|show-ref) return 0 ;;
+    rev-parse) printf '%s\\n' "${code}" ;;
+    *) return 99 ;;
+  esac
+}
+${binder}`], { encoding: 'utf8', env: { ...process.env, GITHUB_ENV: '/dev/null',
+    GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REPOSITORY: 'VortXTV/VortX',
+    GITHUB_REF: ref, GITHUB_SHA: code, RELEASE_TAG: tag, ...overrides } });
+  const previous = 'v0.5.6-beta.12-candidate.3';
+  for (const tag of [beta13Candidate, previous, 'v0.5.6-beta.11-candidate.1']) {
+    assert.equal(run(tag).status, 0, tag);
+  }
+  for (const [tag, ref, env] of [[beta13], [beta13 + '-candidate.2'],
+    [previous, 'refs/tags/' + beta13Candidate], [beta13Candidate, 'refs/tags/' + previous],
+    [beta13Candidate, 'refs/heads/main'], [beta13, 'refs/heads/main'],
+    ['v0.5.6-beta.11', 'refs/tags/' + beta13],
+    [beta13Candidate, undefined, { GITHUB_SHA: source }],
+    [beta13Candidate, undefined, { GITHUB_REPOSITORY: 'fork/VortX' }],
+    [beta13Candidate, undefined, { GITHUB_EVENT_NAME: 'push' }]]) {
+    assert.notEqual(run(tag, ref, env).status, 0, String(tag) + ' ' + String(ref));
+  }
+  const attach = step('Create or append to the draft release', androidWorkflow).split('        env:')[0];
+  for (const prefix of ['v0.5.6-beta.12-candidate.', beta13 + '-candidate.']) {
+    assert(attach.includes(`!startsWith(github.ref, 'refs/tags/${prefix}')`));
+    assert(attach.includes(`!startsWith(inputs.release_tag, '${prefix}')`));
+  }
+  assert(attach.includes(`github.ref != 'refs/tags/${beta13}' && inputs.release_tag != '${beta13}'`));
+});
 
 test('recovery preserves only the verifier outside the source checkout and retains native, feed and environment gates', () => {
   const preserve = workflow.indexOf('- name: Preserve the workflow revision\'s native acceptance tool');

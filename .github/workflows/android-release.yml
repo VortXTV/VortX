@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing tag for the draft release, for example v0.3.14-beta.28-android
+        description: Existing draft release tag, or an exact protected artifact-only candidate tag
         required: true
         type: string
       publish_release:
@@ -46,6 +46,17 @@ jobs:
             echo "::error::checked-out source does not match the requested release tag"
             exit 1
           fi
+          case "$GITHUB_REF:$RELEASE_TAG" in
+            refs/tags/v0.5.6-beta.13:*|*:v0.5.6-beta.13)
+              echo "::error::Beta 13 packages must come from the exact protected candidate"; exit 1 ;;
+            refs/tags/v0.5.6-beta.12-candidate.*:*|*:v0.5.6-beta.12-candidate.*|refs/tags/v0.5.6-beta.13-candidate.*:*|*:v0.5.6-beta.13-candidate.*)
+              case "$GITHUB_REF:$RELEASE_TAG" in
+                refs/tags/v0.5.6-beta.12-candidate.3:v0.5.6-beta.12-candidate.3|refs/tags/v0.5.6-beta.13-candidate.1:v0.5.6-beta.13-candidate.1) ;;
+                *) echo "::error::Protected candidate ref and input must match an exact reviewed pair"; exit 1 ;;
+              esac
+              [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REPOSITORY" == VortXTV/VortX &&
+                 "$GITHUB_SHA" == "$source_commit" ]] || { echo '::error::Protected candidate must use the exact reviewed workflow and source'; exit 1; } ;;
+          esac
           echo "SOURCE_COMMIT=$source_commit" >> "$GITHUB_ENV"
           echo "RELEASE_TAG_COMMIT=$tag_commit" >> "$GITHUB_ENV"
 
@@ -200,6 +211,41 @@ jobs:
           if-no-files-found: warn
           retention-days: 90
 
+      - name: Verify protected Android backup format and CAS
+        if: github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1'
+        working-directory: android
+        timeout-minutes: 15
+        env:
+          JAVA_TOOL_OPTIONS: "-XX:ActiveProcessorCount=1"
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^{commit})" = "$SOURCE_COMMIT"
+          suite=com.vortx.android.sync.VortXBackupCasContractTest
+          report="app/build/test-results/testPlayDebugUnitTest/TEST-$suite.xml"
+          test ! -e "$report"
+          ./gradlew :app:testPlayDebugUnitTest --tests "$suite" --rerun \
+            --no-build-cache --no-daemon --max-workers=1
+          python3 -I - "$report" "$suite" <<'PYTEST'
+          import hashlib
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report, suite = Path(sys.argv[1]), sys.argv[2]
+          data = report.read_bytes()
+          root = ET.fromstring(data)
+          cases = root.findall("testcase")
+          names = {case.get("name") for case in cases}
+          if (root.tag != "testsuite" or root.get("name") != suite or root.get("tests") != "16"
+              or any(root.get(key) != "0" for key in ("skipped", "failures", "errors"))
+              or len(cases) != 16 or len(names) != 16 or not all(names)
+              or "ordinary writes preserve the authenticated head format for this account" not in names
+              or any(case.get("classname") != suite or any(case.find(key) is not None
+                     for key in ("skipped", "failure", "error")) for case in cases)):
+              raise SystemExit("Protected Android backup CAS suite differs or did not pass")
+          print("Verified protected Android backup CAS: 16 cases; XML SHA256 " + hashlib.sha256(data).hexdigest())
+          PYTEST
+
       - name: Build release APKs and Play bundle
         working-directory: android
         env:
@@ -332,6 +378,12 @@ jobs:
           retention-days: 90
 
       - name: Create or append to the draft release
+        if: >-
+          ${{ !startsWith(github.ref, 'refs/tags/v0.5.6-beta.12-candidate.') &&
+            !startsWith(inputs.release_tag, 'v0.5.6-beta.12-candidate.') &&
+            github.ref != 'refs/tags/v0.5.6-beta.13' && inputs.release_tag != 'v0.5.6-beta.13' &&
+            !startsWith(github.ref, 'refs/tags/v0.5.6-beta.13-candidate.') &&
+            !startsWith(inputs.release_tag, 'v0.5.6-beta.13-candidate.') }}
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
