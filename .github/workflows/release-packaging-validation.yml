@@ -74,7 +74,7 @@ jobs:
       contents: write
     env:
       FROZEN_SOURCE: 4d3ef04324b887038da4ff4cf3e822cd07cf101e
-      OPS_HELPER_SHA: 8a3b4e20315f044f5ef832f94a467628e7d8bb26941897872bc03660ab46e119
+      OPS_HELPER_SHA: f279df7220e7ef571c57eca7ada775f193285cd14a95eac43485be4033057a12
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Check out exact reviewed operations source
