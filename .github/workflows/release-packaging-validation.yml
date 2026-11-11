@@ -1,660 +1,345 @@
-name: Release packaging validation
-
-# REL-03 secretless pull-request validation lane. The privileged release workflows
-# (.github/workflows/android-release.yml, release-tvos.yml) hold signing secrets and the private
-# engine token, so by design they never run on pull requests; before this file existed the first
-# complete exercise of packaging-specific scripts could happen only after merge or during a real
-# release. This lane closes that gap WITHOUT weakening the W1-A signing posture:
-#
-#   - It references NO secrets of any kind (`secrets.` context is banned here; the contract test
-#     scripts/test-release-orchestration-contracts.sh enforces that), fetches NO private repos,
-#     and holds only `contents: read`.
-#   - Android job: exercises the EXACT release packaging tasks from android-release.yml
-#     (assembleFullRelease assemblePlayRelease bundlePlayRelease) against an EPHEMERAL ad-hoc
-#     keystore generated on the runner at run time. Nothing is published from this lane, so the
-#     throwaway identity proves packaging mechanics only; the production four-secret fail-closed
-#     gate, the pinned production signer SHA-256 verification, and the tag/source-commit binding
-#     remain exclusively in the protected release stage.
-#   - Apple job: runs the fixture-driven tests of the packaging/feed scripts that releases call
-#     (release-feed.mjs, gen-altstore-source.py, repackage-ipa.sh), then generates the real Xcode
-#     project via pinned XcodeGen and exercises compile/link/package for tvOS, iOS, and macOS
-#     shells with CODE_SIGNING_ALLOWED=NO. CI-only stub engine xcframeworks stand in for the
-#     private engine source (unavailable to PRs); contract tests prove protected workflows cannot
-#     consume them. Signed archives and notarization stay in the thin protected release stage.
-#
-# Documented limits of what CAN be validated secretlessly (do not silently widen):
-#   - libvortx_ffi.so comes from a PRIVATE repository, so the Android APKs built
-#     here carry no engine .so files (the gradle tasks warn-skip exactly as on dev machines).
-#     Engine-linked packaging stays validated by the privileged push/release lanes only.
-#   - No Apple code-signing identity or notarization is exercised here (requires paid accounts).
+name: Protected Beta 13 hosted preflight
 
 on:
-  pull_request:
   workflow_dispatch:
+    inputs:
+      apple_artifact_id:
+        description: Numeric ID of the original attempt-one VortX-tvOS-ci artifact
+        required: true
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
-  group: release-packaging-validation-${{ github.workflow_ref }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: vortx-beta13-hosted-preflight
+  cancel-in-progress: false
 
 jobs:
-  android-release-packaging:
-    name: Ad-hoc Android Full+Play release packaging (secretless)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+  verify-candidate:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      FROZEN_SOURCE: 4d3ef04324b887038da4ff4cf3e822cd07cf101e
+      FROZEN_VERIFIER_SHA: bba10af16bd18ed6f7c0aa4d4c9fb3b4bbece95e89be71b77c8f7b0e26556b2b
+      CANDIDATE: v0.5.6-beta.13-candidate.1
+      FINAL_TAG: v0.5.6-beta.13
+      APPLE_RUN: '43032603923'
+      ANDROID_RUN: '43032604411'
+      ANDROID_ARTIFACT: '13863521461'
+      ANDROID_ARTIFACT_SHA: ff6ecb5edfd87ca5cc0975b181a434af4af77978a8b52f286a8407df6f104596
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Admit only the reviewed operations branch and artifact ID
+        env:
+          APPLE_ARTIFACT: ${{ inputs.apple_artifact_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_ref=refs/heads/beta13-hosted-preflight-20261111
+          test "$GITHUB_REPOSITORY" = VortXTV/VortX
+          test "$GITHUB_ACTOR" = mamaclapper
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = "$expected_ref"
+          test "$GITHUB_WORKFLOW_REF" = "VortXTV/VortX/.github/workflows/release-packaging-validation.yml@$expected_ref"
+          test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
+          [[ "$APPLE_ARTIFACT" =~ ^[1-9][0-9]{0,17}$ ]]
+
+      - name: Check out the frozen package source by exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ env.FROZEN_SOURCE }}
+          path: frozen
           persist-credentials: false
 
-      - name: Set up JDK 21
+      - name: Set up JDK 21 for read-only Android package verification
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: '21'
 
-      # Toolchain parity with the privileged lanes: same pinned setup-android/setup-gradle/NDK as
-      # android.yml + android-release.yml, so packaging behavior observed here transfers.
-      - name: Set up Android SDK
+      - name: Set up Android package inspection tools
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
-          packages: "platform-tools platforms;android-37.0 build-tools;36.0.0 cmake;4.1.2"
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
-
-      - name: Install Android NDK (must match ndkVersion in app/build.gradle.kts)
-        run: |
-          yes | sdkmanager "ndk;30.0.16248370"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
-
-      - name: Prove the native-only build and rejection of removed engine selections
-        run: bash scripts/test-android-native-selection.sh
-
-      - name: Exercise signer parsing and strict verification fixtures
-        run: |
-          bash scripts/test-android-release-signing.sh
-          python3 scripts/tests/test_android_release_version.py
-
-      # Ephemeral ad-hoc release identity: generated on THIS runner for THIS run only, never
-      # committed, never used to publish, shredded below even on failure. A distinct CN (not
-      # "Android Debug") keeps the no-debug-fallback invariant testable: the verifier below
-      # asserts the exact ad-hoc subject AND rejects any Android Debug certificate.
-      - name: Generate ephemeral ad-hoc release keystore
+      - name: Reauthenticate the two original candidate builds without release writes
         env:
-          ADHOC_STORE_PASS: vortx-adhoc-ci-store
-          # JDK PKCS12 normalizes a distinct key password to the store password. Keep this
-          # deliberately equal so the Gradle release build below proves the exact supported path.
-          ADHOC_KEY_PASS: vortx-adhoc-ci-store
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/adhoc-signing"
-          keytool -genkeypair \
-            -keystore "$RUNNER_TEMP/adhoc-signing/adhoc-release.jks" \
-            -storetype PKCS12 \
-            -alias adhoc-release \
-            -keyalg RSA -keysize 4096 -validity 1 \
-            -storepass "$ADHOC_STORE_PASS" -keypass "$ADHOC_KEY_PASS" \
-            -dname "CN=VortX CI Ad-hoc Release, O=VortXTV, C=US"
-          # The immediately following Gradle release build consumes both storePassword and
-          # keyPassword from these same inputs, proving the supported PKCS12 signing path.
-          keytool -list -v -keystore "$RUNNER_TEMP/adhoc-signing/adhoc-release.jks" \
-            -storetype PKCS12 -storepass "$ADHOC_STORE_PASS" -alias adhoc-release >/dev/null
-
-      # Same task set as the privileged release build (android-release.yml), same fail-closed
-      # signing-config path in app/build.gradle.kts (the four VORTX_* inputs are all provided,
-      # pointing at the ephemeral keystore). Engines are intentionally NOT fetched and
-      # VORTX_REQUIRE_ENGINE is NOT set, so the native Cargo task takes the documented dev-machine
-      # warn-and-skip path; every other packaging phase (Kotlin/Compose release compilation,
-      # manifest merge, resources, libmpv native merge, DEX, AGP signing, AAB) is exercised.
-      - name: Acquire reviewed Android mpv component (public-only; baseline is a no-op)
-        run: /usr/bin/python3 -I scripts/acquire-android-mpv-component.py
-
-      - name: Build Full+Play release packages with the ephemeral identity
-        working-directory: android
-        env:
-          VORTX_KEYSTORE_PATH: ${{ runner.temp }}/adhoc-signing/adhoc-release.jks
-          VORTX_KEYSTORE_PASSWORD: vortx-adhoc-ci-store
-          VORTX_KEY_ALIAS: adhoc-release
-          VORTX_KEY_PASSWORD: vortx-adhoc-ci-store
-        run: ./gradlew :app:assembleFullRelease :app:assemblePlayRelease :app:bundlePlayRelease --no-daemon --stacktrace
-
-      - name: Check player startup caller contracts
-        run: |
-          mkdir -p android/app/build/first-frame-focused
-          receipt_dir="$(mktemp -d "$PWD/android/app/build/first-frame-focused/receipt.XXXXXX")"
-          node scripts/tests/android-first-frame-presentation/source-contracts.mjs "$PWD" "$receipt_dir"
-
-      - name: Check selected account-file input bounds
-        run: node test/android-account-file-kernel-bounds-contract.cjs
-
-      # Preserve the bounded recovery filters and exercise the actual shared Media3 metadata
-      # policies. JNI-gated cases still skip without the real private native runtime.
-      - name: Test Android sync, account recovery and active-media metadata
-        working-directory: android
-        run: >-
-          ./gradlew :app:testPlayDebugUnitTest
-          -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true
-          --tests com.vortx.android.sync.AndroidRealtimeSyncTest
-          --tests com.vortx.android.engine.SourceTitleMatchTest
-          --tests com.vortx.android.engine.NativePlaylistTest
-          --tests com.vortx.android.playlists.SavedPlaylistStoreTest
-          --tests com.vortx.android.sync.DurableSessionStateTest
-          --tests com.vortx.android.sync.NativeAccountSyncTest
-          --tests com.vortx.android.sync.AccountBackupFileTest
-          --tests com.vortx.android.sync.AccountBackupRepairTest
-          --tests com.vortx.android.sync.AccountFileHostAdmissionTest
-          --tests com.vortx.android.sync.AccountFileRestoreJournalTest
-          --tests com.vortx.android.sync.AccountFileRestoreTransactionTest
-          --tests com.vortx.android.engine.NativeRestoreExclusionTest
-          --tests com.vortx.android.sync.AccountFileRestoreAbsenceTest
-          --tests com.vortx.android.sync.AccountFileRestoreManagerBindingTest
-          --tests com.vortx.android.sync.PickerFileRecoverySignInTest
-          --tests com.vortx.android.sync.NativeSettingsFencePristineBackingTest
-          --tests com.vortx.android.sync.AddonPrefsRestoreWriterExclusionTest
-          --tests com.vortx.android.sync.AuxiliaryPrefsRestorePhysicalEvidenceTest
-          --tests com.vortx.android.sync.NativeSettingsFenceRestoreExclusionTest
-          --tests com.vortx.android.sync.ProviderRetryRestoreBackingTest
-          --tests com.vortx.android.sync.ProviderRetryOutboxTest
-          --tests com.vortx.android.moat.WatchSignalEnqueueConsentTest
-          --tests com.vortx.android.integrations.NativeProviderCredentialsTest
-          --tests com.vortx.android.integrations.NativeProviderRetryVaultTest
-          --tests com.vortx.android.integrations.ProviderRetryCredentialProofTest
-          --tests com.vortx.android.integrations.ProviderWatchlistReceiptTest
-          --tests com.vortx.android.profile.RestoreProfileDirectWritersTest
-          --tests com.vortx.android.backup.SettingsBackupInteropTest
-          --tests com.vortx.android.sync.AccountFileLegacyAdmissionTest
-          --tests com.vortx.android.engine.DetachedAccountFileKernelTest
-          --tests com.vortx.android.sync.AccountFileProfileMaterialTest
-          --tests com.vortx.android.sync.AccountFileAddonURLTest.decodedHostAndUntouchedConfigurationFixTheReportedIdentityMismatch
-          --tests com.vortx.android.backup.accountfiles.AccountBackupDocumentsTest
-          --tests com.vortx.android.ui.profilepicker.ProfilePickerToolsControllerTest
-          --tests com.vortx.android.ui.profilepicker.ProfilePickerToolsRestoreControllerTest
-          --tests com.vortx.android.ui.profilepicker.ProfilePickerToolsManagerTest
-          --tests com.vortx.android.sync.SessionRenewalPolicyTest
-          --tests com.vortx.android.sync.SessionRenewalManagerTest
-          --tests com.vortx.android.profile.ProfileSelectionWiringTest
-          --tests com.vortx.android.sync.VortXSessionOwnerTransitionContractTest
-          --tests com.vortx.android.diagnostics.DiagnosticShareOperationTest
-          --tests com.vortx.android.engine.NativeRetirementDispatchTest
-          --tests com.vortx.android.sync.NativeAccountAttemptTest
-          --tests com.vortx.android.engine.NativeWatchedMigrationProducerTest
-          --tests com.vortx.android.sync.VortXSyncManagerStaleAddonEnvelopeTest
-          --tests com.vortx.android.ui.viewmodel.PlaybackResolveFenceTest
-          --tests com.vortx.android.ui.randompick.RandomPickPolicyTest
-          --tests com.vortx.android.ui.randompick.RandomLibraryPickModelTest
-          --tests com.vortx.android.ui.randompick.RandomEpisodePickModelTest
-          --tests com.vortx.android.ui.randompick.RandomEpisodePlaybackLeaseTest
-          --tests com.vortx.android.ui.randompick.RandomEpisodeAccessTest
-          --tests com.vortx.android.ui.randompick.RandomTitlePlayRequestTest
-          --tests com.vortx.android.ui.randompick.RandomPickControlsContractTest
-          --tests com.vortx.android.engine.DirectLinkDisplayGroupsTest
-          --tests com.vortx.android.ui.tv.TvDetailSourcesActionContractTest
-          --tests com.vortx.android.whatsnew.ChangelogParserTest
-          --tests com.vortx.android.player.ExoPlayerEngineStatePolicyTest
-          --tests com.vortx.android.player.PlaybackMetadataTest
-          --tests com.vortx.android.player.PlaybackStartupPresentationTest
-          --tests com.vortx.android.player.ExoStartupAdmissionTest
-          --tests com.vortx.android.player.SessionAudioPresetSessionTest
-          --tests com.vortx.android.player.SessionAudioPresetSourceContractTest
-          --tests com.vortx.android.sources.SourceQuickFiltersTest
-          --tests com.vortx.android.sources.SourceQuickFilterCallerContractTest
-          --tests com.vortx.android.sources.SourceQuickFilterTrustTest
-          --tests com.vortx.android.sources.SourceQuickFilterRankingConservationTest
-          --tests com.vortx.android.foryou.ForYouRowsModelTest
-          --tests com.vortx.android.ui.profilepicker.ProfilePickerPresentationTest
-          --tests com.vortx.android.ui.profilepicker.ProfilePickerArtworkStartupTest
-          --tests com.vortx.android.iptv.LiveGuideTest
-          --tests com.vortx.android.player.subtitles.SubtitleTimingSessionTest
-          --tests com.vortx.android.player.SubtitleOffsetBoundaryTest
-          --tests com.vortx.android.player.SubtitleOffsetMemoryTest
-          --tests 'com.vortx.android.engine.NativeOwnAccountSourcesTest.malformed own row is held without losing valid siblings or raw source bytes'
-          --no-daemon --stacktrace
-
-      - name: Test isolated Android backup Restore submission
+          APPLE_ARTIFACT: ${{ inputs.apple_artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: VortXTV/VortX
         shell: bash
-        working-directory: android
         run: |
           set -euo pipefail
-          play_results=app/build/test-results/testPlayDebugUnitTest
-          retained=app/build/recovery-isolated
-          mkdir -p "$retained"
-          test ! -e "$retained/aggregate-play"
-          mv "$play_results" "$retained/aggregate-play"
-          test ! -e "$play_results"
-          ./gradlew :app:testPlayDebugUnitTest \
-            -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true \
-            --tests com.vortx.android.sync.AccountFileRestoreManagerPutTest \
-            --no-daemon --max-workers=1 --no-parallel --no-build-cache --stacktrace
-          python3 - "$play_results" <<'PY'
-          import pathlib
+          umask 077
+          FROZEN_ROOT="$GITHUB_WORKSPACE/frozen"
+          TOOL="$FROZEN_ROOT/scripts/verify-ci-direct-beta.py"
+          test "$(git -C "$FROZEN_ROOT" rev-parse HEAD)" = "$FROZEN_SOURCE"
+          test -z "$(git -C "$FROZEN_ROOT" status --porcelain)"
+          printf '%s  %s\n' "$FROZEN_VERIFIER_SHA" "$TOOL" | shasum -a 256 --check --status
+          WORK_DIR="$(mktemp -d "$RUNNER_TEMP/vortx-beta13-private.XXXXXXXX")"
+          trap 'rm -rf "$WORK_DIR"' EXIT
+          PUBLIC_DIR="$(mktemp -d "$RUNNER_TEMP/vortx-beta13-safe-proof.XXXXXXXX")"
+          BUNDLETOOL="$WORK_DIR/bundletool.jar"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 10 --max-time 90 --max-filesize 33554432 \
+            https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar \
+            --output "$BUNDLETOOL"
+          printf '%s  %s\n' a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29 "$BUNDLETOOL" | shasum -a 256 --check --status
+          export APKSIGNER_BIN="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          export AAPT2_BIN="$ANDROID_HOME/build-tools/36.0.0/aapt2"
+          test -x "$APKSIGNER_BIN" && test -x "$AAPT2_BIN"
+          if ! python3 -B "$TOOL" preflight --tag "$FINAL_TAG" --source-commit "$FROZEN_SOURCE" \
+            --repo-root "$FROZEN_ROOT" --work-dir "$WORK_DIR" --bundletool "$BUNDLETOOL" \
+            --output "$WORK_DIR/beta13-preflight.json" \
+            --apple-run "$APPLE_RUN" --apple-attempt 1 --apple-artifact "$APPLE_ARTIFACT" \
+            --android-run "$ANDROID_RUN" --android-attempt 1 --android-artifact "$ANDROID_ARTIFACT" \
+            >"$WORK_DIR/verifier.log" 2>&1; then
+            echo '::error::Frozen preflight failed. No raw logs or receipts were exported.'
+            exit 1
+          fi
+          test -z "$(git -C "$FROZEN_ROOT" status --porcelain)"
+          if ! python3 -B - "$TOOL" "$WORK_DIR" "$PUBLIC_DIR" >"$WORK_DIR/export.log" 2>&1 <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import runpy
           import sys
-          import xml.etree.ElementTree as ET
 
-          name = "com.vortx.android.sync.AccountFileRestoreManagerPutTest"
-          results = pathlib.Path(sys.argv[1])
-          reports = list(results.glob("TEST-*.xml"))
-          if [report.name for report in reports] != [f"TEST-{name}.xml"]:
-              raise SystemExit(f"Unexpected isolated test reports: {reports}")
-          suite = ET.parse(reports[0]).getroot()
-          summary = {"name": name, "tests": "4", "failures": "0", "errors": "0", "skipped": "0"}
-          if suite.tag != "testsuite" or suite.get("disabled", "0") != "0" or any(
-              suite.get(field) != value for field, value in summary.items()
-          ):
-              raise SystemExit(f"Invalid isolated test summary: {suite.attrib}")
-          cases = suite.findall("testcase")
-          expected = {
-              "originalAbsentOutboxReachesOneActualPutAndConfirmedReadbackWithoutSyncSideEffects",
-              "existingCurrentAccountPendingSidecarVetoesBeforeJournalAndPut",
-              "mutationInsideGrantTakeCannotReplaceTheFirstAbsentOutboxObservationOrReplayTheJournal",
-              "originalPermitRetirementAtTheSyntheticDispatchBoundaryReleasesNoBody",
-          }
-          if len(cases) != len(expected) or {case.get("name") for case in cases} != expected:
-              raise SystemExit("Isolated Restore test roster differs from the reviewed cases")
-          if any(
-              case.get("classname") != name
-              or case.get("disabled", "0") != "0"
-              or case.get("status", "run").lower() not in {"run", "passed"}
-              or any(child.tag in {"skipped", "error", "failure", "disabled", "ignored"} for child in case)
-              for case in cases
-          ):
-              raise SystemExit("Isolated Restore test did not execute successfully")
+          def check(ok):
+              if not ok:
+                  raise ValueError("invalid or non-public preflight evidence")
+
+          def obj(value, *keys):
+              check(type(value) is dict and set(value) == set(keys))
+              return value
+
+          def matches(value, pattern):
+              check(type(value) is str and re.fullmatch(pattern, value) is not None)
+
+          def sha(value):
+              matches(value, r"[0-9a-f]{64}")
+
+          def positive(value):
+              check(type(value) is int and 0 < value < 2**63)
+
+          def hashes(value, names):
+              obj(value, *names)
+              for item in value.values():
+                  sha(item)
+
+          def no_duplicates(pairs):
+              value = dict(pairs)
+              check(len(value) == len(pairs))
+              return value
+
+          tool, work, output = map(Path, sys.argv[1:])
+          v = runpy.run_path(str(tool))
+          source = os.environ["FROZEN_SOURCE"]
+          candidate = os.environ["CANDIDATE"]
+          tag = os.environ["FINAL_TAG"]
+          version, build = "0.5.6", "285"
+          input_path = work / "beta13-preflight.json"
+          check(input_path.is_file() and not input_path.is_symlink())
+          with input_path.open("rb") as stream:
+              raw = stream.read(1024**2 + 1)
+          check(0 < len(raw) <= 1024**2)
+          receipt = obj(json.loads(raw, object_pairs_hook=no_duplicates), "schemaVersion", "mode", "evidence")
+          check(raw == v["canonical"](receipt))
+          check(type(receipt["schemaVersion"]) is int and receipt["schemaVersion"] == 1 and
+                receipt["mode"] == "beta13-candidate-preflight")
+          ev = obj(receipt["evidence"], "schemaVersion", "distribution", "repository", "tag", "sourceCommit",
+                   "version", "build", "sourceFileSha256", "builds", "evidence", "artifacts", "stableMustRemain")
+          check(type(ev["schemaVersion"]) is int and ev["schemaVersion"] == 1 and
+                (ev["distribution"], ev["repository"], ev["tag"], ev["sourceCommit"], ev["version"], ev["build"]) ==
+                ("hosted-direct-beta", "VortXTV/VortX", tag, source, version, build))
+          hashes(ev["sourceFileSha256"], v["TOOLS"] + v["BETA12_TOOLS"])
+          check(ev["sourceFileSha256"]["scripts/verify-ci-direct-beta.py"] == os.environ["FROZEN_VERIFIER_SHA"])
+
+          builds = obj(ev["builds"], "apple", "android")
+          for lane, proof in builds.items():
+              required = ["runId", "attempt", "artifactId", "workflow", "workflowId", "sourceCommit", "headBranch",
+                          "event", "repositoryId", "jobId", "jobName", "requiredSuccessfulSteps", "artifactName",
+                          "artifactSha256", "artifactSize", "artifactCreatedAt", "protectedNativeGate"]
+              if lane == "apple":
+                  required.append("protectedAetherGate")
+              obj(proof, *required)
+              expected_run = int(os.environ[lane.upper() + "_RUN"])
+              expected_artifact = int(os.environ[lane.upper() + "_ARTIFACT"])
+              positive(proof["runId"])
+              positive(proof["attempt"])
+              positive(proof["artifactId"])
+              check((proof["runId"], proof["attempt"], proof["artifactId"]) == (expected_run, 1, expected_artifact))
+              workflow, job, artifact = v["LANES"][lane][:3]
+              check((proof["workflow"], proof["jobName"], proof["artifactName"]) ==
+                    (".github/workflows/" + workflow, job, artifact))
+              check((proof["workflowId"], proof["sourceCommit"], proof["headBranch"], proof["event"]) ==
+                    ({"apple": 293211344, "android": 342394030}[lane], source, candidate, "workflow_dispatch"))
+              check(proof["requiredSuccessfulSteps"] == list(v["job_contract"](lane, tag)[0]))
+              for key in ("repositoryId", "jobId", "artifactSize"):
+                  positive(proof[key])
+              sha(proof["artifactSha256"])
+              matches(proof["artifactCreatedAt"], r"[0-9]{4}(?:-[0-9]{2}){2}T[0-9]{2}(?::[0-9]{2}){2}Z")
+          android = builds["android"]
+          check(android["artifactSha256"] == os.environ["ANDROID_ARTIFACT_SHA"] and android["artifactSize"] == 201681040)
+          check(builds["apple"]["repositoryId"] == android["repositoryId"])
+
+          gate = obj(builds["apple"]["protectedNativeGate"], "artifactId", "artifactSha256", "coordinatorSha256",
+                     "sdkHeaderSha256", "sdkArchiveSha256", "assertionCounts", "fullLiveAbi")
+          positive(gate["artifactId"])
+          for key in ("artifactSha256", "coordinatorSha256", "sdkHeaderSha256", "sdkArchiveSha256"):
+              sha(gate[key])
+          hashes(gate["fullLiveAbi"], ("headerSha256", "librarySha256"))
+          for count in obj(gate["assertionCounts"], "converter", "service", "restore").values():
+              positive(count)
+          gate = obj(android["protectedNativeGate"], "artifactId", "artifactSha256", "hostLibrarySha256",
+                     "hostSourceInputsSha256", "executed", "realJniCases", "junitXmlSha256", "backupCas")
+          positive(gate["artifactId"])
+          for key in ("artifactSha256", "hostLibrarySha256", "hostSourceInputsSha256"):
+              sha(gate[key])
+          positive(gate["executed"])
+          positive(gate["realJniCases"])
+          check((gate["executed"], gate["realJniCases"]) == (107, 52))
+          hashes(gate["junitXmlSha256"], ("TEST-" + name + ".xml" for name in v["BETA12_JNI_CLASSES"]))
+          backup = obj(gate["backupCas"], "cases", "xmlSha256")
+          check(type(backup["cases"]) is int and backup["cases"] == 16)
+          sha(backup["xmlSha256"])
+
+          aether = obj(builds["apple"]["protectedAetherGate"], "artifactId", "artifactSha256", "apps",
+                       "packages", "packageResolvedSha256", "resolutionReceiptSha256")
+          positive(aether["artifactId"])
+          for key in ("artifactSha256", "packageResolvedSha256", "resolutionReceiptSha256"):
+              sha(aether[key])
+          check(aether["packages"] == v["BETA12_AETHER_PACKAGES"])
+          for key, app in obj(aether["apps"], *v["BETA12_AETHER_APPS"]).items():
+              obj(app, "aetherLinkMapSha256", "nativeAppReceiptSha256", "provider", "binaries")
+              sha(app["aetherLinkMapSha256"])
+              sha(app["nativeAppReceiptSha256"])
+              provider = obj(app["provider"], "platform", "variant", "libraryIdentifier", "upstreamSha256",
+                             "processedSha256", "arm64Sha256")
+              check((provider["platform"], provider["variant"]) == v["BETA12_AETHER_APPS"][key])
+              matches(provider["libraryIdentifier"], r"[A-Za-z0-9_-]{1,100}")
+              for field in ("upstreamSha256", "processedSha256", "arm64Sha256"):
+                  sha(provider[field])
+              for name, binary in obj(app["binaries"], *v["BETA12_AETHER_BINARIES"]).items():
+                  obj(binary, "path", "architectures", "rawSha256", "normalizedSha256")
+                  prefix = "Contents/Frameworks/" if key == "macos" else "Frameworks/"
+                  versioned = r"(?:Versions/[A-Za-z0-9_-]+/)?" if key == "macos" else ""
+                  matches(binary["path"], re.escape(prefix + name + ".framework/") + versioned + re.escape(name))
+                  check(binary["architectures"] in (["arm64"], ["arm64", "x86_64"]))
+                  sha(binary["rawSha256"])
+                  sha(binary["normalizedSha256"])
+
+          nested = obj(ev["evidence"], "apple", "android")
+          apple_ev = obj(nested["apple"], "originalWorkflow", "originalDispatch", "receiptSha256")
+          apple_identity = {"schemaVersion": 1, "sourceCommit": source, "workflowCommit": source,
+                            "runId": builds["apple"]["runId"], "attempt": 1}
+          check(v["canonical"](apple_ev["originalWorkflow"]) == v["canonical"]({
+              **apple_identity, "tag": "", "verifierSha256": ev["sourceFileSha256"]["scripts/verify-native-apple-package.py"]}))
+          check(v["canonical"](apple_ev["originalDispatch"]) == v["canonical"]({
+              **apple_identity, "event": "workflow_dispatch", "ref": "refs/tags/" + candidate, "inputs": v["APPLE_INPUTS"]}))
+          apple_files, apple_contents, android_files = v["file_matrix"](tag, version)
+          hashes(apple_ev["receiptSha256"], (name for name in apple_contents if name.endswith(".json")))
+          android_ev = obj(nested["android"], "signingAndVersionEvidenceSha256", "checksumEvidenceSha256",
+                            "engineSourceCommit", "nativeFeatures")
+          sha(android_ev["signingAndVersionEvidenceSha256"])
+          sha(android_ev["checksumEvidenceSha256"])
+          check((android_ev["engineSourceCommit"], android_ev["nativeFeatures"]) ==
+                (v["expected_engine"](tag), "jni,server,resource-host"))
+
+          apple_names = {name.replace("-ci.", f"-{tag}-ci."): platform for platform, name in apple_files.items()}
+          bundle_ids = {"ios": "com.stremiox.app.native", "tvos": "com.stremiox.tv",
+                        "tvos-lite": "com.stremiox.tv.lite", "macos": "com.stremiox.mac"}
+          assets = ev["artifacts"]
+          check(type(assets) is list and len(assets) == 7)
+          check({asset["name"] for asset in assets} == set(apple_names) | android_files)
+          for asset in assets:
+              name = asset["name"]
+              fields = ["name", "sha256", "size", "platform", "version", "build", "signature"]
+              if name in apple_names:
+                  platform = apple_names[name]
+                  obj(asset, *fields, "bundleIdentifier", "notarization")
+                  check((asset["platform"], asset["bundleIdentifier"]) == (platform, bundle_ids[platform]))
+                  signing = ("adhoc", "not-notarized") if platform == "macos" else ("unsigned-resign-required", "not-applicable")
+                  check((asset["signature"], asset["notarization"]) == signing)
+              else:
+                  obj(asset, *fields)
+                  check((asset["platform"], asset["signature"]) == ("android", "pinned-production-signer"))
+              check((asset["version"], asset["build"]) == (version, build))
+              sha(asset["sha256"])
+              positive(asset["size"])
+
+          stable = obj(ev["stableMustRemain"], "latest", "mainCommit", "routes")
+          matches(stable["mainCommit"], r"[0-9a-f]{40}")
+          stable_tag = r"v[0-9]+\.[0-9]+\.[0-9]+(?:-beta\.[1-9][0-9]*)?"
+          latest = obj(stable["latest"], "id", "tag")
+          positive(latest["id"])
+          matches(latest["tag"], stable_tag)
+          routes = obj(stable["routes"], "altstore", "appcast", "download", "feedGeneration")
+          matches(routes["feedGeneration"], stable_tag + r":[0-9]+:[0-9a-f]{64}")
+          appcast = obj(routes["appcast"], "tag", "apple", "android")
+          matches(appcast["tag"], stable_tag)
+          apple_route_names = {"ios": ("iOS", "ipa"), "tvos": ("tvOS", "ipa"), "mac": ("macOS", "dmg")}
+          for key, row in obj(appcast["apple"], *apple_route_names).items():
+              slug, suffix = apple_route_names[key]
+              obj(row, "tag", "asset", "build", "sha256", "version", "size", "artifactType")
+              check(row["tag"] == appcast["tag"] and row["artifactType"] == suffix)
+              check(row["asset"] == f"VortX-{slug}-{row['tag']}-ci.{suffix}")
+              matches(row["build"], r"[0-9]{1,12}")
+              matches(row["version"], r"[0-9]+\.[0-9]+\.[0-9]+")
+              sha(row["sha256"])
+              positive(row["size"])
+          for key, row in obj(routes["altstore"], bundle_ids["ios"], bundle_ids["tvos"]).items():
+              obj(row, "tag", "asset", "build", "sha256")
+              linked = appcast["apple"]["ios" if key == bundle_ids["ios"] else "tvos"]
+              check(row == {name: linked[name] for name in row})
+          engines = {"full": "mpv", "play": "media3"}
+          if appcast["android"] is not None:
+              for flavor, row in obj(appcast["android"], *engines).items():
+                  obj(row, "tag", "asset", "version", "sha256", "size", "artifactType", "engine", "flavor")
+                  matches(row["tag"], stable_tag)
+                  matches(row["version"], r"[0-9]+\.[0-9]+\.[0-9]+")
+                  engine = engines[flavor]
+                  check((row["artifactType"], row["flavor"], row["engine"], row["asset"]) ==
+                        ("apk", flavor, engine, f"VortX-{row['version']}-{flavor}-{engine}-universal.apk"))
+                  sha(row["sha256"])
+                  positive(row["size"])
+          download = obj(routes["download"], "tag", "asset", "platform", "engine", "flavor")
+          matches(download["tag"], stable_tag)
+          check((download["platform"], download["engine"], download["flavor"]) == ("android", "mpv", "full"))
+          matches(download["asset"], r"VortX-[0-9]+\.[0-9]+\.[0-9]+-full-mpv-universal\.apk")
+
+          checksum = hashlib.sha256(raw).hexdigest()
+          marker = f"Verified both original {tag} candidate builds; no release writes. Receipt SHA-256: {checksum}"
+          log = work / "verifier.log"
+          check(log.is_file() and log.stat().st_size <= 1024**2)
+          check(log.read_text().splitlines().count(marker) == 1)
+          check(output.is_dir() and not output.is_symlink() and not list(output.iterdir()))
+          with (output / "beta13-preflight.json").open("xb") as stream:
+              stream.write(raw)
+          with (output / "beta13-preflight.sha256").open("x") as stream:
+              stream.write(f"{checksum}  beta13-preflight.json\n")
           PY
+          then
+            echo '::error::Preflight output did not pass the strict public receipt allowlist.'
+            exit 1
+          fi
+          test "$(find "$PUBLIC_DIR" -mindepth 1 -maxdepth 1 | wc -l | tr -d '[:space:]')" = 2
+          (cd "$PUBLIC_DIR" && shasum -a 256 --check beta13-preflight.sha256)
+          printf 'BETA13_SAFE_PREFLIGHT_DIR=%s\n' "$PUBLIC_DIR" >> "$GITHUB_ENV"
+          printf 'Verified frozen Beta 13 candidate bytes; sanitized preflight receipt SHA-256 %s\n' \
+            "$(cut -d ' ' -f 1 "$PUBLIC_DIR/beta13-preflight.sha256")"
 
-      - name: Test Full player native-load metadata identity
-        working-directory: android
-        run: >-
-          ./gradlew :app:testFullDebugUnitTest
-          -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true
-          --tests com.vortx.android.player.mpv.MpvMetadataLoadIdentityTest
-          --tests com.vortx.android.player.mpv.MpvSessionAudioRouteTest
-          --no-daemon --stacktrace
-
-      - name: Retain current-source recovery test execution and skips
-        if: ${{ always() }}
+      - name: Retain only the original sanitized receipt and its checksum
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: Android-recovery-unit-results
+          name: VortX-Beta13-protected-preflight
           path: |
-            android/app/build/recovery-isolated/aggregate-play/*.xml
-            android/app/build/test-results/testPlayDebugUnitTest/*.xml
-            android/app/build/test-results/testFullDebugUnitTest/*.xml
+            ${{ env.BETA13_SAFE_PREFLIGHT_DIR }}/beta13-preflight.json
+            ${{ env.BETA13_SAFE_PREFLIGHT_DIR }}/beta13-preflight.sha256
           if-no-files-found: error
-
-      - name: Require the exact release package set (two universal APKs, one AAB)
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          apks=(android/app/build/outputs/apk/full/release/*.apk android/app/build/outputs/apk/play/release/*.apk)
-          bundles=(android/app/build/outputs/bundle/playRelease/*.aab)
-          if [ ${#apks[@]} -ne 2 ] || [ ${#bundles[@]} -ne 1 ]; then
-            echo "::error::expected exactly two flavor release APKs and one play AAB, found ${#apks[@]} APKs and ${#bundles[@]} AABs"
-            exit 1
-          fi
-          echo "ok: full + play release APKs and playRelease AAB produced"
-
-      # Self-consistency proof of the ad-hoc signature chain, mirroring the strictness of
-      # scripts/verify-android-release-signing.sh (v2 scheme required, single signer, explicit
-      # Android Debug rejection) while comparing against the EPHEMERAL certificate instead of the
-      # production pin. The production pin itself is untouched and lives only in the verify
-      # script used by the release workflow.
-      - name: Verify ad-hoc signatures fail-closed (v2 scheme, pinned-to-run cert, no debug signer)
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          apksigner="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n1)"
-          [ -x "$apksigner" ] || { echo "::error::apksigner not found under $ANDROID_HOME/build-tools"; exit 1; }
-          expected_dn="CN=VortX CI Ad-hoc Release, O=VortXTV, C=US"
-          expected_fp="$(LC_ALL=C "$JAVA_HOME/bin/keytool" -list -v \
-            -keystore "$RUNNER_TEMP/adhoc-signing/adhoc-release.jks" \
-            -storetype PKCS12 -storepass vortx-adhoc-ci-store -alias adhoc-release \
-            | sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' | head -n1 | tr -d ' :' | tr '[:lower:]' '[:upper:]')"
-          [ -n "$expected_fp" ] || { echo "::error::could not derive the ad-hoc certificate fingerprint from the ephemeral keystore"; exit 1; }
-          apks=(android/app/build/outputs/apk/full/release/*.apk android/app/build/outputs/apk/play/release/*.apk)
-          for apk in "${apks[@]}"; do
-            out="$("$apksigner" verify --verbose --print-certs-pem "$apk")"
-            grep -Fq 'Verified using v2 scheme (APK Signature Scheme v2): true' <<<"$out" \
-              || { echo "::error::$apk is not verified with APK Signature Scheme v2"; exit 1; }
-            begin_count="$(grep -Fc -- '-----BEGIN CERTIFICATE-----' <<<"$out" || true)"
-            end_count="$(grep -Fc -- '-----END CERTIFICATE-----' <<<"$out" || true)"
-            [ "$begin_count" = "1" ] && [ "$end_count" = "1" ] || { echo "::error::$apk must contain exactly one PEM signer certificate"; exit 1; }
-            certificate_dir="$(mktemp -d)"
-            certificate_file="$certificate_dir/signer.pem"
-            awk '/-----BEGIN CERTIFICATE-----/{keep=1} keep{print} /-----END CERTIFICATE-----/{exit}' <<<"$out" > "$certificate_file"
-            certificate_out="$(LC_ALL=C "$JAVA_HOME/bin/keytool" -printcert -file "$certificate_file")" || { rm -rf "$certificate_dir"; echo "::error::could not read PEM signer certificate from $apk"; exit 1; }
-            rm -rf "$certificate_dir"
-            if grep -Eiq 'CN[[:space:]]*=[[:space:]]*Android Debug|Android Debug' <<<"$certificate_out"; then
-              echo "::error::$apk is signed by an Android Debug certificate"; exit 1
-            fi
-            fp="$(sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' <<<"$certificate_out" | tr -d ' :' | tr '[:lower:]' '[:upper:]')"
-            [ "$fp" = "$expected_fp" ] || { echo "::error::$apk signer does not match the ephemeral ad-hoc certificate"; exit 1; }
-            dn="$(sed -n 's/^Owner:[[:space:]]*//p' <<<"$certificate_out")"
-            [ "$dn" = "$expected_dn" ] || { echo "::error::$apk signer DN is not the ad-hoc release identity: $dn"; exit 1; }
-            echo "ok: $apk carries a valid v2 ad-hoc signature bound to the run-local certificate"
-          done
-          bundle="$(ls android/app/build/outputs/bundle/playRelease/*.aab)"
-          # The signer is intentionally self-signed and run-local: trust ONLY this generated keystore,
-          # while retaining strict entry verification and the independent fingerprint/subject checks.
-          jarsigner_out="$(LC_ALL=C "$JAVA_HOME/bin/jarsigner" -verify -strict -verbose \
-            -keystore "$RUNNER_TEMP/adhoc-signing/adhoc-release.jks" \
-            -storepass vortx-adhoc-ci-store "$bundle" 2>&1)" \
-            || { echo "::error::jarsigner strict verification failed for $bundle"; printf '%s\n' "$jarsigner_out"; exit 1; }
-          grep -Eq '^jar verified.$' <<<"$jarsigner_out" \
-            || { echo "::error::$bundle does not contain a verified JAR signature"; exit 1; }
-          bundle_out="$(LC_ALL=C "$JAVA_HOME/bin/keytool" -printcert -jarfile "$bundle")"
-          if grep -Eiq 'CN[[:space:]]*=[[:space:]]*Android Debug|Android Debug' <<<"$bundle_out"; then
-            echo "::error::$bundle is signed by an Android Debug certificate"; exit 1
-          fi
-          bundle_count="$(sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' <<<"$bundle_out" | wc -l | tr -d '[:space:]')"
-          [ "$bundle_count" = "1" ] || { echo "::error::$bundle must report exactly one signer fingerprint, found $bundle_count"; exit 1; }
-          bundle_fp="$(sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' <<<"$bundle_out" | tr -d ' :' | tr '[:lower:]' '[:upper:]')"
-          [ "$bundle_fp" = "$expected_fp" ] || { echo "::error::$bundle signer does not match the ephemeral ad-hoc certificate"; exit 1; }
-          echo "ok: $bundle passes strict JAR verification bound to the run-local certificate"
-
-      # Licensing boundary holds regardless of engines: the play flavor must never contain the
-      # GPL mpv/ffmpeg set, and the full flavor must merge the mavenCentral libmpv natives for
-      # ALL shipped ABIs (real native-input packaging proof available without the private engines).
-      - name: Enforce the GPL boundary and prove native-lib merge packaging
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          gpl_pattern='lib(mpv|player|avcodec|avformat|avutil)\.so'
-          for apk in android/app/build/outputs/apk/play/release/*.apk; do
-            listing="$(unzip -l "$apk")"
-            if grep -Eq "$gpl_pattern" <<<"$listing"; then
-              echo "::error::GPL native library found in play release APK: $apk"
-              exit 1
-            fi
-          done
-          echo "ok: play flavor is clean of GPL native libraries"
-          full_apk="$(ls android/app/build/outputs/apk/full/release/*.apk)"
-          for abi in arm64-v8a armeabi-v7a x86_64; do
-            unzip -p "$full_apk" "lib/$abi/libmpv.so" > /dev/null 2>&1 \
-              || { echo "::error::lib/$abi/libmpv.so missing from $full_apk"; exit 1; }
-            echo "ok: $full_apk packages merged native library for $abi"
-          done
-
-      - name: Shred ephemeral ad-hoc keystore
-        if: always()
-        run: rm -rf "$RUNNER_TEMP/adhoc-signing"
-
-  apple-shell-packaging:
-    name: Apple tvOS/iOS/macOS shell packaging (secretless)
-    runs-on: macos-26-intel
-    timeout-minutes: 150
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # Fixture-driven tests of the exact scripts the privileged release lane invokes
-      # (release-tvos.yml calls release-feed.mjs build-artifact/project-build,
-      # gen-altstore-source.py via the AltStore source step, repackage-ipa.sh for IPA packing).
-      - name: Run release-feed contract tests
-        run: node scripts/tests/release-feed.test.mjs
-
-      - name: Run AltStore source generator tests
-        run: python3 scripts/tests/test_gen_altstore_source.py
-
-      - name: Run IPA repackaging tests
-        run: bash scripts/tests/repackage-ipa.test.sh
-
-      - name: Prove all-shell failure aggregation keeps every gate fail-closed
-        run: node scripts/test-shell-validation-aggregation.mjs
-
-      - name: Test explicit watched-history retry and account readiness
-        run: bash scripts/test-native-watched-retry.sh "$GITHUB_WORKSPACE"
-
-      # Pinned XcodeGen, identical version + checksum gate as release-tvos.yml so project
-      # generation here observes the same generator the release lane uses.
-      - name: Install pinned XcodeGen
-        env:
-          XCODEGEN_VERSION: "2.46.0"
-          XCODEGEN_SHA256: "4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
-        run: |
-          set -euo pipefail
-          workdir="$RUNNER_TEMP/xcodegen"
-          mkdir -p "$workdir"
-          url="https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
-          curl -fsSL --retry 3 -o "$workdir/xcodegen.zip" "$url"
-          printf '%s  %s\n' "$XCODEGEN_SHA256" "$workdir/xcodegen.zip" > "$workdir/xcodegen.sha256"
-          shasum -a 256 -c "$workdir/xcodegen.sha256"
-          unzip -q "$workdir/xcodegen.zip" -d "$workdir"
-          "$workdir/xcodegen/bin/xcodegen" --version
-          echo "$workdir/xcodegen/bin" >> "$GITHUB_PATH"
-
-      # Public fonts and the player package use the protected lane's reviewed pins. The private
-      # engine and Mac daemon are represented by marked, fail-closed CI stand-ins only here.
-      # This checks real native Swift compile/link/package mechanics, not engine/server behavior.
-      - name: Fetch subtitle fonts
-        run: ./scripts/fetch-server-deps.sh
-
-      - name: Fetch MPVKit-DVFEL artifacts (public release asset, sha256-verified)
-        env:
-          MPVKIT_ARTIFACTS_SHA256: "f4e4fcc25a61997ee4e74a7ad155d46192f4d86d7953ce1a352da796b8765672"
-        run: |
-          set -euo pipefail
-          DEST="app/Vendor/MPVKit-DVFEL"
-          curl -sfL --retry 3 -o "$RUNNER_TEMP/mpvkit.zip" \
-            "https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-ffmpeg9-20261021/mpvkit-dvfel-ffmpeg-9.0.2-candidate.zip"
-          ACTUAL="$(shasum -a 256 "$RUNNER_TEMP/mpvkit.zip" | cut -d' ' -f1)"
-          if [ "$ACTUAL" != "$MPVKIT_ARTIFACTS_SHA256" ]; then
-            echo "::error::MPVKit artifact checksum mismatch: expected $MPVKIT_ARTIFACTS_SHA256 got $ACTUAL"
-            exit 1
-          fi
-          rm -rf "$DEST/artifacts"
-          unzip -oq "$RUNNER_TEMP/mpvkit.zip" -d "$DEST"
-          bash scripts/verify-mpvkit-dvfel-artifacts.sh "$DEST"
-
-      - name: Generate CI-only stub engine xcframeworks
-        run: |
-          ./scripts/build-stub-engine-xcframeworks.sh
-          test -f app/Vendor/VortxEngine.xcframework/STUB-CI-ONLY.txt || { echo "::error::VortxEngine stub marker missing"; exit 1; }
-          test -x app/Vendor/vortx-streaming-server || { echo "::error::CI-only Mac daemon is missing"; exit 1; }
-          test -f app/Vendor/vortx-streaming-server.STUB-CI-ONLY.txt || { echo "::error::CI-only Mac daemon marker missing"; exit 1; }
-
-      - name: Generate the Xcode project
-        run: |
-          set -euo pipefail
-          cd app
-          # All-zero revision is an explicit CI-only sentinel; no private engine was fetched.
-          ruby ../scripts/generate-native-apple-project.rb \
-            --engine-revision 0000000000000000000000000000000000000000 \
-            --mpvkit "$PWD/Vendor/MPVKit-DVFEL" --output "$PWD/.native-ci-project.yml"
-          xcodegen generate --spec .native-ci-project.yml
-          ruby ../scripts/native-apple-swift6-policy.rb VortX.xcodeproj native
-
-      # LibDovi 2.1.0 ships the real arm64 tvOS simulator provider but omits Intel.
-      # Build only that missing slice from its exact underlying 3.4.0 source, preserving
-      # the other upstream bytes. All original universal/explicit-x86 shell gates remain.
-      - name: Resolve Aether packages into this job's owned directory
-        run: |
-          set -euo pipefail
-          xcodebuild -resolvePackageDependencies -project app/VortX.xcodeproj -scheme VortXTVLite \
-            -clonedSourcePackagesDirPath "$RUNNER_TEMP/aether-packages"
-          test "$(git -C "$RUNNER_TEMP/aether-packages/checkouts/AetherEngine" rev-parse HEAD)" = 4a82484b256deb70a2ae80d6923707d1fe54c6e7
-          test "$(git -C "$RUNNER_TEMP/aether-packages/checkouts/LibDovi" rev-parse HEAD)" = 0d7cce1d6836a30d13a3a2326e50a153af53f014
-
-      - name: Acquire the exact public libdovi source
-        run: |
-          set -euo pipefail
-          git init "$RUNNER_TEMP/aether-dovi-source"
-          git -C "$RUNNER_TEMP/aether-dovi-source" remote add origin https://github.com/quietvoid/dovi_tool.git
-          git -C "$RUNNER_TEMP/aether-dovi-source" fetch --depth=1 origin d1abe0e27ff2c7ab3339614d06db9f8a058af6b2
-          git -C "$RUNNER_TEMP/aether-dovi-source" checkout --detach FETCH_HEAD
-          test "$(git -C "$RUNNER_TEMP/aether-dovi-source" rev-parse HEAD)" = d1abe0e27ff2c7ab3339614d06db9f8a058af6b2
-
-      - name: Prepare the pinned Rust and cargo-c tools on the hosted runner
-        run: |
-          set -euo pipefail
-          rustup toolchain install nightly-2026-07-19 --profile minimal --component rust-src
-          cargo +nightly-2026-07-19 install cargo-c --version '0.10.26+cargo-0.100.0' --locked \
-            --jobs 1 --root "$RUNNER_TEMP/aether-cargo-c"
-          echo "$RUNNER_TEMP/aether-cargo-c/bin" >> "$GITHUB_PATH"
-
-      - name: Build and admit the real Intel tvOS simulator provider
-        run: |
-          set -euo pipefail
-          bash scripts/build-aether-dovi-tv-simulator.sh \
-            "$RUNNER_TEMP/aether-dovi-source" "$RUNNER_TEMP/aether-packages/checkouts/LibDovi" \
-            "$RUNNER_TEMP/aether-dovi-provider" "$RUNNER_TEMP"
-          python3 scripts/aether-dovi-provider.py extend \
-            --package "$RUNNER_TEMP/aether-packages/checkouts/LibDovi" \
-            --provider "$RUNNER_TEMP/aether-dovi-provider" --work "$RUNNER_TEMP/aether-dovi-extension" --owned-root "$RUNNER_TEMP"
-
-      # Real compile/link/package per platform shell. Signing is disabled outright (no identity,
-      # none needed for simulator or unsigned macOS builds). Each produced .app must carry the
-      # expected bundle ID and a Mach-O executable whose engine symbols are RESOLVED (defined in
-      # the linked binary), proving the link phase consumed the engine libraries.
-      # All four native app targets are built, including both tvOS Lite simulator architectures.
-      - name: Build and verify tvOS, iOS, and macOS shells
-        run: |
-          set -euo pipefail
-          build_one_shell() {
-            local scheme="$1" destination="$2" expected_bundle="$3" dd="$4" require_engines="$5" arch="${6:-}"
-            echo "::group::xcodebuild $scheme"
-            # Keep code in the executable checked below, not Xcode's Debug preview trampoline/dylib pair.
-            xcodebuild -project app/VortX.xcodeproj -scheme "$scheme" \
-              -destination "$destination" \
-              -clonedSourcePackagesDirPath "$RUNNER_TEMP/aether-packages" \
-              -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile \
-              -derivedDataPath "$dd" \
-              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO ENABLE_DEBUG_DYLIB=NO LD_GENERATE_MAP_FILE=YES ${arch:+ARCHS=$arch ONLY_ACTIVE_ARCH=NO} \
-              build
-            echo '::endgroup::'
-            local products_dir
-            products_dir="$(find "$dd/Build/Products" -type d -name '*.app' -prune -print | sed -n '1p')"
-            [ -n "$products_dir" ] || { echo "::error::$scheme produced no .app"; exit 1; }
-            local bundle_id exe info_plist executable_dir
-            info_plist="$products_dir/Info.plist"
-            executable_dir="$products_dir"
-            if [ -f "$products_dir/Contents/Info.plist" ]; then
-              info_plist="$products_dir/Contents/Info.plist"
-              executable_dir="$products_dir/Contents/MacOS"
-            fi
-            bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist")"
-            [ "$bundle_id" = "$expected_bundle" ] || { echo "::error::$scheme bundle id $bundle_id != $expected_bundle"; exit 1; }
-            exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info_plist")"
-            file "$executable_dir/$exe" | grep -q 'Mach-O' || { echo "::error::$scheme executable is not Mach-O"; exit 1; }
-            if [ -n "$arch" ]; then xcrun lipo "$executable_dir/$exe" -verify_arch "$arch"; fi
-            # Capture first: grep -q can close the pipe early and make nm fail with SIGPIPE under pipefail.
-            local defined_symbols undefined_symbols
-            defined_symbols="$(nm -gU "$executable_dir/$exe")"
-            undefined_symbols="$(nm -u "$executable_dir/$exe")"
-            grep -Eq '[[:space:]][Tt][[:space:]]+_vortx_init_from_state_json$' <<< "$defined_symbols" \
-              || { echo "::error::$scheme binary lacks a defined native state-import symbol"; exit 1; }
-            grep -Eq '[[:space:]][Tt][[:space:]]+_vortx_resource_host_new$' <<< "$defined_symbols" \
-              || { echo "::error::$scheme binary lacks a defined native resource-host symbol"; exit 1; }
-            if [ "$require_engines" = "in-process" ]; then
-              grep -Eq '[[:space:]][Tt][[:space:]]+_vortx_server_start$' <<< "$defined_symbols" \
-                || { echo "::error::$scheme binary lacks a defined in-process server symbol"; exit 1; }
-            fi
-            if grep -Eq '_stremiox_core_|_node_start' <<< "$defined_symbols"; then
-              echo "::error::$scheme binary retains removed engine/runtime symbols"; exit 1;
-            fi
-            if grep -Eq '_stremiox_core_|_vortx_' <<< "$undefined_symbols"; then
-              echo "::error::$scheme binary still has unresolved engine symbols"; grep -E '_stremiox_core_|_vortx_' <<< "$undefined_symbols"; exit 1
-            fi
-            local framework_root="$products_dir/Frameworks"
-            if [ -d "$products_dir/Contents/Frameworks" ]; then framework_root="$products_dir/Contents/Frameworks"; fi
-            local aether="$framework_root/VortXAetherKit.framework/VortXAetherKit"
-            [ -f "$aether" ] || { echo "::error::$scheme is missing its real Aether framework"; exit 1; }
-            if [ -n "$arch" ]; then xcrun lipo "$aether" -verify_arch "$arch"; fi
-            local aether_undefined aether_dependencies
-            aether_undefined="$(nm -u "$aether")"
-            if grep -Eq '[[:space:]]_dovi_' <<< "$aether_undefined"; then
-              echo "::error::$scheme Aether retains unresolved Dolby Vision provider calls"; exit 1
-            fi
-            aether_dependencies="$(otool -L "$aether")"
-            grep -Fq '@rpath/AetherLibavcodec.framework/' <<< "$aether_dependencies" \
-              || { echo "::error::$scheme Aether lost its isolated dynamic FFmpeg dependency"; exit 1; }
-            if [ "$scheme" = VortXTVLite ]; then
-              if [ "$arch" = x86_64 ]; then xcrun lipo "$aether" -verify_arch x86_64;
-              else
-                xcrun lipo "$aether" -verify_arch arm64
-                xcrun lipo "$aether" -verify_arch x86_64
-              fi
-            fi
-            local framework framework_binary built_arch
-            for framework in AetherLibavcodec AetherLibavfilter AetherLibavformat AetherLibavutil AetherLibdav1d AetherLibswresample AetherLibswscale AetherLibzimg AetherLibzvbi; do
-              framework_binary="$framework_root/$framework.framework/$framework"
-              [ -f "$framework_binary" ] \
-                || { echo "::error::$scheme is missing the $framework binary"; exit 1; }
-              for built_arch in $(xcrun lipo -archs "$aether"); do
-                xcrun lipo "$framework_binary" -verify_arch "$built_arch"
-              done
-            done
-            local evidence="$RUNNER_TEMP/aether-link-evidence/$scheme-${arch:-default}"
-            mkdir -p "$evidence"
-            cp "$aether" "$evidence/VortXAetherKit"
-            printf '%s\n' "$aether_dependencies" > "$evidence/dynamic-dependencies.txt"
-            local link_map map_count=0
-            while IFS= read -r link_map; do
-              grep -Fq 'libdovi.a' "$link_map" \
-                || { echo "::error::Aether link map lacks its admitted Dovi provider"; exit 1; }
-              if grep -Eq 'MPVKit-DVFEL/|Libmpv\.xcframework/|Libavcodec\.xcframework/' "$link_map"; then
-                echo "::error::Aether link map includes the other player native stack"; exit 1
-              fi
-              cp "$link_map" "$evidence/$(basename "$link_map")"
-              map_count=$((map_count + 1))
-            done < <(find "$dd" -type f -name 'VortXAetherKit-LinkMap-*.txt')
-            [ "$map_count" -gt 0 ] || { echo "::error::Aether link map missing"; exit 1; }
-            local processed processed_count=0 dovi_platform
-            case "$destination" in
-              *tvOS*) dovi_platform=tvos-simulator ;;
-              *iOS*) dovi_platform=ios-simulator ;;
-              *) dovi_platform=macos ;;
-            esac
-            while IFS= read -r processed; do
-              python3 scripts/verify-aether-dovi-processed.py --processed "$processed" \
-                --package "$RUNNER_TEMP/aether-packages/checkouts/LibDovi" \
-                --work "$RUNNER_TEMP/aether-dovi-extension" --owned-root "$RUNNER_TEMP" \
-                --platform "$dovi_platform" --output "$evidence/processed-$processed_count-admission.json"
-              cp "$processed" "$evidence/$(basename "$(dirname "$processed")")-libdovi.a"
-              processed_count=$((processed_count + 1))
-            done < <(find "$dd/Build/Products" -type f -name libdovi.a)
-            [ "$processed_count" -gt 0 ] || { echo "::error::Processed Dovi library missing"; exit 1; }
-            python3 scripts/aether-dovi-provider.py verify-installed \
-              --package "$RUNNER_TEMP/aether-packages/checkouts/LibDovi" --work "$RUNNER_TEMP/aether-dovi-extension" --owned-root "$RUNNER_TEMP"
-            echo "ok: $scheme -> $(basename "$products_dir") bundle=$bundle_id executable=$exe engines resolved; Aether provider resolved and dynamic FFmpeg embedded"
-          }
-          # Keep every original gate fail-fast within its isolated shell, but collect all
-          # platform failures before the job fails. A Lite error must not hide an iOS/Mac error.
-          # A fresh Bash process is intentional: invoking a function directly in `if` disables
-          # errexit inside that function, even if it calls `set -e` again.
-          export -f build_one_shell
-          shell_failures=0
-          build_shell() {
-            if bash -euo pipefail -c 'build_one_shell "$@"' -- "$@"; then
-              echo "::notice::shell passed: $1 ${6:-default}"
-            else
-              echo "::error::shell failed: $1 ${6:-default}"
-              shell_failures=$((shell_failures + 1))
-            fi
-          }
-          build_shell VortXTVLite   'generic/platform=tvOS Simulator' com.stremiox.tv.lite     "$RUNNER_TEMP/dd-tvlite" native
-          build_shell VortXTV       'generic/platform=tvOS Simulator' com.stremiox.tv         "$RUNNER_TEMP/dd-tv"     in-process arm64
-          build_shell VortXTVLite   'generic/platform=tvOS Simulator' com.stremiox.tv.lite    "$RUNNER_TEMP/dd-tvlite-x86" native x86_64
-          build_shell VortXiOSNative 'generic/platform=iOS Simulator'  com.stremiox.app.native "$RUNNER_TEMP/dd-ios"    in-process
-          build_shell VortXMac      'generic/platform=macOS'          com.stremiox.mac        "$RUNNER_TEMP/dd-mac"    daemon arm64
-          [ "$shell_failures" -eq 0 ] || { echo "::error::$shell_failures shell checks failed"; exit 1; }
-
-      - name: Retain the real simulator provider and its complete verification receipts
-        if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: Aether-Intel-tvOS-simulator-provider
-          path: |
-            ${{ runner.temp }}/aether-dovi-provider/install
-            ${{ runner.temp }}/aether-dovi-provider/*.json
-            ${{ runner.temp }}/aether-dovi-provider/*.txt
-            ${{ runner.temp }}/aether-dovi-provider/*.log
-            ${{ runner.temp }}/aether-dovi-provider/probe.c
-            ${{ runner.temp }}/aether-dovi-provider/probe.o
-            ${{ runner.temp }}/aether-dovi-provider/probe.dylib
-            ${{ runner.temp }}/aether-dovi-extension/extension-receipt.json
-            ${{ runner.temp }}/aether-link-evidence
-            app/VortX.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
-          if-no-files-found: warn
+          retention-days: 3
+          overwrite: false
