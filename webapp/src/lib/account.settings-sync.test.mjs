@@ -533,6 +533,95 @@ test("API-key-only account documents support deletion and hydrate missing keys a
   assert.equal(getSettings().mdblistKey, "", "a remote missing key must clear the hydrated local value");
 });
 
+const PROVIDER_TEST_ACTOR = "0f2d3c4b-5a69-4788-9abc-def012345678";
+function providerSettingsDoc(scope) {
+  return {
+    apiKeys: { tmdb: "synthetic-outdated", mdblist: "synthetic-mdb",
+      realDebrid: "synthetic-debrid", metadata: { tmdb: "synthetic-tmdb", mdblist: "synthetic-mdb", other: "keep" } },
+    nativeProviderCredentials: { schemaVersion: 1, scope, fields: {
+      tmdb: { clock: 4, actor: PROVIDER_TEST_ACTOR, value: "synthetic-tmdb" },
+      mdblist: { clock: 7, actor: PROVIDER_TEST_ACTOR, value: "synthetic-mdb" },
+      realDebrid: { clock: 9, actor: PROVIDER_TEST_ACTOR, value: "synthetic-debrid" },
+    } },
+  };
+}
+
+test("encrypted API-key settings writes keep the account-scoped register and its aliases in sync", async () => {
+  const accountSession = makeAccountSession("C99271B0-A309-4D6D-92EA-A2393B2D8D34");
+  const scope = "account." + accountSession.account.id.toLowerCase();
+  const remote = providerSettingsDoc(scope);
+  await adoptSession(accountSession);
+  applySyncDoc(remote);
+  const server = await installSyncServer(accountSession, remote);
+
+  updateSettings({ tmdbKey: "synthetic-new-tmdb" });
+  await waitUntil(() => server.puts.length === 1, "native API key edit PUT");
+  const edited = await server.readDoc();
+  const register = edited.nativeProviderCredentials.fields.tmdb;
+  assert.equal(edited.nativeProviderCredentials.scope, scope);
+  assert.equal(register.clock, 10);
+  assert.equal(register.value, "synthetic-new-tmdb");
+  assert.match(register.actor, /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+  assert.equal(register.value, edited.apiKeys.tmdb);
+  assert.equal(register.value, edited.apiKeys.metadata.tmdb);
+  assert.deepEqual(edited.nativeProviderCredentials.fields.mdblist, remote.nativeProviderCredentials.fields.mdblist);
+  assert.deepEqual(edited.nativeProviderCredentials.fields.realDebrid, remote.nativeProviderCredentials.fields.realDebrid);
+  assert.equal(edited.apiKeys.metadata.other, "keep");
+
+  updateSettings({ mdblistKey: "" });
+  await waitUntil(() => server.puts.length === 2, "native API key clear PUT");
+  const cleared = await server.readDoc();
+  assert.equal(cleared.nativeProviderCredentials.fields.mdblist.clock, 11);
+  assert.equal(cleared.nativeProviderCredentials.fields.mdblist.value, null);
+  assert.equal(Object.hasOwn(cleared.apiKeys, "mdblist"), false);
+  assert.equal(Object.hasOwn(cleared.apiKeys.metadata, "mdblist"), false);
+  assert.deepEqual(cleared.nativeProviderCredentials.fields.tmdb, register);
+});
+
+test("provider edits refuse malformed and foreign registers before changing any alias", () => {
+  const scope = "account.1e1d7130-274d-4365-a2c9-d827ee240b3c";
+  const cases = [
+    (doc) => { doc.nativeProviderCredentials = null; },
+    (doc) => { doc.nativeProviderCredentials.schemaVersion = 2; },
+    (doc) => { doc.nativeProviderCredentials.scope = "account.949331d7-a905-41b5-b087-6b3c2375774e"; },
+    (doc) => { doc.nativeProviderCredentials.unknown = true; },
+    (doc) => { doc.nativeProviderCredentials.fields = []; },
+    (doc) => { doc.nativeProviderCredentials.fields.tmdb.clock = Number.MAX_SAFE_INTEGER; },
+    (doc) => { doc.nativeProviderCredentials.fields.tmdb.clock = 2.5; },
+    (doc) => { doc.nativeProviderCredentials.fields.tmdb.actor = "not-a-uuid"; },
+    (doc) => { doc.nativeProviderCredentials.fields.tmdb.value = false; },
+    (doc) => { doc.nativeProviderCredentials.fields.tmdb.unknown = true; },
+    (doc) => { doc.nativeProviderCredentials.fields.unknown = { clock: 2, actor: PROVIDER_TEST_ACTOR, value: "x" }; },
+    (doc) => { doc.nativeProviderCredentials.fields.traktAccess = { clock: 2, actor: PROVIDER_TEST_ACTOR, value: "x" }; },
+    (doc) => { doc.apiKeys.metadata = []; },
+  ];
+  for (const corrupt of cases) {
+    const remote = providerSettingsDoc(scope);
+    corrupt(remote);
+    const before = structuredClone(remote);
+    assert.throws(() => account.writeApiKeys(remote, { tmdb: "synthetic-edit" }, scope, PROVIDER_TEST_ACTOR), /cannot be edited safely/);
+    assert.deepEqual(remote, before);
+  }
+});
+
+test("an incompatible provider edit stays queued while unrelated settings still sync", async () => {
+  const accountSession = makeAccountSession("C025D700-A028-4A3E-8AF0-65032D5157B5");
+  const foreign = providerSettingsDoc("account.42d0b3c0-38d6-423f-9d03-677375db82c3");
+  const remote = { ...settingsDoc(), ...foreign };
+  await adoptSession(accountSession);
+  applySyncDoc(remote);
+  const server = await installSyncServer(accountSession, remote);
+
+  updateSettings({ tmdbKey: "synthetic-held", accentID: "forest" });
+  await waitUntil(() => server.puts.length === 1, "independent owner setting PUT");
+  const written = await server.readDoc();
+  assert.equal(written.profileEdits.roster.find((row) => row.id === "remote-owner").settings.accent, "forest");
+  assert.deepEqual(written.apiKeys, remote.apiKeys);
+  assert.deepEqual(written.nativeProviderCredentials, remote.nativeProviderCredentials);
+  assert.equal(getSettings().tmdbKey, "synthetic-held");
+  assert.equal(server.puts.length, 1, "the blocked provider edit must not send a PUT");
+});
+
 test("settings writes preserve the effective web roster, tombstones, fields, and library references", async () => {
   const accountSession = makeAccountSession("acct-effective-web-roster");
   const remote = settingsDoc();

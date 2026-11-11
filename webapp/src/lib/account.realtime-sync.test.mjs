@@ -528,7 +528,7 @@ test("automatic encrypted account sync uses sockets, clocks, network and durable
     const doc = structuredClone(nativeFixture.cases[0].document);
     doc.nativeSync.scope = doc.nativeHostPreferences.scope = `account.${s.account.id}`;
     doc.vortx = legacyDoc().vortx; // A retained historical main is not native settings authority.
-    doc.nativeProviderCredentials = { opaque: "synthetic-retained-carrier" };
+    doc.nativeProviderCredentials = { schemaVersion: 1, scope: `account.${s.account.id}`, fields: {} };
     const server = await serverFor(s, doc);
     await admit(vault, s, account); account.applySyncDoc(doc);
     settings.updateSettings({ accentID: "royal", tmdbKey: "synthetic-metadata-key" });
@@ -539,7 +539,10 @@ test("automatic encrypted account sync uses sockets, clocks, network and durable
     const accepted = await server.read();
     assert.equal(accepted.apiKeys.tmdb, "synthetic-metadata-key");
     assert.deepEqual(accepted.nativeSync, doc.nativeSync); assert.deepEqual(accepted.nativeHostPreferences, doc.nativeHostPreferences);
-    assert.deepEqual(accepted.nativeProviderCredentials, doc.nativeProviderCredentials); assert.equal(accepted.profileEdits, undefined);
+    assert.equal(accepted.nativeProviderCredentials.scope, doc.nativeProviderCredentials.scope);
+    assert.equal(accepted.nativeProviderCredentials.fields.tmdb.value, accepted.apiKeys.tmdb);
+    assert.equal(accepted.apiKeys.metadata.tmdb, accepted.apiKeys.tmdb);
+    assert.equal(accepted.profileEdits, undefined);
     assert.equal(accepted.webProgress, undefined);
     assert.equal(accepted.profileEditEvents.events[0].roster[0].settings.accent, "royal");
     assert.ok(journalsFor(s).some(([, raw]) => raw.includes("native-held-progress") && raw.includes("native-held.test") && raw.includes("royal")));
@@ -927,7 +930,9 @@ test("automatic encrypted account sync uses sockets, clocks, network and durable
     for (const field of Object.values(fields)) { assert.match(field.actor, /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/); assert.ok(Number.isSafeInteger(field.clock)); }
     assert.deepEqual(accepted.nativeSync, doc.nativeSync); assert.deepEqual(accepted.nativeProviderCredentials, doc.nativeProviderCredentials);
     assert.deepEqual(accepted.futureCarrier, doc.futureCarrier); assert.equal(accepted.profileEdits, undefined);
-    assert.equal(accepted.apiKeys.tmdb, "synthetic-host-key");
+    assert.equal(accepted.apiKeys, doc.apiKeys, "an unreadable provider register cannot gain a divergent alias");
+    assert.ok(journalsFor(s).some(([, raw]) => raw.includes("synthetic-host-key")),
+      "metadata edit remains queued while the unrelated globals sync");
     assert.equal(hostJournal(s).filter((edit) => edit.intent.global).length, 0, "only verified host receipts retire their intent");
     assert.equal(hostJournal(s).filter((edit) => !edit.intent.global).length, 1, "playback waits for an authenticated full-register baseline");
     assert.ok(journalsFor(s).some(([, raw]) => JSON.parse(raw).settings.sourceOrder?.[0] === "torrent"), "unsupported core settings stay durable");

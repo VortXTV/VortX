@@ -55,7 +55,7 @@ import { CINEMETA_URL, loadAddon } from "./addon";
 import type { MetaItem } from "./types";
 import { effectiveAddonRemovals, applyAddonIntents } from "./addonRemovals";
 import { projectNativeSync, type NativeSyncProjection } from "./nativeSyncProjection";
-import { applyHostIntent, createHostIntent, hostSettingField, watchlistField, watchlistValue, type HostIntent, type HostTarget } from "./nativeHostEdits";
+import { HOST_MAX_CLOCK, applyHostIntent, createHostIntent, hostSettingField, watchlistField, watchlistValue, type HostIntent, type HostTarget } from "./nativeHostEdits";
 import { applyProfileIntent, createProfileIntent, profileIntentAcknowledged, applyAddonEventIntent, addonEventAcknowledged, addonIdentity, type ProfileIntent, type AddonEventIntent } from "./nativeBrowserEvents";
 import { canonicalJSON } from "./nativeProfileEvents";
 let appliedNativeProjection: NativeSyncProjection | null = null;
@@ -1242,6 +1242,97 @@ function rosterForSettingsWrite(
   return order.map((id) => byId.get(id)!);
 }
 
+const PROVIDER_METADATA_FIELDS = new Set(["tmdb", "mdblist", "fanart"]);
+const PROVIDER_OAUTH_GROUPS = [["traktAccess", "traktRefresh", "traktExpiry"], ["simklAccess", "simklExpiry"]];
+const PROVIDER_REGISTER_FIELDS = new Set([
+  ...PROVIDER_METADATA_FIELDS, "realDebrid", "allDebrid", "premiumize", "torBox", ...PROVIDER_OAUTH_GROUPS.flat(),
+]);
+
+type ProviderRegister = { clock: number; actor: string; value: string | null };
+
+function providerRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function providerEditUnavailable(): never {
+  throw new Error("This account's provider keys cannot be edited safely here; the edit remains queued.");
+}
+
+function validProviderActor(value: unknown): value is string {
+  return typeof value === "string" && value.length === 36 && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value);
+}
+
+function validProviderValue(value: unknown): value is string | null {
+  return value === null || (typeof value === "string" && value.length > 0 && !/[\uD800-\uDFFF]/u.test(value));
+}
+
+function readProviderRegisters(value: unknown, scope: string): Record<string, ProviderRegister> {
+  const carrier = providerRecord(value) ?? providerEditUnavailable();
+  const fields = providerRecord(carrier.fields) ?? providerEditUnavailable();
+  if (Object.keys(carrier).length !== 3 || carrier.schemaVersion !== 1 || carrier.scope !== scope) {
+    providerEditUnavailable();
+  }
+  const registers: Record<string, ProviderRegister> = Object.create(null);
+  for (const [key, raw] of Object.entries(fields)) {
+    const register = providerRecord(raw) ?? providerEditUnavailable();
+    const { clock, actor, value } = register;
+    if (!PROVIDER_REGISTER_FIELDS.has(key) || Object.keys(register).length !== 3
+        || typeof clock !== "number" || !Number.isSafeInteger(clock) || clock < 0 || clock > HOST_MAX_CLOCK
+        || !validProviderActor(actor) || !validProviderValue(value)) {
+      providerEditUnavailable();
+    }
+    if (key.endsWith("Expiry") && value !== null) {
+      const seconds = Number(value);
+      if (!Number.isSafeInteger(seconds) || seconds < 0 || String(seconds) !== value) providerEditUnavailable();
+    }
+    registers[key] = { clock, actor, value };
+  }
+  for (const group of PROVIDER_OAUTH_GROUPS) {
+    const values = group.map((key) => registers[key]).filter(Boolean);
+    if (values.length > 0 && (values.length !== group.length || values.some(({ clock, actor, value }) =>
+      clock !== values[0].clock || actor !== values[0].actor || (value === null) !== (values[0].value === null)))) {
+      providerEditUnavailable();
+    }
+  }
+  return registers;
+}
+
+/** Write a browser-owned metadata key and its native register in one encrypted CAS mutation. */
+export function writeApiKeys(
+  doc: Record<string, unknown>, edits: Record<string, string | null>, scope: string, actor: string,
+): void {
+  const changes = Object.entries(edits);
+  if (!changes.length) return;
+  if (!validProviderActor(actor) || changes.some(([key, value]) =>
+    (key !== "tmdb" && key !== "mdblist") || !validProviderValue(value))) providerEditUnavailable();
+
+  // Only an absent carrier denotes a legacy account. Existing incompatible values are retained.
+  const registers = Object.prototype.hasOwnProperty.call(doc, "nativeProviderCredentials")
+    ? readProviderRegisters(doc.nativeProviderCredentials, scope) : undefined;
+  const clock = registers ? Math.max(0, ...Object.values(registers).map((entry) => entry.clock)) : 0;
+  if (registers && clock >= HOST_MAX_CLOCK) providerEditUnavailable();
+
+  const existingKeys = Object.prototype.hasOwnProperty.call(doc, "apiKeys")
+    ? providerRecord(doc.apiKeys) ?? providerEditUnavailable() : {};
+  const existingMetadata = Object.prototype.hasOwnProperty.call(existingKeys, "metadata")
+    ? providerRecord(existingKeys.metadata) ?? providerEditUnavailable() : undefined;
+  const apiKeys = { ...existingKeys };
+  const metadata = { ...existingMetadata };
+  for (const [key, value] of changes) {
+    if (value === null) {
+      delete apiKeys[key];
+      delete metadata[key];
+    } else {
+      apiKeys[key] = value;
+      if (registers || existingMetadata) metadata[key] = value;
+    }
+    if (registers) registers[key] = { clock: clock + 1, actor, value };
+  }
+  if (existingMetadata || Object.keys(metadata).length > 0) apiKeys.metadata = metadata;
+  if (registers) doc.nativeProviderCredentials = { schemaVersion: 1, scope, fields: registers };
+  doc.apiKeys = apiKeys;
+}
+
 /** Push the changed webapp settings up to the MAIN profile via doc.profileEdits (dashboard-compatible shape).
  *  Delta-merges the main settings onto the latest effective app plus web roster, preserving unrelated
  *  profile edits and settings. Profile settings no-op when there is no synced main profile, while
@@ -1279,19 +1370,10 @@ async function pushSettings(
     }
 
     if (changed.has("tmdbKey") || changed.has("mdblistKey")) {
-      const apiKeys =
-        doc.apiKeys && typeof doc.apiKeys === "object"
-          ? { ...(doc.apiKeys as Record<string, unknown>) }
-          : {};
-      if (changed.has("tmdbKey")) {
-        if (s.tmdbKey) apiKeys.tmdb = s.tmdbKey;
-        else delete apiKeys.tmdb;
-      }
-      if (changed.has("mdblistKey")) {
-        if (s.mdblistKey) apiKeys.mdblist = s.mdblistKey;
-        else delete apiKeys.mdblist;
-      }
-      doc.apiKeys = apiKeys;
+      const edits: Record<string, string | null> = {};
+      if (changed.has("tmdbKey")) edits.tmdb = s.tmdbKey || null;
+      if (changed.has("mdblistKey")) edits.mdblist = s.mdblistKey || null;
+      writeApiKeys(doc, edits, `account.${session.account.id.toLowerCase()}`, journalPageId);
     }
   }, isCurrent);
 }
