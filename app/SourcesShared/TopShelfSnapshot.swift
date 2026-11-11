@@ -35,8 +35,8 @@ enum TopShelfSnapshot {
     /// A sideload signer re-signs under its own team, which cannot hold `canonicalAppGroupID`, so it grants
     /// the app and the extension a group of its own instead (a FlareStore log shows `group.<hex>.1`). Asking
     /// only for the canonical ID then found no container in either process, so the shelf stayed the static
-    /// image under every signing service. Both processes now resolve the same group from what their signed
-    /// copy was granted: the canonical group when held, else the first granted group with a container.
+    /// image under re-signing. Both processes choose from the same extension bundle metadata, then
+    /// each verifies access to that one container. Profile hints alone do not establish access.
     ///
     /// A signer's group can be shared by every app that service signs for the viewer, so it is used only by
     /// a bundle that ships or is the Top Shelf extension; Lite never writes there. What it carries is the
@@ -58,7 +58,7 @@ enum TopShelfSnapshot {
         let profile = bundle.url(forResource: "embedded", withExtension: "mobileprovision")
             .flatMap { try? Data(contentsOf: $0, options: .mappedIfSafe) }
         return isDedicatedSignerGroup(id,
-            recordedGroups: bundle.object(forInfoDictionaryKey: "ALTAppGroups") as? [String] ?? [],
+            recordedGroups: bundle.infoDictionary?["ALTAppGroups"] as? [String] ?? [],
             teamIdentifiers: profile.map(provisionedTeamIdentifiers) ?? [])
     }
 
@@ -76,32 +76,59 @@ enum TopShelfSnapshot {
         return isTeamIdentifier && teamIdentifiers.contains(suffix)
     }
 
-    static func resolveAppGroupID(bundle: Bundle) -> String? {
-        let granted = carriesTopShelf(bundle) ? grantedAppGroups(bundle: bundle) : []
-        return selectAppGroup(granted: granted, canonical: canonicalAppGroupID) {
+    static func resolveAppGroupID(
+        bundle: Bundle,
+        hasContainer: (String) -> Bool = {
             FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: $0) != nil
         }
+    ) -> String? {
+        guard let provider = topShelfBundle(for: bundle) else { return nil }
+        let profile = provider.url(forResource: "embedded", withExtension: "mobileprovision")
+            .flatMap { try? Data(contentsOf: $0, options: .mappedIfSafe) }
+        return selectAppGroup(
+            recordedGroups: provider.infoDictionary?["ALTAppGroups"] as? [String] ?? [],
+            profileGroups: profile.map(provisionedAppGroups) ?? [],
+            teamIdentifiers: profile.map(provisionedTeamIdentifiers) ?? [],
+            hasContainer: hasContainer
+        )
     }
 
-    /// The canonical group first when this copy holds it, then the signer's groups in a stable order, so an
-    /// app and its extension granted the same groups settle on the same one. Wildcards are never groups.
-    static func selectAppGroup(granted: [String], canonical: String, hasContainer: (String) -> Bool) -> String? {
-        var seen = Set<String>()
-        let candidates = ([canonical] + granted.sorted()).filter {
-            $0.hasPrefix("group.") && !$0.contains("*") && seen.insert($0).inserted
+    /// Choose before checking access. Canonical and verified VortX-specific groups have a clear owner,
+    /// and a single generic group is usable. Ambiguous generic groups do not identify a shared route.
+    static func selectAppGroup(
+        recordedGroups: [String],
+        profileGroups: [String],
+        teamIdentifiers: [String] = [],
+        hasContainer: (String) -> Bool
+    ) -> String? {
+        func identifiers(_ groups: [String]) -> Set<String> {
+            Set(groups.filter { $0.hasPrefix("group.") && $0.count > "group.".count && !$0.contains("*") })
         }
-        return candidates.first(where: hasContainer)
-    }
+        let recorded = identifiers(recordedGroups)
+        let provisioned = identifiers(profileGroups)
+        let candidates: Set<String>
+        if recorded.isEmpty && provisioned.isEmpty {
+            candidates = [canonicalAppGroupID]
+        } else if recorded.isEmpty || provisioned.isEmpty {
+            candidates = recorded.union(provisioned)
+        } else {
+            candidates = recorded.intersection(provisioned)
+        }
 
-    /// Groups this signed bundle was granted: AltStore and SideStore record their rewritten groups in
-    /// `ALTAppGroups`, and every signer embeds the provisioning profile whose entitlements list them.
-    static func grantedAppGroups(bundle: Bundle) -> [String] {
-        var groups = bundle.object(forInfoDictionaryKey: "ALTAppGroups") as? [String] ?? []
-        if let url = bundle.url(forResource: "embedded", withExtension: "mobileprovision"),
-           let profile = try? Data(contentsOf: url, options: .mappedIfSafe) {
-            groups += provisionedAppGroups(profile: profile)
+        let candidate: String
+        if candidates.contains(canonicalAppGroupID) {
+            candidate = canonicalAppGroupID
+        } else if candidates.count == 1, let only = candidates.first {
+            candidate = only
+        } else {
+            let dedicated = candidates.filter {
+                isDedicatedSignerGroup($0, recordedGroups: recordedGroups, teamIdentifiers: teamIdentifiers)
+            }
+            guard dedicated.count == 1, let only = dedicated.first else { return nil }
+            candidate = only
         }
-        return groups
+        // A unilateral fallback can put the two processes back in different containers.
+        return hasContainer(candidate) ? candidate : nil
     }
 
     /// The application groups in a provisioning profile, a signed envelope around an XML property list.
@@ -128,13 +155,18 @@ enum TopShelfSnapshot {
         return teams
     }
 
-    /// True for the Top Shelf extension itself and for an app that embeds one.
-    static func carriesTopShelf(_ bundle: Bundle) -> Bool {
-        if isTopShelfExtension(bundle.infoDictionary) { return true }
+    /// Use the same signed provider bundle from both processes. The app can read its own nested
+    /// bundle, and the provider can use its own metadata without opening its containing app.
+    static func topShelfBundle(for bundle: Bundle) -> Bundle? {
+        let extensionName = "VortXTopShelf.appex"
+        if bundle.bundleURL.lastPathComponent == extensionName {
+            return isTopShelfExtension(bundle.infoDictionary) ? bundle : nil
+        }
         guard let plugins = bundle.builtInPlugInsURL,
-              let entries = try? FileManager.default.contentsOfDirectory(at: plugins, includingPropertiesForKeys: nil)
-        else { return false }
-        return entries.contains { $0.pathExtension == "appex" && isTopShelfExtension(Bundle(url: $0)?.infoDictionary) }
+              let provider = Bundle(url: plugins.appendingPathComponent(extensionName, isDirectory: true)),
+              isTopShelfExtension(provider.infoDictionary)
+        else { return nil }
+        return provider
     }
 
     static func isTopShelfExtension(_ info: [String: Any]?) -> Bool {
