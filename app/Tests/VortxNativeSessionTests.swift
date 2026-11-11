@@ -1580,17 +1580,23 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         store.failWrites()
         do { _ = try await session.dispatch(["{\"type\":\"edit\",\"value\":42}"], now: 2); fatalError("unacknowledged state published") }
         catch VortxNativeError.checkpointUncertain {}
-        check(try await session.stateJSON() == before)
+        do { _ = try await session.stateJSON(); fatalError("uncertain checkpoint exposed a live state read") }
+        catch VortxNativeError.checkpointUncertain {}
+        check(try store.read(scope: scope) == before)
         do { _ = try await session.dispatch(["{\"type\":\"edit\"}"], now: 3); fatalError("uncertain checkpoint overwritten") }
         catch VortxNativeError.checkpointUncertain {}
-        let slow = Task { try await session.loadMeta(request: .init(resource: .meta, type: "series", id: "slow"), stream: nil,
+        await session.close()
+        store.recover()
+        let resumedSession = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: store, transport: transport)
+        check(try await resumedSession.stateJSON() == before)
+        let slow = Task { try await resumedSession.loadMeta(request: .init(resource: .meta, type: "series", id: "slow"), stream: nil,
             addons: [.init(id: "slow", transportUrl: "https://slow.fixture/manifest.json", manifest: nil)]) }
         await withCheckedContinuation { done in DispatchQueue.global().async { precondition(transport.entered.wait(timeout: .now() + 5) == .success); done.resume() } }
-        _ = try await session.loadCatalog(.search, request: .init(resource: .catalog, type: "series", id: "popular"), addons: [])
-        if case .loading = await session.screen("meta_details") {} else { fatalError("search clobbered meta slot") }
-        await session.close(); transport.release.signal()
+        _ = try await resumedSession.loadCatalog(.search, request: .init(resource: .catalog, type: "series", id: "popular"), addons: [])
+        if case .loading = await resumedSession.screen("meta_details") {} else { fatalError("search clobbered meta slot") }
+        await resumedSession.close(); transport.release.signal()
         do { _ = try await slow.value; fatalError("closed owner published") } catch VortxNativeError.superseded {}
-        check(await session.screen("meta_details") == nil)
+        check(await resumedSession.screen("meta_details") == nil)
 
         let directory = URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent("sealed")
         let key = SymmetricKey(size: .bits256)
@@ -1793,10 +1799,12 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         precondition(legacy.documents[VortxLegacyImport.rosterID] == legacyJSON)
         let ambiguousStore = SessionStore()
         let ambiguous = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: ambiguousStore, transport: transport, allowNewAccount: true)
+        let priorPublication = try await ambiguous.stateJSON()
         ambiguousStore.failWrites(afterInstall: true)
         do { _ = try await ambiguous.dispatch(["{\"type\":\"edit\",\"value\":99}"], now: 4); fatalError("uncertain commit acknowledged") }
         catch VortxNativeError.checkpointUncertain {}
-        let priorPublication = try await ambiguous.stateJSON()
+        do { _ = try await ambiguous.stateJSON(); fatalError("uncertain checkpoint exposed a live state read") }
+        catch VortxNativeError.checkpointUncertain {}
         let uncertainDisk = try ambiguousStore.read(scope: scope)!
         precondition(priorPublication != uncertainDisk)
         await ambiguous.close(); ambiguousStore.recover()
