@@ -1,9 +1,22 @@
 package com.vortx.android.engine
 
+import android.content.Context
+import com.vortx.android.data.AddonPrefsStore
+import com.vortx.android.data.AddonTombstones
+import com.vortx.android.integrations.NativeProviderAccess
+import com.vortx.android.integrations.NativeProviderTestStore
 import com.vortx.android.profile.UserProfile
+import com.vortx.android.sync.LibraryTombstones
 import com.vortx.android.sync.NativeAccountReadCapture
+import com.vortx.android.sync.NativeSettingsFence
 import com.vortx.android.sync.NativeWebsiteRosterCandidate
+import com.vortx.android.sync.NativeWebsiteRosterDenialReceipt
+import com.vortx.android.sync.RevisionContext
 import com.vortx.android.sync.SessionOwnerSnapshot
+import com.vortx.android.sync.SyncRequestTestSeam
+import com.vortx.android.sync.VortXCrypto
+import com.vortx.android.sync.VortXSyncDoc
+import com.vortx.android.sync.VortXSyncManager
 import java.io.File
 import java.lang.management.ManagementFactory
 import java.util.Collections
@@ -13,10 +26,17 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.SecretKey
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
@@ -24,10 +44,10 @@ import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 
-/** Real packaged JNI + actual coordinator/exclusion/Session.open. Authenticated-read issuance,
- * original-auth gate and local-presence results are explicitly synthetic. No HTTP, real account,
- * filesystem/Keystore or manager transaction proof. Authored UNRUN; this opt-in gate must
- * report zero skips. Once enabled, missing/mismatched JNI is a failure, never a skip. */
+/** Real JNI and coordinator/exclusion/Session.open with synthetic accounts and stores.
+ * The direct gateway fixtures supply read/auth/local-presence evidence. The two-manager case
+ * uses real manager admission with the in-process encrypted backup seam. Once this opt-in gate
+ * is enabled, a missing or mismatched JNI artifact fails the fixture. */
 class NativeWebsiteRosterGatewayJniTest {
     private val account = SessionOwnerSnapshot.Account("00000000-0000-0000-0000-000000000123", 7)
     private fun b(value: String) = value.toByteArray(Charsets.UTF_8)
@@ -132,6 +152,249 @@ class NativeWebsiteRosterGatewayJniTest {
         }
         override fun close() { gateway.retire(); assertTrue(bindings.live.isEmpty()) }
     }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun `two real managers admit one encrypted website roster promotion`() = runBlocking {
+        assumeTrue("Explicit reviewed website roster JNI gate required", System.getenv("VORTX_JNI_WEBSITE_ROSTER_ADMISSION") == "1")
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        val previousNotifications = NativeSettingsFence.queuedNotificationsForTest
+        NativeSettingsFence.queuedNotificationsForTest = mutableListOf()
+        val key = ByteArray(32) { 37 }
+        try {
+            withTimeout(30_000) {
+                val identity = VortXSyncManager.Account(account.id, "fixture@example.invalid", "Fixture", false)
+                val addon = "https://fixture.invalid/manifest.json"
+                val original = OHJson.literal(
+                    """{
+                      "addons":[{"transportUrl":"$addon","manifest":{"id":"com.example.fixture","name":"Fixture catalog","version":"1.0.0","types":["movie"],"resources":["catalog"],"catalogs":[]}}],
+                      "addonOrder":["$addon"],
+                      "webProgress":{"editedAt":1720000000000,"owner":[{"id":"tt0000101","type":"series","v":"tt0000101:1:2","t":37.125,"d":2500,"lastWatched":1720000000000}]},
+                      "vortx":{"webFuture":{"n":1.2300e+2,"z":-0}},
+                      "future":{"exact":9007199254740993,"text":"\u0061"}
+                    }""",
+                )
+                val originalFields = OHJson.Obj(original)
+                val originalVortx = originalFields.obj("vortx")
+                val originalProgress = JSONObject(original.toString(Charsets.UTF_8)).getJSONObject("webProgress")
+                var cloudRevision = 40L
+                var cloudCiphertext = VortXCrypto.sealDocument(key, original, identity.id, cloudRevision, writeV2 = true)
+                val requests = mutableListOf<String>()
+                val websiteOwner = UserProfile(id = UserProfile.OWNER_ID, name = "Main", avatar = "🍿", isOwner = true)
+
+                fun cloudReply() = JSONObject().put("version", cloudRevision).put("document", cloudCiphertext)
+
+                withRoundTripDevice { device ->
+                    device.install(VortXSyncManager.Session("first-fixture", identity, key)) { method, path, body, bearer ->
+                        assertEquals("/v1/backup", path)
+                        assertEquals("first-fixture", bearer)
+                        device.assertCold()
+                        requests += "first:$method"
+                        when (method) {
+                            "GET" -> {
+                                assertNull(body)
+                                if (cloudRevision == 41L) device.allowInstallation()
+                                200 to cloudReply()
+                            }
+                            "PUT" -> {
+                                assertTrue(device.closedDetachedRuntime())
+                                assertEquals(40L, cloudRevision)
+                                val request = requireNotNull(body)
+                                assertEquals(40L, request.getLong("baseRevision"))
+                                assertEquals(41L, request.getLong("version"))
+                                val encrypted = request.getString("document")
+                                assertTrue(encrypted.startsWith(VortXCrypto.DOC_V2_PREFIX))
+                                assertNull(VortXCrypto.openDocument(key, encrypted, identity.id, 42L))
+                                val candidate = requireNotNull(VortXCrypto.openDocument(key, encrypted, identity.id, 41L))
+                                try {
+                                    val proposed = OHJson.Obj(candidate)
+                                    assertEquals(originalFields.keys, proposed.keys)
+                                    for (field in originalFields.keys - "vortx")
+                                        assertArrayEquals(field, originalFields.raw(field), proposed.raw(field))
+                                    val vortx = proposed.obj("vortx")
+                                    assertEquals(originalVortx.keys + setOf("roster", "rosterModified"), vortx.keys)
+                                    for (field in originalVortx.keys)
+                                        assertArrayEquals(field, originalVortx.raw(field), vortx.raw(field))
+                                    assertArrayEquals(OHJson.literal("0"), vortx.raw("rosterModified"))
+                                    val parsed = VortXSyncDoc.parse(JSONObject(candidate.toString(Charsets.UTF_8)))
+                                    assertTrue(parsed.rosterIsLossless)
+                                    assertEquals(listOf(websiteOwner), parsed.roster)
+                                    val denial = NativeWebsiteRosterDenialReceipt.decode(requireNotNull(device.firstReceipt()), identity.id, key)
+                                    assertTrue(denial.matchesAttempt(identity.id, key, 40L, original, 41L, candidate))
+                                } finally { candidate.fill(0) }
+                                cloudCiphertext = encrypted
+                                cloudRevision = 41L
+                                200 to JSONObject().put("accepted", true).put("version", cloudRevision)
+                            }
+                            else -> error("Unexpected backup method")
+                        }
+                    }
+                    assertTrue(device.manager.syncDown(force = true))
+                    assertEquals(listOf("first:GET", "first:PUT", "first:GET"), requests)
+                    device.assertMounted(websiteOwner, addon, originalProgress, cloudRevision)
+                }
+
+                withRoundTripDevice { device ->
+                    device.install(VortXSyncManager.Session("second-fixture", identity, key)) { method, path, body, bearer ->
+                        assertEquals("/v1/backup", path)
+                        assertEquals("second-fixture", bearer)
+                        assertEquals("GET", method)
+                        assertNull(body)
+                        device.assertCold()
+                        requests += "second:GET"
+                        device.allowInstallation()
+                        200 to cloudReply()
+                    }
+                    assertTrue(device.manager.syncDown(force = true))
+                    assertEquals(listOf("first:GET", "first:PUT", "first:GET", "second:GET"), requests)
+                    assertEquals(41L, cloudRevision)
+                    assertNull(device.firstReceipt())
+                    device.assertMounted(websiteOwner, addon, originalProgress, cloudRevision)
+                }
+            }
+        } finally {
+            key.fill(0)
+            try {
+                LibraryTombstones.activateAccount(null)
+                AddonTombstones.activateAccount(null)
+                AddonPrefsStore.activateAccount(null)
+            } finally {
+                NativeSettingsFence.queuedNotificationsForTest = previousNotifications
+                Dispatchers.resetMain()
+            }
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private inner class RoundTripDevice {
+        private val bindings = Bindings()
+        private val context = RevisionContext()
+        val manager = VortXSyncManager(context, CoroutineScope(SupervisorJob() + UnconfinedTestDispatcher()))
+        private val scope = VortxAccountScope("account.${account.id}", UserProfile.OWNER_ID)
+        private var mayInstall = false
+        private var checkpoint: String? = null
+        private var locator: VortxAccountScope? = null
+        private var publications = 0
+        private val store = object : VortxCheckpointStore {
+            override fun inspectWebsiteRosterAbsence(scope: VortxAccountScope,
+                readExistingKey: (VortxAccountScope) -> SecretKey?): AccountFileLocalPresence {
+                assertEquals(this@RoundTripDevice.scope, scope)
+                return if (checkpoint == null && locator == null) AccountFileLocalPresence.ABSENT else AccountFileLocalPresence.PRESENT
+            }
+            override fun read(scope: VortxAccountScope): String? {
+                assertEquals(this@RoundTripDevice.scope, scope)
+                return checkpoint
+            }
+            override fun commit(scope: VortxAccountScope, snapshot: String) {
+                assertTrue("A separate readback must precede a local checkpoint", mayInstall)
+                assertEquals(this@RoundTripDevice.scope, scope)
+                checkpoint = snapshot
+            }
+            override fun discover(accountID: String): VortxAccountScope? {
+                assertEquals(scope.accountID, accountID)
+                return locator
+            }
+            override fun remember(scope: VortxAccountScope) {
+                assertTrue(mayInstall)
+                assertEquals(this@RoundTripDevice.scope, scope)
+                assertNotNull(checkpoint)
+                locator = scope
+            }
+            override fun commitPreflight(next: NativeMigrationPreflight, expected: NativeMigrationPreflight?) =
+                error("The fixture must never write a migration preflight")
+        }
+        private val localBindings = object : VortxRuntimeBindings by bindings {
+            override fun resolve(handle: Long, request: String): String? {
+                assertTrue(mayInstall)
+                assertEquals("installed_addons", JSONObject(request).getString("kind"))
+                return VortxCore.nativeResolveJson(handle, request)
+            }
+        }
+        private val gateway = NativeAccountCoordinator(
+            bindings = localBindings,
+            checkpoints = store,
+            transport = {
+                assertTrue(mayInstall)
+                object : VortxResourceTransport {
+                    override fun makeCancellation(): VortxResourceCancellation = error("No add-on network request")
+                    override fun load(requestJson: String, cancellation: VortxResourceCancellation): String =
+                        error("No add-on network request")
+                }
+            },
+            accountCurrent = { manager.sessionOwnerSnapshot() == it },
+            dispose = { it() },
+            project = {
+                assertTrue(mayInstall)
+                publications++
+            },
+            watchedProducer = NativeWatchedMigrationProducer { throw AssertionError("No watched metadata request") },
+            captureOwnAccountAdmission = { captured ->
+                manager.captureLocalLibraryMutationAdmission()?.let { admission -> { action ->
+                    admission { manager.sessionOwnerSnapshot() == captured && action() }
+                } }
+            },
+        )
+
+        private fun principal() = manager.sessionOwnerSnapshot() as SessionOwnerSnapshot.Account
+        private fun state() = context.getSharedPreferences("vortx_sync_state", Context.MODE_PRIVATE)
+        fun firstReceipt() = state().getString("websiteRosterDenialReceipt.${account.id}", null)
+        private fun appliedVersion() = state().getLong("lastSyncedVersion.${account.id}", 0)
+
+        fun install(session: VortXSyncManager.Session, transport: SyncRequestTestSeam) {
+            manager.installSyncTestSeam(session, 0, transport)
+            manager.installSessionRestoreTestSeam(manager.currentSession())
+            manager.installNativeGatewayTestSeam(gateway, NativeProviderTestStore())
+        }
+
+        fun assertCold() {
+            assertFalse(mayInstall)
+            assertNull(gateway.currentMountToken(principal()))
+            assertNull(checkpoint)
+            assertNull(locator)
+            assertEquals(0, publications)
+            assertEquals(0L, appliedVersion())
+            assertTrue(bindings.live.isEmpty())
+        }
+
+        fun closedDetachedRuntime() = bindings.created > 0 && bindings.created == bindings.freed && bindings.live.isEmpty()
+
+        fun allowInstallation() { mayInstall = true }
+
+        fun assertMounted(owner: UserProfile, addon: String, progress: JSONObject, revision: Long) {
+            assertNotNull(gateway.currentMountToken(principal()))
+            assertNotNull(checkpoint)
+            assertEquals(scope, locator)
+            assertEquals(1, publications)
+            assertEquals(revision, appliedVersion())
+            val exported = requireNotNull(gateway.exportDocument(principal()))
+            assertEquals(listOf(owner.copy(disabledAddons = emptyList())), exported.roster)
+            assertEquals(0.0, exported.rosterModifiedSeconds, 0.0)
+            val session = gateway.session()
+            val retained = session.read().state.getJSONObject("hostDocument").getJSONObject("webProgress")
+            assertTrue(NativeHostPreferences.equal(progress, retained))
+            val installed = session.resolve(JSONObject().put("kind", "installed_addons").put("profileId", owner.id))
+                .getJSONArray("addons")
+            assertEquals(1, installed.length())
+            assertEquals(addon, installed.getJSONObject(0).getString("transportUrl"))
+        }
+
+        suspend fun close() {
+            try {
+                manager.cancelSyncTestWork()
+            } finally {
+                try {
+                    gateway.retire()
+                    assertTrue(bindings.live.isEmpty())
+                    assertEquals(bindings.created, bindings.freed)
+                } finally { NativeProviderAccess.unbindForTest() }
+            }
+        }
+    }
+
+    private suspend fun withRoundTripDevice(block: suspend (RoundTripDevice) -> Unit) {
+        val device = RoundTripDevice()
+        try { block(device) } finally { withContext(NonCancellable) { device.close() } }
+    }
+
 
     @Test fun `real complete admission stays detached and ordinary receive starts only after callback release`() = runBlocking {
         Fixture().use { fixture ->
