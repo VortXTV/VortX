@@ -193,7 +193,8 @@ enum HomeContinueWatchingSelection {
         core: CoreBridge,
         profiles: ProfileStore,
         shadow: TraktPlaybackShadow? = nil,
-        localItemsOverride: [CoreCWItem]? = nil
+        localItemsOverride: [CoreCWItem]? = nil,
+        localOnly: Bool = false
     ) -> Snapshot {
         var context = Context(
             profileID: profiles.activeID,
@@ -213,13 +214,13 @@ enum HomeContinueWatchingSelection {
         }
 
         // One original provider read admission for this synchronous presentation assembly.
-        let providerOwner = context.nativeTarget.flatMap { core.captureNativePlaybackReadCapability($0) }
+        let providerOwner = localOnly ? nil : context.nativeTarget.flatMap { core.captureNativePlaybackReadCapability($0) }
         // A native shared profile has its own core bucket too. Never fall back to its
         // retired legacy overlay, including while a native session is unavailable.
         let localItems = localItemsOverride ?? (context.usesNativeProfileState || context.usesEngineHistory
             ? core.continueWatching : profiles.cwItems)
         var selection: TraktPlaybackShadow.ContinueWatchingSelection
-        let requested = context.preferences.source
+        let requested = localOnly ? .local : context.preferences.source
         if !context.usesEngineHistory || requested == .local {
             selection = .init(items: localItems, source: .local, sessionID: nil)
             if requested != .local { selection.status = "This profile uses Local / VortX history. A service rail needs this profile's own account." }

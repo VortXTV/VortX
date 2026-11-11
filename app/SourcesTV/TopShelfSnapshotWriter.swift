@@ -108,16 +108,15 @@ enum TopShelfSnapshotWriter {
         }
 
         let profiles = ProfileStore.shared
-        let snapshot = HomeContinueWatchingSelection.current(core: CoreBridge.shared, profiles: profiles)
+        let snapshot = publicationSnapshot(core: .shared, profiles: profiles)
         let selection = snapshot.selection
         let context = snapshot.context
         let pending = items(from: selection.items, source: selection.source, displayProgress: selection.displayProgress)
         guard snapshot.intent.isCurrent() else {
             cancelWarm(clearArtwork: true); publish([]); return
         }
-        // A signing service's generic group can be shared by other apps it signs for this viewer. Trakt and
-        // SIMKL history, and Trakt's warmed artwork, never go there: such a queue leaves the static shelf
-        // image. VortX's own group, and a signer's copy of it (`.dedicated`), carry them like local rows (#229).
+        // A generic signing-service group can be shared by other apps. Publish only the current
+        // profile's VortX history there. Keep this write guard even when the selector uses local-only.
         guard selection.source == .local || TopShelfSnapshot.appGroupSource != .signer else {
             cancelWarm(clearArtwork: true); publish([]); return
         }
@@ -203,6 +202,19 @@ enum TopShelfSnapshotWriter {
     struct PublicationKey: Equatable {
         let intent: HomeContinueWatchingSelection.Intent
         let items: [TopShelfSnapshot.Item]
+    }
+
+    @MainActor
+    static func publicationSnapshot(
+        core: CoreBridge,
+        profiles: ProfileStore,
+        renderedHome: HomeContinueWatchingSelection.Snapshot? = nil
+    ) -> HomeContinueWatchingSelection.Snapshot {
+        let localOnly = TopShelfSnapshot.appGroupSource == .signer
+        if let renderedHome, !localOnly || renderedHome.context.preferences.source == .local {
+            return renderedHome
+        }
+        return HomeContinueWatchingSelection.current(core: core, profiles: profiles, localOnly: localOnly)
     }
 
     static func publicationKey(for snapshot: HomeContinueWatchingSelection.Snapshot) -> PublicationKey {
