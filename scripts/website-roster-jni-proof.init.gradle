@@ -1,0 +1,63 @@
+// This guarded JVM unit proof must never cross-build, package, sign or install Android apps.
+gradle.taskGraph.whenReady { graph ->
+    def forbidden = graph.allTasks.findAll { task ->
+        task.name ==~ /(?i)(cargo.*|.*externalNativeBuild.*|.*CMake.*|merge.*JniLib.*|assemble.*|bundle.*(Aar|Apk|Aab).*|package.*(Apk|Bundle).*|package(Full|Play)?(Debug|Release)|sign.*(Apk|Bundle|Release).*|validateSigning.*|install.*|connected.*|publish.*)/
+    }
+    if (!forbidden.empty)
+        throw new GradleException("Website roster JNI proof refuses packaging, device and native cross-build tasks")
+    def tests = graph.allTasks.findAll { it instanceof org.gradle.api.tasks.testing.Test }
+    if (tests*.path != [":app:testPlayDebugUnitTest"])
+        throw new GradleException("Website roster JNI proof requires exactly the Play JVM test task")
+}
+
+allprojects {
+    tasks.withType(org.gradle.api.tasks.testing.Test).configureEach { task ->
+        if (task.path == ":app:testPlayDebugUnitTest") {
+            def expectedClass = "com.vortx.android.engine.NativeWebsiteRosterGatewayJniTest"
+            def libraryPath = System.getenv("VORTX_JNI_LIBRARY")
+            def libraryHash = System.getenv("VORTX_JNI_SHA256")
+            if (System.getenv("VORTX_JNI_WEBSITE_ROSTER_ADMISSION") != "1" ||
+                    !libraryPath || !new File(libraryPath).isAbsolute() ||
+                    !(libraryHash ==~ /[0-9a-f]{64}/))
+                throw new GradleException("Exact real website roster JNI admission and host library are required")
+            def library = new File(libraryPath)
+            maxParallelForks = 1
+            forkEvery = 0
+            maxHeapSize = "768m"
+            jvmArgs "-XX:ActiveProcessorCount=1", "-XX:+UseSerialGC",
+                "-Djava.library.path=" + library.parent
+            environment "VORTX_JNI_WEBSITE_ROSTER_ADMISSION", "1"
+            environment "VORTX_JNI_LIBRARY", libraryPath
+            environment "VORTX_JNI_SHA256", libraryHash
+            filter.includeTestsMatching(expectedClass)
+            filter.failOnNoMatchingTests = true
+            ignoreFailures = false
+            outputs.upToDateWhen { false }
+            outputs.cacheIf { false }
+            def requireLibrary = {
+                if (!library.isFile() || library.length() == 0L || library.canonicalPath != libraryPath)
+                    throw new GradleException("Exact host JNI library is absent or indirect")
+                def digest = java.security.MessageDigest.getInstance("SHA-256")
+                library.withInputStream { input ->
+                    byte[] bytes = new byte[65536]
+                    int count
+                    while ((count = input.read(bytes)) != -1) digest.update(bytes, 0, count)
+                }
+                if (digest.digest().collect { String.format("%02x", it & 0xff) }.join() != libraryHash)
+                    throw new GradleException("Exact host JNI library bytes changed")
+            }
+            doFirst { requireLibrary() }
+            beforeTest { descriptor ->
+                if (descriptor.className != expectedClass)
+                    throw new GradleException("Unexpected website roster JNI test class")
+            }
+            afterSuite { descriptor, result ->
+                if (descriptor.parent == null) {
+                    requireLibrary()
+                    if (result.testCount != 8L || result.skippedTestCount != 0L || result.failedTestCount != 0L)
+                        throw new GradleException("Require eight real website roster JNI tests with zero skips/failures")
+                }
+            }
+        }
+    }
+}
