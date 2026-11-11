@@ -360,7 +360,10 @@ async function main() {
             if (ownerRaw) sources.push('app/Tests/OwnerHistoryRawAccountPreparationTests.swift');
             else if (ownerCold) sources.push('app/Tests/OwnerHistoryColdCoordinatorTests.swift',
                 'app/Tests/OwnerHistoryColdCoordinatorMain.swift');
-            else sources.push('app/Tests/VortxNativeSessionTests.swift');
+            else {
+                capture('scripts/build-stub-engine-xcframeworks.sh');
+                sources.push('app/SourcesShared/LibraryGenreFacts.swift', 'app/Tests/VortxNativeSessionTests.swift');
+            }
         }
     }
     // The explicit owner closure overlaps existing per-stage real inputs. Compile each
@@ -504,6 +507,20 @@ async function main() {
             '-Xlinker', '-rpath', '-Xlinker', swiftLibraries);
     }
     if (stage === 'restore') flags.push('-D', 'VORTX_NATIVE_DATA_ENGINE');
+    if (stage === 'session') {
+        // The SessionABI fixture supplies behavior. Its production wrapper types still need the
+        // public C declarations and fail-closed link symbols, never a packaged engine SDK.
+        if (process.arch !== 'arm64') throw new Error('The Session CI stub requires an arm64 Mac host');
+        const stubOutput = path.join(directory, 'ci-stub');
+        await run('engine-stub', ['/usr/bin/env', `TMPDIR=${directory}`, '/usr/bin/nice', '-n', '15',
+            '/bin/bash', copies.get('scripts/build-stub-engine-xcframeworks.sh'), '--output-dir', stubOutput],
+            120_000, helper);
+        const framework = path.join(stubOutput, 'VortxEngine.xcframework');
+        if (!fs.statSync(path.join(framework, 'STUB-CI-ONLY.txt')).isFile()) throw new Error('Unmarked Session ABI stub');
+        const slice = path.join(framework, 'macos-arm64');
+        flags.push('-I', path.join(slice, 'Headers', 'vortx'));
+        links.push(path.join(slice, 'libvortx_ffi.a'));
+    }
     // Exactly one compiler then one fixture, at nice 15. Deadlines are hang guards,
     // never throughput/RSS/UI-latency acceptance thresholds or device evidence.
     await run('compile', ['/usr/bin/nice', '-n', '15', '/usr/bin/xcrun', 'swiftc', ...flags, ...inputs, ...links, '-o', executable], mpvTLS ? 120_000 : 600_000, helper);
