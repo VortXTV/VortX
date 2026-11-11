@@ -124,6 +124,12 @@ object DownloadStore {
      */
     fun fileExists(record: DownloadRecord): Boolean = fileFor(record).isFile
 
+    /** Completed, still indexed and inside our managed directory. Run on the IO dispatcher. */
+    internal fun completedPlaybackFile(record: DownloadRecord): File? = hydrationGate.withLock {
+        if (record.state != DownloadState.COMPLETED || this.record(record.id) != record) return@withLock null
+        managedFilesFor(record)?.media?.takeIf { it.isFile && it.length() > 0L }
+    }
+
     // MARK: Persistence
 
     private fun loadLocked(): DownloadIndexHydration.Receipt<List<DownloadRecord>> {

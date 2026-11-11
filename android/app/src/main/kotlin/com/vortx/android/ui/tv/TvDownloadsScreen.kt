@@ -30,6 +30,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.foundation.focusGroup
 import androidx.compose.ui.focus.focusRequester
@@ -40,23 +41,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.vortx.android.downloads.AndroidDownloadedMediaCapabilityProbe
 import com.vortx.android.downloads.DownloadGroup
 import com.vortx.android.downloads.DownloadManager
 import com.vortx.android.downloads.DownloadStore
-import com.vortx.android.downloads.DownloadedMediaCapabilityResolver
+import com.vortx.android.downloads.openDownloadedPlayback
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
 import com.vortx.android.model.Playable
-import com.vortx.android.model.PlaybackContext
-import com.vortx.android.profile.ProfileStore
-import com.vortx.android.profile.UserProfile
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /// The 10-foot Downloads surface: the device's offline library on the couch, the D-pad analogue of the phone
 /// [com.vortx.android.ui.screens.DownloadsScreen]. It drives the EXACT SAME [DownloadStore] / [DownloadManager]
@@ -280,6 +275,7 @@ private fun tvEpisodeTitle(record: DownloadRecord): String {
 /// `SurfaceCard`); focus lands only on the action pills, so the D-pad steps action -> action -> next row.
 @Composable
 private fun TvDownloadRow(record: DownloadRecord, title: String?, onPlay: (Playable) -> Unit) {
+    val context = LocalContext.current
     val colors = VortXTheme.colors
     val scope = rememberCoroutineScope()
     Box(
@@ -341,7 +337,7 @@ private fun TvDownloadRow(record: DownloadRecord, title: String?, onPlay: (Playa
                     DownloadState.COMPLETED -> TvFilterChip(
                         label = "Play",
                         selected = false,
-                        onClick = { scope.launch { tvPlayLocal(record, onPlay) } },
+                        onClick = { scope.launch { openDownloadedPlayback(context, record)?.let(onPlay) } },
                     )
                     DownloadState.DOWNLOADING -> TvFilterChip(
                         label = "Pause",
@@ -365,55 +361,6 @@ private fun TvDownloadRow(record: DownloadRecord, title: String?, onPlay: (Playa
             }
         }
     }
-}
-
-/// Play a completed download from its LOCAL file, off the UI thread.
-///
-/// IDENTITY BINDING (closes the AND-DL-01 fidelity gap), identical to the phone screen: the playable
-/// is built with the ACTIVE profile captured NOW, so its immutable [PlaybackContext] and derived
-/// mediaRef bind progress / scrobble / auto-next consumers to THIS title before playback starts,
-/// exactly like Apple's `record.playbackMeta` rebuild. Fail-soft if the file was purged out from
-/// under us (the eviction caption is not hypothetical): drop the stale row rather than present a
-/// dead player.
-private suspend fun tvPlayLocal(record: DownloadRecord, onPlay: (Playable) -> Unit) {
-    if (record.state != DownloadState.COMPLETED) return
-    val resolution = withContext(Dispatchers.IO) {
-        val file = DownloadStore.fileFor(record)
-        if (!file.isFile) return@withContext null
-        DownloadedMediaCapabilityResolver.resolve(
-            record = record,
-            file = file,
-            probe = AndroidDownloadedMediaCapabilityProbe,
-            persistResolved = { resolved ->
-                DownloadStore.update(record.id) { current ->
-                    current.copy(
-                        isDolbyVision = resolved.isDolbyVision,
-                        isAtmos = resolved.isAtmos,
-                    )
-                }
-            },
-        )
-    }
-    if (resolution == null) {
-        if (record.state == DownloadState.COMPLETED) DownloadManager.cancel(record.id)
-        return
-    }
-    onPlay(
-        resolution.record.localPlayable(
-            localURL = DownloadStore.fileFor(resolution.record).toURI().toString(),
-            owner = activeTvPlaybackOwner(),
-        ),
-    )
-}
-
-/// TV twin of the phone screen's owner capture: who is watching RIGHT NOW. Defaults match
-/// ProfileStore's own no-store fallbacks (owner id + engine history).
-internal fun activeTvPlaybackOwner(): PlaybackContext.Owner {
-    val profiles = ProfileStore.sharedOrNull()
-    return PlaybackContext.Owner(
-        profileId = profiles?.activeProfileId ?: UserProfile.OWNER_ID,
-        usesEngineHistory = profiles?.activeUsesEngineHistory ?: true,
-    )
 }
 
 private fun tvDownloadStateIcon(state: DownloadState) = when (state) {

@@ -82,6 +82,7 @@ import com.vortx.android.cast.CastOverlay
 import com.vortx.android.cast.CastRouteChooserSheet
 import com.vortx.android.cast.rememberCastManager
 import com.vortx.android.data.PlayerResourceReleaseGate
+import com.vortx.android.downloads.isDownloadedPlaybackAdmissionCurrent
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.model.Episode
 import com.vortx.android.model.Playable
@@ -164,6 +165,8 @@ fun PlayerScreen(
     /// Defaults to [onBack] so a host without an auto-advance flow keeps the old exit-to-detail
     /// behavior; the phone shell wires it to the series Up Next auto-advance instead.
     onEnded: () -> Unit = onBack,
+    /** Dedicated continuation for an admitted local file. Never dispatches into a streaming route. */
+    onDownloadedNaturalEnd: (suspend (Playable, DownloadedNaturalEndAdmission) -> Boolean)? = null,
     /** Optional upcoming-title queue. True means this exact natural completion accepted a queued route. */
     onQueueNaturalEnd: (() -> Boolean)? = null,
     queueCount: Int = 0,
@@ -225,6 +228,7 @@ fun PlayerScreen(
     val currentOnProgress by rememberUpdatedState(onProgress)
     val currentOnError by rememberUpdatedState(onError)
     val currentOnEnded by rememberUpdatedState(onEnded)
+    val currentOnDownloadedNaturalEnd by rememberUpdatedState(onDownloadedNaturalEnd)
     val currentOnQueueNaturalEnd by rememberUpdatedState(onQueueNaturalEnd)
     val currentOnSourceFailed by rememberUpdatedState(onSourceFailed)
     val currentOnSwitchSource by rememberUpdatedState(onSwitchSource)
@@ -371,9 +375,8 @@ fun PlayerScreen(
     // session must NEVER do is feed host callbacks that resolve identity from AMBIENT state: the
     // shell's detail ViewModel may still hold a previously streamed title A when downloaded B plays,
     // and B's end/failure/preload ticks would then advance or retry A. So for a local session this
-    // screen routes its natural end to a plain exit (the TV shell's long-standing behavior) and keeps
-    // the preload + bad-source-retry ladders dormant; a context-less local file (never produced today,
-    // defensive only) is treated the same fail-safe way.
+    // screen offers a continuation only through the admitted download itself and keeps the streaming
+    // preload and bad-source-retry paths dormant. Other local files exit at natural end.
     val isLocalSession = isLocalFilePlayback(currentPlayable)
 
     // Chrome-owned view state (not engine state): the aspect/zoom mode passed to the surface, and the
@@ -394,7 +397,9 @@ fun PlayerScreen(
     var subtitlePoolRetry by remember(playbackSessionKey) { mutableStateOf(0L) }
     DisposableEffect(subtitleTiming) { onDispose { subtitleTiming.retire() } }
     // Capture BEFORE the original manager/UI/account/profile proof; never adopt a successor epoch.
-    val originalOwnerCandidate = remember { PlaybackOwnerEpoch.capture() }
+    val originalOwnerCandidate = remember {
+        playable.downloadedPlaybackAdmission?.ownerToken ?: PlaybackOwnerEpoch.capture()
+    }
     val subtitleApplication = context.applicationContext as? VortXApplication
     val subtitleSyncManager = subtitleApplication?.syncManager
     val subtitleAccountAdmission = remember(playbackSessionKey) {
@@ -584,8 +589,17 @@ fun PlayerScreen(
         exitPlayer()
     }
     var builtEngine by remember(playbackSessionKey, forceExoPlayer, enginePreference) { mutableStateOf<PlayerEngine?>(null) }
+    // A new file must still satisfy its policy proof when it reaches the decoder. An engine
+    // switch on an already mounted file retains that file's original playback-owner gate.
+    var downloadedFileMounted by remember(playbackSessionKey) { mutableStateOf(false) }
     LaunchedEffect(playbackSessionKey, forceExoPlayer, enginePreference) {
         val original = originalPlaybackOwner
+        val needsDownloadAdmission = currentPlayable.downloadedPlaybackAdmission != null && !downloadedFileMounted
+        fun downloadAdmissionCurrent() = !needsDownloadAdmission || isDownloadedPlaybackAdmissionCurrent(currentPlayable)
+        if (!downloadAdmissionCurrent()) {
+            exitPlayer()
+            return@LaunchedEffect
+        }
         if (original == null || !original.isActive || !resourceReleaseGate.beginConstruction()) {
             exitPlayer()
             return@LaunchedEffect
@@ -608,7 +622,7 @@ fun PlayerScreen(
             // check below hands a build that lost its composition straight to release.
             withContext(Dispatchers.Default + NonCancellable) {
                 MpvEngineFactory.create(context)?.also {
-                    if (!it.bindPlaybackOwner(original)) {
+                    if (!downloadAdmissionCurrent() || !it.bindPlaybackOwner(original)) {
                         it.release()
                         return@withContext null
                     }
@@ -617,7 +631,7 @@ fun PlayerScreen(
                         return@withContext null
                     }
                     engineHolder.set(it)
-                    prepareAndLoadEngine(
+                    val loaded = prepareAndLoadEngine(
                         it,
                         playableForEngine,
                         lifecycleStarted = {
@@ -625,17 +639,22 @@ fun PlayerScreen(
                         },
                         pausePlaybackInBackground = { !KeepPlayingBackgroundSetting.isEnabled(context) },
                         playbackIntent = playbackIntent,
+                        mayStart = ::downloadAdmissionCurrent,
                     ) {
                         if (it.audioOutputModeAvailable) it.setAudioOutputMode(audioOutputMode)
                     }
+                    if (!loaded) {
+                        releaseBoundEngine()
+                        return@withContext null
+                    }
                 }
             } ?: run {
-                if (!original.isActive) {
+                if (!original.isActive || !downloadAdmissionCurrent()) {
                     exitPlayer()
                     return@LaunchedEffect
                 }
                 ExoPlayerEngine(context).also {
-                if (!it.bindPlaybackOwner(original)) {
+                if (!downloadAdmissionCurrent() || !it.bindPlaybackOwner(original)) {
                     it.release()
                     exitPlayer()
                     return@LaunchedEffect
@@ -647,7 +666,7 @@ fun PlayerScreen(
                     return@LaunchedEffect
                 }
                 engineHolder.set(it)
-                prepareAndLoadEngine(
+                val loaded = prepareAndLoadEngine(
                     it,
                     playableForEngine,
                     lifecycleStarted = {
@@ -655,12 +674,17 @@ fun PlayerScreen(
                     },
                     pausePlaybackInBackground = { !KeepPlayingBackgroundSetting.isEnabled(context) },
                     playbackIntent = playbackIntent,
+                    mayStart = ::downloadAdmissionCurrent,
                 )
+                if (!loaded) {
+                    exitPlayer()
+                    return@LaunchedEffect
+                }
                 }
             }
         } else {
             ExoPlayerEngine(context).also {
-                if (!it.bindPlaybackOwner(original)) {
+                if (!downloadAdmissionCurrent() || !it.bindPlaybackOwner(original)) {
                     it.release()
                     exitPlayer()
                     return@LaunchedEffect
@@ -671,7 +695,7 @@ fun PlayerScreen(
                     return@LaunchedEffect
                 }
                 engineHolder.set(it)
-                prepareAndLoadEngine(
+                val loaded = prepareAndLoadEngine(
                     it,
                     playableForEngine,
                     lifecycleStarted = {
@@ -679,7 +703,12 @@ fun PlayerScreen(
                     },
                     pausePlaybackInBackground = { !KeepPlayingBackgroundSetting.isEnabled(context) },
                     playbackIntent = playbackIntent,
+                    mayStart = ::downloadAdmissionCurrent,
                 )
+                if (!loaded) {
+                    exitPlayer()
+                    return@LaunchedEffect
+                }
             }
         }
         if (!isActive || !original.isActive) {
@@ -701,16 +730,19 @@ fun PlayerScreen(
             refreshAudioRoute = {
                 if (engine.audioOutputModeAvailable) engine.setAudioOutputMode(audioOutputMode)
             },
+            mayStart = { original.isActive && downloadAdmissionCurrent() },
             publish = {
-                if (original.isActive) {
+                if (original.isActive && downloadAdmissionCurrent()) {
                     builtEngine = it
                     published = true
+                    if (needsDownloadAdmission) downloadedFileMounted = true
                 } else {
                     releaseBoundEngine()
                     exitPlayer()
                 }
             },
         )
+        if (!published) exitPlayer()
         } finally {
             // Also runs on setup failure and prompt cancellation when withContext returns.
             // Keep the reservation until the exact holder has been released or registered live.
@@ -901,6 +933,17 @@ fun PlayerScreen(
     }
     var dismissedSkipStart by remember(playbackSessionKey) { mutableStateOf<Double?>(null) }
     var skipPillFocusedCancel by remember(playbackSessionKey) { mutableStateOf(false) }
+    var activeDownloadedEnd by remember(playbackSessionKey, engine) {
+        mutableStateOf<DownloadedNaturalEndAdmission?>(null)
+    }
+    var downloadedEndRevision by remember(playbackSessionKey, engine) { mutableStateOf(0L) }
+
+    fun invalidateDownloadedEnd() {
+        val admission = activeDownloadedEnd ?: return
+        admission.retire()
+        activeDownloadedEnd = null
+        downloadedEndRevision += 1
+    }
 
     fun invalidateAutoSkipPending(positionMs: Long = latestState.positionMs) {
         val next = autoSkipCountdown.detachedCopy()
@@ -911,11 +954,13 @@ fun PlayerScreen(
     }
 
     fun seekLocalTo(positionMs: Long) {
+        invalidateDownloadedEnd()
         invalidateAutoSkipPending(engine.state.value.positionMs)
         engine.seekTo(positionMs)
     }
 
     fun userSeekLocalBy(deltaMs: Long) {
+        invalidateDownloadedEnd()
         val state = engine.state.value
         val boundedDelta = deltaMs.coerceIn(-86_400_000L, 86_400_000L)
         val predicted = (state.positionMs.coerceIn(0, 86_400_000) + boundedDelta)
@@ -929,6 +974,7 @@ fun PlayerScreen(
         partyPublisher.get()?.invoke("seek", positionMs)
     }
     fun userSetPlaying(playing: Boolean) {
+        if (playing) invalidateDownloadedEnd()
         if (playing) playbackIntent.userPlay() else playbackIntent.userPause()
         partyPublisher.get()?.invoke(if (playing) "play" else "pause", engine.state.value.positionMs)
     }
@@ -1472,6 +1518,7 @@ fun PlayerScreen(
         AutoSkipCountdownPolicy.bindMedia(next, autoSkipIdentity)
         AutoSkipCountdownPolicy.complete(next, segment)
         AutoSkipCountdownPolicy.invalidatePending(next, latestState.positionMs)
+        invalidateDownloadedEnd()
         engine.seekTo(target)
         partyPublisher.get()?.invoke("seek", target)
         autoSkipCountdown = next
@@ -1501,6 +1548,7 @@ fun PlayerScreen(
         playable = currentPlayable,
         speed = speed,
         setUserPlaying = ::userSetPlaying,
+        onUserSeek = ::invalidateDownloadedEnd,
     )
 
     // BAD-SOURCE DISPATCH: hand the verdict to the host's auto-retry ladder exactly once per source.
@@ -2181,7 +2229,15 @@ fun PlayerScreen(
     // "play a 10-second junk file to its end" structurally unable to mark an episode watched or
     // auto-advance, whichever engine reported the EOF.
     var queueCompletionAttempted by remember(playbackSessionKey) { mutableStateOf(false) }
-    LaunchedEffect(playbackSessionKey, playerState.hasEnded, sourceSwitchState.isSwitching, playerExitRequested) {
+    var downloadedCompletionAttempted by remember(playbackSessionKey, engine) { mutableStateOf(false) }
+    LaunchedEffect(
+        playbackSessionKey, playerState.hasEnded, sourceSwitchState.isSwitching, playerExitRequested,
+        downloadedEndRevision, engine.takeIf { isLocalSession },
+        isLocalSession && (playerState.hasError || stallError || runtimeMismatch || knownAudioMismatch),
+        isLocalSession && sleepAtEpisodeEnd,
+        isLocalSession && isDownloadedNaturalCompletion(currentPlayable, playerState),
+    ) {
+        if (isLocalSession && !playerState.hasEnded) downloadedCompletionAttempted = false
         val s = latestState
         if (
             !playerState.hasEnded || s.hasError || stallError || runtimeMismatch || knownAudioMismatch ||
@@ -2206,13 +2262,30 @@ fun PlayerScreen(
             exitPlayer()
             return@LaunchedEffect
         }
-        // A LOCAL session's end is a plain exit, never [currentOnEnded]: the host's ended handler asks
-        // its detail ViewModel for the next episode, and for a download play that ViewModel can belong
-        // to an EARLIER streamed title -- finishing downloaded B must never offer or auto-advance into
-        // A's successor (AND-DL-01). Exiting matches the TV shell, whose player has always closed on
-        // end; a future legitimate local Up Next needs an identity-carrying callback of its own.
         if (isLocalSession) {
-            exitPlayer()
+            if (downloadedCompletionAttempted) return@LaunchedEffect
+            downloadedCompletionAttempted = true
+            val onLocalEnd = currentOnDownloadedNaturalEnd
+            if (currentPlayable.downloadedPlaybackAdmission == null || onLocalEnd == null ||
+                !isDownloadedNaturalCompletion(currentPlayable, s)) {
+                exitPlayer()
+                return@LaunchedEffect
+            }
+            val admission = DownloadedNaturalEndAdmission {
+                !playerExitRequested && !sourceSwitchState.isSwitching && !sleepAtEpisodeEnd &&
+                    sourceSwitchState.sessionKey == playbackSessionKey && engineHolder.get() === engine &&
+                    originalPlaybackOwner?.isActive == true && !stallError && !runtimeMismatch && !knownAudioMismatch &&
+                    isDownloadedNaturalCompletion(currentPlayable, engine.state.value)
+            }
+            activeDownloadedEnd = admission
+            try {
+                if (admission.isCurrent() && onLocalEnd(currentPlayable, admission)) return@LaunchedEffect
+                currentCoroutineContext().ensureActive()
+                if (admission.isCurrent()) exitPlayer()
+            } finally {
+                admission.retire()
+                if (activeDownloadedEnd === admission) activeDownloadedEnd = null
+            }
             return@LaunchedEffect
         }
         // The queue never inherits the manual-forced-source exemption. Ordinary series Up Next keeps

@@ -8,6 +8,9 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.Playable
 import com.vortx.android.model.PlaybackContext
 import com.vortx.android.player.autoSkipMediaIdentity
+import com.vortx.android.player.DownloadedNaturalEndAdmission
+import com.vortx.android.player.PlayerState
+import com.vortx.android.player.isDownloadedNaturalCompletion
 import com.vortx.android.player.isLocalFilePlayback
 import com.vortx.android.player.subtitleOffsetContentKey
 import org.junit.Assert.assertEquals
@@ -26,9 +29,58 @@ import org.junit.Test
  * logic; the identity derivations they consume are proven here.
  */
 class OfflinePlaybackIdentityTest {
-
     private val ownerEngine = PlaybackContext.Owner(profileId = "owner-profile", usesEngineHistory = true)
     private val ownerOverlay = PlaybackContext.Owner(profileId = "kids-profile", usesEngineHistory = false)
+
+    @Test
+    fun `offline next requires exact immediate successor in same series and season`() {
+        val current = episodeRecord().copy(season = 1, episode = 2)
+        val currentContext = current.playbackContext(PlaybackContext.Owner("local", true))
+        val next = current.copy(videoId = "exact-next", episode = 3, state = DownloadState.COMPLETED)
+        val gap = next.copy(videoId = "gap", episode = 4)
+        val rollover = next.copy(videoId = "rollover", season = 2, episode = 1)
+        assertEquals(next, immediateDownloadedSuccessor(currentContext, listOf(gap, next)))
+        assertNull(immediateDownloadedSuccessor(currentContext, listOf(next)) { false })
+        assertNull(immediateDownloadedSuccessor(currentContext, listOf(gap, rollover)))
+        assertNull(immediateDownloadedSuccessor(currentContext, listOf(next.copy(contentId = "other"))))
+        assertNull(immediateDownloadedSuccessor(currentContext, listOf(next.copy(state = DownloadState.PAUSED))))
+        assertNull(immediateDownloadedSuccessor(
+            currentContext, listOf(next, next.copy(videoId = "ambiguous-alias")),
+        ))
+    }
+
+    @Test
+    fun `downloaded early EOF cannot open a successor despite a healthy advertised duration`() {
+        val playable = episodeRecord().localPlayable("file:///fixture.mp4", PlaybackContext.Owner("local", true))
+        val early = PlayerState(positionMs = 10_000L, durationMs = 2_400_000L, hasEnded = true)
+        val credits = early.copy(positionMs = 2_160_000L)
+        assertFalse(isDownloadedNaturalCompletion(playable, early))
+        assertFalse(isDownloadedNaturalCompletion(playable, credits.copy(positionMs = 2_150_000L)))
+        assertTrue(isDownloadedNaturalCompletion(playable, credits))
+        assertFalse(isDownloadedNaturalCompletion(playable, credits.copy(hasEnded = false)))
+        assertFalse(isDownloadedNaturalCompletion(playable, credits.copy(hasError = true)))
+    }
+
+    @Test
+    fun `retired terminal offer stays invalid even after replay ends again`() {
+        var ended = true
+        val original = DownloadedNaturalEndAdmission { ended }
+        assertTrue(original.isCurrent())
+        ended = false
+        assertFalse(original.isCurrent())
+        original.retire()
+        ended = true
+        assertFalse(original.isCurrent())
+        assertTrue(DownloadedNaturalEndAdmission { ended }.isCurrent())
+    }
+
+    @Test
+    fun `manual downloaded playback resumes only a real unfinished local offset`() {
+        assertEquals(120_000L, playableDownloadResumeMs(120_000L, 2_400_000L))
+        assertEquals(0L, playableDownloadResumeMs(2_160_000L, 2_400_000L))
+        assertEquals(0L, playableDownloadResumeMs(120_000L, 0L))
+        assertEquals(0L, playableDownloadResumeMs(-1L, 2_400_000L))
+    }
 
     private fun movieRecord() = DownloadRecord(
         id = "dl-movie",

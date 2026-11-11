@@ -32,6 +32,9 @@ import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.Playable
+import com.vortx.android.downloads.isDownloadedPlaybackOwnerCurrent
+import com.vortx.android.downloads.isDownloadedPlaybackAdmissionCurrent
+import com.vortx.android.downloads.nextDownloadedPlayback
 import com.vortx.android.model.PreferredEpisode
 import com.vortx.android.VortXApplication
 import com.vortx.android.player.queue.PlaybackQueueState
@@ -378,7 +381,9 @@ fun TvApp(
             }
         } }
         val playerDetail = detail
-        val playerVm: DetailViewModel? = if (playable != null && playerDetail != null && !playable.isTrailer) {
+        val playerVm: DetailViewModel? = if (
+            playable != null && playerDetail != null && !playable.isTrailer && playable.downloadedPlaybackAdmission == null
+        ) {
             viewModel(
                 viewModelStoreOwner = detailVmOwner,
                 key = detailViewModelKey(
@@ -624,13 +629,27 @@ fun TvApp(
             // D-pad Back pops the player back to the detail page rather than exiting the app.
             BackHandler(onBack = ::exitPlayer)
             DisposableEffect(historyIdentity) {
-                playbackHistory.begin()
+                val beginHistory = playable.downloadedPlaybackAdmission == null || isDownloadedPlaybackAdmissionCurrent(playable)
+                if (beginHistory) playbackHistory.begin()
                 onDispose {
-                    playbackHistory.end()
+                    if (beginHistory) playbackHistory.end()
                 }
             }
             PlayerScreen(
                 playable = playable,
+                onDownloadedNaturalEnd = downloadedEnd@{ ended, admission ->
+                    fun isCurrent() = admission.isCurrent() && ended === playable && playing === playable &&
+                        launchedPlayerPrincipal == currentPlayerPrincipal &&
+                        repo.continueWatchingOwner() == historyOwnerToken && isDownloadedPlaybackOwnerCurrent(ended)
+                    if (!isCurrent()) return@downloadedEnd false
+                    val next = nextDownloadedPlayback(appContext, ended) ?: return@downloadedEnd false
+                    if (!isCurrent() || !isDownloadedPlaybackAdmissionCurrent(next)) return@downloadedEnd false
+                    autoAdvanceStreak[0] += 1
+                    playingEngineOverride = automaticEngineFor(next)
+                    playingMeta = null
+                    playing = next
+                    true
+                },
                 queueCount = visibleQueueState?.entries?.size ?: 0,
                 onShowQueue = visibleQueueState?.let { {
                     if (queueOwnerIsSelected(currentQueueOwner)) showingPlaybackQueueFor = currentQueueOwner
@@ -898,6 +917,20 @@ fun TvApp(
                             // A deliberate manual action owns the existing Detail; do not replace it.
                             admitted
                         },
+                        onPlayDownloaded = { local, requestedEngine ->
+                            if (playing == null && detailGeneration == routeGeneration &&
+                                detail?.id == current.id && detail?.type == current.type &&
+                                isDownloadedPlaybackAdmissionCurrent(local)) {
+                                playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
+                                    requested = requestedEngine,
+                                    playable = local,
+                                    mpvAvailable = MpvEngineFactory.isBundled,
+                                )
+                                playingMeta = null
+                                autoAdvanceStreak[0] = 0
+                                playing = local
+                            }
+                        },
                         onQueueInteraction = {
                             val request = libraryPlayRequest
                             val admitted = detailGeneration == routeGeneration &&
@@ -986,12 +1019,16 @@ fun TvApp(
                     // A finished download plays straight into the shared player slot (no detail page), the same
                     // slot a streamed source resolves into. Clears any stale detail meta so the player reads the
                     // local file, not a previous title's badges.
-                    onPlayLocal = {
-                        retireLibraryPlayRoute()
-                        autoAdvanceStreak[0] = 0
-                        playingEngineOverride = automaticEngineFor(it)
-                        playingMeta = null
-                        playing = it
+                    onPlayLocal = { local ->
+                        val downloaded = local.downloadedPlaybackAdmission != null
+                        if (!downloaded || (playing == null && detail == null && !fileRecoveryPausedNow() &&
+                                isDownloadedPlaybackAdmissionCurrent(local))) {
+                            retireLibraryPlayRoute()
+                            autoAdvanceStreak[0] = 0
+                            playingEngineOverride = automaticEngineFor(local)
+                            playingMeta = null
+                            playing = local
+                        }
                     },
                     syncManager = syncManager,
                 )

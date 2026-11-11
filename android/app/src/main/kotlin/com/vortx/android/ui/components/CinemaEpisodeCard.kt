@@ -57,6 +57,7 @@ fun CinemaEpisodeCard(
     focusRequester: FocusRequester,
     modifier: Modifier = Modifier,
     scores: MdbListRatings? = null,
+    onPlayDownloaded: (() -> Unit)? = null,
     thumb: @Composable () -> Unit,
 ) {
     val status = cinemaEpisodeStatus(watched, progress)
@@ -97,5 +98,6 @@ fun CinemaEpisodeCard(
             Text(it, style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary), maxLines = 4, overflow = TextOverflow.Ellipsis)
         }
         Chip(label = if (watched) "Mark unwatched" else "Mark watched", selected = watched, onClick = onToggleWatched)
+        onPlayDownloaded?.let { Chip(label = "Play Downloaded", selected = false, onClick = it) }
     }
 }
