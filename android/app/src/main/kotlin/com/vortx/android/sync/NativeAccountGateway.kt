@@ -4,6 +4,7 @@ import org.json.JSONObject
 import com.vortx.android.profile.UserProfile
 import kotlinx.coroutines.flow.Flow
 import com.vortx.android.engine.NativePlaylistCloudReceiptLedger
+import com.vortx.android.engine.VortxAccountScope
 import org.json.JSONArray
 
 internal data class NativeAccountExport(val nativeSync: JSONObject, val roster: List<UserProfile>, val rosterModifiedSeconds: Double,
@@ -43,6 +44,17 @@ internal class NativeAccountReadCapture private constructor(
         check(active && expected == account) { "Authenticated account read is stale" }
         rawBytes.copyOf()
     }
+
+    /** Scalar lifetime only. Does not mint new read/write authority or copy sensitive payloads. */
+    internal fun isCurrentFor(expected: SessionOwnerSnapshot.Account): Boolean = synchronized(lock) {
+        active && expected == account
+    }
+
+    /** Hold this exact read's lifetime through one synchronous action. Callers that also need
+     * authentication/lifecycle admission acquire them BEFORE entering this monitor. The action
+     * must not suspend or acquire authentication/lifecycle locks from inside the read monitor. */
+    internal fun withCurrentFor(expected: SessionOwnerSnapshot.Account, action: () -> Boolean): Boolean =
+        synchronized(lock) { active && expected == account && action() }
 
     /** A private mount copy separates retained provenance from the transient sync-call capture. */
     internal fun retainedCopyFor(expected: SessionOwnerSnapshot.Account): NativeAccountReadCapture = synchronized(lock) {
@@ -97,6 +109,12 @@ internal interface NativeAccountGateway {
     /** Scalar currency and Session health are separate lock-order boundaries. Missing original
      * authentication admission fails closed; readonly exports never manufacture this authority. */
     fun captureUploadOrigin(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): NativeAccountUploadCurrency.Origin? = null
+    /** A detached website-only projection owns the native writer reservation through this callback.
+     * The callback may submit and GET, but must return before ordinary native apply. Old/fake gateways
+     * cannot manufacture admission. The supplied read must be the original lease's actual GET. */
+    suspend fun <T : Any> withWebsiteRosterCandidate(account: SessionOwnerSnapshot.Account,
+        source: NativeAccountReadCapture, original: NativeAccountUploadCurrency.Origin,
+        operation: suspend (NativeWebsiteRosterCandidate) -> T): T? = null
     suspend fun prepareUploadSeed(account: SessionOwnerSnapshot.Account, original: NativeAccountUploadCurrency.Origin, isCurrent: () -> Boolean):
         Pair<JSONObject, NativeAccountUploadCurrency>? = null
     suspend fun applyUploadSeed(account: SessionOwnerSnapshot.Account, document: JSONObject,
@@ -162,6 +180,18 @@ internal interface NativeAccountUploadCurrency {
     interface Origin { fun isCurrent(): Boolean }
     fun isCurrent(): Boolean
     fun <T> withCurrentSession(action: () -> T): T?
+}
+
+/** Callback-scoped detached data, never an authenticated GET or mounted native capability.
+ * Returned byte copies belong to the caller. Every operation refuses after callback retirement. */
+internal interface NativeWebsiteRosterCandidate {
+    val scope: VortxAccountScope
+    val sourceRevision: Long
+    val currency: NativeAccountUploadCurrency
+    fun copyProjectedBytes(): ByteArray
+    /** IO: call after receipt persistence and before submission, outside request/auth monitors.
+     * Request candidateCurrent must use currency.isCurrent(), not this inventory probe. */
+    suspend fun requireLocalAbsenceForSubmission()
 }
 
 /** Exact sent-host acknowledgement metadata. It is neither a host-field setter nor server ACK

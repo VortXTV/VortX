@@ -8,6 +8,7 @@ import com.vortx.android.sync.NativeAccountReadCapture
 import com.vortx.android.sync.NativeAccountExport
 import com.vortx.android.sync.NativeAccountMountToken
 import com.vortx.android.sync.NativeAccountUploadCurrency
+import com.vortx.android.sync.NativeWebsiteRosterCandidate
 import com.vortx.android.sync.NativePlaylistProfileGateway
 import com.vortx.android.sync.NativeXperienceProfileGateway
 import com.vortx.android.sync.NativeHostUploadAcknowledgment
@@ -1503,18 +1504,7 @@ internal class NativeAccountCoordinator(
         // Credentials in host-only settings may be excluded from the sealed archive. Immutable
         // library/add-on/watch source values may not: stripping a nested encoded secret there
         // would bless a different descriptor or migration receipt than the authenticated input.
-        val sourceFields = JSONObject()
-        for (key in listOf("addons", "library", "addonOrder", "webAddonRemovals", "webProgress", "webAddonEdits"))
-            if (document.has(key)) sourceFields.put(key, document.get(key))
-        document.optJSONObject("vortx")?.let { original ->
-            val fields = JSONObject()
-            for (key in listOf("addons", "library", "byProfile", "ownerWatched", "deletedAddonsTs", "deletedAddons",
-                "deletedLibraryTs", "deletedLibrary", "deletedProfiles")) if (original.has(key)) fields.put(key, original.get(key))
-            sourceFields.put("vortx", fields)
-        }
-        NativeHostDocument.requireCredentialFree(sourceFields)
-        val archive = NativeHostDocument.archive(document)
-        nativeMigrationSidecars.forEach(archive.getJSONObject("document")::remove)
+        val archive = nativeLegacySourceArchive(document)
         val watchlists = nativeLegacyWatchlists(document, roster.map { it.id }.toSet())
         archive.getJSONObject("document").put("nativeWatchlistMigrationPending", watchlists.pending)
         val materialDocument = nativeMigrationSourceDocument(archive.getJSONObject("document")).also { it.remove("profileEdits") }
@@ -1836,6 +1826,105 @@ internal class NativeAccountCoordinator(
     override fun captureUploadOrigin(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): NativeAccountUploadCurrency.Origin? {
         val original = captureOwnAccountAdmission(account) ?: return null
         return UploadOrigin(account, original, isCurrent).takeIf { it.isCurrent() }
+    }
+
+    /** Reserve without mounting. No source bytes from this operation are ever labelled as a new
+     * authenticated GET. The cloud callback must return before normal apply can acquire the writer. */
+    override suspend fun <T : Any> withWebsiteRosterCandidate(account: SessionOwnerSnapshot.Account,
+        source: NativeAccountReadCapture, original: NativeAccountUploadCurrency.Origin,
+        operation: suspend (NativeWebsiteRosterCandidate) -> T): T? {
+        val origin = original as? UploadOrigin ?: return null
+        if (origin.issuer !== this || origin.account != account || source.account != account) return null
+        val job = currentCoroutineContext()[Job]
+        fun requireOriginal() {
+            job?.ensureActive()
+            check(source.isCurrentFor(account) && origin.isCurrent()) { "Original website account retired" }
+        }
+        requireOriginal()
+        val raw = source.copyRawForApply(account)
+        var projected: ByteArray? = null
+        try {
+            // Ordinary full-roster/native reads must fall through without requiring local absence.
+            // Keep the output in this owning frame even if cancellation discards withContext's return.
+            withContext(Dispatchers.Default) {
+                requireOriginal()
+                projected = NativeWebsiteRosterProjection.project(raw)
+                requireOriginal()
+            }
+            val bytes = projected ?: return null
+            requireOriginal()
+            var result: T? = null
+            val completed = withRestoreNativeExclusion(account, ::requireOriginal) { held ->
+                val scope = VortxAccountScope("account.${UUID.fromString(account.id)}", UserProfile.OWNER_ID)
+                var candidate: WebsiteRosterCandidate? = null
+                try {
+                    requireWebsiteRosterAbsence(account, scope, held, ::requireOriginal)
+                    withContext(Dispatchers.Default) {
+                        NativeWebsiteRosterAdmission.requireAdmissible(scope, bytes, bindings) {
+                            requireOriginal(); held.requireCurrent(account)
+                        }
+                    }
+                    requireOriginal(); held.requireCurrent(account)
+                    val admitted = WebsiteRosterCandidate(scope, source, bytes, origin, held, job)
+                    candidate = admitted
+                    admitted.requireLocalAbsenceForSubmission()
+                    result = operation(admitted)
+                    requireOriginal(); check(admitted.currency.isCurrent()) { "Website candidate retired" }
+                    true
+                } finally { candidate?.close() }
+            }
+            check(completed == true) { "Website account native writer unavailable" }
+            return requireNotNull(result)
+        } finally {
+            projected?.fill(0)
+            raw.fill(0)
+        }
+    }
+
+    private suspend fun requireWebsiteRosterAbsence(account: SessionOwnerSnapshot.Account, scope: VortxAccountScope,
+        held: RestoreNativeExclusion, checkCurrent: () -> Unit) = withContext(Dispatchers.IO) {
+        checkCurrent(); held.requireCurrent(account)
+        check(checkpoints.inspectWebsiteRosterAbsence(scope) == AccountFileLocalPresence.ABSENT) {
+            "Website account local state is present or unavailable"
+        }
+        checkCurrent(); held.requireCurrent(account)
+    }
+
+    private inner class WebsiteRosterCandidate(override val scope: VortxAccountScope,
+        private val source: NativeAccountReadCapture, private val projected: ByteArray, private val origin: UploadOrigin,
+        private val held: RestoreNativeExclusion, private val job: Job?) : NativeWebsiteRosterCandidate, AutoCloseable {
+        override val sourceRevision: Long get() = source.baseRevision
+        private var active = true // Guarded by lifecycleLock, including callback retirement.
+        private fun currentLocked(): Boolean = active && job?.isActive != false && mounted.get() == null &&
+            restoreNativeExclusion === held && restoreNativeExclusion?.revoked == false
+        private fun <T> admitted(action: () -> T): T? {
+            var result: Result<T>? = null
+            if (!origin.withAuthentication { synchronized(lifecycleLock) {
+                // Retirement already follows lifecycle -> read. Keep that order, and retain
+                // the original read admission until this synchronous action has linearized.
+                if (!currentLocked()) false else source.withCurrentFor(origin.account) {
+                    result = runCatching(action)
+                    true
+                }
+            } }) return null
+            return requireNotNull(result).getOrThrow()
+        }
+        // This is an absent-installation currency, like UploadCurrency(origin, null), with the
+        // additional exact reservation/lifetime fence. Auth precedes lifecycle; no Session/IO.
+        override val currency = object : NativeAccountUploadCurrency {
+            override fun isCurrent(): Boolean = admitted { true } == true
+            override fun <T> withCurrentSession(action: () -> T): T? = admitted(action)
+        }
+        override fun copyProjectedBytes(): ByteArray =
+            admitted { projected.copyOf() } ?: error("Website candidate retired")
+        override suspend fun requireLocalAbsenceForSubmission() =
+            requireWebsiteRosterAbsence(origin.account, scope, held) {
+                job?.ensureActive(); check(currency.isCurrent()) { "Website candidate retired" }
+            }
+        override fun close() = synchronized(lifecycleLock) {
+            active = false
+            projected.fill(0)
+        }
     }
 
     override suspend fun prepareUploadSeed(account: SessionOwnerSnapshot.Account, original: NativeAccountUploadCurrency.Origin, isCurrent: () -> Boolean):

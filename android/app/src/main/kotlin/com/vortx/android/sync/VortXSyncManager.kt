@@ -3153,7 +3153,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
 
     private sealed interface PushOutcome {
         data class Accepted(val version: Long) : PushOutcome
-        data object Rejected : PushOutcome
+        data class Rejected(val reportedVersion: Long?) : PushOutcome
         data object UpgradeRequired : PushOutcome
         data object Error : PushOutcome
     }
@@ -3167,8 +3167,10 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     private suspend fun pushSyncDocAt(
         lease: SyncSessionLease,
         candidate: DerivedBackup,
+        publicationCurrent: () -> Boolean = { true },
+        beforeSubmit: (suspend (String, JSONObject) -> Boolean)? = null,
     ): PushOutcome {
-        if (!candidateHealthIsCurrent(lease, candidate) || requiresUpgrade(lease)) return PushOutcome.Error
+        if (!candidateHealthIsCurrent(lease, candidate) || !publicationCurrent() || requiresUpgrade(lease)) return PushOutcome.Error
         val version = BackupRevisionPolicy.next(candidate.witness.baseRevision) ?: return PushOutcome.Error
         val plaintext = candidate.plaintext.toByteArray(Charsets.UTF_8)
         // An authenticated v2 head stays v2 even while upgrades of legacy accounts are disabled.
@@ -3186,6 +3188,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         if (!candidateHealthIsCurrent(lease, candidate)) return PushOutcome.Error
         val body = JSONObject().put("document", ciphertext).put("version", version)
             .put("baseRevision", candidate.witness.baseRevision ?: JSONObject.NULL)
+        if (beforeSubmit != null && !beforeSubmit(ciphertext, body)) return PushOutcome.Error
         val callPermit = acquireSyncCallPermit(lease) ?: return PushOutcome.Error
         val (code, json) = request(
             "PUT",
@@ -3194,11 +3197,11 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             bearerToken = lease.token,
             callPermit = callPermit,
             candidateCurrent = {
-                candidateIsCurrent(lease, candidate) &&
+                candidateIsCurrent(lease, candidate) && publicationCurrent() &&
                     (!sawDocV2(lease.accountId) || (writeV2 && candidate.witness.baseRevision != null))
             },
         )
-        if (!candidateHealthIsCurrent(lease, candidate)) return PushOutcome.Error
+        if (!candidateHealthIsCurrent(lease, candidate) || !publicationCurrent()) return PushOutcome.Error
         // The terminal status remains authoritative even if its error body was lost/malformed.
         // It never acknowledges this candidate and must not start an infinite conflict retry.
         if (code == 426) {
@@ -3208,9 +3211,12 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         if (code != 200) return PushOutcome.Error
         val accepted = json?.opt("accepted") as? Boolean ?: return PushOutcome.Error
         if (accepted) {
+            if (json?.has("version") == true && BackupRevisionPolicy.parse(json.get("version")) != version) {
+                return PushOutcome.Error
+            }
             var remembered = false
             if (withCandidateSession(candidate) { publishIfSyncLeaseCurrent(lease) {
-                if (candidateIsCurrent(lease, candidate)) {
+                if (candidateIsCurrent(lease, candidate) && publicationCurrent()) {
                     if (writeV2) markSawDocV2(lease.accountId)
                     remembered = syncState.markNativeBackupSeen(lease.accountId)
                 }
@@ -3219,11 +3225,12 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             // credential receipts can still fail). Its caller stamps only after those all succeed.
             return PushOutcome.Accepted(version)
         }
-        // A winner echo is not the base of our document. Only a fresh authenticated GET + merge
-        // can grant the next candidate's revision. Do not advance the high-water mark on rejection.
-        if (json?.has("version") == true && !json.isNull("version") && BackupRevisionPolicy.parse(json.get("version")) == null)
-            return PushOutcome.Error
-        return PushOutcome.Rejected
+        // A winner echo can reject a contradictory detached readback. Only an authenticated GET
+        // grants any read/apply/write base, and rejection never advances the applied revision.
+        val reportedVersion = if (json?.has("version") == true && !json.isNull("version")) {
+            BackupRevisionPolicy.parse(json.get("version")) ?: return PushOutcome.Error
+        } else null
+        return PushOutcome.Rejected(reportedVersion)
     }
 
     private class DerivedBackup(val plaintext: String, val witness: BackupReadWitness,
@@ -3304,6 +3311,88 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         return false
     }
 
+    /** Resolve only this authenticated pull. A website projection never becomes local source evidence. */
+    private suspend fun pullAfterWebsiteRosterAdmission(
+        lease: SyncSessionLease,
+        account: SessionOwnerSnapshot.Account,
+        gateway: NativeAccountGateway,
+        original: NativeAccountUploadCurrency.Origin,
+        pull: SyncDocPull.Doc,
+    ): SyncDocPull.Doc? {
+        fun current() = original.isCurrent() && routineSyncAllowed(lease) && nativeGateway === gateway
+        if (!current()) return null
+        val captured = capturedAccountRead(lease, account, pull) ?: return null
+        var attempted = false
+        val replacement = try {
+            gateway.withWebsiteRosterCandidate<SyncDocPull>(account, captured, original) admission@{ detached ->
+                attempted = true
+                if (detached.sourceRevision != pull.version || detached.scope.accountID != "account.${account.id}" ||
+                    !current()) {
+                    return@admission SyncDocPull.Failed
+                }
+                val target = BackupRevisionPolicy.next(pull.version) ?: return@admission SyncDocPull.Failed
+                val projected = detached.copyProjectedBytes()
+                try {
+                    // The backend document ceiling applies to Base64 GCM nonce+ciphertext+tag.
+                    val maxEncrypted = 7 * 1024 * 1024
+                    if (4L * ((projected.size.toLong() + 28 + 2) / 3) > maxEncrypted) return@admission SyncDocPull.Failed
+                    val candidate = deriveBackup(lease, pull.doc, pull, gateway, mount = null,
+                        rawAccount = projected, currency = detached.currency) ?: return@admission SyncDocPull.Failed
+                    fun detachedCurrent() = current() && detached.currency.isCurrent()
+                    val outcome = pushSyncDocAt(lease, candidate, ::detachedCurrent) submission@{ encrypted, body ->
+                        // These ASCII values are the exact submitted document and JSON envelope.
+                        if (encrypted.length > maxEncrypted || body.toString().length > 8 * 1024 * 1024) {
+                            return@submission false
+                        }
+                        val key = lease.dataKeyCopy()
+                        var retained = false
+                        try {
+                            val receipt = NativeWebsiteRosterDenialReceipt.create(
+                                account.id, key, pull.version, pull.raw, target, projected,
+                            )
+                            val authorized = detached.currency.withCurrentSession {
+                                publishIfSyncLeaseCurrent(lease) {
+                                    if (detachedCurrent()) {
+                                        val saved = syncState.retainFirstWebsiteRosterReceipt(account.id, key, receipt)
+                                        retained = saved is NativeWebsiteRosterReceiptStore.State.Present
+                                    }
+                                }
+                            }
+                            if (authorized != true || !retained) return@submission false
+                        } finally { key.fill(0) }
+                        // Recheck actual files and keys outside HTTP's scalar predicate and after the durable receipt.
+                        detached.requireLocalAbsenceForSubmission()
+                        detachedCurrent()
+                    }
+                    val minimumReadbackVersion = when (outcome) {
+                        is PushOutcome.Accepted -> if (outcome.version == target) target else return@admission SyncDocPull.Failed
+                        is PushOutcome.Rejected -> maxOf(target, outcome.reportedVersion ?: target)
+                        PushOutcome.Error, PushOutcome.UpgradeRequired -> return@admission SyncDocPull.Failed
+                    }
+                    val readback = pullSyncDocResult(lease, allowOlderAddonTombstones = false,
+                        publicationCurrent = ::detachedCurrent) as? SyncDocPull.Doc ?: return@admission SyncDocPull.Failed
+                    val confirmed = readback.version >= minimumReadbackVersion && (outcome !is PushOutcome.Accepted ||
+                        readback.version > target || projected.contentEquals(readback.raw))
+                    if (!confirmed) {
+                        readback.raw.fill(0)
+                        return@admission SyncDocPull.Failed
+                    }
+                    readback
+                } finally { projected.fill(0) }
+            }
+        } finally { captured.retire() }
+        // The gateway reservation has exited. Ordinary native apply alone can admit the real GET.
+        if (!current()) {
+            if (replacement is SyncDocPull.Doc) replacement.raw.fill(0)
+            return null
+        }
+        return when (replacement) {
+            is SyncDocPull.Doc -> replacement
+            null -> if (attempted) null else pull
+            else -> null
+        }
+    }
+
     // ---- syncUp / syncDown ----
 
     /**
@@ -3349,6 +3438,10 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         // debounce marker was written. Re-arm its exact account before permitting a pull.
         if (com.vortx.android.integrations.NativeProviderAccess.hasPending(account) == true) armPendingSync(lease, recordEdit = true)
         if (retryPendingPushBeforePull(lease)) return false
+        val job = currentCoroutineContext()[Job]
+        val websiteOrigin = if (reopened) null else gateway.captureUploadOrigin(account) {
+            job?.isActive != false && routineSyncAllowed(lease) && nativeGateway === gateway
+        }
         val pulled = pullSyncDocResult(lease, allowOlderAddonTombstones = false, ifNoneMatch = conditionalVersion)
         if (pulled is SyncDocPull.Unchanged) {
             if (com.vortx.android.integrations.NativeProviderAccess.hasPending(account) == true) armPendingSync(lease, recordEdit = true)
@@ -3359,9 +3452,12 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         if (pulled is SyncDocPull.Empty) {
             return nativeSyncUp(lease, gateway)
         }
-        val pull = pulled as? SyncDocPull.Doc ?: return false
+        val originalPull = pulled as? SyncDocPull.Doc ?: return false
         if (!isSyncLeaseCurrent(lease)) return false
         if (retryPendingPushBeforePull(lease)) return false
+        val pull = if (websiteOrigin == null) originalPull
+            else pullAfterWebsiteRosterAdmission(lease, account, gateway, websiteOrigin, originalPull) ?: return false
+        if (pull !== originalPull && retryPendingPushBeforePull(lease)) return false
         // A confirmed mounted checkpoint already contains this acknowledged revision. Replaying
         // it on every active poll remounts/projections and can arm needless peer echo work.
         if (reopened && !force && !routineReceive && syncState.hasLastVersion(lease.accountId) && pull.version == lastSyncedVersion(lease)) {
@@ -3373,7 +3469,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         }
         val initialMount = gateway.currentMountToken(account)
         val capturedRead = capturedAccountRead(lease, account, pull) ?: return false
-        val applied = try { gateway.applyRawDocument(account, capturedRead) { isSyncLeaseCurrent(lease) } }
+        val applied = try { gateway.applyRawDocument(account, capturedRead) { isSyncLeaseCurrent(lease) && nativeGateway === gateway } }
             catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
             catch (_: Exception) { false }
             finally { capturedRead.retire() }
@@ -3508,8 +3604,11 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 globals = JSONObject(captured.second)
                 pushedSettingsValues = captured.third
             }) return null
-            val pulled = pullSyncDocResult(lease, allowOlderAddonTombstones = false, publicationCurrent = original::isCurrent)
+            val authenticated = pullSyncDocResult(lease, allowOlderAddonTombstones = false, publicationCurrent = original::isCurrent)
             if (!original.isCurrent()) return null
+            val pulled = if (authenticated is SyncDocPull.Doc && gateway.currentMountToken(account) == null)
+                pullAfterWebsiteRosterAdmission(lease, account, gateway, original, authenticated) ?: return null
+            else authenticated
             val seed = pulled is SyncDocPull.Empty
             var seedCurrency: NativeAccountUploadCurrency? = null
             val document = when (pulled) {
@@ -4824,9 +4923,6 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         private val prefs: SharedPreferences =
             appContext.getSharedPreferences(STATE_FILE, Context.MODE_PRIVATE)
         private val websiteRosterReceipts = NativeWebsiteRosterReceiptStore(prefs)
-
-        fun loadWebsiteRosterReceipt(accountId: String, dataKey: ByteArray): NativeWebsiteRosterReceiptStore.State =
-            websiteRosterReceipts.load(accountId, dataKey)
 
         fun retainFirstWebsiteRosterReceipt(
             accountId: String,
