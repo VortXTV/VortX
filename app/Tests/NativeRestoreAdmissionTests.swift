@@ -1,5 +1,6 @@
 import Foundation
 import CoreFoundation
+import CryptoKit
 
 // Production KeychainFailureClosedStore and exact credential result declarations are inserted here.
 // There is no Security adapter, app, credential file, network, native engine or preferences instance.
@@ -82,10 +83,19 @@ private struct SymmetricKey { init(data: Data) {} }
         return SymmetricKey(data: Data(count: 32))
     }
 }
+private struct VortxAccountScope {
+    let account: String
+    let ownerProfileID: String
+}
 @MainActor private final class VortxEncryptedCheckpointStore {
+    static var checkpointAdoption: Bool?
     struct Recovery { let bootstrap: Data }
     init(directory: URL, key: SymmetricKey, installationKey: SymmetricKey) throws {}
     func recovery(account: String) throws -> Recovery? { nil }
+    func permitsWebsiteRosterAdoption(scope: VortxAccountScope, witness: Data, requiringCheckpoint: Bool) throws -> Bool {
+        precondition(scope.account == "fixture-account" && scope.ownerProfileID == UserProfile.ownerID.uuidString && witness.count == 32)
+        return Self.checkpointAdoption ?? !requiringCheckpoint
+    }
 }
 
 @MainActor private final class RestoreAdmissionFixture {
@@ -109,7 +119,13 @@ private struct SymmetricKey { init(data: Data) {} }
     func isCurrent(_ capture: CredentialScopeRegistry.Capture) -> Bool { capture == credentialAuthority.capture() }
     static func resolveRoster(from document: [String: Any], fullOnly: Bool) -> ProfileRosterSnapshot? {
         precondition(fullOnly, "admission must never accept a lossy summary")
-        return resolvedRoster // Decoder is a dependency aperture; the production owner-count gate is real.
+        if let resolvedRoster { return resolvedRoster }
+        guard let rows = (document["vortx"] as? [String: Any])?["roster"] as? [[String: Any]] else { return nil }
+        return .init(profiles: rows.compactMap { row in
+            guard let id = (row["id"] as? String).flatMap(UUID.init(uuidString:)),
+                  let name = row["name"] as? String, let owner = row["isOwner"] as? Bool else { return nil }
+            return UserProfile(id: id, name: name, avatar: "", isOwner: owner)
+        })
     }
     private func publishDetachedNativeSeed(_ value: [String: Any], capture: CredentialScopeRegistry.Capture, cloudAuthority: ReceivedProviderCloudAuthority) async throws -> [String: Any]? {
         seedCalls += 1
@@ -145,6 +161,7 @@ private struct SymmetricKey { init(data: Data) {} }
     static func check(_ value: Bool, _ label: String) { precondition(value, label); checks += 1 }
     static func fresh() -> RestoreAdmissionFixture {
         Keychain.reset(); DiagnosticsLog.messages = []; VortxNativeInstallationKey.unavailable = false
+        VortxEncryptedCheckpointStore.checkpointAdoption = nil
         ProfileStore.shared.activeID = UserProfile.ownerID; resolvedRoster = .init(profiles: [owner])
         return RestoreAdmissionFixture()
     }
@@ -251,6 +268,61 @@ private struct SymmetricKey { init(data: Data) {} }
         check(accepted.plaintext == original, "admission retains original authenticated plaintext independently of the host projection")
         let old = fresh(); old.lastSyncedVersion = 2; await old.expectAdmission(.staleDocument)
         let missing = fresh(); resolvedRoster = nil; await missing.expectAdmission(.rosterUnavailable)
+        let webBytes = Data(#"{"addons":[{"transportUrl":"https://addon.test/manifest.json"}],"apiKeys":{"tmdb":"synthetic"},"opaque":-0.0,"vortx":{"deletedAddons":["x"],"future":9007199254740993},"webProgress":{"owner":[],"removed":{"owner":[]}}}"#.utf8)
+        let webDocument = try JSONSerialization.jsonObject(with: webBytes) as! [String: Any]
+        let web = fresh(); resolvedRoster = nil
+        let webCapture = web.credentialAuthority.capture()
+        let pulled = VersionedPull.doc(doc: webDocument, version: 7, plaintext: webBytes, observation: UUID())
+        let adoption = try await web.nativeRestoreDocument(pulled, capture: webCapture,
+            selectedProfile: ProfileStore.shared.activeID, generation: web.nativeCheckpointGeneration, cloudAuthority: .init())
+        check(adoption.adoptsWebsiteRoster && adoption.owners.first?.id == UserProfile.ownerID &&
+              adoption.owners.first?.name == "Main", "cold authenticated website backup admits the deterministic owner")
+        check(adoption.plaintext == webBytes && web.seedCalls == 0, "cold admission keeps raw bytes and never sends create-only seed")
+        check((adoption.websiteAdoption?.original["vortx"] as? [String: Any])?["roster"] == nil,
+              "the interpretation-only owner is absent from the archived source input")
+        let progressBytes = Data(#"{"webProgress":{"owner":[]}}"#.utf8)
+        let progressDocument = try JSONSerialization.jsonObject(with: progressBytes) as! [String: Any]
+        let progressAdoption = try NativeWebsiteAccountAdoption(progressDocument, plaintext: progressBytes, revision: 7)
+        check(progressAdoption != nil, "website owner-only progress has the webapp's actual array shape")
+        VortxEncryptedCheckpointStore.checkpointAdoption = false
+        await web.expectAdmission(.rosterUnavailable, pulled: pulled)
+        VortxEncryptedCheckpointStore.checkpointAdoption = true
+        let warm = try web.authorizedWebsiteAccountAdoption(webDocument, plaintext: webBytes, revision: 7,
+            capture: webCapture, requiringCheckpoint: true)!
+        let outgoing = try warm.exportBase()
+        let before = try OwnerHistoryExactJSON.Object(webBytes), after = try OwnerHistoryExactJSON.Object(outgoing)
+        let beforeNamespace = try OwnerHistoryExactJSON.Object(before.required("vortx"))
+        let afterNamespace = try OwnerHistoryExactJSON.Object(after.required("vortx"))
+        check(after["addons"] == before["addons"] && after["apiKeys"] == before["apiKeys"]
+              && after["webProgress"] == before["webProgress"] && after["opaque"] == before["opaque"],
+              "outgoing roster base preserves unrelated exact root slices")
+        check(afterNamespace["future"] == beforeNamespace["future"]
+              && afterNamespace["deletedAddons"] == beforeNamespace["deletedAddons"]
+              && afterNamespace["rosterModified"] == Data("0".utf8),
+              "outgoing base retains exact nested slices and adds a zero baseline clock")
+        let peer = try JSONSerialization.jsonObject(with: outgoing) as! [String: Any]
+        let peerAdoption = try NativeWebsiteAccountAdoption(peer, plaintext: outgoing, revision: 8)
+        check(peerAdoption == nil && resolveRoster(from: peer, fullOnly: true)?.profiles.first?.id == UserProfile.ownerID,
+              "fresh device sees durable full roster and requires no adoption exception")
+        for forbidden in [
+            #"{"addons":[],"settings":null}"#,
+            #"{"addons":[],"nativeSync":{}}"#,
+            #"{"addons":[],"nativeAccountBootstrap":"authenticated-empty-v1"}"#,
+            #"{"addons":[],"vortx":{"roster":"invalid"}}"#,
+            #"{"addons":[],"vortx":{"rosterModified":null}}"#,
+            #"{"addons":[],"vortx":{"profiles":[]}}"#,
+            #"{"addons":[],"vortx":{"byProfile":{}}}"#,
+            #"{"addons":[],"vortx":{"ownerWatched":{}}}"#,
+            #"{"addons":[],"vortx":{"deletedProfiles":[]}}"#,
+            #"{"addons":[],"webProgress":{"byProfile":{"p":{}}}}"#,
+            #"{"addons":[],"webProgress":{"removed":{"byProfile":{"p":[]}}}}"#,
+            #"{"future":1}"#
+        ] {
+            let raw = Data(forbidden.utf8)
+            let existing = try JSONSerialization.jsonObject(with: raw) as! [String: Any]
+            let rejected = try NativeWebsiteAccountAdoption(existing, plaintext: raw, revision: 8)
+            check(rejected == nil, "known ownership carrier or missing website evidence refuses synthetic owner")
+        }
         let noKey = fresh(); noKey.dataKey = nil; await noKey.expectAdmission(.keyUnavailable)
         let short = fresh(); short.dataKey = Data(count: 31); await short.expectAdmission(.invalidKey)
         let noOwner = fresh(); resolvedRoster = .init(profiles: []); await noOwner.expectAdmission(.ownersUnavailable)

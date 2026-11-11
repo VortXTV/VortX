@@ -170,7 +170,8 @@ function extractRestoreAdmission() {
     const credential = captured.get('app/SourcesShared/CredentialScope.swift').toString('utf8');
     const methods = [
         '    private func nativeBackupHistory(', '    private func rememberNativeBackup(',
-        '    private func nativeEmptyAccountDocument(', '    private enum NativeRestoreAdmissionFailure:',
+        '    private func nativeEmptyAccountDocument(', '    private struct NativeWebsiteAccountAdoption {',
+        '    private func authorizedWebsiteAccountAdoption(', '    private enum NativeRestoreAdmissionFailure:',
         '    private struct NativeRestoreDocument {', '    private func nativeRestoreDocument(',
         '    private enum VersionedPull {', '    private func pullDocVersionedResult(',
         '    private func clearAccountReconnectFailure('
@@ -191,7 +192,7 @@ function extractRestoreAdmission() {
         propertiesSHA256: digest(Buffer.from(properties)), secureBoundarySHA256: digest(Buffer.from(secure)),
         observationPropertySHA256: observation ? digest(Buffer.from(observation)) : null,
         methodTransformations: [],
-        apertures: ['inert encrypted-store/key/storage', 'fake secure backend', 'HTTP/crypto', 'roster decoder', 'detached seed'],
+        apertures: ['inert encrypted-store/key/storage including sealed website-roster witness result', 'fake secure backend', 'HTTP/crypto', 'roster decoder', 'detached seed'],
         exclusions: ['full native mount', 'OS Keychain/entitlements', 'device login', 'HTTP absence contract']
     }, null, 2) + '\n');
     // Outer-task diagnostics are source wiring checks, not a second implemented restore algorithm.
@@ -203,7 +204,9 @@ function extractRestoreAdmission() {
     for (const required of ['restore result=joined reason=in_flight', 'restore result=joined_complete',
         'restore result=not_started reason=backoff', 'restore result=not_started reason=superseded',
         'stage=offline_restore reason=checkpoint_unavailable', 'self.nativeRestoreDocument(pulled,',
-        'self.nativeCheckpointGeneration == generation', 'failure.stage', 'failure.rawValue']) {
+        'self.nativeCheckpointGeneration == generation', 'failure.stage', 'failure.rawValue',
+        'initialWebsiteRosterAdoption: hadCheckpoint ? nil : admitted.websiteAdoption?.witness',
+        'self.nativeMutationDidCommit(credentialCapture: capture)']) {
         if (!restore.includes(required)) throw new Error('Missing restore outcome wiring: ' + required);
     }
     if (restore.includes('try? self.nativeEmptyAccountDocument') || restore.includes('try? await self.publishDetachedNativeSeed')) {

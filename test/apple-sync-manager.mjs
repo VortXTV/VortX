@@ -56,6 +56,18 @@ if (process.argv[2] === '--extract') {
     block(source, '    private enum PushOutcome '));
   const observation = xperienceInputs.observationProperty(source);
   if (observation) selected.push(observation);
+  const usesWebsiteAdoption = selected.some(value => value.includes('authorizedWebsiteAccountAdoption('));
+  if (usesWebsiteAdoption) {
+    selected.push(block(source, '    private struct NativeWebsiteAccountAdoption {'));
+    selected.push(`    // Existing upload scenarios have no separately authenticated website-roster checkpoint.
+    private func authorizedWebsiteAccountAdoption(_ document: [String: Any], plaintext: Data, revision: Int,
+        capture: CredentialScopeRegistry.Capture, requiringCheckpoint: Bool) throws -> NativeWebsiteAccountAdoption? { nil }
+    private func prepareNativeLegacyMaterial(_ document: [String: Any], capture: CredentialScopeRegistry.Capture,
+        websiteAdoption: NativeWebsiteAccountAdoption?) async throws -> NativeLegacyPreparation {
+        precondition(websiteAdoption == nil)
+        return try await prepareNativeLegacyMaterial(document, capture: capture)
+    }`);
+  }
   const profiles = await readFile('app/SourcesShared/Profiles.swift', 'utf8');
   const preferenceFixture = await readFile('app/Tests/NativePreferenceAcknowledgementTests.swift', 'utf8');
   const exactDeclaration = (text, expression, label) => {

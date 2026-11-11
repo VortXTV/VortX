@@ -931,7 +931,7 @@ final class VortXSyncManager: ObservableObject {
     /// decision on the newer document and the deferred one stands down instead of merging older 0.4 data.
     private var nativeDocumentCommitGeneration: UInt64 = 0
     private func applyLaunchNativeLegacyConversion(_ conversion: Task<NativeLegacyPreparation, Error>,
-                                                   document: [String: Any], plaintext: Data, capture: CredentialScopeRegistry.Capture,
+                                                   document: [String: Any], plaintext: Data, revision: Int?, capture: CredentialScopeRegistry.Capture,
                                                    cloudAuthority: ReceivedProviderCloudAuthority) {
         deferredLegacyConversion?.cancel()
         DiagnosticsLog.log("native-profiles", "legacy_conversion opened_before_finish stage=launch")
@@ -945,7 +945,8 @@ final class VortXSyncManager: ObservableObject {
                     DiagnosticsLog.log("native-profiles", "legacy_conversion result=superseded stage=deferred")
                     return
                 }
-                _ = try await self.commitNativePulledDocument(document, originalPlaintext: plaintext, capture: capture, preparedAtLaunch: prepared,
+                _ = try await self.commitNativePulledDocument(document, originalPlaintext: plaintext, revision: revision,
+                                                              capture: capture, preparedAtLaunch: prepared,
                                                               standDownIfSuperseded: true, cloudAuthority: cloudAuthority)
                 DiagnosticsLog.log("native-profiles", "legacy_conversion result=done stage=deferred")
             } catch {
@@ -1023,7 +1024,8 @@ final class VortXSyncManager: ObservableObject {
     }
     private func prepareNativeLegacyMaterial(_ document: [String: Any], capture: CredentialScopeRegistry.Capture,
                                              enforceMountedFence: Bool = true,
-                                             ownerHistoryRead: VortxNativeSession.OwnerHistoryCheckpointRead? = nil) async throws -> NativeLegacyPreparation {
+                                             ownerHistoryRead: VortxNativeSession.OwnerHistoryCheckpointRead? = nil,
+                                             websiteAdoption: NativeWebsiteAccountAdoption? = nil) async throws -> NativeLegacyPreparation {
         guard isCurrent(capture), let roster = Self.resolveRoster(from: document, fullOnly: true),
               let owner = roster.profiles.first(where: \.isOwner), roster.profiles.filter(\.isOwner).count == 1 else { throw VortxNativeError.invalidSnapshot }
         let profiles = roster.profiles.filter { !$0.isOwner && $0.usesOwnAccount }
@@ -1127,7 +1129,9 @@ final class VortXSyncManager: ObservableObject {
                 }
             }
         }
-        let archiveCapture = try VortxNativeBootstrapArchive.captureLegacyDocument(document, diagnostics: {
+        // The projected roster is an input to migration policy, not part of the authenticated
+        // legacy source. Keep it out of every source receipt and the credential-free archive.
+        let archiveCapture = try VortxNativeBootstrapArchive.captureLegacyDocument(websiteAdoption?.original ?? document, diagnostics: {
             DiagnosticsLog.log("native-profiles", $0)
         })
         let documentBytes = archiveCapture.document
@@ -1395,6 +1399,93 @@ final class VortXSyncManager: ObservableObject {
         return ["nativeAccountBootstrap": "authenticated-empty-v1", "vortx": ["roster": roster, "rosterModified": 0]]
     }
 
+    /// The website can write these account-owned channels before any app has created a roster.
+    /// Profile-bearing or native documents must use their own authenticated owner, even when their
+    /// carrier is malformed. Unknown siblings are retained as raw values and supply no authority.
+    private struct NativeWebsiteAccountAdoption {
+        let document: [String: Any]
+        let original: [String: Any]
+        let witness: Data
+        private let originalPlaintext: Data
+        private let rosterBytes: Data
+
+        init?(_ original: [String: Any], plaintext: Data, revision: Int) throws {
+            let appCarriers = ["settings", "nativeSync", "nativeAccountBootstrap", "nativeHostPreferences",
+                "nativeOwnerHistorySources", "nativeProviderCredentials", "profileEdits", "profileEditEvents",
+                "profileEditResults", "webAddonEdits"]
+            guard appCarriers.allSatisfy({ original[$0] == nil }) else { return nil }
+            let exact = try OwnerHistoryExactJSON.Object(plaintext)
+            guard appCarriers.allSatisfy({ exact[$0] == nil }),
+                  exact["vortx"] == nil || original["vortx"] is [String: Any],
+                  exact["webProgress"] == nil || original["webProgress"] is [String: Any] else { return nil }
+            let namespace = try exact["vortx"].map(OwnerHistoryExactJSON.Object.init)
+            let appNamespace = ["roster", "rosterModified", "profiles", "byProfile", "deletedProfiles",
+                "activeProfile", "ownerWatched", "library", "deletedLibrary", "deletedLibraryTs", "updatedAt",
+                "addons", "addonsOwnedAt", "mediaServers", "iptv"]
+            guard appNamespace.allSatisfy({ namespace?[$0] == nil }) else { return nil }
+
+            let progress = original["webProgress"] as? [String: Any]
+            let removals = progress?["removed"] as? [String: Any]
+            guard progress?["removed"] == nil || removals != nil,
+                  progress?["byProfile"] == nil || (progress?["byProfile"] as? [String: Any])?.isEmpty == true,
+                  removals?["byProfile"] == nil || (removals?["byProfile"] as? [String: Any])?.isEmpty == true else { return nil }
+
+            let website = original["vortx"] as? [String: Any] ?? [:]
+            let hasWebsiteChannel = original["addons"] is [Any] || original["apiKeys"] is [String: Any]
+                || original["addonOrder"] is [Any] || original["removedAddons"] is [String: Any]
+                || original["webAddonRemovals"] is [Any] || website["deletedAddons"] is [Any]
+                || website["deletedAddonsTs"] is [String: Any] || progress?["owner"] is [Any]
+                || removals?["owner"] is [Any]
+            guard hasWebsiteChannel, revision >= 0 else { return nil }
+            // Bind the sealed local witness to this exact authenticated cloud revision and
+            // original bytes. Even a crash between remote acceptance and local ACK cannot
+            // authorize a later rosterless carrier.
+            var digest = SHA256()
+            digest.update(data: Data("vortx.website-roster-admission.v1\u{0}\(revision)\u{0}".utf8))
+            digest.update(data: plaintext)
+            witness = Data(digest.finalize())
+            let owner = UserProfile(id: UserProfile.ownerID, name: "Main", avatar: "🍿", isOwner: true)
+            guard let roster = ProfileRosterSnapshot.wire([owner]) else { throw VortxNativeError.invalidSnapshot }
+            rosterBytes = try JSONSerialization.data(withJSONObject: roster, options: [.sortedKeys, .withoutEscapingSlashes])
+            var projected = original
+            var vortx = website
+            vortx["roster"] = roster
+            vortx["rosterModified"] = 0
+            projected["vortx"] = vortx
+            self.original = original
+            originalPlaintext = plaintext
+            document = projected
+        }
+
+        /// This is the outgoing CAS base only. The original pull's host bytes and source
+        /// authority keep their original plaintext, and no unrelated JSON value is decoded here.
+        func exportBase() throws -> Data {
+            var account = try OwnerHistoryExactJSON.Object(originalPlaintext)
+            var vortx = try OwnerHistoryExactJSON.Object(account["vortx"] ?? Data("{}".utf8))
+            guard vortx["roster"] == nil, vortx["rosterModified"] == nil else { throw VortxNativeError.invalidSnapshot }
+            vortx.set("roster", rosterBytes)
+            vortx.set("rosterModified", Data("0".utf8))
+            account.set("vortx", try vortx.encoded())
+            return try account.encoded()
+        }
+    }
+
+    private func authorizedWebsiteAccountAdoption(_ document: [String: Any], plaintext: Data, revision: Int,
+        capture: CredentialScopeRegistry.Capture, requiringCheckpoint: Bool) throws -> NativeWebsiteAccountAdoption? {
+        guard let adoption = try NativeWebsiteAccountAdoption(document, plaintext: plaintext, revision: revision) else { return nil }
+        guard isCurrent(capture), case .account = capture.scope,
+              let key = dataKey, key.count == 32 else { throw VortxNativeError.invalidSnapshot }
+        let scope = VortxAccountScope(account: capture.namespace, ownerProfileID: UserProfile.ownerID.uuidString)
+        let directory = try VortxNativeStorage.root().appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
+        let probe = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: key),
+            installationKey: VortxNativeInstallationKey.loadOrCreate())
+        guard try probe.permitsWebsiteRosterAdoption(scope: scope, witness: adoption.witness,
+            requiringCheckpoint: requiringCheckpoint) else {
+            throw NativeRestoreAdmissionFailure.rosterUnavailable
+        }
+        return adoption
+    }
+
     /// Never install a provisional owner before the server accepts its create-only seed. A
     /// rejected/ambiguous PUT is followed by authenticated readback, not a higher-version retry.
     private func publishDetachedNativeSeed(_ baseline: [String: Any], capture: CredentialScopeRegistry.Capture,
@@ -1560,6 +1651,9 @@ final class VortXSyncManager: ObservableObject {
         /// owner-history source from the Foundation projection above.
         let plaintext: Data
         let observation: UUID?
+        let revision: Int?
+        let websiteAdoption: NativeWebsiteAccountAdoption?
+        var adoptsWebsiteRoster: Bool { websiteAdoption != nil }
         let roster: ProfileRosterSnapshot
         let keyBytes: Data
         let owners: [UserProfile]
@@ -1580,10 +1674,18 @@ final class VortXSyncManager: ObservableObject {
         let document: [String: Any]
         let plaintext: Data
         let observation: UUID?
+        let revision: Int?
+        var websiteAdoption: NativeWebsiteAccountAdoption? = nil
         switch pulled {
         case .doc(let value, let version, let original, let observed):
             guard version >= lastSyncedVersion else { throw NativeRestoreAdmissionFailure.staleDocument }
-            document = value; plaintext = original; observation = observed
+            if let adoption = try authorizedWebsiteAccountAdoption(value, plaintext: original, revision: version,
+                capture: capture, requiringCheckpoint: false) {
+                document = adoption.document
+                websiteAdoption = adoption
+                DiagnosticsLog.log("native-profiles", "restore admission=web_only_owner_seeded")
+            } else { document = value }
+            plaintext = original; observation = observed; revision = version
         case .empty:
             let value: [String: Any]
             do { value = try nativeEmptyAccountDocument(capture: capture) }
@@ -1601,7 +1703,7 @@ final class VortXSyncManager: ObservableObject {
             document = accepted
             // This is our newly created, non-source-bearing empty seed, not a decoded peer.
             plaintext = try JSONSerialization.data(withJSONObject: accepted, options: [.sortedKeys, .withoutEscapingSlashes])
-            observation = nil // Fresh non-source-bearing seed; never peer admission authority.
+            observation = nil; revision = nil // Fresh non-source-bearing seed; never peer admission authority.
         case .ownerHistory: throw NativeRestoreAdmissionFailure.accountDocumentUnavailable
         case .unchanged: throw NativeRestoreAdmissionFailure.unexpectedUnchanged
         case .failed: throw NativeRestoreAdmissionFailure.accountDocumentUnavailable
@@ -1613,7 +1715,8 @@ final class VortXSyncManager: ObservableObject {
         let owners = roster.profiles.filter(\.isOwner)
         guard owners.count == 1 else { throw NativeRestoreAdmissionFailure.ownersUnavailable }
         guard let selectedProfile else { throw NativeRestoreAdmissionFailure.selectionUnavailable }
-        return NativeRestoreDocument(document: document, plaintext: plaintext, observation: observation, roster: roster, keyBytes: keyBytes, owners: owners, selectedProfile: selectedProfile)
+        return NativeRestoreDocument(document: document, plaintext: plaintext, observation: observation,
+            revision: revision, websiteAdoption: websiteAdoption, roster: roster, keyBytes: keyBytes, owners: owners, selectedProfile: selectedProfile)
     }
 
     @discardableResult
@@ -1777,6 +1880,12 @@ final class VortXSyncManager: ObservableObject {
                 let documentBytes = admitted.plaintext
                 let probe = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes), installationKey: VortxNativeInstallationKey.loadOrCreate())
                 let checkpoint = try probe.authenticatedCheckpoint(scope: scope)
+                if let adoption = admitted.websiteAdoption {
+                    guard try probe.permitsWebsiteRosterAdoption(scope: scope, witness: adoption.witness,
+                        requiringCheckpoint: checkpoint != nil) else {
+                        throw VortxNativeError.invalidSnapshot
+                    }
+                }
                 let preparationHost = try probe.readHostPreferences(scope: scope)
                 let hadCheckpoint = checkpoint != nil
                 // Every open checks the complete legacy projection, including pending web edits.
@@ -1791,10 +1900,12 @@ final class VortXSyncManager: ObservableObject {
                 var prepared: NativeLegacyPreparation?
                 var launchConversion: Task<NativeLegacyPreparation, Error>?
                 if !openFromCheckpoint {
-                    prepared = try await self.prepareNativeLegacyMaterial(document, capture: capture, enforceMountedFence: false)
+                    prepared = try await self.prepareNativeLegacyMaterial(document, capture: capture, enforceMountedFence: false,
+                                                                         websiteAdoption: admitted.websiteAdoption)
                 } else if self.nativeLegacyConversionDecision(document, capture: capture).convert {
                     launchConversion = Task { @MainActor in
-                        try await self.prepareNativeLegacyMaterial(document, capture: capture, enforceMountedFence: false)
+                        try await self.prepareNativeLegacyMaterial(document, capture: capture, enforceMountedFence: false,
+                                                                   websiteAdoption: admitted.websiteAdoption)
                     }
                 }
                 guard self.isCurrent(capture), !Task.isCancelled, self.nativeCheckpointGeneration == generation,
@@ -1854,7 +1965,8 @@ final class VortXSyncManager: ObservableObject {
                 stage = "checkpoint_creation"
                 let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes),
                                                                installationKey: VortxNativeInstallationKey.loadOrCreate(),
-                                                               bootstrap: archive, bootstrapScope: scope)
+                                                               bootstrap: archive, bootstrapScope: scope,
+                                                               initialWebsiteRosterAdoption: hadCheckpoint ? nil : admitted.websiteAdoption?.witness)
                 stage = "session_creation"
                 let session = try VortxNativeSession(scope: scope, ownerName: owners[0].name, abi: VortxCABI(), store: store,
                                                     transport: VortxCResourceTransport(), allowNewAccount: !hadCheckpoint, initialActions: initialActions,
@@ -1902,12 +2014,19 @@ final class VortXSyncManager: ObservableObject {
                           ProfileStore.shared.activeID == installationProfile else { throw VortxNativeError.superseded }
                     try cloudAuthority.withActive {}
                     if prepared != nil { self.recordNativeLegacyConversion(self.nativeLegacyConversionDigest(document), capture: capture) }
-                    else if let launchConversion { self.applyLaunchNativeLegacyConversion(launchConversion, document: document, plaintext: documentBytes, capture: capture, cloudAuthority: cloudAuthority) }
+                    else if let launchConversion {
+                        self.applyLaunchNativeLegacyConversion(launchConversion, document: admitted.websiteAdoption?.original ?? document,
+                            plaintext: documentBytes, revision: admitted.revision, capture: capture, cloudAuthority: cloudAuthority)
+                    }
                     self.applyNativeGlobals(acceptedHost)
                     try self.publishNativeWebsiteOutcome(websiteOutcome, capture: capture)
-                    // Upload only the new nativeSync carrier. The archive never enters the wire,
-                    // and adopting an existing remote carrier must not create an echo push.
-                    if didImportLegacy || !websiteEvents.isEmpty || !websiteAddonEvents.isEmpty { self.requestSyncSoon() }
+                    // A website roster still needs its first normal CAS even when the import was
+                    // mounted from a local checkpoint. Remote projection suppresses ordinary scheduling.
+                    if admitted.adoptsWebsiteRoster {
+                        self.nativeMutationDidCommit(credentialCapture: capture)
+                    } else if didImportLegacy || !websiteEvents.isEmpty || !websiteAddonEvents.isEmpty {
+                        self.requestSyncSoon()
+                    }
                     self.nativeCheckpointStatus = "mounted"
                     CoreBridge.shared.replayNativeResourceRestore(resourceRestore, target: CoreBridge.shared.captureNativePlaybackTarget())
                     DiagnosticsLog.log("native-profiles", "restore result=mounted ms=\(Self.elapsedMs(since: restoreStarted))")
@@ -5244,12 +5363,20 @@ final class VortXSyncManager: ObservableObject {
         var rawExport: Data?
         do {
             try cloudAuthority.withActive {}
+            let adoption: NativeWebsiteAccountAdoption?
+            if let baseRevision {
+                adoption = try authorizedWebsiteAccountAdoption(doc, plaintext: originalPlaintext,
+                    revision: baseRevision, capture: capture, requiringCheckpoint: true)
+            } else { adoption = nil }
+            if let adoption { doc = adoption.document }
             var providers = try mergedNativeProviderState(doc, capture: capture)
             exportStage = "legacy_prepare"
             nativeDocumentCommitGeneration &+= 1
             let conversion = nativeLegacyConversionDecision(doc, capture: capture)
             var prepared: NativeLegacyPreparation?
-            if conversion.convert { prepared = try await prepareNativeLegacyMaterial(doc, capture: capture) }
+            if conversion.convert {
+                prepared = try await prepareNativeLegacyMaterial(doc, capture: capture, websiteAdoption: adoption)
+            }
             guard isCurrent(capture), sourceIsCurrent() else { return nil }
             try cloudAuthority.withActive {}
             let remote = try doc["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
@@ -5299,7 +5426,8 @@ final class VortXSyncManager: ObservableObject {
             applyNativeGlobals(merged["nativeHostPreferences"]!)
             // The unchanged legacy/unknown account siblings come from the authenticated
             // plaintext. Only native-owned projections and actual secure provider edits move.
-            var account = try OwnerHistoryAccountExport(completeAccountPlaintext: originalPlaintext)
+            let exportBase = try adoption?.exportBase() ?? originalPlaintext
+            var account = try OwnerHistoryAccountExport(completeAccountPlaintext: exportBase)
                 .projectingGenericHost(native: merged["nativeSync"]!, host: receipt.rawHost,
                     profileEditResults: merged["profileEditResults"]!)
             account = try OwnerHistoryRawAccountPreparation.projectingLocalProvider(account: account, provider: providers)
@@ -5309,8 +5437,8 @@ final class VortXSyncManager: ObservableObject {
             DiagnosticsLog.log("sync", "operation=native_sync_export result=failed stage=\(exportStage) reason=\(VortxNativeError.diagnosticCode(error))\(detail)")
             return nil
         }
-        // Never rewrite the legacy migration baseline from native/profile/overlay mirrors. Until
-        // a versioned bidirectional adapter exists, native exports only its own accepted carrier.
+        // Never rewrite an existing legacy migration baseline from native/profile/overlay mirrors.
+        // The first website adoption above only fills two absent roster fields.
         guard sourceIsCurrent() else { return nil }
         guard let rawExport else { return nil }
         return DerivedSyncDoc(document: doc, baseRevision: baseRevision, credentialCapture: capture,
@@ -5433,7 +5561,8 @@ final class VortXSyncManager: ObservableObject {
     /// A mount alone cannot acknowledge a pulled document. Merge both carriers against its exact
     /// current profile/credential receipt, durably commit, and publish the accepted host projections.
     @discardableResult
-    private func commitNativePulledDocument(_ doc: [String: Any], originalPlaintext: Data, capture: CredentialScopeRegistry.Capture,
+    private func commitNativePulledDocument(_ original: [String: Any], originalPlaintext: Data, revision: Int?,
+                                            capture: CredentialScopeRegistry.Capture,
                                             preparedAtLaunch: NativeLegacyPreparation? = nil,
                                             standDownIfSuperseded: Bool = false,
                                             cloudAuthority: ReceivedProviderCloudAuthority) async throws -> PlaybackMutationTarget {
@@ -5445,10 +5574,18 @@ final class VortXSyncManager: ObservableObject {
         }
         nativeDocumentCommitGeneration &+= 1
         let commitGeneration = nativeDocumentCommitGeneration
+        let adoption: NativeWebsiteAccountAdoption?
+        if let revision {
+            adoption = try authorizedWebsiteAccountAdoption(original, plaintext: originalPlaintext, revision: revision,
+                capture: capture, requiringCheckpoint: true)
+        } else { adoption = nil }
+        let doc = adoption?.document ?? original
         let conversion = preparedAtLaunch == nil ? nativeLegacyConversionDecision(doc, capture: capture)
             : (convert: true, digest: nativeLegacyConversionDigest(doc))
         var prepared = preparedAtLaunch
-        if prepared == nil, conversion.convert { prepared = try await prepareNativeLegacyMaterial(doc, capture: capture) }
+        if prepared == nil, conversion.convert {
+            prepared = try await prepareNativeLegacyMaterial(doc, capture: capture, websiteAdoption: adoption)
+        }
         guard isCurrent(capture), ProfileStore.shared.activeID == profileID,
               CoreBridge.shared.hasCertifiedNativeSession(capture: capture, profileID: profileID) else { throw VortxNativeError.superseded }
         try cloudAuthority.withActive {}
@@ -5468,7 +5605,7 @@ final class VortXSyncManager: ObservableObject {
         guard let joinedNative = merged["nativeSync"], let joinedHost = merged["nativeHostPreferences"] else {
             throw VortxNativeError.invalidResponse
         }
-        if NativeForegroundSyncPolicy.requiresCausalRepublish(pulledNative: remote, pulledHost: hostRemote,
+        if adoption != nil || NativeForegroundSyncPolicy.requiresCausalRepublish(pulledNative: remote, pulledHost: hostRemote,
                                                               joinedNative: joinedNative, joinedHost: joinedHost) {
             // A legacy epoch writer can replace these siblings with an older carrier. The local
             // checkpoint retains the join; repair via fresh pull/base+1, preserving legacy siblings.
@@ -5670,7 +5807,8 @@ final class VortXSyncManager: ObservableObject {
             var providers = try mergedNativeProviderState(doc, capture: capture)
             if !nativeAccountDocumentCommitted,
                CoreBridge.shared.hasCertifiedNativeSession(capture: capture, profileID: ProfileStore.shared.activeID) {
-                nativeCommittedTarget = try await commitNativePulledDocument(doc, originalPlaintext: pulled.plaintext, capture: capture, cloudAuthority: cloudAuthority)
+                nativeCommittedTarget = try await commitNativePulledDocument(doc, originalPlaintext: pulled.plaintext,
+                    revision: pulled.version, capture: capture, cloudAuthority: cloudAuthority)
                 nativeAccountDocumentCommitted = true
             }
             try cloudAuthority.withActive {}
@@ -5972,7 +6110,8 @@ final class VortXSyncManager: ObservableObject {
                         CoreBridge.shared.cancelNativeOwnerHistoryRead(accepted.read)
                         nativeCommittedTarget = accepted.target
                     } else {
-                        nativeCommittedTarget = try await self.commitNativePulledDocument(pulled.doc, originalPlaintext: pulled.plaintext, capture: capture, cloudAuthority: cloudAuthority)
+                        nativeCommittedTarget = try await self.commitNativePulledDocument(pulled.doc, originalPlaintext: pulled.plaintext,
+                            revision: pulled.version, capture: capture, cloudAuthority: cloudAuthority)
                     }
                     return true
                 }

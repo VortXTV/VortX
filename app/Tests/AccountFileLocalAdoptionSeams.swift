@@ -278,7 +278,7 @@ enum SyncBackupUploadFailure { case upgradeRequired, other
         }
         return mirrored
     }
-    private func commitNativePulledDocument(_ doc: [String: Any], originalPlaintext: Data, capture: CredentialScopeRegistry.Capture,
+    private func commitNativePulledDocument(_ doc: [String: Any], originalPlaintext: Data, revision: Int?, capture: CredentialScopeRegistry.Capture,
         cloudAuthority: ReceivedProviderCloudAuthority) async throws -> PlaybackMutationTarget {
         try cloudAuthority.withActive {}
         let originalTarget = CoreBridge.shared.captureNativePlaybackTarget()
