@@ -64,6 +64,7 @@ export interface PlayerControlsCtx {
   onNextEpisode?: () => void;
   /** Manually advance to the next fallback source (present only when a fallback exists). */
   onTryNextSource?: () => void;
+  onSelectSubtitle: (track: TextTrack | null) => void;
 }
 
 export interface PlayerController {
@@ -157,7 +158,7 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
           </div>
           <div class="pl-time"><span id="pl-cur">0:00</span> <span class="pl-time-sep">/</span> <span id="pl-dur">0:00</span></div>
           <div class="pl-spacer"></div>
-          <button class="pl-icon" id="pl-subs-btn" aria-label="Subtitles" aria-haspopup="true">${icon("subtitles") || "CC"}</button>
+          <button class="pl-icon" id="pl-subs-btn" aria-label="Subtitles" aria-haspopup="true" aria-keyshortcuts="C">${icon("subtitles") || "CC"}</button>
           <button class="pl-icon" id="pl-snap" aria-label="Save frame">${icon("camera") || "▣"}</button>
           <button class="pl-icon" id="pl-settings-btn" aria-label="Settings" aria-haspopup="true">${icon("settings") || "⚙"}</button>
           ${canCast ? `<button class="pl-icon" id="pl-cast" aria-label="Cast">${icon("cast") || "▶"}</button>` : ""}
@@ -443,9 +444,7 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
       buildSettingsMenu();
     } else if (action === "player-subtitle") {
       const tracks = Array.from(video.textTracks).filter((t) => t.kind === "subtitles" || t.kind === "captions");
-      const pick = Number(value);
-      tracks.forEach((t, i) => (t.mode = i === pick ? "showing" : "disabled"));
-      buildSubsMenu();
+      ctx.onSelectSubtitle(tracks[Number(value)] ?? null);
       closeMenus();
     } else if (action === "player-aspect") {
       const fit = value === "cover" || value === "fill" ? value : "contain";

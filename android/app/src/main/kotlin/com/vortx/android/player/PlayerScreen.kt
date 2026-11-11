@@ -1606,6 +1606,13 @@ fun PlayerScreen(
         automaticPoolRequest?.cancel()
         poolLookupRequest?.cancel()
     }
+    fun selectPrimarySubtitle(id: Int?) {
+        cancelAutomaticPoolSelection()
+        cancelAddonSubtitlePreparation()
+        showControls()
+        trackSelectionPhases = trackSelectionPhases.holdSubtitle()
+        engine.selectSubtitleTrack(id)
+    }
     DisposableEffect(playbackSessionKey, engine, currentPoolEpoch) {
         val observedEpoch = currentPoolEpoch
         val registration = SourceIndexLifecycle.onEpochInvalidated(observedEpoch) {
@@ -1625,6 +1632,19 @@ fun PlayerScreen(
     fun admitCurrentSubtitleEngine(action: () -> Boolean): Boolean = withCurrentSubtitleOwner {
         latestSubtitleEngine === engine && action()
     }
+    fun togglePreferredPrimarySubtitle(): Boolean =
+        admitCurrentSubtitleEngine {
+            // Media3 can display a protected add-on overlay absent from its track inventory.
+            if (engine.hasUnlistedPrimarySubtitle) return@admitCurrentSubtitleEngine false
+            val choice = TrackSelector.preferredSubtitleShortcut(
+                subtitles = engine.state.value.subtitleTracks,
+                preferences = trackPreferences,
+                primarySubtitleId = if (engine.secondarySubtitleAvailable) engine.primarySubtitleId else null,
+                secondarySubtitleId = engine.secondarySubtitleId,
+            ) ?: return@admitCurrentSubtitleEngine false
+            selectPrimarySubtitle(choice.takeUnless { it == TrackSelector.SUBTITLE_OFF })
+            true
+        }
     fun admitCurrentPoolEngine(expectedEpoch: Long, action: () -> Boolean): Boolean =
         SourceIndexLifecycle.currentEpoch() == expectedEpoch &&
             subtitleSyncManager?.isSignedIn == true && MoatConsent.contributeAndConsume(context) &&
@@ -2356,6 +2376,11 @@ fun PlayerScreen(
                     revealUnlockHint()
                     return@onKeyEvent true
                 }
+                if (event.key == Key.C && event.nativeKeyEvent.hasNoModifiers()) {
+                    return@onKeyEvent event.nativeKeyEvent.repeatCount == 0 &&
+                        !showSkipEditor && !partyPanelOpen && !effectiveError && !pip.isInPip &&
+                        togglePreferredPrimarySubtitle()
+                }
                 if (!controlsVisible) {
                     // TV hidden-chrome SKIP PILL reachability: while a resolved skip segment sits under the
                     // playhead and its pill has not been waved off, Select seeks past it and Back dismisses the
@@ -2602,13 +2627,7 @@ fun PlayerScreen(
                     currentOnAudioIntentChanged(intent)
                 }
             },
-            onSelectSubtitle = {
-                cancelAutomaticPoolSelection()
-                cancelAddonSubtitlePreparation()
-                showControls()
-                trackSelectionPhases = trackSelectionPhases.holdSubtitle()
-                engine.selectSubtitleTrack(it)
-            },
+            onSelectSubtitle = ::selectPrimarySubtitle,
             onSetSpeed = { newSpeed ->
                 showControls()
                 speed = newSpeed

@@ -56,6 +56,21 @@ enum TrackSelector {
         return nil
     }
 
+    /// A deliberate subtitle pick can use the full language preference even when the automatic policy is Off.
+    static func preferredSelectableSubtitle(
+        in tracks: [MPVTrack], language: String, rejectTerms: [String]
+    ) -> MPVTrack? {
+        firstMatch(tracks, languages: [language], reject: rejectTerms)
+    }
+
+    /// The active primary language. Dual-track engines supply their primary ID because a secondary can
+    /// also have a selected flag; a single-track engine can use the selected row.
+    static func primarySubtitleLanguage(in tracks: [MPVTrack], primaryID: Int?) -> String? {
+        tracks.first { track in
+            track.isSelectable && (primaryID.map { $0 == track.id } ?? track.selected)
+        }?.lang
+    }
+
     /// Audio rows within one language tier are otherwise ordered only by the engine/container. Keep the row
     /// already playing so an automatic pass cannot turn a no-op into a source-audio remount.
     private static func firstAudioMatch(_ tracks: [MPVTrack], languages: [String], reject: [String]) -> MPVTrack? {
