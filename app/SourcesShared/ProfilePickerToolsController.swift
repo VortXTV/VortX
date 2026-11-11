@@ -82,6 +82,7 @@ final class ProfilePickerToolsController: ObservableObject {
     @Published private(set) var picker: Picker?
     @Published private(set) var isBusy = false
     @Published private(set) var restoreNeedsVerification = false
+    @Published private var restoreDiscoveryPending = false
     @Published private(set) var tvPublication: ProfilePickerToolsTVTransfer.Publication?
     @Published private(set) var canRetryTVOutput = false
     @Published private(set) var canRetryTVInput = false
@@ -141,6 +142,7 @@ final class ProfilePickerToolsController: ObservableObject {
         routeID = id
         self.services = services
         routeOwner = services.owner() // Captured once for this route, never at a later action or callback.
+        restoreDiscoveryPending = routeOwner != nil
         if let owner = pendingRestoreOwner, !services.isCurrent(owner) {
             pendingRestoreOwner = nil; pendingRestoreID = nil; pendingRestoreAction = nil; pendingRestoreIsCurrent = nil
             restoreNeedsVerification = false; canVerifyRestore = false; canFinishRestore = false
@@ -170,13 +172,14 @@ final class ProfilePickerToolsController: ObservableObject {
         case .notSubmitted, .conflict: return nil
         }
     }
-    var canRestore: Bool { accountActionsAvailable && !isBusy && !restoreNeedsVerification }
+    var canRestore: Bool { accountActionsAvailable && !isBusy && !restoreDiscoveryPending && !restoreNeedsVerification }
+    var canCancelFileAction: Bool { isBusy && operation?.action != .restoreStatus }
 
     func begin(_ action: Action, route id: UUID) {
         guard [.download, .repair, .restore].contains(action),
               routeID == id, operation == nil, task == nil, let services,
               let owner = routeOwner, services.isCurrent(owner),
-              action != .restore || !restoreNeedsVerification else { return }
+              action != .restore || canRestore else { return }
         let captured = Operation(routeID: id, owner: owner, action: action, services: services)
         operation = captured; isBusy = true
         status = Status()
@@ -310,6 +313,7 @@ final class ProfilePickerToolsController: ObservableObject {
               let owner = routeOwner, services.isCurrent(owner) else { return }
         let captured = Operation(routeID: id, owner: owner, action: .restoreStatus, services: services)
         operation = captured; isBusy = true
+        restoreDiscoveryPending = false
         start(captured, stage: .checkingRestore) { [self] in
             let discovered = await captured.services.restore.status()
             try require(captured)
@@ -333,8 +337,7 @@ final class ProfilePickerToolsController: ObservableObject {
                     }
                     finish(captured, message: pendingRestoreID == nil ? "Backup tools are ready." : Self.pendingRestoreMessage)
                 }
-            case .accountChanged: throw Refusal.stale
-            case .recoveryUnavailable:
+            case .accountChanged, .recoveryUnavailable:
                 restoreNeedsVerification = true; canVerifyRestore = false; canFinishRestore = false
                 finish(captured, message: "The retained restore could not be verified. Its recovery files have been kept. Reopen Tools after account recovery is available.")
             }
@@ -424,6 +427,12 @@ final class ProfilePickerToolsController: ObservableObject {
 
     func cancel(operationID: UUID? = nil) {
         guard let captured = operation, operationID == nil || captured.id == operationID else { return }
+        if captured.action == .restoreStatus, !restoreDiscoveryPending {
+            // A cancelled inventory is not evidence that there is no retained restore.
+            restoreNeedsVerification = true
+            canVerifyRestore = false
+            canFinishRestore = false
+        }
         captured.cancelled = true
         picker = nil; tvPublication = nil; canRetryTVInput = false; canRetryTVOutput = false
         // Keep exact input/output and possible-send state inside the original operation until drain.
@@ -440,13 +449,23 @@ final class ProfilePickerToolsController: ObservableObject {
         cancel()
         routeID = nil
         services = nil; routeOwner = nil
+        restoreDiscoveryPending = false
         if operation == nil { status = Status() }
     }
 
     /// Foreground/PIN/route changes revoke the original operation without recapturing authority.
     func admissionDidChange(route id: UUID? = nil, revoked: Bool = false) {
         guard id == nil || routeID == id else { return }
-        if let captured = operation, revoked || !isCurrent(captured) { cancel(operationID: captured.id) }
+        if let captured = operation {
+            if revoked || !isCurrent(captured) {
+                if captured.routeID == routeID, captured.action == .restoreStatus {
+                    restoreDiscoveryPending = true
+                }
+                cancel(operationID: captured.id)
+            }
+        } else if !revoked, restoreDiscoveryPending, let routeID {
+            discoverRestore(route: routeID)
+        }
     }
 
     func credentialDidChange() {
@@ -513,7 +532,7 @@ final class ProfilePickerToolsController: ObservableObject {
             if routeID != captured.routeID { status = Status() }
             else if captured.cancelled { status = Status(message: captured.terminalMessage ?? "Cancelled.") }
             if let currentRoute = routeID,
-               currentRoute != captured.routeID || !captured.services.isCurrent(captured.owner) {
+               currentRoute != captured.routeID || restoreDiscoveryPending || !captured.services.isCurrent(captured.owner) {
                 // This may still be the original cancelled controller worker. Claim discovery
                 // only in a fresh task, after checking the exact route and empty owned slot.
                 Task { @MainActor [weak self] in

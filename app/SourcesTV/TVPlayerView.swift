@@ -1182,6 +1182,11 @@ struct TVPlayerView: View {
             if !showWatchParty {
             RemoteCatcher(
                 onPress: { handlePress($0) },
+                onPreferredSubtitleKey: {
+                    guard togglePreferredSubtitle() else { return false }
+                    noteInteraction()
+                    return true
+                },
                 onSwipe: { if !showWatchParty { noteInteraction(); if !stillWatching && !showStreamQR { showControls() } } },
                 accessibilityItems: remoteAccessibilityItems,
                 accessibilityFocusedID: remoteAccessibilityFocusedID,
@@ -3608,12 +3613,7 @@ struct TVPlayerView: View {
                 label: String(localized: "Off"),
                 isSelected: aligned == nil && subtitleTracks.allSatisfy { !$0.selected || !$0.isSelectable }
             ) {
-                invalidateSubtitleAlignmentPresentation()
-                userPickedSubtitle = true
-                suppressRapidBufferingRecovery(reason: "user subtitle off")
-                optimisticSelect(type: "sub", id: -1)
-                coordinator.player?.setSubtitleTrack(-1); refreshTracksSoon()
-                VXProbe.event("subs", "subs selected off")
+                selectPrimarySubtitleTrack(-1, language: "off")
             })
             // External subtitles from the installed subtitle add-ons. Work on BOTH engines now: libmpv sub-adds
             // the downloaded file (it joins the embedded list above); AVPlayer parses it and renders the cues
@@ -3662,13 +3662,7 @@ struct TVPlayerView: View {
                         isEnabled: t.isSelectable
                     ) {
                         guard t.isSelectable else { return }
-                        invalidateSubtitleAlignmentPresentation()
-                        userPickedSubtitle = true
-                        suppressRapidBufferingRecovery(reason: "user embedded subtitle")
-                        optimisticSelect(type: "sub", id: t.id)
-                        coordinator.player?.setSubtitleTrack(t.id); refreshTracksSoon()
-                        let lang = langName(t.lang)
-                        VXProbe.event("subs", "subs selected \(lang)")
+                        selectPrimarySubtitleTrack(t.id, language: langName(t.lang))
                     })
                 }
             }
@@ -3703,10 +3697,7 @@ struct TVPlayerView: View {
                     rows.append(OptionRow(label: pooledLabel(sub),
                                           detail: loading ? String(localized: "Loading…") : String(localized: "Community"),
                                           isSelected: selectedAetherExternalSubtitle?.url == sub.url.absoluteString) {
-                        invalidateSubtitleAlignmentPresentation()
-                        userPickedSubtitle = true
-                        suppressRapidBufferingRecovery(reason: "user pooled subtitle")
-                        selectPooledSubtitle(sub)
+                        selectPrimaryPooledSubtitle(sub)
                     })
                 }
             }
@@ -8712,6 +8703,65 @@ struct TVPlayerView: View {
         }
     }
 
+    private func selectPrimarySubtitleTrack(_ id: Int, language: String) {
+        invalidateSubtitleAlignmentPresentation()
+        userPickedSubtitle = true
+        suppressRapidBufferingRecovery(reason: id < 0 ? "user subtitle off" : "user embedded subtitle")
+        optimisticSelect(type: "sub", id: id)
+        coordinator.player?.setSubtitleTrack(id)
+        refreshTracksSoon()
+        VXProbe.event("subs", "subs selected \(language)")
+    }
+
+    private func selectPrimaryPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle) {
+        invalidateSubtitleAlignmentPresentation()
+        userPickedSubtitle = true
+        suppressRapidBufferingRecovery(reason: "user pooled subtitle")
+        selectPooledSubtitle(sub)
+    }
+
+    private func togglePreferredSubtitle() -> Bool {
+        guard hasStartedPlaying, !leftPlayback, !loadFailed, !refinding, !showOptions,
+              !stillWatching, !showStreamQR, !showWatchParty, !scrubbing,
+              pendingAdvance == nil, supersededAdvance == nil, !hasUncommittedIssuedMedia,
+              subtitleLoadingURL == nil, pendingSubtitleReapply == nil,
+              let player = coordinator.player, player.activeLoadToken != nil else { return false }
+        let preferences = TrackPreferences.current
+        let tracks = player.tracks(ofType: "sub")
+        let activeLanguage = player.alignedExternalSubtitle?.lang ?? selectedAetherExternalSubtitle?.lang
+            ?? TrackSelector.primarySubtitleLanguage(
+                in: tracks, primaryID: player.supportsSecondarySubtitles ? player.primarySubtitleID : nil)
+        let secondaryID = player.secondarySubtitleID
+        let primaryCandidates = tracks.filter { $0.id != secondaryID }
+        let availableAddon = addonSubs.filter { !addedSubURLs.contains($0.url) || isAetherEngineActive }
+        let availablePooled = MoatConsent.contributeAndConsume && VortXSyncManager.shared.isSignedIn
+            ? pooledSubs.filter { $0.contentKey == communityContentKey &&
+                (!addedPooledIDs.contains($0.id) || isAetherEngineActive) }
+            : []
+        for language in preferences.subtitleLanguages {
+            if let activeLanguage, TrackSelector.matches(activeLanguage, language) {
+                selectPrimarySubtitleTrack(-1, language: "off")
+                return true
+            }
+            let loaded = TrackSelector.preferredSelectableSubtitle(
+                in: primaryCandidates, language: language, rejectTerms: preferences.rejectTerms)
+            let addon = TrackSelector.preferredSubtitle(in: availableAddon, languages: [language], language: \.lang)
+            if let addon, TrackPreferences.prefersAddonSubtitles || loaded == nil {
+                selectAddonSubtitle(addon)
+                return true
+            }
+            if let loaded {
+                selectPrimarySubtitleTrack(loaded.id, language: langName(loaded.lang))
+                return true
+            }
+            if let pooled = TrackSelector.preferredSubtitle(in: availablePooled, languages: [language], language: \.lang) {
+                selectPrimaryPooledSubtitle(pooled)
+                return true
+            }
+        }
+        return false
+    }
+
     /// Auto-load an ADD-ON subtitle in the user's preferred language when the container itself has none.
     /// The embedded auto-select (autoSelectTracks) already honors the preference chain for EMBEDDED tracks;
     /// this is the missing half: a title whose file carries no track in the chain used to end "subs selected
@@ -13297,6 +13347,7 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
     }
 
     var onPress: (UIPress.PressType) -> Void
+    var onPreferredSubtitleKey: () -> Bool
     var onSwipe: () -> Void
     var accessibilityItems: [AccessibilityItem]
     var accessibilityFocusedID: String?
@@ -13322,6 +13373,7 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
 
     private func update(_ vc: CatchVC) {
         vc.onPress = onPress
+        vc.onPreferredSubtitleKey = onPreferredSubtitleKey
         vc.onSwipe = onSwipe
         vc.onAccessibilityFocus = onAccessibilityFocus
         vc.onAccessibilityActivate = onAccessibilityActivate
@@ -13380,7 +13432,9 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
     /// a directional press would otherwise move focus to nothing (which left the player deaf to the remote).
     final class CatchVC: UIViewController {
         var onPress: ((UIPress.PressType) -> Void)?
+        var onPreferredSubtitleKey: (() -> Bool)?
         var onSwipe: (() -> Void)?
+        private var capturedSubtitlePresses: Set<UIPress> = []
         var onAccessibilityFocus: ((String) -> Void)?
         var onAccessibilityActivate: ((String) -> Void)?
         var onAccessibilityAdjust: ((String, Int) -> Void)?
@@ -13503,6 +13557,8 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
             acceptsRepeat = false
             stopRepeat()
             onPress = nil
+            onPreferredSubtitleKey = nil
+            capturedSubtitlePresses.removeAll()
             onSwipe = nil
             onAccessibilityFocus = nil
             onAccessibilityActivate = nil
@@ -13582,7 +13638,17 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
 
         override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
             var handled = false
+            var remaining = presses
+            let modifiers: UIKeyModifierFlags = [.command, .alternate, .control, .shift]
             for press in presses {
+                if let key = press.key, key.charactersIgnoringModifiers.lowercased() == "c" {
+                    if key.modifierFlags.intersection(modifiers).isEmpty,
+                       !capturedSubtitlePresses.isEmpty || onPreferredSubtitleKey?() == true {
+                        capturedSubtitlePresses.insert(press)
+                        remaining.remove(press)
+                    }
+                    continue
+                }
                 switch press.type {
                 case .select, .menu, .playPause:
                     onPress?(press.type); handled = true
@@ -13592,16 +13658,25 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
                 default: break
                 }
             }
-            if !handled { super.pressesBegan(presses, with: event) }
+            if !handled, !remaining.isEmpty { super.pressesBegan(remaining, with: event) }
+        }
+
+        override func pressesChanged(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+            let remaining = presses.subtracting(capturedSubtitlePresses)
+            if !remaining.isEmpty { super.pressesChanged(remaining, with: event) }
         }
 
         override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+            let remaining = presses.subtracting(capturedSubtitlePresses)
+            capturedSubtitlePresses.subtract(presses)
+            guard !remaining.isEmpty else { return }
             stopRepeat()
             // Swallow the RELEASE of every press type pressesBegan handled, not just
             // the press itself. Forwarding the menu release to UIKit let the system
             // act on it anyway and suspend the app to the home screen, intermittently,
             // raced against the player teardown the menu press had just started.
-            let unhandled = presses.filter {
+            let unhandled = remaining.filter {
+                if $0.key?.charactersIgnoringModifiers.lowercased() == "c" { return true }
                 switch $0.type {
                 case .select, .menu, .playPause, .upArrow, .downArrow, .leftArrow, .rightArrow:
                     return false
@@ -13612,7 +13687,10 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
             if !unhandled.isEmpty { super.pressesEnded(unhandled, with: event) }
         }
         override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-            stopRepeat(); super.pressesCancelled(presses, with: event)
+            let remaining = presses.subtracting(capturedSubtitlePresses)
+            capturedSubtitlePresses.subtract(presses)
+            guard !remaining.isEmpty else { return }
+            stopRepeat(); super.pressesCancelled(remaining, with: event)
         }
 
         private func startRepeat(_ type: UIPress.PressType) {

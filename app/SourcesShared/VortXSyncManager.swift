@@ -893,6 +893,7 @@ final class VortXSyncManager: ObservableObject {
     }
     private struct NativeLegacyPreparation {
         let material: Data
+        let archiveCapture: VortxNativeBootstrapArchive.LegacyCapture
         let authority: VortxNativeOwnAccountProducer.Authority?
         let sourceArchive: Data?
         var initialPendingOwnProfileIDs: Set<UUID> = []
@@ -1126,9 +1127,10 @@ final class VortXSyncManager: ObservableObject {
                 }
             }
         }
-        let documentBytes = try VortxNativeBootstrapArchive.credentialFreeDocument(document, diagnostics: {
+        let archiveCapture = try VortxNativeBootstrapArchive.captureLegacyDocument(document, diagnostics: {
             DiagnosticsLog.log("native-profiles", $0)
         })
+        let documentBytes = archiveCapture.document
         let sourceDocument = try JSONDecoder().decode(VortxJSON.self, from: documentBytes)
         let firstImportRecovery = try await initialRecovery.firstImportRecovery(priorSourceArchive)
         let resumedPendingOwn = validatedSync == nil ? Set(firstImportRecovery.pending.keys.compactMap(UUID.init(uuidString:))) : []
@@ -1335,7 +1337,7 @@ final class VortXSyncManager: ObservableObject {
             guard let binding = captured.first(where: { $0.profileID == source.profileID }) else { throw VortxNativeError.invalidSnapshot }
             try CoreBridge.stageNativeCredential(token: binding.token, source: source, transactionID: nil, capture: capture, authority: authority)
         }
-        return .init(material: preparation.material, authority: authority, sourceArchive: preparedArchive,
+        return .init(material: preparation.material, archiveCapture: archiveCapture, authority: authority, sourceArchive: preparedArchive,
                      initialPendingOwnProfileIDs: missingOwn)
     }
     private static func nativeWebsiteEvents(_ document: [String: Any]) throws -> [VortxJSON] {
@@ -1830,7 +1832,11 @@ final class VortXSyncManager: ObservableObject {
                             profileIDs: prepared?.initialPendingOwnProfileIDs ?? [], scope: scope)
                     }
                 }
-                let archive = try material.map { try VortxNativeBootstrapArchive.encode(document: documentBytes, material: $0, authenticatedSourceArchive: prepared?.sourceArchive) }
+                stage = "legacy_archive"
+                let archive = try prepared.map {
+                    try VortxNativeBootstrapArchive.encode(capture: $0.archiveCapture, material: $0.material,
+                                                           authenticatedSourceArchive: $0.sourceArchive)
+                }
                 // Keep an already validated session visible while authentication/source parsing
                 // is pending or fails. Only retire it once the replacement has passed preflight.
                 stage = "session_replacement"
@@ -3520,7 +3526,7 @@ final class VortXSyncManager: ObservableObject {
     private static func decodeDecryptedSyncDocument(_ plaintext: Data) throws -> [String: Any] {
         // Validate original numeric lexemes, duplicate keys and Unicode before Foundation can
         // round/drop them. Those values later become authenticated per-profile overlay witnesses.
-        return try VortxProfileOverlayWitness.decodeObject(json: plaintext)
+        return try VortxProfileOverlayWitness.decodeAccountObject(json: plaintext)
     }
 
     /// Download the full encrypted account file even when profile migration cannot mount.
@@ -4266,6 +4272,9 @@ final class VortXSyncManager: ObservableObject {
                 readingRecovery = false
                 try await VortxAccountFileRestoreWorker.shared.requireLocalAbsence(scope: prepared.scope, key: operation.input.dataKey)
                 try requireIdleLegacyFileRestore(operation)
+                guard sealed.hasPrefix(VortXSyncCrypto.docV2Prefix) || !Self.sawDocV2(operation.input.accountID) else {
+                    throw VortxAccountFileRestoreFailure.revisionUnavailable
+                }
                 // After this point an absent/lost verdict means possible delivery. There is exactly one PUT.
                 attempted = true
                 let verdict = await putAccountFileRestore(intent, operation: operation)
@@ -4492,17 +4501,21 @@ final class VortXSyncManager: ObservableObject {
         guard let pt = openSyncDocument(docStr, version: version) else {
             return failed(.documentOpenRefused)
         }
+        let requiresTypedRoute: Bool
         do {
-            if try await VortxNativeOwnerHistoryIngress.shared.requiresTypedRoute(pt) {
-                guard isCurrent(capture), dataKey == originalKey, let observation else { return failed(.superseded) }
-                try Self.xperienceExportObservation.withCurrent(observation) {}
-                guard rememberNativeBackup(capture: capture) else { return failed(.backupMarkerUnavailable) }
-                return .ownerHistory(plaintext: pt, version: version, observation: observation)
-            }
+            requiresTypedRoute = try await VortxNativeOwnerHistoryIngress.shared.requiresTypedRoute(pt)
         } catch {
+            guard !Task.isCancelled, isCurrent(capture), dataKey == originalKey else { return failed(.superseded) }
             return failed(.ownerHistoryAdmissionFailed)
         }
-        guard isCurrent(capture), dataKey == originalKey else { return failed(.superseded) }
+        guard !Task.isCancelled, isCurrent(capture), dataKey == originalKey else { return failed(.superseded) }
+        if requiresTypedRoute {
+            guard let observation else { return failed(.superseded) }
+            do { try Self.xperienceExportObservation.withCurrent(observation) {} }
+            catch { return failed(.superseded) }
+            guard rememberNativeBackup(capture: capture) else { return failed(.backupMarkerUnavailable) }
+            return .ownerHistory(plaintext: pt, version: version, observation: observation)
+        }
         guard let obj = try? Self.decodeDecryptedSyncDocument(pt) else {
             return failed(.legacyDocumentDecodeFailed)
         }
@@ -4550,11 +4563,15 @@ final class VortXSyncManager: ObservableObject {
                                sourceIsCurrent: () -> Bool = { true }) async -> PushOutcome {
         let capture = suppliedCapture ?? credentialAuthority.capture()
         let capturedAccountID = account?.id ?? ""
+        let requiresV2 = Self.sawDocV2(capturedAccountID)
+        // The rollout gate controls upgrades, never downgrades an authenticated v2 head.
+        let writeV2 = Self.writeSyncDocV2 || requiresV2
         guard !accountFileRestoreBusy, isCurrent(capture), !accountReconnectRequired(for: capture), sourceIsCurrent(), !Task.isCancelled,
+              baseRevision != nil || !requiresV2,
               SyncDocumentRevisionPolicy.next(after: baseRevision) == version,
               !hasPendingAccountDocApply(for: capture), let capturedDataKey = dataKey,
               let pt = plaintextData ?? (try? JSONSerialization.data(withJSONObject: obj)),
-              let ct = VortXSyncCrypto.sealDocument(dataKey: capturedDataKey, plaintext: pt, accountId: capturedAccountID, version: version, writeV2: Self.writeSyncDocV2) else {
+              let ct = VortXSyncCrypto.sealDocument(dataKey: capturedDataKey, plaintext: pt, accountId: capturedAccountID, version: version, writeV2: writeV2) else {
             DiagnosticsLog.log("sync", "upload result=blocked stage=local_preflight")
             return .error
         }
@@ -4586,7 +4603,7 @@ final class VortXSyncManager: ObservableObject {
             }
             lastSyncedVersion = max(lastSyncedVersion, version)
             persistLastSyncedVersion()   // survive relaunch so the version guard stays consistent
-            if Self.writeSyncDocV2 { Self.markSawDocV2(capturedAccountID) }  // H-1: account's stored doc is now v2
+            if writeV2 { Self.markSawDocV2(capturedAccountID) }  // H-1: account's stored doc is now v2
             backupUploadFailure = nil // Clear only after actual acceptance and local durable receipts.
             stampSyncSuccess()           // the account now holds this device's doc: "last synced" = now
             DiagnosticsLog.log("sync", "upload result=accepted plaintextBytes=\(pt.count) ciphertextBytes=\(ct.utf8.count)")
@@ -7750,7 +7767,12 @@ extension VortXSyncManager {
             }
             let transaction = try await prepareOwnerHistoryLocalCheckpoint(base: plaintext, scope: scope,
                 source: latch, authenticatedPeer: true)
-            let bootstrap = try VortxNativeBootstrapArchive.encode(document: hostBytes)
+            // The typed transaction keeps the original peer bytes. The separate local bootstrap
+            // archive keeps only the inspected host projection, with the same setting holds as legacy restore.
+            let archiveCapture = try VortxNativeBootstrapArchive.captureLegacyDocument(document, diagnostics: {
+                DiagnosticsLog.log("native-profiles", $0)
+            })
+            let bootstrap = try VortxNativeBootstrapArchive.encode(capture: archiveCapture)
             try latch.withActive {}
             try Self.xperienceExportObservation.withCurrent(observation) {}
             guard isCurrent(capture), dataKey == key, nativeCheckpointGeneration == generation,

@@ -58,6 +58,7 @@ struct ProfilePickerToolsView: View {
                     backButton
                     diagnosticsButton
                 }
+                .padding(.horizontal, Theme.Space.xl)
                 .frame(maxWidth: 760, alignment: .leading)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, Theme.Space.sm)
@@ -96,8 +97,7 @@ struct ProfilePickerToolsView: View {
             route.admission?.setForeground(scenePhase == .active)
             controller.present(route.id, services: services)
             #if os(tvOS)
-            focused = route.focusDiagnostics && route.diagnostics.permitsExport ? .diagnostics
-                : controller.accountActionsAvailable ? .download : .back
+            focused = preferredFocus
             #endif
         }
         .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
@@ -105,9 +105,14 @@ struct ProfilePickerToolsView: View {
         }
         .onValueChange(of: scenePhase) { phase in
             route.admission?.setForeground(phase == .active)
-            if phase != .active { controller.admissionDidChange(route: route.id, revoked: true) }
+            controller.admissionDidChange(route: route.id, revoked: phase != .active)
         }
         #if os(tvOS)
+        .onValueChange(of: controller.isBusy) { busy in
+            if !busy, focused == nil || focused == .cancel {
+                focused = preferredFocus
+            }
+        }
         .onValueChange(of: controller.status.stage) { stage in
             switch stage {
             case .reviewRepair: focused = .approveRepair
@@ -119,6 +124,13 @@ struct ProfilePickerToolsView: View {
         .onExitCommand { close() }
         #endif
     }
+
+    #if os(tvOS)
+    private var preferredFocus: Focus {
+        if route.focusDiagnostics && route.diagnostics.permitsExport { return .diagnostics }
+        return controller.accountActionsAvailable && !controller.isBusy ? .download : .back
+    }
+    #endif
 
     private var diagnosticsButton: some View {
         DiagnosticLogExportButton(grant: route.diagnostics)
@@ -157,7 +169,9 @@ struct ProfilePickerToolsView: View {
     private var accountFileActions: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
             if !controller.accountActionsAvailable {
-                Text("Sign in from the profile picker to download, repair or restore an account backup.")
+                Text(route.accountFiles.owner == nil
+                    ? "Sign in from the profile picker to download, repair or restore an account backup."
+                    : "Account backups are unavailable in this Tools session. Return to the profile picker and reopen Tools.")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             }
             Button { controller.begin(.download, route: route.id) } label: {
@@ -270,7 +284,7 @@ struct ProfilePickerToolsView: View {
                     #endif
                     .accessibilityHint("Receives the stored backup through normal account recovery without uploading the file again.")
             }
-            if controller.isBusy {
+            if controller.canCancelFileAction {
                 Button("Cancel file action", role: .cancel) { controller.cancel() }
                     .buttonStyle(ChipButtonStyle())
                     .accessibilityIdentifier("profile-tools-cancel-file-action")

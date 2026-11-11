@@ -890,6 +890,31 @@ private struct PlayerVideoTouchPolicy<TouchID: Hashable> {
 }
 
 #if os(iOS)
+@MainActor private struct PlayerSubtitleKeyboardShortcut: ViewModifier {
+    let enabled: Bool
+    let toggle: @MainActor () -> Bool
+    @FocusState private var videoFocused: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 17.0, *) {
+            content
+                .focusable(interactions: .edit)
+                .focused($videoFocused)
+                .defaultFocus($videoFocused, true)
+                .focusEffectDisabled()
+                .onKeyPress("c", phases: [.down, .repeat]) { press in
+                    let modifiers: EventModifiers = [.command, .option, .control, .shift]
+                    guard enabled, press.modifiers.intersection(modifiers).isEmpty else { return .ignored }
+                    guard press.phase == .down else { return .handled }
+                    return toggle() ? .handled : .ignored
+                }
+        } else {
+            content
+        }
+    }
+}
+
 @MainActor private struct PlayerVideoInteractionSurface: UIViewRepresentable {
     let locked: Bool
     let pinchEnabled: Bool
@@ -1633,7 +1658,7 @@ struct PlayerScreen: View {
     /// Display-sleep assertion held while the player is open (macOS parity with the iOS idle-timer
     /// disable): keeps the Mac from dimming / sleeping mid-movie. Ended on disappear.
     @State private var macSleepActivity: NSObjectProtocol?
-    /// macOS player keyDown monitor for Space/Left/Right; see installMacKeyMonitor.
+    /// macOS player keyDown monitor for Space/Left/Right and C; see installMacKeyMonitor.
     @State private var macKeyMonitor: Any?
     /// Tracks whether the player's window is in native macOS fullscreen, so the toolbar glyph flips
     /// between enter/exit. Kept in sync by NSWindow's will-enter / will-exit fullscreen notifications.
@@ -2547,6 +2572,8 @@ struct PlayerScreen: View {
             PlayerVideoInteractionSurface(locked: isLocked, pinchEnabled: touchPinchEnabled,
                 onTap: { if isLocked { revealUnlockChip() } else { toggleControls() } },
                 onPinch: handleVideoPinch)
+                .modifier(PlayerSubtitleKeyboardShortcut(
+                    enabled: acceptsSubtitleShortcut, toggle: togglePreferredSubtitle))
                 .ignoresSafeArea()
             #else
             Color.clear.contentShape(Rectangle())
@@ -2678,9 +2705,8 @@ struct PlayerScreen: View {
             Button { toggleMacFullScreen() } label: { EmptyView() }
                 .keyboardShortcut("f", modifiers: [.command, .control])
                 .hidden()
-            // Space/Left/Right are handled by an NSEvent keyDown monitor (installMacKeyMonitor), not
-            // SwiftUI .keyboardShortcut: AppKit gives unmodified arrows+Space to the Metal NSView's
-            // keyDown:, so hidden-button shortcuts never fired. The Esc/.cancelAction handler above stays.
+            // The NSEvent monitor handles unmodified player keys before AppKit sends them to the
+            // Metal NSView. The Esc/.cancelAction handler above stays.
             #endif
         }
         .animation(.easeOut(duration: 0.3), value: upNextRemaining != nil)
@@ -10392,6 +10418,72 @@ struct PlayerScreen: View {
         }
     }
 
+    private var acceptsSubtitleShortcut: Bool {
+        hasStartedPlaying && !playbackExited && !isLocked && !loadFailed && panel == nil &&
+        !touchOptionsVisible && !skipEditActive && !showExternalChooser && !showShare &&
+        grabbedFrame == nil && !externalLinkDead && !subtitleLoadFailed && !stillWatchingPrompt &&
+        subtitleLoadingURL == nil && pendingSubtitleReapply == nil
+    }
+
+    private func selectPrimarySubtitleTrack(_ id: Int) {
+        invalidateSubtitleAlignmentPresentation()
+        userPickedSubtitle = true
+        if id < 0 {
+            VXProbe.log("subs", "selected track off")
+        } else {
+            VXProbe.log("subs", "selected embedded track \(id)")
+        }
+        coordinator.player?.setSubtitleTrack(id)
+    }
+
+    private func selectPrimaryPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle) {
+        invalidateSubtitleAlignmentPresentation()
+        userPickedSubtitle = true
+        selectPooledSubtitle(sub)
+    }
+
+    private func togglePreferredSubtitle() -> Bool {
+        guard acceptsSubtitleShortcut, let player = coordinator.player,
+              player.activeLoadToken != nil else { return false }
+        let preferences = TrackPreferences.current
+        let tracks = player.tracks(ofType: "sub")
+        let activeLanguage = player.alignedExternalSubtitle?.lang ?? selectedAetherExternalSubtitle?.lang
+            ?? TrackSelector.primarySubtitleLanguage(
+                in: tracks, primaryID: player.supportsSecondarySubtitles ? player.primarySubtitleID : nil)
+
+        // Promoting the current secondary would clear it on both dual-track engines.
+        let secondaryID = player.secondarySubtitleID
+        let primaryCandidates = tracks.filter { $0.id != secondaryID }
+        let availableAddon = addonSubs.filter { !addedSubURLs.contains($0.url) || isAetherEngineActive }
+        let availablePooled = MoatConsent.contributeAndConsume && VortXSyncManager.shared.isSignedIn
+            ? pooledSubs.filter { $0.contentKey == communityContentKey &&
+                (!addedPooledIDs.contains($0.id) || isAetherEngineActive) }
+            : []
+        for language in preferences.subtitleLanguages {
+            // Earlier preference tiers get the first chance to replace a lower-ranked active language.
+            if let activeLanguage, TrackSelector.matches(activeLanguage, language) {
+                selectPrimarySubtitleTrack(-1)
+                return true
+            }
+            let loaded = TrackSelector.preferredSelectableSubtitle(
+                in: primaryCandidates, language: language, rejectTerms: preferences.rejectTerms)
+            let addon = TrackSelector.preferredSubtitle(in: availableAddon, languages: [language], language: \.lang)
+            if let addon, TrackPreferences.prefersAddonSubtitles || loaded == nil {
+                selectAddonSubtitle(addon)
+                return true
+            }
+            if let loaded {
+                selectPrimarySubtitleTrack(loaded.id)
+                return true
+            }
+            if let pooled = TrackSelector.preferredSubtitle(in: availablePooled, languages: [language], language: \.lang) {
+                selectPrimaryPooledSubtitle(pooled)
+                return true
+            }
+        }
+        return false
+    }
+
     /// Auto-load an ADD-ON subtitle in the user's preferred language when the container itself has none.
     /// Mirror of TVPlayerView.autoSelectAddonSubtitleIfNeeded (this same UI runs on iOS and macOS): the
     /// embedded auto-select honors the preference chain for EMBEDDED tracks only, so a file with no track in
@@ -11422,10 +11514,7 @@ struct PlayerScreen: View {
                 : subtitleTracks.allSatisfy { !$0.selected || !$0.isSelectable })
             var rs: [Row] = [Row(label: String(localized: "Subtitle Settings"), detail: "›") { openPanel(.subtitleSettings) }]
             rs.append(Row(label: String(localized: "Off"), selected: primaryOff) {
-                invalidateSubtitleAlignmentPresentation()
-                userPickedSubtitle = true
-                VXProbe.log("subs", "selected track off")
-                coordinator.player?.setSubtitleTrack(-1)
+                selectPrimarySubtitleTrack(-1)
             })
             // External subtitles from the installed subtitle add-ons. These work on BOTH engines now: libmpv
             // sub-adds the downloaded file; AVPlayer parses it and renders the cues over the video itself. When
@@ -11489,10 +11578,7 @@ struct PlayerScreen: View {
                         isEnabled: t.isSelectable
                     ) {
                         guard t.isSelectable else { return }
-                        invalidateSubtitleAlignmentPresentation()
-                        userPickedSubtitle = true
-                        VXProbe.log("subs", "selected embedded track \(t.id)")
-                        coordinator.player?.setSubtitleTrack(t.id)
+                        selectPrimarySubtitleTrack(t.id)
                     })
                 }
             }
@@ -11525,9 +11611,7 @@ struct PlayerScreen: View {
                     let loading = subtitleLoadingURL == sub.url.absoluteString
                     rs.append(Row(label: pooledLabel(sub), detail: loading ? String(localized: "Loading…") : String(localized: "Community"),
                         selected: selectedAetherExternalSubtitle?.url == sub.url.absoluteString) {
-                        invalidateSubtitleAlignmentPresentation()
-                        userPickedSubtitle = true
-                        selectPooledSubtitle(sub)
+                        selectPrimaryPooledSubtitle(sub)
                     })
                 }
             }
@@ -12210,9 +12294,8 @@ struct PlayerScreen: View {
     private static let kVK_LeftArrow = 123
     private static let kVK_RightArrow = 124
 
-    /// App-level keyDown monitor for the transport keys. SwiftUI .keyboardShortcut does not see
-    /// unmodified Space/arrows on macOS (AppKit routes them to the Metal NSView's keyDown:), so we
-    /// intercept here before responder dispatch. nil consumes the event (no beep); the event passes through.
+    /// App-level keyDown monitor for unmodified player keys. AppKit can send them directly to
+    /// the Metal NSView, so intercept before responder dispatch. Returning nil consumes the event.
     private func installMacKeyMonitor() {
         guard macKeyMonitor == nil else { return }
         macKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
@@ -12221,6 +12304,11 @@ struct PlayerScreen: View {
             let mods: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
             if !event.modifierFlags.intersection(mods).isEmpty { return event }
             if event.window?.firstResponder is NSText { return event }
+            if event.window?.isMainWindow == true, event.charactersIgnoringModifiers?.lowercased() == "c",
+               acceptsSubtitleShortcut {
+                if event.isARepeat || togglePreferredSubtitle() { return nil }
+                return event
+            }
             switch Int(event.keyCode) {
             case Self.kVK_Space:
                 viewerToggle(); scheduleHide(); return nil

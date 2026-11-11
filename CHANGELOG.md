@@ -4,6 +4,21 @@ Notable VortX changes, newest first. VortX is Apple TV first, with iPhone/iPad, 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.5.6 beta 13 candidate - Profile recovery, cloud sync and subtitle shortcuts
+
+Build **285** for Apple TV, iPhone, iPad, Mac and Android.
+
+### Profiles and cloud sync
+
+- **Apple TV backup tools** ([#263](https://github.com/VortXTV/VortX/issues/263)). Download, Repair and Restore can become available when Tools opens during a screen transition. The remote can move from Back or Diagnostics to the backup actions once they're ready.
+- **Older accounts open with unreadable settings held aside** ([#263](https://github.com/VortXTV/VortX/issues/263)). An unreadable preference no longer fails the second stage of profile recovery. The original encrypted backup remains available.
+- **Mac sign-in** ([#296](https://github.com/VortXTV/VortX/issues/296)). Password and QR sign-in can save credentials when the streaming server created the app support folder first.
+- **Library and backup reads.** The first Library result stays visible during refresh. Cloud sync handles larger encrypted backup responses and keeps the encryption format already used by the account.
+
+### Playback
+
+- **Press `C` for preferred subtitles.** With a keyboard in the player, `C` selects an available track in your preferred language, or turns it off if that language is already active. On iPhone and iPad, this shortcut requires iOS or iPadOS 17 or later.
+
 ## 0.5.6 beta 11 - AetherEngine on every Apple device and Trakt that stays signed in
 
 Build **282** for Apple TV, iPhone, iPad and Mac. The AetherEngine player to try now comes to iPhone, iPad and Mac, Trakt stays signed in on every device you use, and Trakt Continue Watching reaches the Apple TV Top Shelf after re-signing. Android stays on its 0.5.6 beta 7 packages for now: its release build stopped at an account-sync check, and it ships once that passes.

@@ -72,6 +72,9 @@ interface PlayerEngine {
     /** The engine-native id of the SECONDARY subtitle track, or -1 for none / unsupported. */
     val secondarySubtitleId: Int get() = -1
 
+    /** A primary subtitle presentation that is not represented by the ordinary track inventory. */
+    val hasUnlistedPrimarySubtitle: Boolean get() = false
+
     /// Begin (or replace) playback of [playable]. Applies per-stream headers and mounts external
     /// subtitles. Safe to call once per engine instance for the player's lifetime.
     fun load(playable: com.vortx.android.model.Playable)

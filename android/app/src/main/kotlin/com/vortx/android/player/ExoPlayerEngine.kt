@@ -144,6 +144,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         var referenceTrack: EmbeddedTrack? = null
     }
     private var ownedSubtitle: OwnedSubtitle? = null
+    override val hasUnlistedPrimarySubtitle: Boolean get() = ownedSubtitle != null
     private val ownedSubtitleClock = SubtitleReferencePresentation.Clock()
     private var ownedSubtitleView: SubtitleView? = null
     private val ownedSubtitleTicker = object : Runnable {

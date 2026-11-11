@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import importlib.util
+import json
 import re
 from pathlib import Path
 import tempfile
@@ -401,10 +402,10 @@ class NativeBeta11Contract(NativeBeta7Contract):
 
     def test_builds_bind_to_the_candidate_tag_and_the_beta7_engine(self):
         self.assertEqual(MODULE.build_tag(self.tag), self.build_tag)
-        for tag in ("v0.5.6-beta.7", "v0.5.6-beta.6", "v0.5.6-beta.12"):
+        for tag in ("v0.5.6-beta.7", "v0.5.6-beta.6", "v0.5.6-beta.14"):
             self.assertEqual(MODULE.build_tag(tag), tag)
         self.assertEqual(MODULE.expected_engine(self.tag), MODULE.NATIVE_BETA7_ENGINE)
-        for tag in ("v0.5.6-beta.8", "v0.5.6-beta.9", "v0.5.6-beta.10", "v0.5.6-beta.12", self.build_tag):
+        for tag in ("v0.5.6-beta.8", "v0.5.6-beta.9", "v0.5.6-beta.10", "v0.5.6-beta.14", self.build_tag):
             with self.subTest(tag=tag), self.assertRaises(ValueError):
                 MODULE.expected_engine(tag)
         for lane in ("apple", "android"):
@@ -424,6 +425,132 @@ class NativeBeta11Contract(NativeBeta7Contract):
         evidence[0] = "release tag: " + self.tag
         with self.assertRaises(ValueError):
             MODULE.validate_android_evidence(evidence, {"runId": 5, "attempt": 1}, self.tag, self.source, "0.5.6", "281")
+
+
+class NativeBeta12Contract(unittest.TestCase):
+    tag = "v0.5.6-beta.12"
+    candidate = "v0.5.6-beta.12-candidate.3"
+    build = "283"
+    preflight_mode = "beta12-candidate-preflight"
+    rejected_candidates = ("1", "2")
+    source = "a" * 40
+    pointer = {"runId": 5, "attempt": 1, "artifactId": 8}
+
+    def test_only_exact_protected_tag_candidate_and_build_are_admitted(self):
+        self.assertEqual(MODULE.build_tag(self.tag), self.candidate)
+        self.assertEqual(MODULE.expected_engine(self.tag), "2ea2e0f27dd2e53b7b28228435ca35a70f92831f")
+        self.assertEqual(MODULE.source_versions(NativeBeta11Contract.project(build=self.build),
+            NativeBeta11Contract.gradle(build=self.build), "0.5.6", self.tag), self.build)
+        with self.assertRaisesRegex(ValueError, "exact cross-platform build"):
+            MODULE.source_versions(NativeBeta11Contract.project(build="282"),
+                NativeBeta11Contract.gradle(build="282"), "0.5.6", self.tag)
+        for tag in (self.candidate, "v0.5.6-beta.14",
+                    *(self.tag + "-candidate." + suffix for suffix in self.rejected_candidates)):
+            with self.subTest(tag=tag), self.assertRaises(ValueError):
+                MODULE.expected_engine(tag)
+
+    def test_candidate_requires_all_native_gates_and_skips_android_draft_write(self):
+        apple, _ = MODULE.job_contract("apple", self.tag)
+        android, skipped = MODULE.job_contract("android", self.tag)
+        for name in (MODULE.BETA12_LIVE_ABI, MODULE.BETA12_APPLE_GATE, MODULE.BETA12_APPLE_EVIDENCE,
+                     MODULE.BETA12_AETHER_RESOLVE, MODULE.BETA12_AETHER_VERIFY, MODULE.BETA12_AETHER_EVIDENCE):
+            self.assertIn(name, apple)
+        self.assertIn(MODULE.BETA12_ANDROID_GATE, android)
+        self.assertIn(MODULE.BETA12_ANDROID_EVIDENCE, android)
+        self.assertIn(MODULE.ANDROID_DRAFT_STEP, skipped)
+        self.assertNotIn(MODULE.ANDROID_DRAFT_STEP, android)
+        historical, _ = MODULE.job_contract("android", NativeBeta11Contract.tag)
+        self.assertIn(MODULE.ANDROID_DRAFT_STEP, historical)
+        original = NativeBeta7Contract.job(self, "android", self.tag)
+        MODULE.successful_job([original], "android", 5, 1, self.source, self.tag)
+        draft = next(step for step in original["steps"] if step["name"] == MODULE.ANDROID_DRAFT_STEP)
+        draft["conclusion"] = "success"
+        with self.assertRaisesRegex(ValueError, "forbidden publication"):
+            MODULE.successful_job([original], "android", 5, 1, self.source, self.tag)
+
+    def test_preflight_ref_absence_and_receipt_are_distinct_from_a_release(self):
+        with mock.patch.object(MODULE, "api", return_value=[{"ref": "refs/tags/" + self.candidate}]):
+            MODULE.require_uncreated_protected_tag(self.tag)
+        with mock.patch.object(MODULE, "api", return_value=[{"ref": "refs/tags/" + self.tag}]):
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                MODULE.require_uncreated_protected_tag(self.tag)
+        proof = {"tag": self.tag, "sourceCommit": self.source, "builds": {"apple": self.pointer}}
+        self.assertEqual(MODULE.candidate_receipt(proof)["mode"], self.preflight_mode)
+        self.assertEqual(MODULE.candidate_receipt(proof), MODULE.candidate_receipt({**proof, "releaseId": 17}))
+        self.assertNotEqual(MODULE.candidate_receipt(proof), MODULE.candidate_receipt({**proof, "sourceCommit": "b" * 40}))
+
+    def test_aether_sidecar_binds_every_original_native_receipt(self):
+        identity = {"schemaVersion": 1, "sourceCommit": self.source, "workflowCommit": self.source,
+                    "ref": "refs/tags/" + self.candidate, "runId": 5, "attempt": 1}
+        lock = "1" * 64
+        raw_resolution = MODULE.canonical({**identity, "packageResolvedSha256": lock, "packages": MODULE.BETA12_AETHER_PACKAGES})
+        contents = {"aether-resolved.json": raw_resolution}
+        with tempfile.TemporaryDirectory() as temporary:
+            handoff = Path(temporary)
+            for key, (platform, variant) in MODULE.BETA12_AETHER_APPS.items():
+                prefix = "Contents/Frameworks/" if key == "macos" else "Frameworks/"
+                binaries = {name: {"path": prefix + name + ".framework/" + name, "architectures": ["arm64"],
+                                   "rawSha256": "2" * 64, "normalizedSha256": "3" * 64}
+                            for name in MODULE.BETA12_AETHER_BINARIES}
+                native = MODULE.canonical({"bundlePayload": {item["path"]: {"sha256": item["normalizedSha256"]}
+                                                            for item in binaries.values()}})
+                (handoff / f"native-{key}.json").write_bytes(native)
+                contents[f"aether-{key}.json"] = MODULE.canonical({**identity, "key": key, "architecture": "arm64",
+                    "resolutionReceiptSha256": hashlib.sha256(raw_resolution).hexdigest(), "packageResolvedSha256": lock,
+                    "nativeAppReceiptSha256": hashlib.sha256(native).hexdigest(), "aetherLinkMapSha256": "4" * 64,
+                    "provider": {"platform": platform, "variant": variant, "libraryIdentifier": "fixture-arm64",
+                                 "upstreamSha256": "5" * 64, "processedSha256": "6" * 64, "arm64Sha256": "7" * 64},
+                    "binaries": binaries})
+            proof = MODULE.protected_aether_gate(contents, self.pointer, self.tag, self.source, handoff)
+            self.assertEqual(set(proof["apps"]), set(MODULE.BETA12_AETHER_APPS))
+            wrong_ref = MODULE.canonical({**json.loads(raw_resolution), "ref": "refs/tags/" + self.tag})
+            with self.assertRaisesRegex(ValueError, "resolution source or pins"):
+                MODULE.protected_aether_gate({**contents, "aether-resolved.json": wrong_ref},
+                                             self.pointer, self.tag, self.source, handoff)
+            changed = json.loads(contents["aether-tvos-lite.json"])
+            changed["binaries"]["VortXAetherKit"]["normalizedSha256"] = "8" * 64
+            with self.assertRaisesRegex(ValueError, "normalized bytes"):
+                MODULE.protected_aether_gate({**contents, "aether-tvos-lite.json": MODULE.canonical(changed)},
+                                             self.pointer, self.tag, self.source, handoff)
+
+
+class NativeBeta13Contract(NativeBeta12Contract):
+    tag = "v0.5.6-beta.13"
+    candidate = "v0.5.6-beta.13-candidate.1"
+    build = "285"
+    preflight_mode = "beta13-candidate-preflight"
+    rejected_candidates = ("2", "9")
+
+    def test_beta13_artifact_only_guard_is_part_of_the_original_apple_job(self):
+        required, _ = MODULE.job_contract("apple", self.tag)
+        historical, _ = MODULE.job_contract("apple", NativeBeta12Contract.tag)
+        guard = "Verify protected Beta 13 artifact-only dispatch"
+        self.assertIn(guard, required)
+        self.assertNotIn(guard, historical)
+        original = NativeBeta7Contract.job(self, "apple", self.tag)
+        MODULE.successful_job([original], "apple", 5, 1, self.source, self.tag)
+        original["steps"] = [step for step in original["steps"] if step["name"] != guard]
+        with self.assertRaisesRegex(ValueError, guard):
+            MODULE.successful_job([original], "apple", 5, 1, self.source, self.tag)
+
+    def test_beta13_requires_focused_android_backup_cas_step(self):
+        guard = MODULE.BETA13_ANDROID_BACKUP_CAS
+        historical, _ = MODULE.job_contract("android", NativeBeta12Contract.tag)
+        self.assertNotIn(guard, historical)
+        original = NativeBeta7Contract.job(self, "android", self.tag)
+        MODULE.successful_job([original], "android", 5, 1, self.source, self.tag)
+        original["steps"] = [step for step in original["steps"] if step["name"] != guard]
+        with self.assertRaisesRegex(ValueError, guard):
+            MODULE.successful_job([original], "android", 5, 1, self.source, self.tag)
+
+    def test_dispatch_receipt_rejects_final_previous_and_unapproved_candidate_refs(self):
+        receipt = {"schemaVersion": 1, "event": "workflow_dispatch", "ref": "refs/tags/" + self.candidate,
+                   "sourceCommit": self.source, "workflowCommit": self.source, "runId": 5, "attempt": 1,
+                   "inputs": MODULE.APPLE_INPUTS}
+        MODULE.validate_dispatch(receipt, self.pointer, self.tag, self.source)
+        for tag in (self.tag, NativeBeta12Contract.candidate, self.tag + "-candidate.2"):
+            with self.subTest(tag=tag), self.assertRaises(ValueError):
+                MODULE.validate_dispatch({**receipt, "ref": "refs/tags/" + tag}, self.pointer, self.tag, self.source)
 
 
 if __name__ == "__main__":

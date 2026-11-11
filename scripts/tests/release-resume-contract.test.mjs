@@ -68,13 +68,20 @@ ${script('Validate immutable handoff provenance before coordinator resume')}`], 
 test('actual protected coordinator condition admits only native successful tag builds or native main resumes', () => {
   const job = workflow.split('  attach-release:\n')[1].split('    concurrency:')[0];
   const expression = job.split('    if: >-\n')[1].trim().replaceAll('needs.build-tvos.result', 'result');
-  const condition = new Function('github', 'inputs', 'result', 'cancelled', 'always', 'format', `return (${expression});`);
+  const condition = new Function('github', 'inputs', 'result', 'cancelled', 'always', 'format', 'startsWith',
+    `return (${expression});`);
   const allowed = (result, ref, handoff = '', extra = {}, event = 'workflow_dispatch', cancelled = false) =>
     condition({ event_name: event, ref }, { recovery_source_commit: '', resume_handoff: handoff, release_tag: tag, tvos_test_only: false, native_only: true, ...extra }, result,
-      () => cancelled, () => true, (_, value) => `refs/tags/${value}`);
+      () => cancelled, () => true, (_, value) => `refs/tags/${value}`,
+      (value, prefix) => String(value).toLowerCase().startsWith(prefix.toLowerCase()));
   assert(allowed('success', `refs/tags/${tag}`));
   assert(allowed('success', 'refs/heads/main', '', { recovery_source_commit: '844782d29a93ae51991bfadc639d50bc3619d40b' }));
   assert(!allowed('success', 'refs/heads/main'));
+  for (const protectedTag of ['v0.5.6-beta.13', 'v0.5.6-beta.13-candidate.1', 'v0.5.6-beta.13-candidate.8']) {
+    const protectedRelease = { release_tag: protectedTag, release_id: '123', publish_release: true };
+    assert(!allowed('success', `refs/tags/${protectedTag}`, '', protectedRelease));
+    assert(!allowed('skipped', 'refs/heads/main', '{}', protectedRelease));
+  }
   assert(!allowed('success', 'refs/heads/feature', '', { recovery_source_commit: '844782d29a93ae51991bfadc639d50bc3619d40b' }));
   assert(!allowed('skipped', 'refs/heads/main', '{}', { recovery_source_commit: '844782d29a93ae51991bfadc639d50bc3619d40b' }));
   for (const result of ['failure', 'cancelled', 'skipped']) assert(!allowed(result, `refs/tags/${tag}`));

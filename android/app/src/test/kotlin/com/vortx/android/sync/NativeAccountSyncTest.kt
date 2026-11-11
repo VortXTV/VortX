@@ -142,7 +142,10 @@ class NativeAccountSyncTest {
                     VortXCrypto.sealDocument(key, doc.toString().toByteArray(), account.id, 100, true))
                 else {
                     val request = requireNotNull(body)
-                    uploaded = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key, request.getString("document"), account.id, request.getLong("version")))))
+                    val ciphertext = request.getString("document")
+                    assertTrue(ciphertext.startsWith(VortXCrypto.DOC_V2_PREFIX))
+                    assertNull(VortXCrypto.openDocument(key, ciphertext, account.id, request.getLong("version") + 1))
+                    uploaded = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key, ciphertext, account.id, request.getLong("version")))))
                     200 to JSONObject().put("accepted", true)
                 }
             })
