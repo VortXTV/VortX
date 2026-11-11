@@ -67,7 +67,8 @@ if (process.argv[2] === '--extract') {
   // A legitimate older baseline without that call does not acquire newer policy.
   const usesConversion = selected.some(value => value.includes('nativeLegacyConversionDecision('));
   let commitGeneration = '';
-  selected.push(block(source, '    private struct NativeLegacyPreparation {'));
+  const legacyPreparation = block(source, '    private struct NativeLegacyPreparation {');
+  selected.push(legacyPreparation);
   if (usesConversion) {
     commitGeneration = exactDeclaration(source, /^    private var nativeDocumentCommitGeneration: UInt64 = 0$/gm, 'conversion generation');
     selected.push(exactDeclaration(source, /^    private static let nativeExportKeys = \[[^\]]+\]/gm, 'native export keys'),
@@ -79,6 +80,13 @@ if (process.argv[2] === '--extract') {
   const backupDecoder = [exactDeclaration(backup, /^    static let formatTag = .*$/gm, 'backup format'),
     ...['    struct Envelope:', '    enum RestoreError:', '    static func decodeDomain('].map(marker => block(backup, marker))].join('\n');
   let peerSource = await readFile('app/Tests/AppleSyncManagerPeer.swift', 'utf8');
+  if (!legacyPreparation.includes('let archiveCapture: VortxNativeBootstrapArchive.LegacyCapture')) {
+    const currentFixture = '        let archiveCapture = try VortxNativeBootstrapArchive.captureLegacyDocument(doc)\n'
+      + '        return NativeLegacyPreparation(material: Data(), archiveCapture: archiveCapture, authority: nil, sourceArchive: nil)';
+    assert.equal(peerSource.split(currentFixture).length, 2, 'unique current legacy preparation fixture');
+    peerSource = peerSource.replace(currentFixture,
+      '        return NativeLegacyPreparation(material: Data(), authority: nil, sourceArchive: nil)');
+  }
   if (!hasCompletePull) {
     const currentPattern = 'if case .doc(let doc, let version, _, _) = await pullDocVersionedResult(credentialCapture: capture) {';
     assert.equal(peerSource.split(currentPattern).length, 2, 'unique fixture-only pull pattern');

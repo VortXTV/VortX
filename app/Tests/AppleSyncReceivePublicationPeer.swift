@@ -279,7 +279,8 @@ final class TraktNextEpisodeConsumer<Owner: Hashable & Sendable>: Sendable {}
         // input imported at first creation. Never manufacture or reset an existing baseline.
         let material = try AppleSyncReceivePublicationPeer.legacyMaterial(document: doc)
         guard material == (try AppleSyncReceivePublicationPeer.legacyMaterial()) else { throw VortxNativeError.invalidSnapshot }
-        return NativeLegacyPreparation(material: material, authority: nil, sourceArchive: nil)
+        let archiveCapture = try VortxNativeBootstrapArchive.captureLegacyDocument(doc)
+        return NativeLegacyPreparation(material: material, archiveCapture: archiveCapture, authority: nil, sourceArchive: nil)
     }
     static func nativeWebsiteEvents(_ doc: [String: Any]) throws -> [VortxJSON] { [] }
     static func nativeWebsiteAddonEvents(_ doc: [String: Any]) throws -> [VortxJSON] { [] }

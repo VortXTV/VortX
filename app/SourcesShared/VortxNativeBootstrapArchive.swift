@@ -50,6 +50,10 @@ enum VortxNativeBootstrapArchive {
         "auth", "authkey", "password", "apikey", "apikeys", "authorization", "bearer", "datakey",
         "token", "accesstoken", "refreshtoken", "authtoken", "clientsecret", "credentials", "nativeprovidercredentials"
     ]
+    struct LegacyCapture: Sendable {
+        let document: Data
+        fileprivate let excludedCredentialPaths: [String]
+    }
     /// Fresh authenticated capture only. Do not use this to rewrite an archived source. The caller
     /// supplies the strict-decoded object so binary64 provenance is not reparsed by Foundation.
     /// One unreadable device setting is left out of this capture and logged as held, so it cannot stop
@@ -59,15 +63,28 @@ enum VortxNativeBootstrapArchive {
     /// with their input to prove nothing changed.
     static func credentialFreeDocument(_ source: [String: Any], diagnostics: ((String) -> Void)? = nil,
                                        holdingUnreadableValues: Bool = true) throws -> Data {
+        try captureLegacyDocument(source, diagnostics: diagnostics, holdingUnreadableValues: holdingUnreadableValues).document
+    }
+    static func captureLegacyDocument(_ source: [String: Any], diagnostics: ((String) -> Void)? = nil,
+                                      holdingUnreadableValues: Bool = true) throws -> LegacyCapture {
         var exclusions: [String] = []
         let value = try sanitize(source, path: "", exclusions: &exclusions, diagnostics: diagnostics, textContext: .legacyHost,
                                  holdsUnreadablePreferences: holdingUnreadableValues)
-        return try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
+        let document = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
+        return LegacyCapture(document: document, excludedCredentialPaths: exclusions.filter { $0.hasPrefix("/") })
     }
     static func encode(document: Data, material: Data? = nil, authenticatedSourceArchive: Data? = nil) throws -> Data {
+        try encode(document: document, material: material, authenticatedSourceArchive: authenticatedSourceArchive, priorExclusions: [])
+    }
+    static func encode(capture: LegacyCapture, material: Data? = nil, authenticatedSourceArchive: Data? = nil) throws -> Data {
+        try encode(document: capture.document, material: material, authenticatedSourceArchive: authenticatedSourceArchive,
+                   priorExclusions: capture.excludedCredentialPaths)
+    }
+    private static func encode(document: Data, material: Data?, authenticatedSourceArchive: Data?,
+                               priorExclusions: [String]) throws -> Data {
         guard let source = try decodeJSON(with: document) as? [String: Any] else { throw Failure.malformed }
         try requireUnambiguousJSON(document)
-        var exclusions: [String] = []
+        var exclusions = priorExclusions
         let sanitized = try sanitize(source, path: "", exclusions: &exclusions, textContext: .legacyHost)
         var archive: [String: Any] = ["schemaVersion": 1, "hostDocument": sanitized,
                                       "excludedCredentialPaths": exclusions.sorted()]
@@ -201,9 +218,8 @@ enum VortxNativeBootstrapArchive {
     }
     /// The plain label a loaded copy shows in place of display text that fails every display rule.
     static let replacedDisplayText = "Untitled"
-    /// Recorded in `exclusions` (loading mode only) when a value is held or replaced, so an enclosing
-    /// structured string is rebuilt from the cleaned value. Never a pointer: it cannot reach an archive,
-    /// because the archive writer and validator never hold or replace.
+    /// Recorded while inspecting a capture so an enclosing structured string is rebuilt from the
+    /// cleaned value. These markers are filtered out of the archive's credential paths.
     private static let heldMarker = "held:"
     private static func isSeriesChoicePreference(_ key: String) -> Bool {
         // SeriesSourceSticky.key writes only the active UUID, or the pre-roster default.

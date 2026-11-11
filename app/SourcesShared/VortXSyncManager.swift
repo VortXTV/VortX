@@ -893,6 +893,7 @@ final class VortXSyncManager: ObservableObject {
     }
     private struct NativeLegacyPreparation {
         let material: Data
+        let archiveCapture: VortxNativeBootstrapArchive.LegacyCapture
         let authority: VortxNativeOwnAccountProducer.Authority?
         let sourceArchive: Data?
         var initialPendingOwnProfileIDs: Set<UUID> = []
@@ -1126,9 +1127,10 @@ final class VortXSyncManager: ObservableObject {
                 }
             }
         }
-        let documentBytes = try VortxNativeBootstrapArchive.credentialFreeDocument(document, diagnostics: {
+        let archiveCapture = try VortxNativeBootstrapArchive.captureLegacyDocument(document, diagnostics: {
             DiagnosticsLog.log("native-profiles", $0)
         })
+        let documentBytes = archiveCapture.document
         let sourceDocument = try JSONDecoder().decode(VortxJSON.self, from: documentBytes)
         let firstImportRecovery = try await initialRecovery.firstImportRecovery(priorSourceArchive)
         let resumedPendingOwn = validatedSync == nil ? Set(firstImportRecovery.pending.keys.compactMap(UUID.init(uuidString:))) : []
@@ -1335,7 +1337,7 @@ final class VortXSyncManager: ObservableObject {
             guard let binding = captured.first(where: { $0.profileID == source.profileID }) else { throw VortxNativeError.invalidSnapshot }
             try CoreBridge.stageNativeCredential(token: binding.token, source: source, transactionID: nil, capture: capture, authority: authority)
         }
-        return .init(material: preparation.material, authority: authority, sourceArchive: preparedArchive,
+        return .init(material: preparation.material, archiveCapture: archiveCapture, authority: authority, sourceArchive: preparedArchive,
                      initialPendingOwnProfileIDs: missingOwn)
     }
     private static func nativeWebsiteEvents(_ document: [String: Any]) throws -> [VortxJSON] {
@@ -1830,7 +1832,11 @@ final class VortXSyncManager: ObservableObject {
                             profileIDs: prepared?.initialPendingOwnProfileIDs ?? [], scope: scope)
                     }
                 }
-                let archive = try material.map { try VortxNativeBootstrapArchive.encode(document: documentBytes, material: $0, authenticatedSourceArchive: prepared?.sourceArchive) }
+                stage = "legacy_archive"
+                let archive = try prepared.map {
+                    try VortxNativeBootstrapArchive.encode(capture: $0.archiveCapture, material: $0.material,
+                                                           authenticatedSourceArchive: $0.sourceArchive)
+                }
                 // Keep an already validated session visible while authentication/source parsing
                 // is pending or fails. Only retire it once the replacement has passed preflight.
                 stage = "session_replacement"
@@ -7761,7 +7767,12 @@ extension VortXSyncManager {
             }
             let transaction = try await prepareOwnerHistoryLocalCheckpoint(base: plaintext, scope: scope,
                 source: latch, authenticatedPeer: true)
-            let bootstrap = try VortxNativeBootstrapArchive.encode(document: hostBytes)
+            // The typed transaction keeps the original peer bytes. The separate local bootstrap
+            // archive keeps only the inspected host projection, with the same setting holds as legacy restore.
+            let archiveCapture = try VortxNativeBootstrapArchive.captureLegacyDocument(document, diagnostics: {
+                DiagnosticsLog.log("native-profiles", $0)
+            })
+            let bootstrap = try VortxNativeBootstrapArchive.encode(capture: archiveCapture)
             try latch.withActive {}
             try Self.xperienceExportObservation.withCurrent(observation) {}
             guard isCurrent(capture), dataKey == key, nativeCheckpointGeneration == generation,

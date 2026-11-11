@@ -267,7 +267,8 @@ enum Keychain {
         return provider
     }
     private func prepareNativeLegacyMaterial(_ doc: [String: Any], capture: CredentialScopeRegistry.Capture) async throws -> NativeLegacyPreparation {
-        NativeLegacyPreparation(material: Data(), authority: nil, sourceArchive: nil)
+        let archiveCapture = try VortxNativeBootstrapArchive.captureLegacyDocument(doc)
+        return NativeLegacyPreparation(material: Data(), archiveCapture: archiveCapture, authority: nil, sourceArchive: nil)
     }
     static func nativeWebsiteEvents(_ doc: [String: Any]) throws -> [Int] { [] }
     static func nativeWebsiteAddonEvents(_ doc: [String: Any]) throws -> [Int] { [] }
