@@ -215,11 +215,18 @@ class VortxNativeSessionTest {
         try {
             val absent = store.captureCheckpoint(scope)
             assertNull(absent.plaintext)
-            val original = VortxNativeSession.open(scope, "Owner", Runtime(), store, Transport(), true).use { it.read().state.toString() }
+            VortxNativeSession.open(scope, "Owner", Runtime(), store, Transport(), true).use { }
+            // The presentation JSON and exact persisted JSON can serialize fields differently.
+            // Compare the committed plaintext and ciphertext across the rejected first-write CAS.
+            val original = requireNotNull(store.captureCheckpoint(scope).plaintext)
+            val target = directory.listFiles()!!.single()
+            val ciphertext = target.readBytes()
             assertTrue(runCatching { store.compareAndCommitCheckpoint(scope, absent, original) }.isFailure)
             assertEquals(original, store.read(scope))
-            val target = directory.listFiles()!!.single()
-            val bytes = target.readBytes(); bytes[bytes.lastIndex] = (bytes.last().toInt() xor 1).toByte(); target.writeBytes(bytes)
+            assertArrayEquals(ciphertext, target.readBytes())
+            val bytes = ciphertext.copyOf()
+            bytes[bytes.lastIndex] = (bytes.last().toInt() xor 1).toByte()
+            target.writeBytes(bytes)
             assertTrue(runCatching { store.captureCheckpoint(scope) }.isFailure)
 
             val racedDirectory = Files.createTempDirectory(directory.toPath(), "intervening-winner-").toFile()
