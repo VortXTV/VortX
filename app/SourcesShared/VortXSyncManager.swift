@@ -1585,10 +1585,12 @@ final class VortXSyncManager: ObservableObject {
                           pending.result == .value(encodedReceipt) else { return failure }
                     var readbackReceipt = receipt
                     if case .upgradeRequired = result { return failure }
-                    if case .rejected = result, isNewAttempt {
+                    if case .rejected(let storedRevision) = result, isNewAttempt {
                         // A replay can be rejected because an earlier ambiguous request won.
                         // Only rejection of a newly reserved attempt can retire that uncertainty.
-                        readbackReceipt = try receipt.markingDefinitivelyRejected(accountNamespace: capture.namespace, dataKey: key)
+                        // The response's revision only bounds a later authenticated read.
+                        readbackReceipt = try receipt.markingDefinitivelyRejected(accountNamespace: capture.namespace,
+                            dataKey: key, storedRevision: storedRevision)
                         let rejected = readbackReceipt.encode()
                         try bound.withActive {
                             guard Keychain.compareAndSetConfirmed(pending, with: rejected, for: slot,
@@ -1600,7 +1602,8 @@ final class VortXSyncManager: ObservableObject {
                     guard current(), Keychain.confirmedString(slot) == .value(readbackReceipt.encode()) else { return failure }
                     if self.acceptsWebsiteRosterReadback(readback, receipt: readbackReceipt) { return readback }
                     guard case .rejected = result, isNewAttempt,
-                          case .doc(let latest, let version, let bytes, _) = readback, version >= target,
+                          case .doc(let latest, let version, let bytes, _) = readback,
+                          version >= readbackReceipt.minimumReadbackRevision,
                           let replacement = try NativeWebsiteAccountAdoption(latest, plaintext: bytes, revision: version) else {
                         return failure
                     }
@@ -4872,7 +4875,10 @@ final class VortXSyncManager: ObservableObject {
         if accepted {
             // Detached roster publication leaves the normal ACK and all local apply state to
             // the authenticated readback. A transport verdict alone must not advance either.
-            if prepareWebsiteSubmission != nil { return .accepted(version: version) }
+            if prepareWebsiteSubmission != nil {
+                if let echo = json?["version"], Self.documentVersion(echo) != version { return .error }
+                return .accepted(version: version)
+            }
             guard rememberNativeBackup(capture: capture) else {
                 DiagnosticsLog.log("sync", "upload result=accepted_remote_unacknowledged stage=local_backup")
                 return .error

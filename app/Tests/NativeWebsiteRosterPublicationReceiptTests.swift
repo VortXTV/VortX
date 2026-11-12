@@ -72,6 +72,14 @@ enum NativeWebsiteRosterPublicationReceiptTests {
         try check(try !rejected.permitsAttempt(pending(39), accountNamespace: account, dataKey: key), "Rejected cannot go backward")
         try check(try rejected.markingDefinitivelyRejected(accountNamespace: account, dataKey: key) == rejected, "Idempotent rejection")
 
+        let ahead = try decode(reopened.markingDefinitivelyRejected(accountNamespace: account, dataKey: key, storedRevision: 50).encode())
+        try check(ahead.minimumReadbackRevision == 50 && ahead.targetRevision == 41, "Rejection bounds readback without moving target")
+        try check(ahead.classifyFullRosterReadback(revision: 41, raw: candidate) == .denied, "Known stale exact target cannot mount after restart")
+        try check(ahead.classifyFullRosterReadback(revision: 50, raw: independent) == .requiresIndependentAdmission,
+                  "First acceptable revision still needs independent admission")
+        try check(try !ahead.permitsAttempt(pending(49), accountNamespace: account, dataKey: key), "Stale rosterless read cannot send")
+        try check(try ahead.permitsAttempt(pending(50), accountNamespace: account, dataKey: key), "Authenticated head can be readmitted")
+
         rejects("Account binding") { _ = try decode(wire, owner: foreign) }
         rejects("Data-key binding") { _ = try decode(wire, key: wrongKey) }
         rejects("Transition cannot re-key") { _ = try reopened.markingDefinitivelyRejected(accountNamespace: account, dataKey: wrongKey) }
@@ -85,6 +93,7 @@ enum NativeWebsiteRosterPublicationReceiptTests {
             wire.replacingOccurrences(of: "v1:p:", with: "v1:r:"),
             wire.replacingOccurrences(of: "v1:p:40:", with: "v1:p:040:"),
             wire.replacingOccurrences(of: "v1:p:40:41:", with: "v1:p:40:42:"),
+            wire.replacingOccurrences(of: "v1:p:40:41:41:", with: "v1:p:40:41:50:"),
             String(wire.dropLast()) + (wire.last == "0" ? "1" : "0"),
             wire + ":extra", wire.uppercased(), " " + wire, "",
         ]

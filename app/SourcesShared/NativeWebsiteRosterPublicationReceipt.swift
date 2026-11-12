@@ -25,6 +25,7 @@ struct NativeWebsiteRosterPublicationReceipt: Equatable, Sendable {
     let state: State
     let baseRevision: Int
     let targetRevision: Int
+    let minimumReadbackRevision: Int
     private let sourceDigest: Data
     private let candidateDigest: Data
     private let encoded: String
@@ -32,7 +33,7 @@ struct NativeWebsiteRosterPublicationReceipt: Equatable, Sendable {
     private static let version = "v1"
     private static let maximumRevision = SyncDocumentRevisionPolicy.maximumSafeRevision
     private static let maximumRawBytes = 32 * 1024 * 1024
-    private static let maximumEncodedBytes = 233
+    private static let maximumEncodedBytes = 250
     private static let recordDomain = "vortx/apple/website-roster-publication/record/v1\u{0}"
     private static let keyDomain = Data("vortx/apple/website-roster-publication/key/v1".utf8)
     private static let slotDomain = "vortx/apple/website-roster-publication/slot/v1\u{0}"
@@ -51,7 +52,7 @@ struct NativeWebsiteRosterPublicationReceipt: Equatable, Sendable {
         guard let target = SyncDocumentRevisionPolicy.next(after: baseRevision), bounded(source), bounded(candidate) else {
             throw Failure.invalidAttempt
         }
-        return signed(state: .pending, baseRevision: baseRevision, targetRevision: target,
+        return signed(state: .pending, baseRevision: baseRevision, targetRevision: target, minimumReadbackRevision: target,
                       sourceDigest: digest(source), candidateDigest: digest(candidate),
                       accountNamespace: accountNamespace, key: key)
     }
@@ -64,26 +65,32 @@ struct NativeWebsiteRosterPublicationReceipt: Equatable, Sendable {
         let key = try receiptKey(accountNamespace: accountNamespace, dataKey: dataKey)
         guard encoded.utf8.count <= maximumEncodedBytes else { throw Failure.invalidRecord }
         let fields = encoded.split(separator: ":", omittingEmptySubsequences: false)
-        guard fields.count == 7, fields[0] == version,
+        guard fields.count == 8, fields[0] == version,
               let state = State(rawValue: String(fields[1])),
               let base = parseRevision(fields[2]), let target = parseRevision(fields[3]),
               SyncDocumentRevisionPolicy.next(after: base) == target,
-              let sourceDigest = parseDigest(fields[4]), let candidateDigest = parseDigest(fields[5]),
-              let seal = parseDigest(fields[6]) else { throw Failure.invalidRecord }
+              let minimumReadback = parseRevision(fields[4]), minimumReadback >= target,
+              state == .definitivelyRejected || minimumReadback == target,
+              let sourceDigest = parseDigest(fields[5]), let candidateDigest = parseDigest(fields[6]),
+              let seal = parseDigest(fields[7]) else { throw Failure.invalidRecord }
         let body = fields.dropLast().joined(separator: ":")
         guard HMAC<SHA256>.isValidAuthenticationCode(seal, authenticating: framed(body, accountNamespace), using: key) else {
             throw Failure.invalidRecord
         }
         return Self(state: state, baseRevision: base, targetRevision: target,
+                    minimumReadbackRevision: minimumReadback,
                     sourceDigest: sourceDigest, candidateDigest: candidateDigest, encoded: encoded)
     }
 
     /// The caller may use this only for an explicit rejection of a fresh send with no
     /// preceding ambiguous submission. A rejection on replay does not settle an earlier send.
-    func markingDefinitivelyRejected(accountNamespace: String, dataKey: Data) throws -> Self {
+    func markingDefinitivelyRejected(accountNamespace: String, dataKey: Data, storedRevision: Int? = nil) throws -> Self {
         try requireAuthenticated(accountNamespace: accountNamespace, dataKey: dataKey)
         if state == .definitivelyRejected { return self }
+        let minimumReadback = max(targetRevision, storedRevision ?? targetRevision)
+        guard minimumReadback <= Self.maximumRevision else { throw Failure.invalidAttempt }
         return Self.signed(state: .definitivelyRejected, baseRevision: baseRevision, targetRevision: targetRevision,
+                           minimumReadbackRevision: minimumReadback,
                            sourceDigest: sourceDigest, candidateDigest: candidateDigest,
                            accountNamespace: accountNamespace,
                            key: try Self.receiptKey(accountNamespace: accountNamespace, dataKey: dataKey))
@@ -96,7 +103,7 @@ struct NativeWebsiteRosterPublicationReceipt: Equatable, Sendable {
         try requireAuthenticated(accountNamespace: accountNamespace, dataKey: dataKey)
         try next.requireAuthenticated(accountNamespace: accountNamespace, dataKey: dataKey)
         guard next.state == .pending else { return false }
-        if state == .definitivelyRejected { return next.baseRevision > baseRevision }
+        if state == .definitivelyRejected { return next.baseRevision >= minimumReadbackRevision }
         return next.baseRevision == baseRevision && next.sourceDigest == sourceDigest && next.candidateDigest == candidateDigest
     }
 
@@ -105,7 +112,7 @@ struct NativeWebsiteRosterPublicationReceipt: Equatable, Sendable {
     /// a different winner at that target, or at any later valid revision, still needs normal
     /// full-roster ownership admission. Neither result grants mount or applied-version authority.
     func classifyFullRosterReadback(revision: Int, raw: Data) -> FullRosterReadback {
-        guard revision >= targetRevision, revision <= Self.maximumRevision, Self.bounded(raw) else { return .denied }
+        guard revision >= minimumReadbackRevision, revision <= Self.maximumRevision, Self.bounded(raw) else { return .denied }
         if revision > targetRevision { return .requiresIndependentAdmission }
         if Self.digest(raw) == candidateDigest { return .exactCandidate }
         return state == .definitivelyRejected ? .requiresIndependentAdmission : .denied
@@ -117,13 +124,14 @@ struct NativeWebsiteRosterPublicationReceipt: Equatable, Sendable {
         }
     }
 
-    private static func signed(state: State, baseRevision: Int, targetRevision: Int,
+    private static func signed(state: State, baseRevision: Int, targetRevision: Int, minimumReadbackRevision: Int,
                                sourceDigest: Data, candidateDigest: Data,
                                accountNamespace: String, key: SymmetricKey) -> Self {
-        let body = [version, state.rawValue, String(baseRevision), String(targetRevision),
+        let body = [version, state.rawValue, String(baseRevision), String(targetRevision), String(minimumReadbackRevision),
                     hex(sourceDigest), hex(candidateDigest)].joined(separator: ":")
         let seal = Data(HMAC<SHA256>.authenticationCode(for: framed(body, accountNamespace), using: key))
         return Self(state: state, baseRevision: baseRevision, targetRevision: targetRevision,
+                    minimumReadbackRevision: minimumReadbackRevision,
                     sourceDigest: sourceDigest, candidateDigest: candidateDigest, encoded: body + ":" + hex(seal))
     }
 
