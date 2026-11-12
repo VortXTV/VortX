@@ -242,9 +242,9 @@ private fun HomeContent(
                         if (item.continueWatchingPermit == null || viewModel.isContinueWatchingTapCurrent(item)) onItem(item)
                     },
                     // Direct resume remains an affordance only for the leading Continue Watching title.
-                    onDirectResume = ({ item: MetaItem ->
+                    onDirectResume = if (heroCanDirectResume) { item ->
                         viewModel.localContinueWatchingResume(item, renderedHeroDownload)?.let(onDirectResume)
-                    }).takeIf { heroCanDirectResume },
+                    } else null,
                     directResumeIdentity = initialHero.let(PhoneHeroPolicy::identity).takeIf { heroCanDirectResume },
                 )
             }
