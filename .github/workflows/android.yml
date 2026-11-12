@@ -50,6 +50,11 @@ permissions:
 
 jobs:
   build-android:
+    if: >-
+      github.repository == 'VortXTV/VortX' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.actor_id == '50227842' &&
+      github.ref == 'refs/tags/v0.5.6-device-android-test.2'
     # Environment gate for the token-bearing job (trust boundary): the `engine-ci` environment
     # carries explicit deployment protection policies: BRANCH entries (beta, main, ci/engine-token)
     # plus a `v*` TAG policy (the tag lane is used by the release workflow; this workflow only ever
@@ -74,7 +79,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 2
           persist-credentials: false
+
+      - name: Verify the exact Android device-test source and workflow boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
+          test "$GITHUB_WORKFLOW_REF" = 'VortXTV/VortX/.github/workflows/android.yml@refs/tags/v0.5.6-device-android-test.2'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA 2a31c4e46dd54717adc304ef454c60f8adeb40cf"
+          test "$(git diff --name-only HEAD^ HEAD)" = .github/workflows/android.yml
+          test -z "$(git status --porcelain --untracked-files=all)"
+          printf 'Verified Android device-test source 2a31c4e46dd54717adc304ef454c60f8adeb40cf on exact attempt 1.\n'
 
       - name: Acquire reviewed Android mpv component (baseline is a no-op)
         run: /usr/bin/python3 -I scripts/acquire-android-mpv-component.py
