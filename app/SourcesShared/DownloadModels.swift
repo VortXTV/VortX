@@ -18,6 +18,56 @@ enum DownloadState: String, Codable, Sendable {
     case failed
 }
 
+/// Exact unfinished local history eligible to open an indexed copy when connectivity is down.
+struct DownloadedContinueWatchingTarget: Equatable {
+    let libraryID: String
+    let type: String
+    let videoID: String
+    let resumeSeconds: Double
+
+    init?(
+        libraryID: String, type: String, cardVideoID: String?,
+        resumeSeconds: Double?, progress: Double, isUpNext: Bool
+    ) {
+        guard !libraryID.isEmpty, !isUpNext,
+              let resumeSeconds, resumeSeconds.isFinite, resumeSeconds > 0 else { return nil }
+        if EpisodePlaybackIdentity.usesSeriesLifecycle(type: type) {
+            guard let cardVideoID, !cardVideoID.isEmpty, cardVideoID != libraryID else { return nil }
+            videoID = cardVideoID
+        } else {
+            let exactMovieID = cardVideoID ?? libraryID
+            guard type == "movie", progress.isFinite, progress >= 0, progress < 0.9,
+                  !exactMovieID.isEmpty,
+                  !EpisodePlaybackIdentity.isEpisodicContext(
+                    type: type, season: nil, episode: nil, videoID: exactMovieID
+                  ) else { return nil }
+            videoID = exactMovieID
+        }
+        self.libraryID = libraryID
+        self.type = type
+        self.resumeSeconds = resumeSeconds
+    }
+
+    init?(item: CoreCWItem) {
+        guard !item.isFinished else { return nil }
+        self.init(libraryID: item.id, type: item.type, cardVideoID: item.state.videoId,
+                  resumeSeconds: item.resumeSeconds, progress: item.progress, isUpNext: item.isUpNext)
+    }
+}
+
+/// A single admission result shared by value copies of the original player request.
+@MainActor
+final class DownloadedContinueWatchingInitialMount {
+    private var admission: Bool?
+
+    func admit(confirmedOffline: Bool, exactCopy: Bool) -> Bool {
+        if let admission { return admission }
+        let accepted = confirmedOffline && exactCopy
+        admission = accepted
+        return accepted
+    }
+}
+
 /// A device-local, provider-verified transition between two canonical series episodes.
 struct DownloadSeasonBoundary: Codable, Hashable, Sendable {
     let libraryID: String
@@ -359,6 +409,32 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
         of target: PlaybackMeta, in records: [Self], fileExists: (Self) -> Bool
     ) -> Self? {
         records.first { $0.state == .completed && $0.matchesPlayback(target) && fileExists($0) }
+    }
+
+    static func offlineContinueWatchingCopy(
+        for target: DownloadedContinueWatchingTarget, in records: [Self],
+        fileExists: (Self) -> Bool
+    ) -> Self? {
+        let matches = records.filter {
+            $0.state == .completed && $0.contentId == target.libraryID
+                && $0.type == target.type && $0.videoId == target.videoID
+        }
+        if target.type == "movie" {
+            return matches.first { $0.season == nil && $0.episode == nil && fileExists($0) }
+        }
+        guard let first = matches.first,
+              let numbers = EpisodePlaybackIdentity.provenEpisodeNumbers(season: first.season, episode: first.episode),
+              matches.allSatisfy({ $0.season == first.season && $0.episode == first.episode }) else { return nil }
+        // The indexed coordinates must agree when the exact video ID also carries this title's numbers.
+        // An opaque video ID still needs its own exact indexed row with valid stored coordinates.
+        let prefix = "\(target.libraryID):"
+        if target.videoID.hasPrefix(prefix) {
+            let suffix = target.videoID.dropFirst(prefix.count).split(separator: ":", omittingEmptySubsequences: false)
+            if suffix.count == 2, let season = Int(suffix[0]), let episode = Int(suffix[1]) {
+                guard season == numbers.season && episode == numbers.episode else { return nil }
+            }
+        }
+        return matches.first(where: fileExists)
     }
 
     /// A stored file URL is a hint for one indexed copy. Never open or resolve that path itself.

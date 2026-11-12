@@ -1283,8 +1283,12 @@ struct TVPlayerView: View {
             core.setPlayerActive(true)
             if let downloadedPlayback {
                 guard downloadedPlayback.ownsCurrentContext(core: core),
-                      downloadedPlayback.revalidated()?.url == url else {
+                      let revalidated = downloadedPlayback.revalidated(), revalidated.url == url else {
                     leavePlayback()
+                    return
+                }
+                guard downloadedPlayback.permitsInitialMount(revalidated: revalidated) else {
+                    onClose()
                     return
                 }
                 downloadMountAdmitted = true

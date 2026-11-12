@@ -179,6 +179,15 @@ struct HomeView: View {
                                     : .continueWatching,
                                 traktSessionID: renderedContinueWatching.selection.sessionID,
                                 intent: renderedContinueWatching.intent,
+                                isCurrentLocalDownloadTarget: { target in
+                                    let current = HomeContinueWatchingSelection.current(
+                                        core: core, profiles: profiles, localOnly: true
+                                    )
+                                    return current.intent == renderedContinueWatching.intent
+                                        && current.selection.items.contains {
+                                            DownloadedContinueWatchingTarget(item: $0) == target
+                                        }
+                                },
                                 isActive: isActive,
                                 displayProgress: renderedContinueWatching.selection.displayProgress,
                                 captions: renderedContinueWatching.selection.captions
@@ -905,6 +914,7 @@ struct CoreContinueWatchingRow: View {
     var menu: PosterMenu = .continueWatching   // .none on overlay-profile rails (engine menu doesn't apply)
     var traktSessionID: TraktSessionID?
     var intent: HomeContinueWatchingSelection.Intent? = nil
+    let isCurrentLocalDownloadTarget: @MainActor (DownloadedContinueWatchingTarget) -> Bool
     var isActive: Bool = true
     var displayProgress: [String: Double] = [:]
     var captions: [String: String] = [:]
@@ -1009,11 +1019,63 @@ struct CoreContinueWatchingRow: View {
         source?.isPrivate != true && traktSessionID == nil
     }
 
+    private func directResume(_ item: CoreCWItem) -> (() -> Void)? {
+        guard intent?.source == .local, traktSessionID == nil,
+              let target = DownloadedContinueWatchingTarget(item: item) else { return rememberedDirectResume(item) }
+        return {
+            let profileID = profiles.activeID
+            let remembered = LastStreamStore.entry(for: item.id, profileID: profileID)
+            let rememberedURL = remembered.flatMap { URL(string: $0.url) }
+            if ConnectivityMonitor.shared.hasConfirmedOfflinePath,
+               remembered == nil || rememberedURL?.isFileURL == false {
+                resumeOfflineDownload(item, target: target, profileID: profileID, remembered: remembered)
+            } else if let resume = rememberedDirectResume(item) {
+                resume()
+            } else {
+                openDetails(item)
+            }
+        }
+    }
+
+    private func resumeOfflineDownload(
+        _ item: CoreCWItem, target: DownloadedContinueWatchingTarget, profileID: UUID?,
+        remembered: LastStreamStore.Entry?
+    ) {
+        let ownsRoute: @MainActor () -> Bool = {
+            isActive && detailTarget == nil && presenter.request == nil && profiles.activeID == profileID
+                && intent?.source == .local && traktSessionID == nil
+                && intent?.isCurrent(core: core, profiles: profiles) == true
+                && LastStreamStore.entry(for: item.id, profileID: profileID) == remembered
+                && isCurrentLocalDownloadTarget(target)
+        }
+        guard ownsRoute() else { return }
+        resumeHoardTask?.cancel()
+        resumeHoardTask = nil
+        guard let candidate = DownloadStore.shared.offlineContinueWatchingDownload(for: target) else {
+            openDetails(item)
+            return
+        }
+        let requestID = UUID()
+        continueWatchingRequestID = requestID
+        presenter.presentDownloaded(
+            candidate, core: core, displayedResume: target.resumeSeconds, requiresConfirmedOffline: true,
+            onUnavailable: {
+                if !ConnectivityMonitor.shared.hasConfirmedOfflinePath, let resume = rememberedDirectResume(item) {
+                    resume()
+                } else {
+                    openDetails(item)
+                }
+            }, stillCurrent: {
+                continueWatchingRequestID == requestID && ownsRoute() && candidate.ownsCurrentContext(core: core)
+            }
+        )
+    }
+
     /// Continue Watching resumes the exact link that was playing last time, straight
     /// into the player, instead of routing through the detail page and re-resolving
     /// sources. Falls back to the detail page when no remembered link fits: never
     /// played here, or the engine moved the series on to a different episode.
-    private func directResume(_ item: CoreCWItem) -> (() -> Void)? {
+    private func rememberedDirectResume(_ item: CoreCWItem) -> (() -> Void)? {
         // SIMKL supplies percentages/next-episode identity, not a truthful seconds offset.
         // Resolve its captured target through Detail; never borrow this device's last stream.
         guard intent?.source != .simkl else { return nil }

@@ -355,6 +355,82 @@ private struct NonSeriesEpisodeLifecycleContractTests {
         expect(DownloadRecord.playableCopy(
             of: seriesDownload.playbackMeta, in: [incomplete, alias], fileExists: { _ in true }
         ) == nil, "no coordinate-only replacement for explicit playback")
+        let offlineEpisode = DownloadedContinueWatchingTarget(
+            libraryID: "tt-lifecycle", type: "series", cardVideoID: "tt-lifecycle:1:2",
+            resumeSeconds: 90, progress: 0.2, isUpNext: false
+        )!
+        let otherTitle = download(type: "series", season: 1, episode: 2, videoID: "tt-lifecycle:1:2",
+                                  contentID: "tt-elsewhere")
+        let contradictory = download(type: "series", season: 3, episode: 4, videoID: "tt-lifecycle:1:2")
+        let missingCoordinates = download(type: "series", season: nil, episode: nil, videoID: "tt-lifecycle:1:2")
+        expect(DownloadRecord.offlineContinueWatchingCopy(
+            for: offlineEpisode, in: [e1, incomplete, alias, otherTitle, seriesDownload],
+            fileExists: { $0.id == seriesDownload.id }
+        )?.id == seriesDownload.id, "offline resume uses exact local title and current card video")
+        for records in [[incomplete, alias, otherTitle], [missingCoordinates], [contradictory], [contradictory, seriesDownload]] {
+            expect(DownloadRecord.offlineContinueWatchingCopy(
+                for: offlineEpisode, in: records, fileExists: { _ in true }
+            ) == nil, "offline resume refuses wrong, pending, unproven and contradictory episode copies")
+        }
+        expect(DownloadRecord.offlineContinueWatchingCopy(
+            for: offlineEpisode, in: [seriesDownload], fileExists: { _ in false }
+        ) == nil, "a completed index row cannot play when its managed file is absent")
+        let opaqueCard = continueWatching(type: "series", videoID: alias.videoId, progress: 0.2)
+        let opaqueTarget = DownloadedContinueWatchingTarget(item: opaqueCard)!
+        expect(opaqueTarget.resumeSeconds == 20 && DownloadRecord.offlineContinueWatchingCopy(
+            for: opaqueTarget, in: [seriesDownload, alias], fileExists: { _ in true }
+        )?.id == alias.id, "an opaque card identity can play only its exact indexed video")
+        let offlineMovie = DownloadedContinueWatchingTarget(
+            libraryID: "tt-movie", type: "movie", cardVideoID: nil,
+            resumeSeconds: 45, progress: 0.3, isUpNext: false
+        )!
+        let exactMovie = download(type: "movie", season: nil, episode: nil, videoID: "tt-movie",
+                                  contentID: "tt-movie")
+        let movieEpisode = download(type: "movie", season: 1, episode: 2, videoID: "tt-movie",
+                                    contentID: "tt-movie")
+        expect(DownloadRecord.offlineContinueWatchingCopy(
+            for: offlineMovie, in: [movieDownload, movieEpisode, exactMovie], fileExists: { _ in true }
+        )?.id == exactMovie.id, "a movie can resume without card video only by exact movie identity")
+        let alternateMovie = download(type: "movie", season: nil, episode: nil, videoID: "provider:movie",
+                                      contentID: "tt-movie")
+        let alternateMovieTarget = DownloadedContinueWatchingTarget(
+            libraryID: "tt-movie", type: "movie", cardVideoID: alternateMovie.videoId,
+            resumeSeconds: 45, progress: 0.3, isUpNext: false
+        )!
+        expect(DownloadRecord.offlineContinueWatchingCopy(
+            for: alternateMovieTarget, in: [exactMovie, alternateMovie], fileExists: { _ in true }
+        )?.id == alternateMovie.id && DownloadRecord.offlineContinueWatchingCopy(
+            for: offlineMovie, in: [alternateMovie], fileExists: { _ in true }
+        ) == nil, "a movie's distinct video identity is eligible only when the card supplies it exactly")
+        expect(DownloadedContinueWatchingTarget(
+            item: continueWatching(type: "series", videoID: seriesDownload.videoId, progress: 0.95)
+        )?.resumeSeconds == 95, "positive unfinished series history retains the existing credits behavior")
+        let admittedMount = DownloadedContinueWatchingInitialMount()
+        expect(admittedMount.admit(confirmedOffline: true, exactCopy: true)
+               && admittedMount.admit(confirmedOffline: false, exactCopy: false),
+               "an admitted original request does not stop already-open playback on reconnect or view reuse")
+        let reconnectedMount = DownloadedContinueWatchingInitialMount()
+        expect(!reconnectedMount.admit(confirmedOffline: false, exactCopy: true)
+               && !reconnectedMount.admit(confirmedOffline: true, exactCopy: true),
+               "a reconnect before first mount refuses the inferred route and does not resurrect it")
+        expect(!DownloadedContinueWatchingInitialMount().admit(confirmedOffline: true, exactCopy: false),
+               "the first mount needs the exact prepared copy")
+        for (type, videoID, seconds, progress, isUpNext) in [
+            ("series", nil, 45.0, 0.2, false),
+            ("series", "tt-lifecycle", 45, 0.2, false),
+            ("series", "tt-lifecycle:1:2", 45, 0.2, true),
+            ("series", "tt-lifecycle:1:2", .infinity, 0.2, false),
+            ("series", "tt-lifecycle:1:2", 0, 0.2, false),
+            ("movie", "tt-lifecycle", 45, 0.9, false),
+            ("movie", "tt-lifecycle:1:2", 45, 0.2, false),
+            ("movie", "", 45, 0.2, false),
+            ("collection", "tt-lifecycle:1:2", 45, 0.2, false)
+        ] as [(String, String?, Double, Double, Bool)] {
+            expect(DownloadedContinueWatchingTarget(
+                libraryID: "tt-lifecycle", type: type, cardVideoID: videoID,
+                resumeSeconds: seconds, progress: progress, isUpNext: isUpNext
+            ) == nil, "offline resume requires unfinished exact current local playback")
+        }
         expect(DownloadRecord.playableSuccessor(
             after: e1.playbackMeta, in: [e3, seriesDownload], fileExists: { _ in true }
         )?.id == seriesDownload.id, "download autoplay chooses immediate E+1")

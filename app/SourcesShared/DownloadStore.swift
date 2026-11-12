@@ -160,6 +160,12 @@ final class DownloadStore: ObservableObject {
         ).flatMap { playableDownload(id: $0.id, expected: $0.playbackMeta) }
     }
 
+    func offlineContinueWatchingDownload(for target: DownloadedContinueWatchingTarget) -> AppleDownloadedPlayback? {
+        guard ProfileStore.shared.active?.isKids != true else { return nil }
+        return DownloadRecord.offlineContinueWatchingCopy(for: target, in: records, fileExists: hasValidPlaybackFile)
+            .flatMap { playableDownload(id: $0.id, expected: $0.playbackMeta) }
+    }
+
     func playableDownloads(libraryID: String, type: String) -> [AppleDownloadedPlayback] {
         guard ProfileStore.shared.active?.isKids != true else { return [] }
         var seen = Set<String>()
@@ -448,6 +454,7 @@ struct AppleDownloadedPlayback {
     private let profileID: UUID?
     private let isKids: Bool
     private let owner: PlaybackMutationTarget
+    private var offlineInitialMount: DownloadedContinueWatchingInitialMount?
 
     @MainActor init(record: DownloadRecord, url: URL) {
         self.record = record
@@ -461,6 +468,20 @@ struct AppleDownloadedPlayback {
         profileID == ProfileStore.shared.activeID
             && isKids == (ProfileStore.shared.active?.isKids == true)
             && owner.stillOwnsCurrentContext(core: core)
+    }
+
+    @MainActor func requiringConfirmedOfflineAtInitialMount() -> Self {
+        var copy = self
+        copy.offlineInitialMount = DownloadedContinueWatchingInitialMount()
+        return copy
+    }
+
+    @MainActor func permitsInitialMount(revalidated: Self) -> Bool {
+        guard let offlineInitialMount else { return true }
+        return offlineInitialMount.admit(
+            confirmedOffline: ConnectivityMonitor.shared.hasConfirmedOfflinePath,
+            exactCopy: record == revalidated.record && url == revalidated.url
+        )
     }
 
     @MainActor func revalidated() -> Self? {

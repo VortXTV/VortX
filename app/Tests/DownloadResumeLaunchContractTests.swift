@@ -29,7 +29,7 @@ import Foundation
         precondition(presenter.components(separatedBy: "ProfileStore.shared.activeID == activeProfileID").count == 3,
                      "an extant inactive overlay may persist history but must never admit this launch")
         precondition(!admission.contains("active?.isKids"), "the existing exact Downloads entry stays available")
-        precondition(store.components(separatedBy: "guard ProfileStore.shared.active?.isKids != true").count == 5,
+        precondition(store.components(separatedBy: "guard ProfileStore.shared.active?.isKids != true").count == 6,
                      "all inferred lookup paths and local successor respect Kids mode")
         precondition(store.contains("isKids == (ProfileStore.shared.active?.isKids == true)"),
                      "a Kids setting change invalidates an asynchronous launch")
@@ -74,6 +74,22 @@ import Foundation
         precondition(iosCW.contains("return .downloaded(prepared.copy, resume: prepared.resume)"))
         precondition(iosCW.contains("prepared.copy.ownsCurrentContext(core: core)"))
         precondition(iosCW.contains("stillCurrent(), ProfileStore.shared.activeID == pid"))
+        let offlineIOS = iosCW.components(separatedBy: "if expectedTraktSession == nil, ConnectivityMonitor.shared.hasConfirmedOfflinePath")[1]
+            .components(separatedBy: "guard let entry = remembered")[0]
+        let iosAdmission = offlineIOS.range(of: "await candidate.prepareForPlayback")!.lowerBound
+        let iosCommit = offlineIOS.components(separatedBy: "await candidate.prepareForPlayback")[1]
+        precondition(offlineIOS.range(of: "isCurrentLocalDownloadTarget(target)")!.lowerBound < iosAdmission)
+        for gate in ["refreshSeasonBoundary: false", "stillCurrent()",
+                     "isCurrentLocalDownloadTarget(target)", "hasConfirmedOfflinePath",
+                     "prepared.copy.record == candidate.record", "prepared.copy.url == candidate.url",
+                     "prepared.copy.requiringConfirmedOfflineAtInitialMount()"] {
+            precondition(iosCommit.contains(gate), "missing offline iOS gate: \(gate)")
+        }
+        precondition(offlineIOS.contains("remembered == nil || rememberedURL?.isFileURL == false"))
+        precondition(root.contains("guard provenance.source == .local else { return false }"))
+        precondition(root.contains("rendered.items.contains { $0.offlineDownloadTarget == target }"))
+        let connectivity = try String(contentsOfFile: "app/SourcesShared/ConnectivityMonitor.swift", encoding: .utf8)
+        precondition(connectivity.contains("launchOffline != nil && isOffline && lastRawOffline"))
         precondition(root.components(separatedBy: "didSet { if path != oldValue { continueWatchingRequestID = nil } }").count == 3)
         precondition(root.components(separatedBy: "Binding(get: { path }, set: { path = $0 })").count == 3)
         precondition(root.contains("didSet { if player?.id != oldValue?.id { continueWatchingRequestID = nil } }"))
@@ -93,6 +109,21 @@ import Foundation
         precondition(tvResume.contains("onUnavailable: { openDetails(item) }, stillCurrent: {"))
         precondition(tvResume.contains("continueWatchingRequestID == requestID"))
         precondition(tvResume.contains("candidate.ownsCurrentContext(core: core)"))
+        let tvOffline = tvResume.components(separatedBy: "private func resumeOfflineDownload(")[1]
+            .components(separatedBy: "private func rememberedDirectResume(")[0]
+        precondition(tvResume.contains("guard intent?.source == .local, traktSessionID == nil"))
+        precondition(tvResume.contains("remembered == nil || rememberedURL?.isFileURL == false"))
+        precondition(tvCW.contains("core: core, profiles: profiles, localOnly: true"))
+        precondition(tvCW.contains("current.intent == renderedContinueWatching.intent"))
+        precondition(tvOffline.contains("isCurrentLocalDownloadTarget(target)"))
+        precondition(tvOffline.contains("requiresConfirmedOffline: true"))
+        precondition(tvOffline.contains("!ConnectivityMonitor.shared.hasConfirmedOfflinePath, let resume = rememberedDirectResume(item)"))
+        precondition(store.contains("exactCopy: record == revalidated.record && url == revalidated.url"))
+        let revalidation = store.components(separatedBy: "@MainActor func revalidated()")[1]
+            .components(separatedBy: "@MainActor func prepareForPlayback(")[0]
+        precondition(!revalidation.contains("offlineInitialMount"),
+                     "ordinary revalidation and successors do not inherit the one-time offline witness")
+        precondition(!tvOffline.contains("CWResume.") && !tvOffline.contains("hoardResumedGroups"))
         precondition(presenter.contains("iOSPlayerLaunch.downloaded(prepared.copy, resume: prepared.resume)"))
         precondition(store.contains("attributes.isRegularFile == true"))
         precondition(store.contains("attributes.isSymbolicLink == false"))
@@ -113,7 +144,8 @@ import Foundation
         let mount = player.components(separatedBy: "// A rejected new mount must still unwind")[1]
             .components(separatedBy: "downloadMountAdmitted = true")[0]
         precondition(mount.contains("macWasFullScreenAtOpen = downloadedPlayback.macWasFullScreenAtOpen"))
-        precondition(mount.contains("downloadedPlayback.revalidated()?.url == url"))
+        precondition(mount.contains("let revalidated = downloadedPlayback.revalidated(), revalidated.url == url"))
+        precondition(mount.contains("guard downloadedPlayback.permitsInitialMount(revalidated: revalidated) else"))
         let detail = try String(contentsOfFile: "app/SourcesiOS/iOSDetailView.swift", encoding: .utf8)
         let handoffs = [root, detail].flatMap {
             $0.components(separatedBy: "onDownloadedAdvance: { candidate, onFailure in").dropFirst()
@@ -162,7 +194,17 @@ import Foundation
         let tvRoot = try String(contentsOfFile: "app/SourcesTV/RootTabView.swift", encoding: .utf8)
         precondition(tvRoot.contains("startAtSeconds: resume, downloadedPlayback: playback"))
         precondition(tvRoot.contains("guard request?.id == expectedRequestID, stillCurrent()"))
-        precondition(tvRoot.contains("refreshSeasonBoundary: expectedRequestID == nil"), "EOF may not request season data")
+        precondition(tvRoot.contains("refreshSeasonBoundary: expectedRequestID == nil && !requiresConfirmedOffline"),
+                     "EOF and inferred offline resume may not request season data")
+        let tvPresentation = tvRoot.components(separatedBy: "@MainActor func presentDownloaded(")[1]
+            .components(separatedBy: "func close(requestID:")[0]
+        precondition(tvPresentation.components(separatedBy: "if requiresConfirmedOffline, !ConnectivityMonitor.shared.hasConfirmedOfflinePath").count == 3)
+        let tvPrepared = tvPresentation.components(separatedBy: "await candidate.prepareForPlayback")[1]
+        let tvRoute = tvPrepared.range(of: "request?.id == expectedRequestID, stillCurrent()")!.lowerBound
+        let tvReconnect = tvPrepared.range(of: "onUnavailable?()")!.lowerBound
+        precondition(tvRoute < tvReconnect)
+        precondition(tvPrepared.contains("prepared.copy.record == candidate.record && prepared.copy.url == candidate.url"))
+        precondition(tvPrepared.contains("prepared.copy.requiringConfirmedOfflineAtInitialMount()"))
         precondition(tvRoot.contains("if request?.id != oldValue?.id { requestGeneration = UUID() }"))
         precondition(tvRoot.contains("guard !Task.isCancelled, requestGeneration == presentation,"))
         precondition(tvPlayer.contains("if !downloadHandoffProgressFlushed"))
@@ -184,7 +226,9 @@ import Foundation
             precondition(source.contains("DownloadRecord.permitsDownloadedAdvance("))
             precondition(source.contains("completionEvidence.settledProgress(owner:"))
             precondition(source.contains("transportSettled: event.transportSettled"))
-            precondition(source.contains("downloadedPlayback.revalidated()?.url == url"))
+            precondition(source.contains("let revalidated = downloadedPlayback.revalidated(), revalidated.url == url"))
+            let initialAdmission = source.range(of: "guard downloadedPlayback.permitsInitialMount(revalidated: revalidated) else")!.lowerBound
+            precondition(initialAdmission < source.range(of: "downloadMountAdmitted = true")!.lowerBound)
             precondition(source.contains("if let confirmed, confirmed.isSeasonRollover"))
             precondition(source.contains("next = confirmed.revalidated()"))
             precondition(source.contains("if downloadedPlayback == nil || downloadMountAdmitted"))

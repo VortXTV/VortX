@@ -2763,8 +2763,13 @@ struct PlayerScreen: View {
                     ?? (macPlayerWindow?.styleMask.contains(.fullScreen) ?? false)
                 #endif
                 guard downloadedPlayback.ownsCurrentContext(core: core),
-                      downloadedPlayback.revalidated()?.url == url else {
+                      let revalidated = downloadedPlayback.revalidated(), revalidated.url == url else {
                     leavePlayback()
+                    return
+                }
+                guard downloadedPlayback.permitsInitialMount(revalidated: revalidated) else {
+                    exitPlayerFullScreenIfNeeded()
+                    onClose()
                     return
                 }
                 downloadMountAdmitted = true

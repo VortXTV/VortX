@@ -127,18 +127,32 @@ final class PlayerPresenter: ObservableObject {
         _ candidate: AppleDownloadedPlayback, core: CoreBridge,
         replacing expectedRequestID: UUID? = nil,
         displayedResume: Double? = nil,
+        requiresConfirmedOffline: Bool = false,
         onUnavailable: (@MainActor () -> Void)? = nil,
         stillCurrent: @escaping @MainActor () -> Bool = { true }
     ) {
         guard request?.id == expectedRequestID, stillCurrent() else { return }
+        if requiresConfirmedOffline, !ConnectivityMonitor.shared.hasConfirmedOfflinePath {
+            onUnavailable?()
+            return
+        }
         let presentation = requestGeneration
         Task { @MainActor in
-            let prepared = await candidate.prepareForPlayback(core: core, displayedResume: displayedResume,
-                                                               refreshSeasonBoundary: expectedRequestID == nil)
+            let prepared = await candidate.prepareForPlayback(
+                core: core, displayedResume: displayedResume,
+                refreshSeasonBoundary: expectedRequestID == nil && !requiresConfirmedOffline
+            )
             guard !Task.isCancelled, requestGeneration == presentation,
                   request?.id == expectedRequestID, stillCurrent() else { return }
-            if let prepared {
-                request = .downloaded(prepared.copy, resume: prepared.resume)
+            if requiresConfirmedOffline, !ConnectivityMonitor.shared.hasConfirmedOfflinePath {
+                onUnavailable?()
+                return
+            }
+            if let prepared, !requiresConfirmedOffline
+                || (prepared.copy.record == candidate.record && prepared.copy.url == candidate.url) {
+                let copy = requiresConfirmedOffline
+                    ? prepared.copy.requiringConfirmedOfflineAtInitialMount() : prepared.copy
+                request = .downloaded(copy, resume: prepared.resume)
             } else if let expectedRequestID {
                 close(requestID: expectedRequestID)
             } else {

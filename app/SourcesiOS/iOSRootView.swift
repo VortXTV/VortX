@@ -2445,6 +2445,15 @@ struct iOSHomeView: View {
                 core: core,
                 account: account,
                 expectedTraktSession: provenance.traktSessionID,
+                isCurrentLocalDownloadTarget: { target in
+                    guard provenance.source == .local else { return false }
+                    let rendered = continueWatchingRenderSnapshot
+                    let localItems = core.usesNativeProfileState || profiles.activeUsesEngineHistory
+                        ? core.continueWatching : profiles.cwItems
+                    return rendered.provenance.intent == provenance.intent
+                        && rendered.items.contains { $0.offlineDownloadTarget == target }
+                        && localItems.contains { DownloadedContinueWatchingTarget(item: $0) == target }
+                },
                 stillCurrent: stillCurrent
             )
             guard stillCurrent() else { return }
@@ -3192,8 +3201,15 @@ struct iOSLibraryView: View {
         }
         Task { @MainActor in
             guard stillCurrent() else { return }
-            let launch = await iOSDirectResume(for: item, core: core, account: account,
-                                               expectedTraktSession: nil, stillCurrent: stillCurrent)
+            let launch = await iOSDirectResume(
+                for: item, core: core, account: account, expectedTraktSession: nil,
+                isCurrentLocalDownloadTarget: { target in
+                    let localItems = core.usesNativeProfileState || profiles.activeUsesEngineHistory
+                        ? core.continueWatching : profiles.cwItems
+                    return localItems.contains { DownloadedContinueWatchingTarget(item: $0) == target }
+                },
+                stillCurrent: stillCurrent
+            )
             guard stillCurrent() else { return }
             continueWatchingRequestID = nil
             if let launch {
@@ -4899,6 +4915,11 @@ struct RailItem: Identifiable {
     /// The saved resume position in seconds, so a Continue Watching card can show the "1:03" resume
     /// timecode badge. Nil on every non-CW rail, so their cards are byte-for-byte unchanged.
     var resumeSeconds: Double? = nil
+
+    var offlineDownloadTarget: DownloadedContinueWatchingTarget? {
+        DownloadedContinueWatchingTarget(libraryID: id, type: type, cardVideoID: cwVideoId,
+                                         resumeSeconds: resumeSeconds, progress: progress, isUpNext: cwUpNext)
+    }
 }
 
 /// Reuses only metadata the current UI has already received. History membership, artwork identity, and
@@ -5079,6 +5100,7 @@ extension View {
 private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                              account: StremioAccount,
                              expectedTraktSession: TraktSessionID?,
+                             isCurrentLocalDownloadTarget: @MainActor (DownloadedContinueWatchingTarget) -> Bool,
                              stillCurrent: @MainActor () -> Bool) async -> iOSPlayerLaunch? {
     guard stillCurrent(), expectedTraktSession == nil
             || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
@@ -5088,10 +5110,30 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     if item.cwUpNext {
         LastStreamStore.logResume("upNext", libraryId: item.id, profileID: pid); return nil
     }
-    guard let entry = LastStreamStore.entry(for: item.id, profileID: pid) else {
+    let remembered = LastStreamStore.entry(for: item.id, profileID: pid)
+    let rememberedURL = remembered.flatMap { URL(string: $0.url) }
+    if expectedTraktSession == nil, ConnectivityMonitor.shared.hasConfirmedOfflinePath,
+       remembered == nil || rememberedURL?.isFileURL == false,
+       let target = item.offlineDownloadTarget, isCurrentLocalDownloadTarget(target) {
+        guard let candidate = DownloadStore.shared.offlineContinueWatchingDownload(for: target) else { return nil }
+        let prepared = await candidate.prepareForPlayback(
+            core: core, displayedResume: target.resumeSeconds, refreshSeasonBoundary: false
+        )
+        guard stillCurrent(), ProfileStore.shared.activeID == pid,
+              account.credentialBoundaryGeneration == accountBoundary,
+              candidate.ownsCurrentContext(core: core),
+              LastStreamStore.entry(for: item.id, profileID: pid) == remembered,
+              isCurrentLocalDownloadTarget(target) else { return nil }
+        if ConnectivityMonitor.shared.hasConfirmedOfflinePath {
+            guard let prepared, prepared.copy.record == candidate.record,
+                  prepared.copy.url == candidate.url else { return nil }
+            return .downloaded(prepared.copy.requiringConfirmedOfflineAtInitialMount(), resume: prepared.resume)
+        }
+    }
+    guard let entry = remembered else {
         LastStreamStore.logResume("noEntry", libraryId: item.id, profileID: pid); return nil
     }
-    guard let url = URL(string: entry.url) else {
+    guard let url = rememberedURL else {
         LastStreamStore.logResume("badURL", libraryId: item.id, profileID: pid); return nil
     }
     if url.isFileURL {
