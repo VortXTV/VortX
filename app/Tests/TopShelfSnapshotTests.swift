@@ -499,6 +499,26 @@ do {
           "valid empty is explicitly empty, never invalid or unavailable")
     check(TopShelfSnapshot.writeResult([], to: diagnosticFile) == .unchanged && !TopShelfSnapshot.write([], to: diagnosticFile),
           "repeated explicit empty preserves the original no-change Bool")
+
+    section("Top Shelf refreshes once when a process inherits its snapshot")
+    var notification = TopShelfSnapshot.ContentNotification()
+    for failure in [TopShelfSnapshot.WriteResult.noContainer, .invalidDestination, .encodingFailed, .writeFailed] {
+        check(!notification.shouldNotify(after: failure), "\(failure) does not notify tvOS")
+    }
+    check(TopShelfSnapshot.writeResult(eight, to: diagnosticFile) == .written, "seed a previous launch's snapshot")
+    let retainedBytes = try Data(contentsOf: diagnosticFile)
+    let retainedResult = TopShelfSnapshot.writeResult(eight, to: diagnosticFile)
+    check(retainedResult == .unchanged, "first publication sees the same valid rows")
+    check(notification.shouldNotify(after: retainedResult),
+          "a retained current snapshot refreshes the system on first publication")
+    check(try Data(contentsOf: diagnosticFile) == retainedBytes, "first refresh preserves the retained bytes")
+    check(!notification.shouldNotify(after: TopShelfSnapshot.writeResult(eight, to: diagnosticFile)),
+          "unchanged Home refreshes do not wake the extension repeatedly")
+    check(notification.shouldNotify(after: TopShelfSnapshot.writeResult([], to: diagnosticFile)),
+          "a later clear refreshes the system")
+    var coldNotification = TopShelfSnapshot.ContentNotification()
+    check(coldNotification.shouldNotify(after: .written), "a fresh successful write refreshes the system")
+    check(!coldNotification.shouldNotify(after: .unchanged), "a fresh write consumes the first-publication refresh")
 } catch {
     check(false, "disposable snapshot fixture failed: \(error)")
 }

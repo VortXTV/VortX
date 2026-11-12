@@ -560,6 +560,18 @@ enum TopShelfSnapshot {
         case written, unchanged, noContainer, invalidDestination, encodingFailed, writeFailed
     }
 
+    struct ContentNotification {
+        private var didNotify = false
+
+        mutating func shouldNotify(after result: WriteResult) -> Bool {
+            // On the first usable publication, tvOS may still hold a display from before app launch
+            // or an update, even when the retained snapshot already matches the current profile.
+            guard result == .written || (result == .unchanged && !didNotify) else { return false }
+            didNotify = true
+            return true
+        }
+    }
+
     /// Outcomes come from the actual operation. The compatibility Bool remains true ONLY for
     /// a changed successful write; unchanged content is not diagnosed as a failure.
     static func writeResult(_ items: [Item]) -> WriteResult {

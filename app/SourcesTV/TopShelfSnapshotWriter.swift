@@ -33,7 +33,8 @@ enum TopShelfSnapshotWriter {
     @MainActor private static var lastPrivateArtworkInputs: [WarmCandidate]?
     @MainActor private static var lastPrivatePublished: [TopShelfSnapshot.Item]?
     @MainActor private static var lastPublishedSelectionSource: TraktPlaybackShadow.ContinueWatchingSource?
-    // At most five added lines per app process. Existing successful-publication logging remains.
+    @MainActor private static var contentNotification = TopShelfSnapshot.ContentNotification()
+    // Record each write status and the resolved group class once per process.
     @MainActor private static var reportedWriteResults: Set<TopShelfSnapshot.WriteResult> = []
     @MainActor private static var reportedGroupSource = false
 
@@ -93,8 +94,8 @@ enum TopShelfSnapshotWriter {
     /// Rebuild and publish the shelf from the CURRENT engine + profile state.
     ///
     /// Main-actor because it reads `@Published` state off `CoreBridge` / `ProfileStore`. Cheap and
-    /// idempotent: it caps at 8 items, and the store's own content diff means an unchanged Home
-    /// refresh writes nothing and wakes nothing. Safe to call from every Home re-seed.
+    /// idempotent: it caps at 8 items, and unchanged Home refreshes keep the retained bytes.
+    /// Only the first publication may ask tvOS to reload those bytes. Safe on every Home re-seed.
     @MainActor
     static func publishCurrent() {
         installAuthBoundaryObserver()
@@ -490,10 +491,12 @@ enum TopShelfSnapshotWriter {
             reportedGroupSource = true
             DiagnosticsLog.log("topshelf", "group=\(TopShelfSnapshot.appGroupSource.rawValue)")
         }
-        guard result == .written else { return }
-        // Only nudge the system when the content actually moved: this wakes the extension, so firing
-        // it on every unchanged Home re-seed would be pure churn.
+        guard contentNotification.shouldNotify(after: result) else { return }
         TVTopShelfContentProvider.topShelfContentDidChange()
+        if result == .unchanged {
+            DiagnosticsLog.log("topshelf", "refresh requested for retained snapshot")
+            return
+        }
         // Overflow may compact/drop unrepresentable cache rows. Do not report the input count
         // as the number actually written, and do not re-read the file just for logging.
         DiagnosticsLog.log("topshelf", "published snapshot")
