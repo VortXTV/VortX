@@ -1,13 +1,23 @@
 package com.vortx.android.tv
 
 import android.content.Context
+import android.media.tv.TvContract.BaseTvColumns.COLUMN_PACKAGE_NAME
+import android.media.tv.TvContract.WatchNextPrograms.COLUMN_INTERNAL_PROVIDER_ID
 import android.net.Uri
+import android.provider.BaseColumns._ID
+import android.util.AtomicFile
 import androidx.tvprovider.media.tv.TvContractCompat
 import androidx.tvprovider.media.tv.WatchNextProgram
 import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.data.ContinueWatchingSnapshot
 import com.vortx.android.home.continueWatchingOwnerIsKnown
 import com.vortx.android.model.MediaType
+import java.io.DataInputStream
+import java.io.File
+import java.io.FileNotFoundException
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.security.SecureRandom
 
 internal data class WatchNextPublication(
     val owner: ContinueWatchingOwner,
@@ -33,22 +43,15 @@ internal fun watchNextPublication(
  * system TvProvider; clicking one fires the app's own `vortx://open` deep link (TV-1), which resumes the
  * title.
  *
- * FAIL-SOFT IS THE WHOLE CONTRACT. Every ContentResolver call is wrapped: on a phone (no system TvProvider),
- * on a locked-down device, or on any provider error, publishing degrades to a no-op and never crashes the
- * caller. It is safe to call from any device; the caller does not gate on "is this a TV".
- *
- * RECONCILE, NOT APPEND. Each [publish] computes the desired row set (capped at [MAX_ROWS], newest first),
- * upserts each by its stable [internalId], and DELETES any row this app previously owned that is no longer in
- * the set. Turning the setting off, or an empty Continue Watching list, clears every owned row. Rows authored
- * by anything other than this app (a different `internalProviderId` prefix) are never touched.
+ * Provider errors leave the in-app history untouched. The publisher owns only its own package's
+ * namespaced rows. A durable owner stamp lets account changes retire old rows before native opens,
+ * and lets an exact native mount retire rows for a prior profile or account binding before reading CW.
  */
 object WatchNextPublisher {
-
     private const val MAX_ROWS = 8
+    private const val KEY_BYTES = 32
     private val mutationLock = Any()
-
-    /** The `internalProviderId` namespace for the rows this app owns, so reconcile never touches foreign rows. */
-    private const val INTERNAL_ID_PREFIX = "vortx-cw:"
+    private var preparedOwner: WatchNextOwnerStamp? = null
 
     /** One Continue Watching entry to mirror onto the Play Next row. */
     data class Item(
@@ -60,39 +63,97 @@ object WatchNextPublisher {
         val progress: Float?,
     )
 
-    /**
-     * Reconcile on a worker. Query before entering the owner fence, then admit each provider write
-     * independently. A profile change during a slow query cannot authorize that query's old rows.
-     */
-    internal fun publish(context: Context, items: List<Item>, admit: (() -> Boolean) -> Boolean): Boolean =
+    /** Account truth is sufficient only for a recognized, same-installation account stamp. */
+    internal fun retireOtherAccounts(
+        context: Context, accountId: String, admit: (() -> Boolean) -> Boolean,
+    ): Boolean = synchronized(mutationLock) {
         runCatching {
-            fun mutate(write: () -> Boolean): Boolean = synchronized(mutationLock) {
-                TopShelfSettings.showContinueWatching(context) && admit(write)
-            }
-            if (!TopShelfSettings.showContinueWatching(context)) return false
-            val desired = items
-                .filter { it.id.isNotBlank() && (it.type == MediaType.MOVIE || it.type == MediaType.SERIES) }
-                .distinctBy(::internalId)
-                .take(MAX_ROWS)
-            val owned = synchronized(mutationLock) { ownedRows(context) } ?: return false
-            val desiredIds = desired.mapTo(HashSet(), ::internalId)
-            owned.forEach { (providerId, rowId) ->
-                if (providerId !in desiredIds && !mutate { deleteRow(context, rowId) }) return false
-            }
-            // Decreasing engagement time preserves the incoming order (most-recent first) on the home row.
-            val now = System.currentTimeMillis()
-            desired.forEachIndexed { index, item ->
-                if (!mutate { upsert(context, item, owned[internalId(item)], engagementTime = now - index) }) return false
+            val key = readKey(context) ?: return@synchronized true
+            val account = try { WatchNextRowIdentity.account(key, accountId) } finally { key.fill(0) }
+            val rows = ownedRows(context) ?: return@synchronized false
+            for (row in rows) {
+                if (WatchNextRowIdentity.belongsToOtherAccount(row.providerId, account) &&
+                    !admit { deleteRow(context, row.id) }
+                ) return@synchronized false
             }
             true
         }.getOrDefault(false)
+    }
+
+    /**
+     * Prune before reading Continue Watching. Without a readable key, a completed mount may retire
+     * unbound rows, but an unreadable key is never overwritten. Creation follows confirmed absence.
+     */
+    internal fun prepareMountedOwner(
+        context: Context, identity: WatchNextOwnerIdentity, admit: (() -> Boolean) -> Boolean,
+    ): WatchNextOwnerStamp? = synchronized(mutationLock) {
+        runCatching {
+            if (!TopShelfSettings.showContinueWatching(context)) return@synchronized null
+            val stored = runCatching { readKey(context) }
+            val key = stored.getOrNull()
+            var owner = key?.let {
+                try { WatchNextRowIdentity.owner(it, identity) } finally { it.fill(0) }
+            }
+            if (owner != null && preparedOwner == owner) return@synchronized owner
+            val rows = ownedRows(context) ?: return@synchronized null
+            for (row in rows) {
+                if (WatchNextRowIdentity.belongsOutsideMount(row.providerId, owner) &&
+                    !admit { deleteRow(context, row.id) }
+                ) return@synchronized null
+            }
+            if (owner == null) {
+                if (stored.isFailure || !admit {
+                        val created = createKey(context)
+                        owner = try { WatchNextRowIdentity.owner(created, identity) } finally { created.fill(0) }
+                        true
+                    }
+                ) return@synchronized null
+            }
+            preparedOwner = owner
+            owner
+        }.getOrNull()
+    }
+
+    /** Query before entering owner fences, then admit each provider write independently. */
+    internal fun publish(
+        context: Context, owner: WatchNextOwnerStamp, items: List<Item>, admit: (() -> Boolean) -> Boolean,
+    ): Boolean = synchronized(mutationLock) {
+        runCatching {
+            fun mutate(write: () -> Boolean): Boolean = TopShelfSettings.showContinueWatching(context) && admit(write)
+            fun providerId(item: Item): String = WatchNextRowIdentity.providerId(owner, item.type.id, item.id)
+            if (!TopShelfSettings.showContinueWatching(context)) return@synchronized false
+            val desired = items
+                .filter { it.id.isNotBlank() && (it.type == MediaType.MOVIE || it.type == MediaType.SERIES) }
+                .distinctBy(::providerId)
+                .take(MAX_ROWS)
+            val owned = ownedRows(context) ?: return@synchronized false
+            val desiredIds = desired.mapTo(HashSet(), ::providerId)
+            val existing = HashMap<String, Long>()
+            for (row in owned) {
+                val remove = WatchNextRowIdentity.belongsOutsideMount(row.providerId, owner) ||
+                    (row.providerId in desiredIds && existing.putIfAbsent(row.providerId, row.id) != null) ||
+                    (WatchNextRowIdentity.belongsToMount(row.providerId, owner) && row.providerId !in desiredIds)
+                if (remove && !mutate { deleteRow(context, row.id) }) return@synchronized false
+            }
+            // Decreasing engagement time preserves the incoming order (most-recent first).
+            val now = System.currentTimeMillis()
+            desired.forEachIndexed { index, item ->
+                val id = providerId(item)
+                if (!mutate { upsert(context, item, id, existing[id], engagementTime = now - index) }) {
+                    return@synchronized false
+                }
+            }
+            true
+        }.getOrDefault(false)
+    }
 
     /** Remove app-owned rows for an explicit opt-out, even when account storage is unavailable. */
     internal fun clearWhenDisabled(context: Context) {
         synchronized(mutationLock) {
             runCatching {
                 if (!TopShelfSettings.showContinueWatching(context)) {
-                    ownedRows(context)?.values?.forEach { runCatching { deleteRow(context, it) } }
+                    preparedOwner = null
+                    ownedRows(context)?.forEach { runCatching { deleteRow(context, it.id) } }
                 }
             }
         }
@@ -102,11 +163,12 @@ object WatchNextPublisher {
     internal fun clearAfterSignOut(context: Context, admit: (() -> Boolean) -> Boolean) {
         runCatching {
             val owned = synchronized(mutationLock) { ownedRows(context) } ?: return
-            for (rowId in owned.values) {
+            for (row in owned) {
                 val current = synchronized(mutationLock) {
                     admit {
                         // One failed row must not prevent retirement of other old-owner rows.
-                        runCatching { deleteRow(context, rowId) }
+                        preparedOwner = null
+                        runCatching { deleteRow(context, row.id) }
                         true
                     }
                 }
@@ -117,35 +179,80 @@ object WatchNextPublisher {
 
     // ---- internals ----
 
-    private fun internalId(item: Item): String = "$INTERNAL_ID_PREFIX${item.type.id}:${item.id}"
-
     private fun deepLink(item: Item): String =
         "vortx://open?type=${item.type.id}&id=${Uri.encode(item.id)}"
 
-    /** internalProviderId -> WatchNext row id, for the rows this app authored. */
-    private fun ownedRows(context: Context): Map<String, Long>? {
-        val out = LinkedHashMap<String, Long>()
-        context.contentResolver.query(
-            TvContractCompat.WatchNextPrograms.CONTENT_URI,
-            WatchNextProgram.PROJECTION,
-            null,
-            null,
-            null,
-        )?.use { cursor ->
-            if (cursor.moveToFirst()) {
-                do {
-                    val program = WatchNextProgram.fromCursor(cursor)
-                    val providerId = program.internalProviderId
-                    if (providerId != null && providerId.startsWith(INTERNAL_ID_PREFIX)) {
-                        out[providerId] = program.id
-                    }
-                } while (cursor.moveToNext())
+    private data class OwnedRow(val providerId: String, val id: Long)
+
+    private fun ownedRows(context: Context): List<OwnedRow>? {
+        val columns = arrayOf(_ID, COLUMN_PACKAGE_NAME, COLUMN_INTERNAL_PROVIDER_ID)
+        return context.contentResolver.query(TvContractCompat.WatchNextPrograms.CONTENT_URI, columns,
+            null, null, null)?.use { cursor ->
+            val rowId = cursor.getColumnIndexOrThrow(_ID)
+            val rowPackage = cursor.getColumnIndexOrThrow(COLUMN_PACKAGE_NAME)
+            val rowProviderId = cursor.getColumnIndexOrThrow(COLUMN_INTERNAL_PROVIDER_ID)
+            buildList {
+                while (cursor.moveToNext()) {
+                    val id = cursor.getString(rowProviderId)
+                    if (cursor.getString(rowPackage) == context.packageName && id != null &&
+                        id.startsWith(WatchNextRowIdentity.PREFIX) && !cursor.isNull(rowId)
+                    ) add(OwnedRow(id, cursor.getLong(rowId)))
+                }
             }
-        } ?: return null
-        return out
+        }
     }
 
-    private fun upsert(context: Context, item: Item, existingRowId: Long?, engagementTime: Long): Boolean {
+    private fun keyFile(context: Context) = AtomicFile(File(context.noBackupFilesDir, "watch-next-owner-key-v1"))
+
+    /** An inaccessible file is not absent. AtomicFile may recover its committed .bak on open. */
+    private fun readKey(context: Context): ByteArray? {
+        val file = keyFile(context)
+        return try {
+            file.openRead().use { input ->
+                val key = ByteArray(KEY_BYTES)
+                try {
+                    DataInputStream(input).readFully(key)
+                    check(input.read() == -1) { "Invalid Play Next owner key" }
+                    key
+                } catch (error: Exception) {
+                    key.fill(0)
+                    throw error
+                }
+            }
+        } catch (error: FileNotFoundException) {
+            if (!Files.notExists(file.baseFile.toPath(), LinkOption.NOFOLLOW_LINKS) ||
+                !Files.notExists(File(file.baseFile.path + ".bak").toPath(), LinkOption.NOFOLLOW_LINKS)
+            ) throw error
+            null
+        }
+    }
+
+    private fun createKey(context: Context): ByteArray {
+        val file = keyFile(context)
+        val key = ByteArray(KEY_BYTES).also(SecureRandom()::nextBytes)
+        try {
+            val output = file.startWrite()
+            try {
+                output.write(key)
+                file.finishWrite(output)
+            } catch (error: Exception) {
+                file.failWrite(output)
+                throw error
+            }
+            val observed = checkNotNull(readKey(context))
+            if (!observed.contentEquals(key)) {
+                observed.fill(0)
+                error("Play Next owner key could not be verified")
+            }
+            return observed
+        } finally {
+            key.fill(0)
+        }
+    }
+
+    private fun upsert(
+        context: Context, item: Item, providerId: String, existingRowId: Long?, engagementTime: Long,
+    ): Boolean {
         val builder = WatchNextProgram.Builder()
             .setType(
                 if (item.type == MediaType.MOVIE) {
@@ -156,7 +263,7 @@ object WatchNextPublisher {
             )
             .setWatchNextType(TvContractCompat.WatchNextPrograms.WATCH_NEXT_TYPE_CONTINUE)
             .setTitle(item.title.ifBlank { "Continue watching" })
-            .setInternalProviderId(internalId(item))
+            .setInternalProviderId(providerId)
             .setIntentUri(Uri.parse(deepLink(item)))
             .setLastEngagementTimeUtcMillis(engagementTime)
 

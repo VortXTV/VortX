@@ -128,7 +128,22 @@ class ProfileSelectionWiringTest {
             assertTrue(workerSource.indexOf("app.awaitAccountSyncStartup()") in
                 0 until workerSource.indexOf("captureEpisodeNotificationOwner(app)"))
         }
+        val watchNext = app.substringAfter("private fun retireWatchNextOtherAccounts").substringBefore("private val xperienceCatalogDelegate")
+        assertTrue(watchNext.contains("manager.sessionOwnerSnapshot() == owner && delete()"))
+        val completedMount = watchNext.indexOf("nativeAccounts.withCompletedPickerMount(session, account)")
+        assertTrue(completedMount >= 0 && watchNext.indexOf("PlaybackOwnerEpoch.isCurrent(epoch) && write()") > completedMount)
+        val coordinator = source("engine/NativeAccountCoordinator.kt").substringAfter("internal fun withCompletedPickerMount(")
+            .substringBefore("override fun retire()")
+        val lifecycleFence = coordinator.indexOf("withMountedSession(session, account)")
+        assertTrue(lifecycleFence >= 0 && coordinator.indexOf("isPickerMountCurrent(session, account) && action()") > lifecycleFence)
+        assertTrue(watchNext.contains("binding.matches(NativeAccountBinding.read(current.state, native.profileID))"))
+
+        val publisher = source("tv/WatchNextPublisher.kt")
+        assertTrue(publisher.contains("cursor.getString(rowPackage) == context.packageName"))
         val tv = source("ui/tv/TvActivity.kt").substringAfter("repeatOnLifecycle(Lifecycle.State.STARTED)")
+        val retire = tv.indexOf("WatchNextPublisher.prepareMountedOwner(")
+        val read = tv.indexOf("repo.continueWatchingSnapshot(mount.owner)")
+        assertTrue(retire >= 0 && read > retire && tv.indexOf("WatchNextPublisher.publish(") > read)
         val wait = tv.indexOf("app.awaitAccountSyncStartup()")
         assertTrue(tv.indexOf("app.clearWatchNextIfDisabled()") in 0 until wait)
         assertTrue(wait in 0 until tv.indexOf("val repo = app.catalogRepository"))

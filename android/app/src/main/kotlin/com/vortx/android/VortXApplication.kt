@@ -41,6 +41,7 @@ import com.vortx.android.diagnostics.CrashReporter
 import com.vortx.android.engine.NativeCatalogRepository
 import com.vortx.android.engine.AndroidNativePlaybackResolver
 import com.vortx.android.engine.NativeAccountCoordinator
+import com.vortx.android.engine.NativeAccountBinding
 import com.vortx.android.engine.runNativeRetirementAttempt
 import com.vortx.android.engine.NativeProfileAccess
 import com.vortx.android.engine.VortxAccountScope
@@ -67,6 +68,7 @@ import com.vortx.android.sync.AccountSyncForeground
 import com.vortx.android.sync.ApplicationAccountFileRestoreExclusion
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.sync.SessionOwnerSnapshot
+import com.vortx.android.tv.WatchNextOwnerIdentity
 import com.vortx.android.tv.WatchNextPublisher
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -171,32 +173,62 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
 
     /** IO only. Unavailable encrypted state is never allowed to retire launcher rows. */
     private fun retireWatchNextAfterSignOut(manager: VortXSyncManager, owner: SessionOwnerSnapshot.SignedOutLocal) {
-        if (!runCatching { packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) }.getOrDefault(false)) return
+        if (!hasWatchNextLauncher()) return
         val admit = manager.captureLocalLibraryMutationAdmission() ?: return
         WatchNextPublisher.clearAfterSignOut(this) { delete ->
             admit { syncManager === manager && manager.sessionOwnerSnapshot() == owner && delete() }
         }
     }
 
-    /** Admit one launcher provider mutation under the actual session, account and mount fences. */
-    internal fun publishWatchNextIfCurrent(
-        expected: ContinueWatchingOwner,
-        epoch: PlaybackOwnerToken,
-        publication: () -> Boolean,
-    ): Boolean = runCatching {
+    private fun hasWatchNextLauncher(): Boolean =
+        runCatching { packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) }.getOrDefault(false)
+
+    /** Retire attributable old-account rows without waiting for the next native mount. */
+    private fun retireWatchNextOtherAccounts(manager: VortXSyncManager, owner: SessionOwnerSnapshot.Account): Boolean {
+        if (!hasWatchNextLauncher()) return true
+        val admit = manager.captureLocalLibraryMutationAdmission() ?: return false
+        return WatchNextPublisher.retireOtherAccounts(this, owner.id) { delete ->
+            admit { syncManager === manager && manager.sessionOwnerSnapshot() == owner && delete() }
+        }
+    }
+
+    internal class WatchNextMount(
+        val owner: ContinueWatchingOwner,
+        val identity: WatchNextOwnerIdentity,
+        val admit: (() -> Boolean) -> Boolean,
+    )
+
+    /** Capture the one exact Session, authenticated account, native binding and playback epoch. */
+    internal fun captureWatchNextMount(epoch: PlaybackOwnerToken): WatchNextMount? = runCatching {
         val session = nativeAccounts.session()
         session.withCurrentRead { read ->
-            val owner = read.owner
-            if (!expected.usesEngineHistory || expected.profileId != owner.profileID ||
-                expected.accountSlot != owner.scope.digest || expected.principal != owner.scope.accountID ||
-                expected.revision != owner.revision
-            ) return@withCurrentRead false
-            val account = nativeAccounts.accountFor(session) ?: return@withCurrentRead false
-            nativeAccounts.withProfileMutation(session, account) {
-                PlaybackOwnerEpoch.isCurrent(epoch) && publication()
+            val native = read.owner
+            val manager = syncManager ?: return@withCurrentRead null
+            val account = nativeAccounts.accountFor(session) ?: return@withCurrentRead null
+            val accountAdmission = manager.captureLocalLibraryMutationAdmission() ?: return@withCurrentRead null
+            fun admitCurrentMount(write: () -> Boolean): Boolean = accountAdmission {
+                syncManager === manager && manager.sessionOwnerSnapshot() == account &&
+                    nativeAccounts.withCompletedPickerMount(session, account) {
+                        PlaybackOwnerEpoch.isCurrent(epoch) && write()
+                    }
+            }
+            if (!admitCurrentMount { true }) return@withCurrentRead null
+            val binding = NativeAccountBinding.read(read.state, native.profileID)
+            val scope = native.scope.digest
+            val identity = WatchNextOwnerIdentity(account.id, scope, native.profileID, binding.kind,
+                binding.json().getJSONObject("account").opt("value") as? String, binding.revision, binding.transactionID)
+            val owner = ContinueWatchingOwner(native.profileID, scope, native.scope.accountID, true, native.revision)
+            WatchNextMount(owner, identity) { write ->
+                runCatching {
+                    session.withCurrentRead { current ->
+                        current.owner == native && binding.matches(NativeAccountBinding.read(current.state, native.profileID)) &&
+                            admitCurrentMount(write)
+                    }
+                }.getOrDefault(false)
             }
         }
-    }.getOrDefault(false)
+    }.getOrNull()
+
     private val xperienceCatalogDelegate = lazy {
         com.vortx.android.engine.NativeXperienceCatalogAccess(nativeAccounts, nativeRepository, applicationScope)
     }
@@ -446,12 +478,19 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         applicationScope.launch {
             var observed: SessionOwnerSnapshot? = confirmedOwner
             var recoveredDownloadOwner: SessionOwnerSnapshot? = null
+            var checkedWatchNextAccount: SessionOwnerSnapshot.Account? = null
             manager.sessionUiState.combine(manager.pickerAccountRevision) { state, _ ->
                 state
             }.collect { state ->
                 if (syncManager !== manager) return@collect
                 val current = runCatching { manager.sessionOwnerSnapshot() }.getOrNull()
                 if (current is SessionOwnerSnapshot.SignedOutLocal) retireWatchNextAfterSignOut(manager, current)
+                val watchNextAccount = current as? SessionOwnerSnapshot.Account
+                if (watchNextAccount == null) {
+                    checkedWatchNextAccount = null
+                } else if (watchNextAccount != checkedWatchNextAccount && retireWatchNextOtherAccounts(manager, watchNextAccount)) {
+                    checkedWatchNextAccount = watchNextAccount
+                }
                 if (current != observed || state !is VortXSyncManager.SessionUiState.SignedIn) {
                     com.vortx.android.singularity.SourceIndexLifecycle.invalidateDeferred()
                 }

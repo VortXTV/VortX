@@ -979,6 +979,13 @@ internal class NativeAccountCoordinator(
     internal fun withMountedSession(session: VortxNativeSession, account: SessionOwnerSnapshot.Account, action: () -> Boolean): Boolean = synchronized(lifecycleLock) {
         if (mounted.get()?.let { it.session === session && it.account == account } == true) action() else false
     }
+    /** Complete roster publication is required before a launcher row or installation key can change. */
+    internal fun withCompletedPickerMount(
+        session: VortxNativeSession, account: SessionOwnerSnapshot.Account, action: () -> Boolean,
+    ): Boolean = withMountedSession(session, account) {
+        isPickerMountCurrent(session, account) && action()
+    }
+
     override fun retire() {
         val old = synchronized(lifecycleLock) {
             restoreNativeExclusion?.revoked = true

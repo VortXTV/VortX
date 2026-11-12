@@ -14,10 +14,10 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.vortx.android.VortXApplication
 import com.vortx.android.deeplink.ActivityDeepLinkDelivery
-import com.vortx.android.home.continueWatchingOwnerIsKnown
 import com.vortx.android.player.PlaybackOwnerEpoch
 import com.vortx.android.player.PlaybackOwnerToken
 import com.vortx.android.tv.TopShelfSettings
+import com.vortx.android.tv.WatchNextOwnerStamp
 import com.vortx.android.tv.WatchNextPublication
 import com.vortx.android.tv.WatchNextPublisher
 import com.vortx.android.tv.watchNextPublication
@@ -89,20 +89,20 @@ class TvActivity : ComponentActivity() {
                         }
                         app.awaitAccountSyncStartup()
                         val repo = app.catalogRepository
-                        var published: Pair<PlaybackOwnerToken, WatchNextPublication>? = null
+                        var published: Triple<PlaybackOwnerToken, WatchNextOwnerStamp, WatchNextPublication>? = null
                         repo.ctxUpdates().onStart { emit(Unit) }.flowOn(Dispatchers.IO).conflate().collect {
                             val previous = published
                             published = withContext(Dispatchers.IO) {
                                 val epoch = PlaybackOwnerEpoch.capture() ?: return@withContext null
-                                val owner = repo.continueWatchingOwner()
-                                if (!continueWatchingOwnerIsKnown(owner, owner.profileId)) return@withContext null
-                                val candidate = watchNextPublication(owner, repo.continueWatchingSnapshot(owner))
+                                val mount = app.captureWatchNextMount(epoch) ?: return@withContext null
+                                val admit: (() -> Boolean) -> Boolean = { write -> mount.admit { isActive && write() } }
+                                val stamp = WatchNextPublisher.prepareMountedOwner(applicationContext, mount.identity, admit)
                                     ?: return@withContext null
-                                val projection = epoch to candidate
+                                val candidate = watchNextPublication(mount.owner, repo.continueWatchingSnapshot(mount.owner))
+                                    ?: return@withContext null
+                                val projection = Triple(epoch, stamp, candidate)
                                 if (projection == previous) return@withContext previous
-                                val success = WatchNextPublisher.publish(applicationContext, candidate.items) { write ->
-                                    app.publishWatchNextIfCurrent(candidate.owner, epoch) { isActive && write() }
-                                }
+                                val success = WatchNextPublisher.publish(applicationContext, stamp, candidate.items, admit)
                                 projection.takeIf { success }
                             }
                         }
