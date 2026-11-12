@@ -5047,7 +5047,7 @@ extension View {
                     guard launch.wrappedValue?.id == item.id else { return }
                     core.unloadEnginePlayer()
                     Task { @MainActor in
-                        let prepared = await candidate.prepareForPlayback(core: core)
+                        let prepared = await candidate.prepareForPlayback(core: core, refreshSeasonBoundary: false)
                         guard launch.wrappedValue?.id == item.id else { return }
                         guard let prepared else {
                             onFailure()

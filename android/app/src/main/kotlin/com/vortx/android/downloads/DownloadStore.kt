@@ -182,13 +182,7 @@ object DownloadStore {
 
     fun upsert(record: DownloadRecord) {
         hydrationGate.withLock {
-            val current = _records.value
-            val index = current.indexOfFirst { it.id == record.id }
-            _records.value = if (index >= 0) {
-                current.toMutableList().also { it[index] = record }
-            } else {
-                listOf(record) + current
-            }
+            _records.value = downloadIndexAfterUpsert(_records.value, record)
             persistLocked()
         }
     }
@@ -473,6 +467,7 @@ object DownloadStore {
         record.errorText?.let { put("errorText", it) }
         record.retryNote?.let { put("retryNote", it) }
         record.taskIdentifier?.let { put("taskIdentifier", it) }
+        record.seasonBoundary?.let { put("seasonBoundary", it.toJson()) }
     }
 
     internal fun recordFromJson(json: JSONObject): DownloadRecord? {
@@ -518,6 +513,7 @@ object DownloadStore {
             errorText = json.optStringOrNull("errorText"),
             retryNote = json.optStringOrNull("retryNote"),
             taskIdentifier = if (json.has("taskIdentifier")) json.optInt("taskIdentifier") else null,
+            seasonBoundary = DownloadedSeasonBoundary.read(json.optJSONObject("seasonBoundary")),
         )
     }
 
@@ -576,6 +572,24 @@ object DownloadStore {
 
     private fun JSONObject.optBooleanOrNull(key: String): Boolean? =
         if (has(key) && !isNull(key)) optBoolean(key) else null
+}
+
+/** Publish the later episode and any exact earlier-finale revocation in one index snapshot. */
+internal fun downloadIndexAfterUpsert(current: List<DownloadRecord>, record: DownloadRecord): List<DownloadRecord> {
+    val index = current.indexOfFirst { it.id == record.id }
+    val next = if (index >= 0) {
+        current.toMutableList().also { it[index] = record }
+    } else {
+        listOf(record) + current
+    }
+    return next.map { origin ->
+        val boundary = origin.seasonBoundary
+        if (boundary != null && boundary.matchesOrigin(origin) && boundary.isDisprovedByLaterEpisode(record)) {
+            origin.copy(seasonBoundary = null)
+        } else {
+            origin
+        }
+    }
 }
 
 /**

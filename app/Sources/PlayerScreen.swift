@@ -1708,7 +1708,7 @@ struct PlayerScreen: View {
     @State private var consecutiveAutoAdvances = 0          // back-to-back auto-advances with no interaction between them
     @State private var pendingStillWatchingEpisodeId: String?  // next episode to roll to when Continue is chosen at a binge boundary
     @State private var pendingStillWatchingQueue = false
-    @State private var pendingDownloadedAdvance = false
+    @State private var pendingDownloadedAdvance: AppleDownloadedPlayback?
     @State private var downloadedBoundaryConsumed = false
     @State private var downloadMountAdmitted = false
     @State private var downloadedSuccessor: AppleDownloadedPlayback?
@@ -12928,29 +12928,34 @@ struct PlayerScreen: View {
 
     /// "Continue": re-arm the guard, then resume -- either roll to the pending next episode (binge boundary)
     /// or un-pause the current title.
-    private func finishDownloadedEpisode(confirmed: Bool = false, eligibleEOF: Bool = false) {
-        guard confirmed || !downloadedBoundaryConsumed else { return }
-        guard confirmed || eligibleEOF else {
+    private func finishDownloadedEpisode(confirmed: AppleDownloadedPlayback? = nil, eligibleEOF: Bool = false) {
+        guard confirmed != nil || !downloadedBoundaryConsumed else { return }
+        guard confirmed != nil || eligibleEOF else {
             leavePlayback()
             return
         }
         downloadedBoundaryConsumed = true
-        guard downloadedPlayback != nil, !playbackExited,
-              let meta = curMeta, meta == downloadedPlayback?.record.playbackMeta,
+        guard let downloadedPlayback, !playbackExited,
+              let meta = curMeta, meta == downloadedPlayback.record.playbackMeta,
               downloadProfileID == ProfileStore.shared.activeID,
               playbackMutationTarget.stillOwnsCurrentContext(core: core) else {
             leavePlayback()
             return
         }
-        guard var successor = DownloadStore.shared.nextPlayableDownload(after: meta),
-              onDownloadedAdvance != nil else {
+        let next: AppleDownloadedPlayback?
+        if let confirmed, confirmed.isSeasonRollover {
+            next = confirmed.revalidated()
+        } else {
+            next = DownloadStore.shared.nextPlayableDownload(after: downloadedPlayback.record)
+        }
+        guard var successor = next, onDownloadedAdvance != nil else {
             leavePlayback()
             return
         }
-        if !confirmed {
+        if confirmed == nil {
             consecutiveAutoAdvances += 1
             if stillWatchingPromptEnabled, consecutiveAutoAdvances >= max(1, stillWatchingAfterEpisodes) {
-                pendingDownloadedAdvance = true
+                pendingDownloadedAdvance = successor
                 presentStillWatching()
                 return
             }
@@ -12968,9 +12973,9 @@ struct PlayerScreen: View {
         let next = pendingStillWatchingEpisodeId
         pendingStillWatchingEpisodeId = nil
         noteInteraction()
-        if pendingDownloadedAdvance {
-            pendingDownloadedAdvance = false
-            finishDownloadedEpisode(confirmed: true)
+        if let pending = pendingDownloadedAdvance {
+            pendingDownloadedAdvance = nil
+            finishDownloadedEpisode(confirmed: pending)
             return
         }
         if pendingStillWatchingQueue {
@@ -12993,7 +12998,7 @@ struct PlayerScreen: View {
         stillWatchingPrompt = false
         pendingStillWatchingEpisodeId = nil
         pendingStillWatchingQueue = false
-        pendingDownloadedAdvance = false
+        pendingDownloadedAdvance = nil
         leavePlayback()
     }
 

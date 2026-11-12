@@ -22,6 +22,7 @@ final class DownloadStore: ObservableObject {
     /// most twice per second prevents unrelated rows from re-rendering for each delegate callback.
     private var pendingProgressRecords: [UUID: DownloadRecord] = [:]
     private var progressPublishTask: Task<Void, Never>?
+    private var seasonBoundaryRequests: Set<UUID> = []
 
     init() {
         ensureDirectory()
@@ -170,10 +171,91 @@ final class DownloadStore: ObservableObject {
             .compactMap { playableDownload(id: $0.id, expected: $0.playbackMeta) }
     }
 
-    func nextPlayableDownload(after current: PlaybackMeta) -> AppleDownloadedPlayback? {
+    func nextPlayableDownload(after current: DownloadRecord) -> AppleDownloadedPlayback? {
         guard ProfileStore.shared.active?.isKids != true else { return nil }
-        return DownloadRecord.playableSuccessor(after: current, in: records, fileExists: hasValidPlaybackFile)
-            .flatMap { playableDownload(id: $0.id, expected: $0.playbackMeta) }
+        let saved = record(id: current.id)
+        let boundary = saved.flatMap {
+            $0.state == .completed && $0.playbackMeta == current.playbackMeta ? $0.seasonBoundary : nil
+        }
+        guard let next = DownloadRecord.playableSuccessor(after: current.playbackMeta, seasonBoundary: boundary,
+                                                           in: records, fileExists: hasValidPlaybackFile),
+              var admitted = playableDownload(id: next.id, expected: next.playbackMeta) else { return nil }
+        if next.season != current.season {
+            guard let boundary else { return nil }
+            admitted.seasonRollover = DownloadSeasonRolloverWitness(originID: current.id, originMeta: current.playbackMeta,
+                                                                     proof: boundary, successorID: next.id)
+        }
+        return admitted
+    }
+
+    fileprivate func stillAdmitsSeasonRollover(_ witness: DownloadSeasonRolloverWitness,
+                                               candidate: DownloadRecord) -> Bool {
+        witness.accepts(candidate, in: records, fileExists: hasValidPlaybackFile)
+    }
+
+    func refreshSeasonBoundaries(libraryID: String, type: String, owner: PlaybackMutationTarget,
+                                 afterEnqueuing added: DownloadRecord? = nil) {
+        guard EpisodePlaybackIdentity.usesSeriesLifecycle(type: type) else { return }
+        var possibleFinales: [Int: DownloadRecord] = [:]
+        var firstEpisodeSeasons: Set<Int> = []
+        for candidate in records where candidate.contentId == libraryID && candidate.type == type {
+            guard let season = candidate.season, season > 0, season < Int.max,
+                  let episode = candidate.episode, episode > 0 else { continue }
+            if episode == 1, candidate.state != .failed { firstEpisodeSeasons.insert(season) }
+            if episode > (possibleFinales[season]?.episode ?? 0) { possibleFinales[season] = candidate }
+        }
+        for season in possibleFinales.keys.sorted(by: >) {
+            guard seasonBoundaryRequests.count < 2 else { return }
+            guard firstEpisodeSeasons.contains(season + 1), let candidate = possibleFinales[season] else { continue }
+            if let added, added.id != candidate.id,
+               !(added.season == season + 1 && added.episode == 1) { continue }
+            refreshSeasonBoundary(for: candidate, owner: owner)
+        }
+        if added == nil {
+            for candidate in records where candidate.contentId == libraryID && candidate.type == type
+                && candidate.seasonBoundary != nil {
+                guard seasonBoundaryRequests.count < 2 else { return }
+                refreshSeasonBoundary(for: candidate, owner: owner)
+            }
+        }
+    }
+
+    func refreshSeasonBoundary(for candidate: DownloadRecord, owner: PlaybackMutationTarget) {
+        guard seasonBoundaryRequests.count < 2, !seasonBoundaryRequests.contains(candidate.id),
+              let original = record(id: candidate.id), original.playbackMeta == candidate.playbackMeta,
+              let season = original.season, season > 0, season < Int.max,
+              let episode = original.episode, episode > 0 else { return }
+        let id = candidate.id
+        let meta = original.playbackMeta
+        let saved = original.seasonBoundary
+        let stillCurrent: @MainActor @Sendable () -> Bool = { [weak self] in
+            guard let self, !Task.isCancelled, ConnectivityMonitor.shared.launchOffline != nil,
+                  !ConnectivityMonitor.shared.isOffline, ProfileStore.shared.active?.isKids != true,
+                  owner.stillOwnsCurrentContext(core: CoreBridge.shared),
+                  let current = self.record(id: id) else { return false }
+            return current.state != .failed && current.playbackMeta == meta && current.seasonBoundary == saved
+        }
+        let savedMatches = saved?.matches(meta, successorVideoID: "\(meta.libraryId):\(season + 1):1") == true
+        guard stillCurrent(), savedMatches || DownloadRecord.seasonRolloverSuccessorID(after: meta, in: records) != nil
+        else { return }
+        seasonBoundaryRequests.insert(id)
+        Task { @MainActor [weak self] in
+            defer { self?.seasonBoundaryRequests.remove(id) }
+            let result = await TMDBClient.downloadSeasonBoundary(
+                libraryID: meta.libraryId, season: season, episode: episode, replacing: saved, stillCurrent: stillCurrent
+            )
+            guard stillCurrent(), let self else { return }
+            let verified = result.replacement(for: saved)
+            guard verified != saved else { return }
+            // Changed canonical evidence retires the old proof even if the new pair cannot be installed.
+            let replacement = verified.flatMap { boundary in
+                DownloadRecord.seasonRolloverSuccessorID(after: meta, in: self.records).flatMap { successorID in
+                    boundary.matches(meta, successorVideoID: successorID) ? boundary : nil
+                }
+            }
+            guard replacement != saved else { return }
+            self.update(id: id) { $0.seasonBoundary = replacement }
+        }
     }
 
     private func hasValidPlaybackFile(_ record: DownloadRecord) -> Bool {
@@ -217,11 +299,17 @@ final class DownloadStore: ObservableObject {
 
     func upsert(_ record: DownloadRecord) {
         pendingProgressRecords.removeValue(forKey: record.id)
-        if let idx = records.firstIndex(where: { $0.id == record.id }) {
-            records[idx] = record
+        var next = records
+        if let idx = next.firstIndex(where: { $0.id == record.id }) {
+            next[idx] = record
         } else {
-            records.insert(record, at: 0)
+            next.insert(record, at: 0)
         }
+        for index in next.indices where record.contradictsSeasonBoundary(of: next[index]) {
+            pendingProgressRecords[next[index].id]?.seasonBoundary = nil
+            next[index].seasonBoundary = nil
+        }
+        records = next
         persist()
     }
 
@@ -340,6 +428,8 @@ struct AppleDownloadedPlayback {
     let record: DownloadRecord
     let url: URL
     var consecutiveAutoAdvances = 0
+    fileprivate var seasonRollover: DownloadSeasonRolloverWitness?
+    var isSeasonRollover: Bool { seasonRollover != nil }
     var macWasFullScreenAtOpen: Bool?
     private let profileID: UUID?
     private let isKids: Bool
@@ -363,13 +453,17 @@ struct AppleDownloadedPlayback {
         guard ownsCurrentContext(core: CoreBridge.shared),
               var current = DownloadStore.shared.playableDownload(id: record.id, expected: record.playbackMeta)
         else { return nil }
+        if let seasonRollover {
+            guard DownloadStore.shared.stillAdmitsSeasonRollover(seasonRollover, candidate: current.record) else { return nil }
+            current.seasonRollover = seasonRollover
+        }
         current.consecutiveAutoAdvances = consecutiveAutoAdvances
         current.macWasFullScreenAtOpen = macWasFullScreenAtOpen
         return current
     }
 
     @MainActor func prepareForPlayback(
-        core: CoreBridge, displayedResume: Double? = nil
+        core: CoreBridge, displayedResume: Double? = nil, refreshSeasonBoundary: Bool = true
     ) async -> (copy: Self, resume: Double)? {
         guard !Task.isCancelled, let current = revalidated() else { return nil }
         let meta = current.record.playbackMeta
@@ -384,6 +478,9 @@ struct AppleDownloadedPlayback {
             resume = ProfileStore.shared.resumeOffset(for: meta)
         }
         guard !Task.isCancelled, let final = current.revalidated() else { return nil }
+        if refreshSeasonBoundary {
+            DownloadStore.shared.refreshSeasonBoundary(for: final.record, owner: final.owner)
+        }
         return (final, resume.isFinite ? max(0, resume) : 0)
     }
 }

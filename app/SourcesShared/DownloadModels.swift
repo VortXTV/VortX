@@ -18,6 +18,169 @@ enum DownloadState: String, Codable, Sendable {
     case failed
 }
 
+/// A device-local, provider-verified transition between two canonical series episodes.
+struct DownloadSeasonBoundary: Codable, Hashable, Sendable {
+    let libraryID: String
+    let finaleVideoID: String
+    let successorVideoID: String
+    let season: Int
+    let finaleEpisode: Int
+    let tmdbSeriesID: Int
+    let tmdbFinaleID: Int
+    let tmdbSuccessorID: Int
+
+    enum Refresh: Sendable {
+        case verified(DownloadSeasonBoundary)
+        case contradicted
+        case unavailable
+
+        func replacement(for saved: DownloadSeasonBoundary?) -> DownloadSeasonBoundary? {
+            switch self {
+            case let .verified(boundary): return boundary
+            case .contradicted: return nil
+            case .unavailable: return saved
+            }
+        }
+    }
+
+    /// Keep independent authenticated facts even when a different endpoint is unavailable.
+    struct RefreshObservations {
+        let saved: DownloadSeasonBoundary?
+        private var contradicted = false
+
+        init(saved: DownloadSeasonBoundary?) { self.saved = saved }
+
+        mutating func observe(seriesID: Int? = nil, finaleEpisode: Int? = nil,
+                              finaleID: Int? = nil, successorID: Int? = nil) {
+            guard let saved else { return }
+            contradicted = contradicted || (seriesID.map { $0 != saved.tmdbSeriesID } ?? false)
+                || (finaleEpisode.map { $0 != saved.finaleEpisode } ?? false)
+                || (finaleID.map { $0 != saved.tmdbFinaleID } ?? false)
+                || (successorID.map { $0 != saved.tmdbSuccessorID } ?? false)
+        }
+
+        var incompleteResult: Refresh { contradicted ? .contradicted : .unavailable }
+    }
+
+    enum SeriesID: Sendable {
+        case imdb(String)
+        case tmdb(Int)
+
+        init?(_ libraryID: String) {
+            let imdbDigits = libraryID.utf8.dropFirst(2)
+            if libraryID.hasPrefix("tt"), (6...10).contains(imdbDigits.count),
+               imdbDigits.allSatisfy({ (48...57).contains($0) }) {
+                self = .imdb(libraryID)
+            } else if libraryID.hasPrefix("tmdb:"), let id = Int(libraryID.dropFirst(5)),
+                      id > 0, id <= Int(Int32.max), libraryID == "tmdb:\(id)" {
+                self = .tmdb(id)
+            } else {
+                return nil
+            }
+        }
+    }
+
+    func matches(_ current: PlaybackMeta, successorVideoID: String) -> Bool {
+        guard let title = SeriesID(libraryID) else { return false }
+        if case let .tmdb(id) = title, id != tmdbSeriesID { return false }
+        return libraryID == current.libraryId && finaleVideoID == current.videoId
+            && season == current.season && finaleEpisode == current.episode
+            && self.successorVideoID == successorVideoID
+            && tmdbSeriesID > 0 && tmdbFinaleID > 0 && tmdbSuccessorID > 0
+            && tmdbFinaleID != tmdbSuccessorID
+    }
+}
+
+/// A malformed optional proof must never make an existing download index unreadable.
+@propertyWrapper
+struct DecodedDownloadSeasonBoundary: Codable, Hashable, Sendable {
+    var wrappedValue: DownloadSeasonBoundary?
+}
+
+extension KeyedDecodingContainer {
+    func decode(_ type: DecodedDownloadSeasonBoundary.Type, forKey key: Key) throws -> DecodedDownloadSeasonBoundary {
+        .init(wrappedValue: try? decodeIfPresent(DownloadSeasonBoundary.self, forKey: key))
+    }
+}
+
+extension KeyedEncodingContainer {
+    mutating func encode(_ value: DecodedDownloadSeasonBoundary, forKey key: Key) throws {
+        try encodeIfPresent(value.wrappedValue, forKey: key)
+    }
+}
+
+struct DownloadSeasonSeries: Decodable {
+    struct Season: Decodable {
+        let id: Int
+        let seasonNumber: Int
+        let episodeCount: Int
+    }
+
+    struct ExternalIDs: Decodable { let imdbId: String? }
+
+    let id: Int
+    let seasons: [Season]
+    let externalIds: ExternalIDs?
+
+    func matches(_ title: DownloadSeasonBoundary.SeriesID, requestedID: Int) -> Bool {
+        guard id == requestedID else { return false }
+        switch title {
+        case let .tmdb(id): return self.id == id
+        case let .imdb(id): return externalIds?.imdbId == id
+        }
+    }
+
+    func season(_ number: Int) -> Season? {
+        let matches = seasons.filter { $0.seasonNumber == number }
+        guard matches.count == 1, let match = matches.first, match.id > 0, match.episodeCount > 0,
+              seasons.filter({ $0.id == match.id }).count == 1 else { return nil }
+        return match
+    }
+}
+
+struct DownloadSeasonDetails: Decodable {
+    struct Episode: Decodable {
+        let id: Int
+        let showId: Int
+        let seasonNumber: Int
+        let episodeNumber: Int
+    }
+
+    let id: Int
+    let seasonNumber: Int
+    let episodes: [Episode]
+
+    func completeEpisodes(seriesID: Int, season: DownloadSeasonSeries.Season) -> [Episode]? {
+        guard id == season.id, seasonNumber == season.seasonNumber,
+              episodes.count == season.episodeCount,
+              Set(episodes.map(\.id)).count == episodes.count else { return nil }
+        let ordered = episodes.sorted { $0.episodeNumber < $1.episodeNumber }
+        guard ordered.enumerated().allSatisfy({ index, episode in
+            episode.id > 0 && episode.showId == seriesID && episode.seasonNumber == seasonNumber
+                && episode.episodeNumber == index + 1
+        }) else { return nil }
+        return ordered
+    }
+}
+
+/// Retain the exact origin, proof, and selected file through deferred playback admission.
+struct DownloadSeasonRolloverWitness {
+    let originID: UUID
+    let originMeta: PlaybackMeta
+    let proof: DownloadSeasonBoundary
+    let successorID: UUID
+
+    func accepts(_ candidate: DownloadRecord, in records: [DownloadRecord],
+                 fileExists: (DownloadRecord) -> Bool) -> Bool {
+        guard candidate.id == successorID, candidate.season != originMeta.season,
+              let origin = records.first(where: { $0.id == originID }), origin.state == .completed,
+              origin.playbackMeta == originMeta, origin.seasonBoundary == proof else { return false }
+        let current = DownloadRecord.playableSuccessor(after: originMeta, seasonBoundary: proof,
+                                                        in: records, fileExists: fileExists)
+        return current?.id == successorID && current?.playbackMeta == candidate.playbackMeta
+    }
+}
+
 /// One offline download. Identifiable + Codable so it both persists in `index.json` and drives the
 /// SwiftUI list directly. All playback-relevant ids (`contentId`/`videoId`/`season`/`episode`) are the
 /// SAME values the streaming play path uses, so `playbackMeta` rebuilds a byte-equivalent `PlaybackMeta`
@@ -95,6 +258,9 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
     /// reconciliation also falls back to matching `localFilename` (byte) / `id` (HLS) via `taskDescription`,
     /// so a stale or missing identifier never strands a good download.
     var taskIdentifier: Int?
+
+    /// Missing on older indexes. This carries no path, account identifier, provider URL or token.
+    @DecodedDownloadSeasonBoundary var seasonBoundary: DownloadSeasonBoundary? = nil
 
     /// A completed HLS offline download (its media is a `.movpkg`, playable only by AVPlayer).
     var isHLSOffline: Bool { hlsRelativePath != nil }
@@ -224,9 +390,36 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
         return position >= duration * 0.9
     }
 
-    /// A download list is partial. Only an unambiguous same-season E+1 is known to be adjacent.
+    /// The index can identify a candidate for verification, but cannot prove the current season ended.
+    static func seasonRolloverSuccessorID(after current: PlaybackMeta, in records: [Self]) -> String? {
+        guard current.usesSeriesLifecycle, DownloadSeasonBoundary.SeriesID(current.libraryId) != nil,
+              let season = current.season, season > 0, season < Int.max,
+              let episode = current.episode, episode > 0,
+              current.videoId == "\(current.libraryId):\(season):\(episode)" else { return nil }
+        let successorID = "\(current.libraryId):\(season + 1):1"
+        let series = records.filter { $0.contentId == current.libraryId && $0.usesSeriesLifecycle }
+        guard !series.contains(where: { $0.season == season && ($0.episode ?? 0) > episode }),
+              !series.contains(where: { $0.season == season && $0.episode == episode && $0.videoId != current.videoId }),
+              !series.contains(where: { $0.season == season + 1 && $0.episode == 1 && $0.videoId != successorID }),
+              series.contains(where: {
+                  $0.videoId == successorID && $0.type == current.type && $0.season == season + 1
+                      && $0.episode == 1 && $0.state != .failed
+              }) else { return nil }
+        return successorID
+    }
+
+    /// A newly indexed canonical later episode retires earlier stored finale evidence even offline.
+    func contradictsSeasonBoundary(of origin: Self) -> Bool {
+        guard origin.seasonBoundary != nil, usesSeriesLifecycle,
+              contentId == origin.contentId, type == origin.type,
+              let season, season == origin.season, let episode, let earlier = origin.episode,
+              episode > earlier else { return false }
+        return videoId == "\(contentId):\(season):\(episode)"
+    }
+
     static func playableSuccessor(
-        after current: PlaybackMeta, in records: [Self], fileExists: (Self) -> Bool
+        after current: PlaybackMeta, seasonBoundary: DownloadSeasonBoundary? = nil,
+        in records: [Self], fileExists: (Self) -> Bool
     ) -> Self? {
         guard current.usesSeriesLifecycle, let season = current.season, season >= 0,
               let episode = current.episode, episode >= 0, episode < Int.max else { return nil }
@@ -235,9 +428,18 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
                 && $0.videoId != current.videoId && $0.season == season && $0.episode == episode + 1
                 && fileExists($0)
         }
-        // If two distinct video identities claim the successor coordinate, don't guess a provider alias.
-        guard Set(candidates.map(\.videoId)).count == 1 else { return nil }
-        return candidates.first
+        if !candidates.isEmpty {
+            // If two distinct video identities claim the coordinate, don't guess a provider alias.
+            guard Set(candidates.map(\.videoId)).count == 1 else { return nil }
+            return candidates.first
+        }
+        guard let seasonBoundary,
+              let successorID = seasonRolloverSuccessorID(after: current, in: records),
+              seasonBoundary.matches(current, successorVideoID: successorID) else { return nil }
+        return records.first {
+            $0.contentId == current.libraryId && $0.type == current.type && $0.videoId == successorID
+                && $0.season == season + 1 && $0.episode == 1 && $0.state == .completed && fileExists($0)
+        }
     }
 
     /// 0...1 download progress; 0 until a total is known (a torrent's total is unknown up front).

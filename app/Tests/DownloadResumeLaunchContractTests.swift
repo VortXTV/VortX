@@ -37,6 +37,23 @@ import Foundation
         precondition(store.contains("await core.nativeResumeSeconds(for: meta, target: current.owner)"))
         precondition(store.contains("ProfileStore.shared.resumeOffset(for: meta)"))
         precondition(store.contains("let final = current.revalidated()"))
+        precondition(store.contains("stillAdmitsSeasonRollover(seasonRollover, candidate: current.record)"))
+        precondition(store.contains("current.seasonRollover = seasonRollover"))
+        precondition(store.contains("current.seasonBoundary == saved"))
+        precondition(store.contains("let verified = result.replacement(for: saved)"))
+        precondition(store.contains("self.update(id: id) { $0.seasonBoundary = replacement }"))
+        precondition(store.contains("pendingProgressRecords[next[index].id]?.seasonBoundary = nil"))
+        let metadata = try String(contentsOfFile: "app/SourcesShared/TMDBClient.swift", encoding: .utf8)
+        let refresh = metadata.components(separatedBy: "static func downloadSeasonBoundary(")[1]
+            .components(separatedBy: "/// Season poster art")[0]
+        let titleObservation = refresh.range(of: "observations.observe(seriesID: tvID)")!.lowerBound
+        let seriesFetch = refresh.range(of: "let response = await get(")!.lowerBound
+        let countObservation = refresh.range(of: "observations.observe(finaleEpisode: from?.episodeCount)")!.lowerBound
+        let currentFetch = refresh.range(of: "let current = await downloadSeasonEpisodes")!.lowerBound
+        let successorObservation = refresh.range(of: "observations.observe(successorID: next?.id)")!.lowerBound
+        let complete = refresh.range(of: "guard let current, current.episodeNumber == episode")!.lowerBound
+        precondition(titleObservation < seriesFetch && countObservation < currentFetch && successorObservation < complete,
+                     "affirmative contradictions survive an unavailable companion lookup")
         precondition(store.contains("if let displayedResume, displayedResume.isFinite, displayedResume >= 0"))
         let iosCW = root.components(separatedBy: "private func iOSDirectResume(for item:")[1]
             .components(separatedBy: "private func iOSDirectStream")[0]
@@ -90,7 +107,7 @@ import Foundation
         }
         precondition(handoffs.count == 3)
         for handoff in handoffs {
-            let afterAwait = handoff.components(separatedBy: "await candidate.prepareForPlayback(core: core)")[1]
+            let afterAwait = handoff.components(separatedBy: "await candidate.prepareForPlayback(core: core, refreshSeasonBoundary: false)")[1]
                 .components(separatedBy: "onClose:")[0]
             let requestFence = afterAwait.range(of: "?.id == item.id else { return }")!.lowerBound
             let failure = afterAwait.range(of: "onFailure()")!.lowerBound
@@ -132,6 +149,7 @@ import Foundation
         let tvRoot = try String(contentsOfFile: "app/SourcesTV/RootTabView.swift", encoding: .utf8)
         precondition(tvRoot.contains("startAtSeconds: resume, downloadedPlayback: playback"))
         precondition(tvRoot.contains("guard request?.id == expectedRequestID, stillCurrent()"))
+        precondition(tvRoot.contains("refreshSeasonBoundary: expectedRequestID == nil"), "EOF may not request season data")
         precondition(tvRoot.contains("if request?.id != oldValue?.id { requestGeneration = UUID() }"))
         precondition(tvRoot.contains("guard !Task.isCancelled, requestGeneration == presentation,"))
         precondition(tvPlayer.contains("if !downloadHandoffProgressFlushed"))
@@ -143,17 +161,19 @@ import Foundation
         let invalidate = tvLeave.range(of: "coordinator.player?.invalidateLoadToken()")!.lowerBound
         precondition(handoff < flush && flush < invalidate)
         for source in [player, tvPlayer] {
-            precondition(source.contains("nextPlayableDownload(after: meta)"))
-            precondition(source.contains("meta == downloadedPlayback?.record.playbackMeta"))
+            precondition(source.contains("nextPlayableDownload(after: downloadedPlayback.record)"))
+            precondition(source.contains("meta == downloadedPlayback.record.playbackMeta"))
             precondition(source.contains("downloadProfileID == ProfileStore.shared.activeID"))
             precondition(source.contains("successor.consecutiveAutoAdvances = consecutiveAutoAdvances"))
-            precondition(source.contains("pendingDownloadedAdvance = true"))
-            precondition(source.contains("guard confirmed || !downloadedBoundaryConsumed else { return }"))
-            precondition(source.contains("guard confirmed || eligibleEOF else"))
+            precondition(source.contains("pendingDownloadedAdvance = successor"))
+            precondition(source.contains("guard confirmed != nil || !downloadedBoundaryConsumed else { return }"))
+            precondition(source.contains("guard confirmed != nil || eligibleEOF else"))
             precondition(source.contains("DownloadRecord.permitsDownloadedAdvance("))
             precondition(source.contains("completionEvidence.settledProgress(owner:"))
             precondition(source.contains("transportSettled: event.transportSettled"))
             precondition(source.contains("downloadedPlayback.revalidated()?.url == url"))
+            precondition(source.contains("if let confirmed, confirmed.isSeasonRollover"))
+            precondition(source.contains("next = confirmed.revalidated()"))
             precondition(source.contains("if downloadedPlayback == nil || downloadMountAdmitted"))
             precondition(source.contains("guard downloadedPlayback == nil else { return [] }"))
         }

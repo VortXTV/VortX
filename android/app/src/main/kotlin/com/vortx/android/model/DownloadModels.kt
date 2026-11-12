@@ -1,5 +1,6 @@
 package com.vortx.android.model
 
+import com.vortx.android.downloads.DownloadedSeasonBoundary
 import java.util.UUID
 
 /**
@@ -108,6 +109,8 @@ data class DownloadRecord(
     val taskIdentifier: Int? = null,
     /** Confirmed I/O retries charged to this generation, independent of WorkManager admission waits. */
     val transferRetryCount: Int = 0,
+    /** An optional exact canonical season boundary retained only in the local download index. */
+    val seasonBoundary: DownloadedSeasonBoundary? = null,
 ) {
     /** Display title, episode-aware (matches the streaming episode title format). */
     val displayTitle: String

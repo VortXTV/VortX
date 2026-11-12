@@ -14,6 +14,8 @@ import com.vortx.android.debrid.DebridResolver
 import com.vortx.android.debrid.DebridService
 import com.vortx.android.catalog.DetailMetaRecoveryPolicy
 import com.vortx.android.downloads.DownloadManager
+import com.vortx.android.downloads.DownloadedSeasonBoundaryRefreshFence
+import com.vortx.android.downloads.refreshDownloadedSeasonBoundaries
 import com.vortx.android.engine.SourceListModel
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.integrations.buildMediaRef
@@ -37,6 +39,8 @@ import com.vortx.android.model.TrackPreferences
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.person.TMDBPersonClient
 import com.vortx.android.player.PlaybackBehaviorSettings
+import com.vortx.android.player.PlaybackOwnerEpoch
+import com.vortx.android.player.PlaybackOwnerToken
 import com.vortx.android.player.PlayerSourceSwitchCommitGate
 import com.vortx.android.player.PlayerSourceSwitchResolution
 import com.vortx.android.singularity.SourceIndexClient
@@ -567,6 +571,8 @@ class DetailViewModel(
     @Volatile private var metaRecoveryAttempted = false
     private val detailMutationFence = DetailMutationFence()
     private val detailMutationMutex = Mutex()
+    private val offlineSeasonBoundaryFence = DownloadedSeasonBoundaryRefreshFence()
+    private var offlineSeasonBoundaryRefresh: Job? = null
 
     // ---- Source-list assembly + debrid orchestration (the assembly + coordinator wave) ----
     //
@@ -1030,7 +1036,21 @@ class DetailViewModel(
 
     private fun publishMeta(detail: MetaDetail): MetaDetail {
         _meta.value = UiState.Success(detail)
+        if (detail.type == MediaType.SERIES) refreshOfflineSeasonBoundary(detail.id, PlaybackOwnerEpoch.capture())
         return detail
+    }
+
+    private fun refreshOfflineSeasonBoundary(detailId: String, owner: PlaybackOwnerToken?) {
+        if (owner == null || !PlaybackOwnerEpoch.isCurrent(owner) || !isRouteAdmissionCurrent() ||
+            metaId != detailId
+        ) return
+        val request = offlineSeasonBoundaryFence.begin()
+        offlineSeasonBoundaryRefresh?.cancel()
+        offlineSeasonBoundaryRefresh = viewModelScope.launch {
+            refreshDownloadedSeasonBoundaries(setOf(id, detailId), owner,
+                routeGenerationCurrent = { offlineSeasonBoundaryFence.isCurrent(request) && metaId == detailId },
+                routeCurrentOnMain = ::isRouteAdmissionCurrent)
+        }
     }
 
     /// A minimal placeholder meta for the current [metaId] (a `tt`): a hero + the standard metahub backdrop/
@@ -1042,6 +1062,8 @@ class DetailViewModel(
     /// the ORIGINAL route id again (not the previously-recovered one), and re-run the load. Mirrors Apple
     /// `retryMeta`.
     fun retryMeta() {
+        offlineSeasonBoundaryFence.invalidate()
+        offlineSeasonBoundaryRefresh?.cancel()
         clearRandomEpisodePick()
         detailMutationFence.invalidate()
         invalidateWarmNextSource()
@@ -2116,6 +2138,7 @@ class DetailViewModel(
         val detail = (_meta.value as? UiState.Success)?.data ?: return
         val episode = detail.videos.firstOrNull { it.id == _selectedEpisodeId.value }
         val actionOwner = debridKeys.ownerToken()
+        val boundaryOwner = PlaybackOwnerEpoch.capture()
         _downloadNotice.value = "Preparing download…"
         viewModelScope.launch {
             resolveForOwner(source, episode, actionOwner).fold(
@@ -2151,6 +2174,9 @@ class DetailViewModel(
                         debridOwnerGeneration = debridDownloadOwner?.generation,
                     )
                     _downloadNotice.value = downloadNoticeFor(record)
+                    if (record.type == "series" && record.state != DownloadState.FAILED) {
+                        refreshOfflineSeasonBoundary(detail.id, boundaryOwner)
+                    }
                 },
                 onFailure = { _downloadNotice.value = it.message ?: "Couldn't start this download." },
             )

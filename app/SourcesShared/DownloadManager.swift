@@ -339,6 +339,7 @@ final class DownloadManager: NSObject, ObservableObject {
                   nativeUsenetLease: UsenetNodeClient.OperationLease? = nil,
                   nativeOwner: NativeDownloadOwner? = nil,
                   requiresNativeOwner: Bool = false) async -> DownloadRecord {
+        let seasonBoundaryOwner = meta.usesSeriesLifecycle ? PlaybackMutationTarget.capture(core: CoreBridge.shared) : nil
         var nativeAdmissionFailed = requiresNativeOwner && nativeOwner?.isCurrent != true
         if let nativeUsenetLease {
             do { try await nativeUsenetLease.validateOwner() }
@@ -386,6 +387,10 @@ final class DownloadManager: NSObject, ObservableObject {
             return store.record(id: id) ?? record
         }
         appendToQueueOrder(record.id)
+        if let seasonBoundaryOwner {
+            store.refreshSeasonBoundaries(libraryID: meta.libraryId, type: meta.type, owner: seasonBoundaryOwner,
+                                          afterEnqueuing: record)
+        }
 
         // Defensive: iOS does not auto-create Application Support. Create the destination before any
         // background daemon stages bytes, while leaving index durability behavior unchanged for Wave 3.

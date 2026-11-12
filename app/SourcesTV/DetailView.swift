@@ -298,6 +298,8 @@ struct DetailView: View {
             // the meta loads, so load meta FIRST then dispatch streams on meta-ready (loadMovieStreamsIfNeeded).
             // Series load streams per-episode (CoreEpisodeStreams), so a series detail loads meta only.
             if effectiveType == "series" {
+                detailDownloads.refreshSeasonBoundaries(libraryID: fencedMeta?.id ?? id, type: effectiveType,
+                                                    owner: PlaybackMutationTarget.capture(core: core))
                 core.loadMeta(type: effectiveType, id: metaRequestID)
             } else if fencedMeta != nil {
                 loadMovieStreamsIfNeeded()

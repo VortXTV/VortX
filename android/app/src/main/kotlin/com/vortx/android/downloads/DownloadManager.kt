@@ -338,6 +338,26 @@ object DownloadManager {
         DownloadStore.record(id) ?: record
     }
 
+    /** Preserve transfer identity. Positive evidence must persist; a known revocation takes effect live. */
+    internal fun rememberSeasonBoundary(
+        expected: DownloadRecord,
+        boundary: DownloadedSeasonBoundary?,
+        isCurrent: () -> Boolean,
+    ) {
+        if (boundary == expected.seasonBoundary || boundary?.matchesOrigin(expected) == false) return
+        val file = DownloadedSeasonFile(expected)
+        synchronized(lock) {
+            DownloadStore.updateIf(expected.id, predicate = { live ->
+                file.matches(live) && live.state != DownloadState.FAILED &&
+                    live.type == expected.type && live.contentId == expected.contentId &&
+                    live.videoId == expected.videoId && live.season == expected.season && live.episode == expected.episode &&
+                    live.seasonBoundary == expected.seasonBoundary &&
+                    (boundary == null || DownloadStore.records.value.none(boundary::isDisprovedByLaterEpisode)) &&
+                    isCurrent()
+            }, requireDurable = boundary != null) { it.copy(seasonBoundary = boundary) }
+        }
+    }
+
     /**
      * Pause a download. A queued item has no live transfer yet: just mark it paused so it stops being eligible to
      * start. A running one has its worker cancelled; the partial file stays on disk and [resume] continues it only

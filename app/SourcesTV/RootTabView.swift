@@ -133,7 +133,8 @@ final class PlayerPresenter: ObservableObject {
         guard request?.id == expectedRequestID, stillCurrent() else { return }
         let presentation = requestGeneration
         Task { @MainActor in
-            let prepared = await candidate.prepareForPlayback(core: core, displayedResume: displayedResume)
+            let prepared = await candidate.prepareForPlayback(core: core, displayedResume: displayedResume,
+                                                               refreshSeasonBoundary: expectedRequestID == nil)
             guard !Task.isCancelled, requestGeneration == presentation,
                   request?.id == expectedRequestID, stillCurrent() else { return }
             if let prepared {

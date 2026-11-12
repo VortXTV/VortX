@@ -25,6 +25,7 @@ class DownloadedPlaybackAdmission internal constructor(
     internal val ownerToken: PlaybackOwnerToken,
     internal val target: PlaybackContext,
     internal val policyWitness: DownloadedPolicyWitness?,
+    internal val rollover: DownloadedRollover? = null,
 )
 
 internal fun interface DownloadedPolicyWitness {
@@ -210,7 +211,8 @@ internal fun isDownloadedPlaybackOwnerCurrent(playable: Playable): Boolean {
 internal fun isDownloadedPlaybackAdmissionCurrent(playable: Playable): Boolean {
     val admission = playable.downloadedPlaybackAdmission ?: return false
     return playable.playbackContext == admission.target && isDownloadedPlaybackOwnerCurrent(playable) &&
-        admission.policyWitness?.isCurrent() != false
+        admission.policyWitness?.isCurrent() != false &&
+        admission.rollover?.isCurrent(DownloadStore.records.value) != false
 }
 
 internal suspend fun openDownloadedPlayback(
@@ -250,16 +252,28 @@ internal suspend fun nextDownloadedPlayback(context: Context, ended: Playable): 
     val admission = ended.downloadedPlaybackAdmission ?: return null
     if (!isDownloadedPlaybackOwnerCurrent(ended) || !ended.url.startsWith("file:")) return null
     if (readDownloadedAdmission(context, current, admission.recordId, admission.ownerToken) == null) return null
-    val next = withContext(Dispatchers.IO) {
+    val (next, rollover) = withContext<Pair<DownloadRecord, DownloadedRollover?>?>(Dispatchers.IO) {
         val records = DownloadStore.records.value
         val origin = records.firstOrNull { it.id == admission.recordId } ?: return@withContext null
         if (origin.state != DownloadState.COMPLETED || origin.playbackContext(current.owner) != current ||
             !DownloadStore.matchesManagedFileUri(origin, ended.url)) return@withContext null
         immediateDownloadedSuccessor(current, records) {
             DownloadStore.completedPlaybackFile(it) != null
-        }
+        }?.let { return@withContext it to null }
+        val boundary = origin.seasonBoundary?.takeIf { it.matchesOrigin(origin) } ?: return@withContext null
+        if (records.any(boundary::contradicts)) return@withContext null
+        val successor = records.firstOrNull {
+            boundary.matchesNext(it) && DownloadStore.completedPlaybackFile(it) != null
+        } ?: return@withContext null
+        successor to DownloadedRollover(DownloadedSeasonFile(origin), DownloadedSeasonFile(successor), boundary)
     } ?: return null
-    return openDownloadedPlaybackWithResume(context, next, current.owner, admission.ownerToken, episodeTitle = null)
+    val playable = openDownloadedPlaybackWithResume(context, next, current.owner, admission.ownerToken, episodeTitle = null)
+        ?: return null
+    if (rollover == null) return playable
+    val opened = playable.downloadedPlaybackAdmission ?: return null
+    return playable.copy(downloadedPlaybackAdmission = DownloadedPlaybackAdmission(
+        opened.recordId, opened.ownerToken, opened.target, opened.policyWitness, rollover,
+    )).takeIf(::isDownloadedPlaybackAdmissionCurrent)
 }
 
 /** Re-admit the same file for a new mount without replacing its original playback-owner token. */
@@ -270,11 +284,14 @@ internal suspend fun refreshDownloadedPlaybackAdmission(context: Context, playab
     val exists = withContext(Dispatchers.IO) {
         val record = DownloadStore.record(admission.recordId) ?: return@withContext false
         record.playbackContext(target.owner) == target && DownloadStore.completedPlaybackFile(record) != null &&
-            DownloadStore.matchesManagedFileUri(record, playable.url)
+            DownloadStore.matchesManagedFileUri(record, playable.url) &&
+            admission.rollover?.isCurrent(DownloadStore.records.value) != false
     }
     if (!exists) return null
     val current = readDownloadedAdmission(context, target, admission.recordId, admission.ownerToken) ?: return null
-    return playable.copy(downloadedPlaybackAdmission = current).takeIf(::isDownloadedPlaybackAdmissionCurrent)
+    return playable.copy(downloadedPlaybackAdmission = DownloadedPlaybackAdmission(
+        current.recordId, current.ownerToken, current.target, current.policyWitness, admission.rollover,
+    )).takeIf(::isDownloadedPlaybackAdmissionCurrent)
 }
 
 private suspend fun openDownloadedPlayback(

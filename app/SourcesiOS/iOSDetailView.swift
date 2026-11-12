@@ -1097,6 +1097,8 @@ struct iOSDetailView: View {
             sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex,
                             mediaServers: mediaServers, debridCache: debridCache)
             if effectiveType == "series" {
+                downloads.refreshSeasonBoundaries(libraryID: meta?.id ?? id, type: effectiveType,
+                                                    owner: PlaybackMutationTarget.capture(core: core))
                 torboxSearch.clearResults(); sourceIndex.clearResults(); mediaServers.clearResults()
                 // A series detail loads meta only; streams load per-episode from iOSEpisodeStreams.
                 if meta == nil { core.loadMeta(type: effectiveType, id: metaRequestID) }
@@ -1258,7 +1260,7 @@ struct iOSDetailView: View {
                         guard presentation?.id == item.id else { return }
                         core.unloadEnginePlayer()
                         Task { @MainActor in
-                            let prepared = await candidate.prepareForPlayback(core: core)
+                            let prepared = await candidate.prepareForPlayback(core: core, refreshSeasonBoundary: false)
                             guard presentation?.id == item.id else { return }
                             guard let prepared else {
                                 onFailure()
@@ -5898,7 +5900,7 @@ struct iOSEpisodeStreams: View {
                         _ = playbackReturnReceipt.close(requestID: launch.id)
                         core.unloadEnginePlayer()
                         Task { @MainActor in
-                            let prepared = await candidate.prepareForPlayback(core: core)
+                            let prepared = await candidate.prepareForPlayback(core: core, refreshSeasonBoundary: false)
                             guard presentation?.id == item.id else { return }
                             guard let prepared else {
                                 onFailure()
