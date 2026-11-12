@@ -3126,8 +3126,15 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         if (!isSyncLeaseCurrent(lease) || !publicationCurrent()) return SyncDocPull.Failed
         if (code == 304) return if (ifNoneMatch != null && etag == "\"$ifNoneMatch\"")
             SyncDocPull.Unchanged(ifNoneMatch) else SyncDocPull.Failed
-        if (code == 404) return if (lastSyncedVersion(lease) > 0 || syncState.nativeBackupSeen(lease.accountId)) SyncDocPull.Failed
-            else SyncDocPull.Empty(BackupReadWitness(lease, null))
+        if (code == 404) {
+            if (lastSyncedVersion(lease) > 0 || syncState.nativeBackupSeen(lease.accountId)) return SyncDocPull.Failed
+            // The detached receipt independently proves a backup was observed before a possible PUT.
+            val key = lease.dataKeyCopy()
+            val receipt = try { syncState.loadWebsiteRosterReceipt(lease.accountId, key) } finally { key.fill(0) }
+            return if (receipt == NativeWebsiteRosterReceiptStore.State.Absent &&
+                isSyncLeaseCurrent(lease) && publicationCurrent()) SyncDocPull.Empty(BackupReadWitness(lease, null))
+            else SyncDocPull.Failed
+        }
         if (code != 200) return SyncDocPull.Failed                // network/server error: do not clobber
         val body = json ?: return SyncDocPull.Failed
         val docStr = (body.opt("document") as? String)?.takeIf { it.isNotEmpty() } ?: return SyncDocPull.Failed
@@ -3311,7 +3318,15 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         return false
     }
 
-    /** Resolve only this authenticated pull. A website projection never becomes local source evidence. */
+    private sealed interface WebsiteRosterAttempt {
+        data object NotApplicable : WebsiteRosterAttempt
+        data object Failed : WebsiteRosterAttempt
+        data class Confirmed(val pull: SyncDocPull.Doc) : WebsiteRosterAttempt
+        data class Rebase(val pull: SyncDocPull.Doc) : WebsiteRosterAttempt
+    }
+
+    /** The next attempt must independently admit an authenticated GET after the previous
+     * detached candidate and native writer reservation have retired. */
     private suspend fun pullAfterWebsiteRosterAdmission(
         lease: SyncSessionLease,
         account: SessionOwnerSnapshot.Account,
@@ -3320,76 +3335,136 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         pull: SyncDocPull.Doc,
     ): SyncDocPull.Doc? {
         fun current() = original.isCurrent() && routineSyncAllowed(lease) && nativeGateway === gateway
-        if (!current()) return null
-        val captured = capturedAccountRead(lease, account, pull) ?: return null
+        var source = pull
+        try {
+            repeat(2) { attempt ->
+                if (!current()) return null
+                when (val result = attemptWebsiteRosterPublication(lease, account, gateway, original, source, ::current)) {
+                    WebsiteRosterAttempt.NotApplicable -> return source.takeIf {
+                        attempt == 0 && current() && permitsPreviouslyAttemptedWebsiteReadback(lease, it) && current()
+                    }
+                    WebsiteRosterAttempt.Failed -> return null
+                    is WebsiteRosterAttempt.Confirmed -> return result.pull
+                    is WebsiteRosterAttempt.Rebase -> {
+                        if (source !== pull) source.raw.fill(0)
+                        source = result.pull
+                    }
+                }
+            }
+            return null
+        } finally {
+            if (source !== pull) source.raw.fill(0)
+        }
+    }
+
+    private fun permitsPreviouslyAttemptedWebsiteReadback(lease: SyncSessionLease, readback: SyncDocPull.Doc): Boolean {
+        val key = lease.dataKeyCopy()
+        return try {
+            when (val stored = syncState.loadWebsiteRosterReceipt(lease.accountId, key)) {
+                NativeWebsiteRosterReceiptStore.State.Absent -> true
+                NativeWebsiteRosterReceiptStore.State.Unavailable -> false
+                is NativeWebsiteRosterReceiptStore.State.Present ->
+                    permitsWebsiteRosterReadback(lease.accountId, key, stored.receipt, readback)
+            }
+        } finally { key.fill(0) }
+    }
+
+    private fun permitsWebsiteRosterReadback(accountId: String, key: ByteArray,
+        receipt: NativeWebsiteRosterDenialReceipt, readback: SyncDocPull.Doc): Boolean {
+        if (readback.version < receipt.minimumReadbackRevision) return false
+        if (receipt.matchesProjectedBytes(accountId, key, readback.version, readback.raw)) return true
+        return (readback.version > receipt.targetRevision || receipt.isDefinitivelyRejected) &&
+            hasIndependentWebsiteRoster(readback.doc)
+    }
+
+    /** Ordinary native apply still owns the complete source and owner validation. */
+    private fun hasIndependentWebsiteRoster(document: JSONObject): Boolean {
+        val parsed = VortXSyncDoc.parse(document)
+        val roster = SettingsBackup.resolveRosterForPull(document.opt("settings"),
+            parsed.roster.takeIf { parsed.rosterIsLossless }, parsed.rosterModifiedSeconds, parsed.rosterIsLossless).roster
+        if (roster != null && roster.count { it.isOwner } == 1 && roster.distinctBy { it.id }.size == roster.size) return true
+        // A typed cold receive can establish its owner from its authenticated native archive.
+        return document.has(com.vortx.android.engine.NativeOwnerHistoryAccount.ARCHIVE) &&
+            document.optJSONObject("nativeSync")?.opt("schemaVersion")?.let(BackupRevisionPolicy::parse) == 6L
+    }
+
+    private suspend fun attemptWebsiteRosterPublication(
+        lease: SyncSessionLease,
+        account: SessionOwnerSnapshot.Account,
+        gateway: NativeAccountGateway,
+        original: NativeAccountUploadCurrency.Origin,
+        pull: SyncDocPull.Doc,
+        current: () -> Boolean,
+    ): WebsiteRosterAttempt {
+        val captured = capturedAccountRead(lease, account, pull) ?: return WebsiteRosterAttempt.Failed
         var attempted = false
-        val replacement = try {
-            gateway.withWebsiteRosterCandidate<SyncDocPull>(account, captured, original) admission@{ detached ->
+        var ownedReadback: SyncDocPull.Doc? = null
+        try {
+            val result = gateway.withWebsiteRosterCandidate<WebsiteRosterAttempt>(account, captured, original) admission@{ detached ->
                 attempted = true
                 if (detached.sourceRevision != pull.version || detached.scope.accountID != "account.${account.id}" ||
-                    !current()) {
-                    return@admission SyncDocPull.Failed
-                }
-                val target = BackupRevisionPolicy.next(pull.version) ?: return@admission SyncDocPull.Failed
+                    !current()) return@admission WebsiteRosterAttempt.Failed
+                val target = BackupRevisionPolicy.next(pull.version) ?: return@admission WebsiteRosterAttempt.Failed
                 val projected = detached.copyProjectedBytes()
+                val key = lease.dataKeyCopy()
                 try {
-                    // The backend document ceiling applies to Base64 GCM nonce+ciphertext+tag.
                     val maxEncrypted = 7 * 1024 * 1024
-                    if (4L * ((projected.size.toLong() + 28 + 2) / 3) > maxEncrypted) return@admission SyncDocPull.Failed
+                    if (4L * ((projected.size.toLong() + 28 + 2) / 3) > maxEncrypted) return@admission WebsiteRosterAttempt.Failed
                     val candidate = deriveBackup(lease, pull.doc, pull, gateway, mount = null,
-                        rawAccount = projected, currency = detached.currency) ?: return@admission SyncDocPull.Failed
+                        rawAccount = projected, currency = detached.currency) ?: return@admission WebsiteRosterAttempt.Failed
                     fun detachedCurrent() = current() && detached.currency.isCurrent()
-                    val outcome = pushSyncDocAt(lease, candidate, ::detachedCurrent) submission@{ encrypted, body ->
-                        // These ASCII values are the exact submitted document and JSON envelope.
-                        if (encrypted.length > maxEncrypted || body.toString().length > 8 * 1024 * 1024) {
-                            return@submission false
-                        }
-                        val key = lease.dataKeyCopy()
-                        var retained = false
-                        try {
-                            val receipt = NativeWebsiteRosterDenialReceipt.create(
-                                account.id, key, pull.version, pull.raw, target, projected,
-                            )
-                            val authorized = detached.currency.withCurrentSession {
-                                publishIfSyncLeaseCurrent(lease) {
-                                    if (detachedCurrent()) {
-                                        val saved = syncState.retainFirstWebsiteRosterReceipt(account.id, key, receipt)
-                                        retained = saved is NativeWebsiteRosterReceiptStore.State.Present
-                                    }
-                                }
+                    fun confirmedReceipt(action: () -> NativeWebsiteRosterReceiptStore.State): NativeWebsiteRosterReceiptStore.State.Present? {
+                        var saved: NativeWebsiteRosterReceiptStore.State.Present? = null
+                        val authorized = detached.currency.withCurrentSession {
+                            publishIfSyncLeaseCurrent(lease) {
+                                if (detachedCurrent()) saved = action() as? NativeWebsiteRosterReceiptStore.State.Present
                             }
-                            if (authorized != true || !retained) return@submission false
-                        } finally { key.fill(0) }
-                        // Recheck actual files and keys outside HTTP's scalar predicate and after the durable receipt.
+                        }
+                        return if (authorized == true) saved else null
+                    }
+                    val receipt = NativeWebsiteRosterDenialReceipt.create(
+                        account.id, key, pull.version, pull.raw, target, projected,
+                    )
+                    var reservation: NativeWebsiteRosterReceiptStore.State.Present? = null
+                    val outcome = pushSyncDocAt(lease, candidate, ::detachedCurrent) submission@{ encrypted, body ->
+                        if (encrypted.length > maxEncrypted || body.toString().length > 8 * 1024 * 1024) return@submission false
+                        reservation = confirmedReceipt { syncState.retainFirstWebsiteRosterReceipt(account.id, key, receipt) }
+                        if (reservation == null) return@submission false
+                        // Probe actual files and keys outside the HTTP admission monitors.
                         detached.requireLocalAbsenceForSubmission()
                         detachedCurrent()
                     }
-                    val minimumReadbackVersion = when (outcome) {
-                        is PushOutcome.Accepted -> if (outcome.version == target) target else return@admission SyncDocPull.Failed
+                    val reserved = reservation ?: return@admission WebsiteRosterAttempt.Failed
+                    val floor = when (outcome) {
+                        is PushOutcome.Accepted -> if (outcome.version == target) target else return@admission WebsiteRosterAttempt.Failed
                         is PushOutcome.Rejected -> maxOf(target, outcome.reportedVersion ?: target)
-                        PushOutcome.Error, PushOutcome.UpgradeRequired -> return@admission SyncDocPull.Failed
+                        PushOutcome.Error, PushOutcome.UpgradeRequired -> return@admission WebsiteRosterAttempt.Failed
                     }
+                    val checked = if (outcome is PushOutcome.Rejected) {
+                        // False on a replay can raise the readback floor without resolving
+                        // whether the earlier PUT took effect.
+                        confirmedReceipt { syncState.recordWebsiteRosterRejectedResponse(account.id, key, reserved, floor) }
+                            ?.receipt ?: return@admission WebsiteRosterAttempt.Failed
+                    } else reserved.receipt
                     val readback = pullSyncDocResult(lease, allowOlderAddonTombstones = false,
-                        publicationCurrent = ::detachedCurrent) as? SyncDocPull.Doc ?: return@admission SyncDocPull.Failed
-                    val confirmed = readback.version >= minimumReadbackVersion && (outcome !is PushOutcome.Accepted ||
-                        readback.version > target || projected.contentEquals(readback.raw))
-                    if (!confirmed) {
-                        readback.raw.fill(0)
-                        return@admission SyncDocPull.Failed
-                    }
-                    readback
-                } finally { projected.fill(0) }
+                        publicationCurrent = ::detachedCurrent) as? SyncDocPull.Doc ?: return@admission WebsiteRosterAttempt.Failed
+                    ownedReadback = readback
+                    val currentReceipt = confirmedReceipt { syncState.loadWebsiteRosterReceipt(account.id, key) }
+                    if (currentReceipt?.receipt?.encode() != checked.encode() || readback.version < floor)
+                        return@admission WebsiteRosterAttempt.Failed
+                    if (permitsWebsiteRosterReadback(account.id, key, checked, readback)) {
+                        WebsiteRosterAttempt.Confirmed(readback)
+                    } else if (checked.isDefinitivelyRejected) {
+                        WebsiteRosterAttempt.Rebase(readback)
+                    } else WebsiteRosterAttempt.Failed
+                } finally { projected.fill(0); key.fill(0) }
             }
-        } finally { captured.retire() }
-        // The gateway reservation has exited. Ordinary native apply alone can admit the real GET.
-        if (!current()) {
-            if (replacement is SyncDocPull.Doc) replacement.raw.fill(0)
-            return null
-        }
-        return when (replacement) {
-            is SyncDocPull.Doc -> replacement
-            null -> if (attempted) null else pull
-            else -> null
+            if (!current()) return WebsiteRosterAttempt.Failed
+            if (result is WebsiteRosterAttempt.Confirmed || result is WebsiteRosterAttempt.Rebase) ownedReadback = null
+            return result ?: if (attempted) WebsiteRosterAttempt.Failed else WebsiteRosterAttempt.NotApplicable
+        } finally {
+            captured.retire()
+            ownedReadback?.raw?.fill(0)
         }
     }
 
@@ -3455,8 +3530,11 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         val originalPull = pulled as? SyncDocPull.Doc ?: return false
         if (!isSyncLeaseCurrent(lease)) return false
         if (retryPendingPushBeforePull(lease)) return false
-        val pull = if (websiteOrigin == null) originalPull
-            else pullAfterWebsiteRosterAdmission(lease, account, gateway, websiteOrigin, originalPull) ?: return false
+        val pull = when {
+            reopened -> originalPull
+            websiteOrigin == null -> originalPull.takeIf { permitsPreviouslyAttemptedWebsiteReadback(lease, it) } ?: return false
+            else -> pullAfterWebsiteRosterAdmission(lease, account, gateway, websiteOrigin, originalPull) ?: return false
+        }
         if (pull !== originalPull && retryPendingPushBeforePull(lease)) return false
         // A confirmed mounted checkpoint already contains this acknowledged revision. Replaying
         // it on every active poll remounts/projections and can arm needless peer echo work.
@@ -4923,6 +5001,17 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         private val prefs: SharedPreferences =
             appContext.getSharedPreferences(STATE_FILE, Context.MODE_PRIVATE)
         private val websiteRosterReceipts = NativeWebsiteRosterReceiptStore(prefs)
+
+        fun loadWebsiteRosterReceipt(accountId: String, dataKey: ByteArray): NativeWebsiteRosterReceiptStore.State =
+            websiteRosterReceipts.load(accountId, dataKey)
+
+        fun recordWebsiteRosterRejectedResponse(
+            accountId: String,
+            dataKey: ByteArray,
+            expected: NativeWebsiteRosterReceiptStore.State.Present,
+            readbackFloor: Long,
+        ): NativeWebsiteRosterReceiptStore.State =
+            websiteRosterReceipts.recordRejectedResponse(accountId, dataKey, expected, readbackFloor)
 
         fun retainFirstWebsiteRosterReceipt(
             accountId: String,
