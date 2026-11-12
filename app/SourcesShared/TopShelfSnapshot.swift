@@ -41,7 +41,12 @@ enum TopShelfSnapshot {
     /// A signer's group can be shared by every app that service signs for the viewer, so it is used only by
     /// a bundle that ships or is the Top Shelf extension; Lite never writes there. What it carries is the
     /// Continue Watching row the Home screen already shows. Nil means the feature is off, never an error.
-    static let appGroupID: String? = resolveAppGroupID(bundle: .main)
+    private static let appGroupResolution = resolveAppGroup(bundle: .main)
+    static let appGroupID: String? = appGroupResolution.id
+
+    /// Closed, identifier-free diagnostic reason. Never expose App Group ids, paths, teams, or entitlement bytes.
+    static var appGroupResolutionSource: String { appGroupResolution.source.rawValue }
+    static var appGroupResolutionDecision: String { appGroupResolution.decision.rawValue }
 
     /// `dedicated` is a signer's copy of VortX's own group; `signer` is a signer group other apps can share.
     enum AppGroupSource: String, Sendable { case canonical, dedicated, signer, none }
@@ -76,28 +81,76 @@ enum TopShelfSnapshot {
         return isTeamIdentifier && teamIdentifiers.contains(suffix)
     }
 
+    private enum AppGroupResolutionSource: String, Sendable {
+        case missingProvider, metadata, signedXML, signedEmpty, signedMalformed
+        case metadataDERUnsupported, metadataLayoutUnsupported
+    }
+
+    private enum AppGroupResolutionDecision: String, Sendable {
+        case selected, noCandidate, containerDenied
+    }
+
+    private struct AppGroupResolution: Sendable {
+        let id: String?
+        let source: AppGroupResolutionSource
+        let decision: AppGroupResolutionDecision
+    }
+
+    /// A valid XML claim is authoritative. An uninspected representation retains the exact original
+    /// provider-metadata route, while a malformed signature or a confirmed empty claim stops resolution.
+    enum SignedAppGroupState: Equatable, Sendable {
+        case absent, xml([String]), emptyXML, malformed, derUnsupported, layoutUnsupported
+    }
+
     static func resolveAppGroupID(
         bundle: Bundle,
         hasContainer: (String) -> Bool = {
             FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: $0) != nil
         }
     ) -> String? {
-        guard let provider = topShelfBundle(for: bundle) else { return nil }
-        let profile = provider.url(forResource: "embedded", withExtension: "mobileprovision")
-            .flatMap { try? Data(contentsOf: $0, options: .mappedIfSafe) }
-        return selectAppGroup(
-            recordedGroups: provider.infoDictionary?["ALTAppGroups"] as? [String] ?? [],
-            profileGroups: profile.map(provisionedAppGroups) ?? [],
-            teamIdentifiers: profile.map(provisionedTeamIdentifiers) ?? [],
-            hasContainer: hasContainer
-        )
+        resolveAppGroup(bundle: bundle, hasContainer: hasContainer).id
     }
 
-    /// Choose before checking access. Canonical and verified VortX-specific groups have a clear owner,
-    /// and a single generic group is usable. Ambiguous generic groups do not identify a shared route.
+    private static func resolveAppGroup(
+        bundle: Bundle,
+        hasContainer: (String) -> Bool = {
+            FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: $0) != nil
+        }
+    ) -> AppGroupResolution {
+        guard let provider = topShelfBundle(for: bundle) else {
+            return .init(id: nil, source: .missingProvider, decision: .noCandidate)
+        }
+        let signed: [String]?
+        let source: AppGroupResolutionSource
+        switch signedAppGroups(executable: provider.executableURL) {
+        case let .xml(groups): signed = groups; source = .signedXML
+        case .absent: signed = nil; source = .metadata
+        case .derUnsupported: signed = nil; source = .metadataDERUnsupported
+        case .layoutUnsupported: signed = nil; source = .metadataLayoutUnsupported
+        case .emptyXML: return .init(id: nil, source: .signedEmpty, decision: .noCandidate)
+        case .malformed: return .init(id: nil, source: .signedMalformed, decision: .noCandidate)
+        }
+        let profile = provider.url(forResource: "embedded", withExtension: "mobileprovision")
+            .flatMap { try? Data(contentsOf: $0, options: .mappedIfSafe) }
+        let recorded = provider.infoDictionary?["ALTAppGroups"] as? [String] ?? []
+        let provisioned = profile.map(provisionedAppGroups) ?? []
+        let teams = profile.map(provisionedTeamIdentifiers) ?? []
+        var checkedContainer = false
+        let id = selectAppGroup(recordedGroups: recorded, profileGroups: provisioned,
+                                signedGroups: signed, teamIdentifiers: teams) { candidate in
+            checkedContainer = true
+            return hasContainer(candidate)
+        }
+        let decision: AppGroupResolutionDecision = id != nil ? .selected : (checkedContainer ? .containerDenied : .noCandidate)
+        return .init(id: id, source: source, decision: decision)
+    }
+
+    /// Choose before checking access. A signed executable group set is authoritative; it is never unioned with
+    /// mutable Info/profile hints. The final FileManager probe remains the operating system's authority.
     static func selectAppGroup(
         recordedGroups: [String],
         profileGroups: [String],
+        signedGroups: [String]? = nil,
         teamIdentifiers: [String] = [],
         hasContainer: (String) -> Bool
     ) -> String? {
@@ -107,14 +160,15 @@ enum TopShelfSnapshot {
         let recorded = identifiers(recordedGroups)
         let provisioned = identifiers(profileGroups)
         let candidates: Set<String>
-        if recorded.isEmpty && provisioned.isEmpty {
+        if let signedGroups {
+            candidates = identifiers(signedGroups)
+        } else if recorded.isEmpty && provisioned.isEmpty {
             candidates = [canonicalAppGroupID]
         } else if recorded.isEmpty || provisioned.isEmpty {
             candidates = recorded.union(provisioned)
         } else {
             candidates = recorded.intersection(provisioned)
         }
-
         let candidate: String
         if candidates.contains(canonicalAppGroupID) {
             candidate = canonicalAppGroupID
@@ -127,8 +181,123 @@ enum TopShelfSnapshot {
             guard dedicated.count == 1, let only = dedicated.first else { return nil }
             candidate = only
         }
-        // A unilateral fallback can put the two processes back in different containers.
         return hasContainer(candidate) ? candidate : nil
+    }
+
+    // Apple Mach-O loader.h: mach_header_64 / LC_CODE_SIGNATURE / linkedit_data_command.
+    // Apple Code Signing Services: CSMAGIC_EMBEDDED_SIGNATURE, CSMAGIC_EMBEDDED_ENTITLEMENTS and slots 5/7.
+    private static let machHeader64Size = 32, maxLoadCommands = 4_096, maxLoadCommandBytes = 1_048_576
+    private static let maxSignatureBytes = 4_194_304, maxEntitlementXMLBytes = 262_144, maxSuperBlobEntries = 256
+    private static let mhMagic64: UInt32 = 0xfeedfacf, cpuTypeArm64: UInt32 = 0x0100000c, lcCodeSignature: UInt32 = 0x1d
+    private static let csMagicEmbeddedSignature: UInt32 = 0xfade0cc0, csMagicEmbeddedEntitlements: UInt32 = 0xfade7171
+    private static let csSlotEntitlements: UInt32 = 5, csSlotDEREntitlements: UInt32 = 7
+
+    static func signedAppGroups(executable: URL?) -> SignedAppGroupState {
+        guard let executable else { return .absent }
+        guard let values = try? executable.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+              values.isRegularFile == true, let fileSize = values.fileSize, fileSize >= machHeader64Size else { return .malformed }
+        do {
+            let handle = try FileHandle(forReadingFrom: executable); defer { try? handle.close() }
+            guard let header = try handle.read(upToCount: machHeader64Size), header.count == machHeader64Size
+            else { return .malformed }
+            // A universal executable needs an architecture-table reader. Keep it on the original
+            // metadata route rather than sampling a slice or treating an unsupported layout as corrupt.
+            switch bigEndian32(header, 0) {
+            case 0xcafebabe, 0xcafebabf, 0xbebafeca, 0xbfbafeca: return .layoutUnsupported
+            default: break
+            }
+            guard littleEndian32(header, 0) == mhMagic64 else { return .malformed }
+            guard littleEndian32(header, 4) == cpuTypeArm64 else { return .layoutUnsupported }
+            guard let count = littleEndian32(header, 16), let byteCount = littleEndian32(header, 20),
+                  count <= maxLoadCommands, byteCount <= maxLoadCommandBytes,
+                  machHeader64Size + Int(byteCount) <= fileSize,
+                  let commands = try handle.read(upToCount: Int(byteCount)), commands.count == Int(byteCount)
+            else { return .malformed }
+            let location = codeSignatureLocation(commands, count: Int(count), fileSize: fileSize,
+                                                 minimumOffset: machHeader64Size + Int(byteCount))
+            let signature: (offset: Int, size: Int)
+            switch location {
+            case .absent: return .absent
+            case .malformed: return .malformed
+            case let .range(range): signature = range
+            }
+            guard signature.size <= maxSignatureBytes else { return .malformed }
+            try handle.seek(toOffset: UInt64(signature.offset))
+            guard let blob = try handle.read(upToCount: signature.size), blob.count == signature.size else { return .malformed }
+            return signedAppGroups(signature: blob)
+        } catch { return .malformed }
+    }
+
+    private enum CodeSignatureLocation {
+        case absent, malformed, range((offset: Int, size: Int))
+    }
+
+    private static func codeSignatureLocation(_ commands: Data, count: Int, fileSize: Int,
+                                              minimumOffset: Int) -> CodeSignatureLocation {
+        var cursor = 0; var result: (offset: Int, size: Int)?
+        for _ in 0..<count {
+            guard let command = littleEndian32(commands, cursor), let size = littleEndian32(commands, cursor + 4),
+                  size >= 8, Int(size) <= commands.count - cursor else { return .malformed }
+            if command == lcCodeSignature {
+                guard size == 16, result == nil, let offset = littleEndian32(commands, cursor + 8),
+                      let length = littleEndian32(commands, cursor + 12), length > 0,
+                      Int(offset) >= minimumOffset, Int(offset) <= fileSize, Int(length) <= fileSize - Int(offset) else { return .malformed }
+                result = (Int(offset), Int(length))
+            }
+            cursor += Int(size)
+        }
+        guard cursor == commands.count else { return .malformed }
+        return result.map(CodeSignatureLocation.range) ?? .absent
+    }
+
+    private static func signedAppGroups(signature: Data) -> SignedAppGroupState {
+        guard bigEndian32(signature, 0) == csMagicEmbeddedSignature, let totalLength = bigEndian32(signature, 4),
+              Int(totalLength) <= signature.count, let count = bigEndian32(signature, 8), count <= maxSuperBlobEntries,
+              12 + Int(count) * 8 <= Int(totalLength) else { return .malformed }
+        let indexEnd = 12 + Int(count) * 8
+        var xml: Range<Int>?
+        var hasDER = false
+        var ranges: [Range<Int>] = []
+        for index in 0..<Int(count) {
+            let cursor = 12 + index * 8
+            guard let slot = bigEndian32(signature, cursor), let offset = bigEndian32(signature, cursor + 4),
+                  Int(offset) >= indexEnd, Int(offset) <= Int(totalLength) - 8,
+                  let length = bigEndian32(signature, Int(offset) + 4),
+                  length >= 8, Int(length) <= Int(totalLength) - Int(offset) else { return .malformed }
+            let range = Int(offset)..<(Int(offset) + Int(length))
+            ranges.append(range)
+            switch slot {
+            case csSlotEntitlements:
+                guard xml == nil, bigEndian32(signature, range.lowerBound) == csMagicEmbeddedEntitlements,
+                      range.count <= maxEntitlementXMLBytes + 8 else { return .malformed }
+                xml = range
+            case csSlotDEREntitlements:
+                guard !hasDER, bigEndian32(signature, range.lowerBound) == 0xfade7172 else { return .malformed }
+                hasDER = true
+            default:
+                break
+            }
+        }
+        ranges.sort { $0.lowerBound < $1.lowerBound }
+        guard zip(ranges, ranges.dropFirst()).allSatisfy({ $0.upperBound <= $1.lowerBound }) else { return .malformed }
+        guard let xml else { return hasDER ? .derUnsupported : .absent }
+        let body = signature.subdata(in: (xml.lowerBound + 8)..<xml.upperBound)
+        var format = PropertyListSerialization.PropertyListFormat.xml
+        guard let plist = try? PropertyListSerialization.propertyList(from: body, format: &format) as? [String: Any],
+              format == .xml
+        else { return .malformed }
+        guard let value = plist["com.apple.security.application-groups"] else { return .emptyXML }
+        guard let groups = value as? [String] else { return .malformed }
+        return groups.isEmpty ? .emptyXML : .xml(groups)
+    }
+
+    private static func littleEndian32(_ data: Data, _ offset: Int) -> UInt32? {
+        guard offset >= 0, offset <= data.count - 4 else { return nil }
+        return data[offset..<(offset + 4)].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).littleEndian }
+    }
+    private static func bigEndian32(_ data: Data, _ offset: Int) -> UInt32? {
+        guard offset >= 0, offset <= data.count - 4 else { return nil }
+        return data[offset..<(offset + 4)].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).bigEndian }
     }
 
     /// The application groups in a provisioning profile, a signed envelope around an XML property list.

@@ -489,7 +489,7 @@ enum TopShelfSnapshotWriter {
         }
         if !reportedGroupSource {
             reportedGroupSource = true
-            DiagnosticsLog.log("topshelf", "group=\(TopShelfSnapshot.appGroupSource.rawValue)")
+            DiagnosticsLog.log("topshelf", "group=\(TopShelfSnapshot.appGroupSource.rawValue) source=\(TopShelfSnapshot.appGroupResolutionSource) decision=\(TopShelfSnapshot.appGroupResolutionDecision)")
         }
         guard contentNotification.shouldNotify(after: result) else { return }
         TVTopShelfContentProvider.topShelfContentDidChange()

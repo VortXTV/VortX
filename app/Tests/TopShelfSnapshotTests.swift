@@ -592,6 +592,113 @@ let unavailable = TopShelfSnapshot.selectAppGroup(recordedGroups: [], profileGro
 }
 check(unavailable == nil && probedGroups == [canonicalGroup],
       "a denied shared choice does not probe a different group")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [canonicalGroup], profileGroups: [canonicalGroup],
+                                     signedGroups: [signerGroup]) { $0 == signerGroup } == signerGroup,
+      "a signed extension entitlement overrides asymmetric canonical metadata")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [canonicalGroup], profileGroups: [canonicalGroup],
+                                     signedGroups: []) { _ in true } == nil,
+      "an explicit signed empty set never falls back to canonical metadata")
+check(TopShelfSnapshot.signedAppGroups(executable: nil) == .absent,
+      "an absent executable preserves the existing metadata route")
+
+section("the provider's signed executable is read within Mach-O and SuperBlob bounds")
+
+do {
+    let fixtureRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        .appendingPathComponent("top-shelf-signature-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: fixtureRoot, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: fixtureRoot) }
+    func le32(_ value: UInt32) -> Data { withUnsafeBytes(of: value.littleEndian) { Data($0) } }
+    func be32(_ value: UInt32) -> Data { withUnsafeBytes(of: value.bigEndian) { Data($0) } }
+    func entitlement(_ magic: UInt32, _ payload: Data) -> Data {
+        be32(magic) + be32(UInt32(8 + payload.count)) + payload
+    }
+    func signedFixture(_ entries: [(UInt32, Data)]?, signatureOffset: UInt32 = 48,
+                       slotOffsets: [Int: UInt32] = [:]) throws -> URL {
+        let url = fixtureRoot.appendingPathComponent(UUID().uuidString)
+        var header = le32(0xfeedfacf) + le32(0x0100000c) + le32(0) + le32(2)
+        guard let entries else {
+            header += le32(1) + le32(8) + le32(0) + le32(0)
+            header += le32(0x2a) + le32(8)
+            try header.write(to: url)
+            return url
+        }
+        let indexEnd = 12 + entries.count * 8
+        var index = Data()
+        var body = Data()
+        for (ordinal, entry) in entries.enumerated() {
+            let offset = slotOffsets[ordinal] ?? UInt32(indexEnd + body.count)
+            index += be32(entry.0) + be32(offset)
+            body += entry.1
+        }
+        let signature = be32(0xfade0cc0) + be32(UInt32(indexEnd + body.count)) + be32(UInt32(entries.count)) + index + body
+        header += le32(1) + le32(16) + le32(0) + le32(0)
+        header += le32(0x1d) + le32(16) + le32(signatureOffset) + le32(UInt32(signature.count))
+        try (header + signature).write(to: url)
+        return url
+    }
+    let xml = try PropertyListSerialization.data(fromPropertyList: [
+        "com.apple.security.application-groups": [signerGroup]
+    ], format: .xml, options: 0)
+    let empty = try PropertyListSerialization.data(fromPropertyList: [String: Any](), format: .xml, options: 0)
+    let signedGroup = (UInt32(5), entitlement(0xfade7171, xml))
+    let signedEmpty = (UInt32(5), entitlement(0xfade7171, empty))
+    let der = (UInt32(7), entitlement(0xfade7172, Data([0x30, 0])))
+    let badDER = (UInt32(7), entitlement(0xfade7171, Data([0x30, 0])))
+    let unknownBadLength = (UInt32(0), be32(0xfade0c02) + be32(999))
+    let unknown = (UInt32(0), entitlement(0xfade0c02, Data()))
+    let xmlExecutable = try signedFixture([signedGroup])
+    let universal = fixtureRoot.appendingPathComponent("universal")
+    try (be32(0xcafebabe) + Data(repeating: 0, count: 28)).write(to: universal)
+    let cases: [(URL, TopShelfSnapshot.SignedAppGroupState, String)] = try [
+        (signedFixture(nil), .absent, "a real unsigned Mach-O without LC_CODE_SIGNATURE preserves metadata fallback"),
+        (signedFixture([]), .absent, "a signature without entitlement slots preserves metadata fallback"),
+        (xmlExecutable, .xml([signerGroup]), "bounded XML yields only its signed group"),
+        (signedFixture([signedGroup, der]), .xml([signerGroup]), "a DER slot can coexist with the XML claim"),
+        (signedFixture([signedEmpty]), .emptyXML, "a signed XML dictionary without groups blocks metadata fallback"),
+        (signedFixture([der]), .derUnsupported, "DER-only signed entitlements are distinguished"),
+        (signedFixture([signedGroup, badDER]), .malformed, "bad DER slot structure does not hide behind XML"),
+        (signedFixture([signedGroup, signedGroup]), .malformed, "duplicate XML entitlement slots are refused"),
+        (signedFixture([signedGroup, der, der]), .malformed, "duplicate DER entitlement slots are refused"),
+        (signedFixture([signedGroup], signatureOffset: 9_999_999), .malformed, "out-of-range signature offset is refused"),
+        (signedFixture([signedGroup], signatureOffset: 32), .malformed, "signature cannot start inside load commands"),
+        (signedFixture([signedGroup], slotOffsets: [0: 12]), .malformed, "a slot cannot start inside the index"),
+        (signedFixture([unknownBadLength]), .malformed, "an unknown slot may not extend beyond the signature"),
+        (signedFixture([unknown, signedGroup], slotOffsets: [0: 36]), .malformed, "different slots may not alias one blob"),
+        (universal, .layoutUnsupported, "universal layout is left uninspected")
+    ]
+    for (url, expected, description) in cases {
+        check(TopShelfSnapshot.signedAppGroups(executable: url) == expected, description)
+    }
+
+    let host = fixtureRoot.appendingPathComponent("VortX.app", isDirectory: true)
+    let provider = host.appendingPathComponent("Contents/PlugIns/VortXTopShelf.appex", isDirectory: true)
+    let providerExecutables = provider.appendingPathComponent("Contents/MacOS", isDirectory: true)
+    try FileManager.default.createDirectory(at: providerExecutables, withIntermediateDirectories: true)
+    try FileManager.default.copyItem(at: xmlExecutable, to: providerExecutables.appendingPathComponent("Provider"))
+    let hostInfo = try PropertyListSerialization.data(fromPropertyList: [
+        "CFBundleIdentifier": "test.vortx.signing-host", "CFBundlePackageType": "APPL"
+    ], format: .xml, options: 0)
+    let providerInfo = try PropertyListSerialization.data(fromPropertyList: [
+        "CFBundleIdentifier": "test.vortx.signing-host.topshelf", "CFBundlePackageType": "XPC!",
+        "CFBundleExecutable": "Provider", "ALTAppGroups": [canonicalGroup],
+        "NSExtension": ["NSExtensionPointIdentifier": "com.apple.tv-top-shelf"]
+    ] as [String: Any], format: .xml, options: 0)
+    try hostInfo.write(to: host.appendingPathComponent("Contents/Info.plist"))
+    try providerInfo.write(to: provider.appendingPathComponent("Contents/Info.plist"))
+    if let hostBundle = Bundle(url: host), let providerBundle = Bundle(url: provider) {
+        check(TopShelfSnapshot.resolveAppGroupID(bundle: hostBundle) { $0 == signerGroup } == signerGroup,
+              "the host routes to the actual provider claim over the canonical metadata")
+        check(TopShelfSnapshot.resolveAppGroupID(bundle: providerBundle) { $0 == signerGroup } == signerGroup,
+              "the provider independently routes to the same signed claim")
+        check(TopShelfSnapshot.resolveAppGroupID(bundle: hostBundle) { $0 == canonicalGroup } == nil,
+              "host denial of the signed claim cannot fall back to its canonical container")
+    } else {
+        check(false, "open the signed-route fixture bundles")
+    }
+} catch {
+    check(false, "write and read the disposable Mach-O signature fixtures")
+}
 
 section("the app and provider use the same exact embedded extension")
 
