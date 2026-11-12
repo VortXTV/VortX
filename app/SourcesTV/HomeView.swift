@@ -179,6 +179,7 @@ struct HomeView: View {
                                     : .continueWatching,
                                 traktSessionID: renderedContinueWatching.selection.sessionID,
                                 intent: renderedContinueWatching.intent,
+                                isActive: isActive,
                                 displayProgress: renderedContinueWatching.selection.displayProgress,
                                 captions: renderedContinueWatching.selection.captions
                             )
@@ -904,13 +905,20 @@ struct CoreContinueWatchingRow: View {
     var menu: PosterMenu = .continueWatching   // .none on overlay-profile rails (engine menu doesn't apply)
     var traktSessionID: TraktSessionID?
     var intent: HomeContinueWatchingSelection.Intent? = nil
+    var isActive: Bool = true
     var displayProgress: [String: Double] = [:]
     var captions: [String: String] = [:]
     @EnvironmentObject private var theme: ThemeManager   // observe so the rail's cards repaint on a theme change
     @EnvironmentObject private var presenter: PlayerPresenter
     @EnvironmentObject private var profiles: ProfileStore
     private var core: CoreBridge { CoreBridge.shared }   // actions only; not observed, so engine events do not re-render it
-    @State private var detailTarget: CWDetailTarget?
+    @State private var detailTarget: CWDetailTarget? {
+        didSet { if detailTarget != oldValue { continueWatchingRequestID = nil } }
+    }
+    private var detailTargetBinding: Binding<CWDetailTarget?> {
+        Binding(get: { detailTarget }, set: { detailTarget = $0 })
+    }
+    @State private var continueWatchingRequestID: UUID?
     @State private var unavailableContinueWatching: String?
     @State private var resumeHoardTask: Task<Void, Never>?
 
@@ -939,23 +947,7 @@ struct CoreContinueWatchingRow: View {
                                            }
                                        } : nil,
                                    directPlay: directResume(item),
-                                   onDetails: {
-                                       guard intent?.isCurrent(core: core, profiles: profiles) != false else { return }
-                                       guard traktSessionID == nil
-                                                || TraktAuth.storedSessionID == traktSessionID else { return }
-                                       if let reason = intent?.unavailableReason(id: item.id, type: item.type, videoID: item.state.videoId) {
-                                           unavailableContinueWatching = reason
-                                           return
-                                       }
-                                       detailTarget = CWDetailTarget(
-                                           id: item.id,
-                                           type: item.type,
-                                            resumeSeconds: item.resumeSeconds,
-                                            videoID: item.state.videoId,
-                                           traktSessionID: traktSessionID,
-                                           intent: intent
-                                       )
-                                   })
+                                   onDetails: { openDetails(item) })
                             .accessibilityElement(children: .ignore)
                             .accessibilityLabel(
                                 intent?.source.isPrivate != true && traktSessionID == nil
@@ -976,7 +968,7 @@ struct CoreContinueWatchingRow: View {
         .alert("Playback unavailable", isPresented: Binding(get: { unavailableContinueWatching != nil }, set: { if !$0 { unavailableContinueWatching = nil } })) {
             Button("OK", role: .cancel) { unavailableContinueWatching = nil }
         } message: { Text(unavailableContinueWatching ?? "") }
-        .navigationDestination(item: $detailTarget) {
+        .navigationDestination(item: detailTargetBinding) {
             if $0.intent?.permitsDetails(id: $0.id, type: $0.type, videoID: $0.videoID) != false,
                $0.traktSessionID == nil || TraktAuth.storedSessionID == $0.traktSessionID {
                 DetailView(
@@ -989,10 +981,26 @@ struct CoreContinueWatchingRow: View {
                 )
             }
         }
+        .onChange(of: isActive) { _, active in
+            if !active { continueWatchingRequestID = nil }
+        }
         .onDisappear {
+            continueWatchingRequestID = nil
             resumeHoardTask?.cancel()
             resumeHoardTask = nil
         }
+    }
+
+    private func openDetails(_ item: CoreCWItem) {
+        continueWatchingRequestID = nil
+        guard intent?.isCurrent(core: core, profiles: profiles) != false,
+              traktSessionID == nil || TraktAuth.storedSessionID == traktSessionID else { return }
+        if let reason = intent?.unavailableReason(id: item.id, type: item.type, videoID: item.state.videoId) {
+            unavailableContinueWatching = reason
+            return
+        }
+        detailTarget = CWDetailTarget(id: item.id, type: item.type, resumeSeconds: item.resumeSeconds,
+                                      videoID: item.state.videoId, traktSessionID: traktSessionID, intent: intent)
     }
 
     /// Focus stays native and usable, but private history never enters the generic
@@ -1017,8 +1025,11 @@ struct CoreContinueWatchingRow: View {
         guard let entry = LastStreamStore.entry(for: item.id, profileID: pid) else {
             LastStreamStore.logResume("noEntry", libraryId: item.id, profileID: pid); return nil
         }
-        guard URL(string: entry.url) != nil else {   // validity gate; CWResume re-parses entry.url itself
+        guard let url = URL(string: entry.url) else {
             LastStreamStore.logResume("badURL", libraryId: item.id, profileID: pid); return nil
+        }
+        if url.isFileURL {
+            return { resumeDownloaded(item, entry: entry, file: url, profileID: pid) }
         }
         if PlaybackSettings.torrentsDisabled && entry.torrent == true {
             LastStreamStore.logResume("torrentDisabled", libraryId: item.id, profileID: pid); return nil
@@ -1033,7 +1044,11 @@ struct CoreContinueWatchingRow: View {
         }
         LastStreamStore.logResume("hit", libraryId: item.id, profileID: pid)
         return {
-            guard intent?.isCurrent(core: core, profiles: profiles) != false else { return }
+            guard isActive, detailTarget == nil, presenter.request == nil,
+                  intent?.isCurrent(core: core, profiles: profiles) != false else { return }
+            let requestID = UUID()
+            let presentation = presenter.requestGeneration
+            continueWatchingRequestID = requestID
             guard traktSessionID == nil
                     || TraktAuth.storedSessionID == traktSessionID else { return }
             let meta = PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,
@@ -1071,9 +1086,16 @@ struct CoreContinueWatchingRow: View {
                 }
             }
             Task { @MainActor in
+                guard !Task.isCancelled, continueWatchingRequestID == requestID,
+                      presenter.requestGeneration == presentation, presenter.request == nil,
+                      intent?.isCurrent(core: core, profiles: profiles) != false,
+                      traktSessionID == nil || TraktAuth.storedSessionID == traktSessionID else { return }
                 let hashShort = (entry.infoHash?.prefix(8)).map(String.init) ?? "-"
                 let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
-                guard intent?.isCurrent(core: core, profiles: profiles) != false else { return }
+                guard !Task.isCancelled, continueWatchingRequestID == requestID,
+                      presenter.requestGeneration == presentation, presenter.request == nil,
+                      !resolvedURL.isFileURL,
+                      intent?.isCurrent(core: core, profiles: profiles) != false else { return }
                 guard traktSessionID == nil
                         || TraktAuth.storedSessionID == traktSessionID else { return }
                 let bridge = CoreBridge.shared   // this row has no `core` env-object; use the shared engine bridge
@@ -1095,7 +1117,9 @@ struct CoreContinueWatchingRow: View {
                                     streamType: requestType, streamId: entry.videoId)
                     let eps = await prefetchEpisodes(bridge, itemID: item.id,
                                                      usesSeriesLifecycle: usesSeriesLifecycle)
-                    guard intent?.isCurrent(core: core, profiles: profiles) != false else { return }
+                    guard !Task.isCancelled, continueWatchingRequestID == requestID,
+                          presenter.requestGeneration == presentation, presenter.request == nil,
+                          intent?.isCurrent(core: core, profiles: profiles) != false else { return }
                     guard traktSessionID == nil
                             || TraktAuth.storedSessionID == traktSessionID else { return }
                     let groups = bridge.streamGroups(forStreamId: entry.videoId)
@@ -1137,7 +1161,9 @@ struct CoreContinueWatchingRow: View {
                 }
                 let eps = await prefetchEpisodes(bridge, itemID: item.id,
                                                  usesSeriesLifecycle: usesSeriesLifecycle)
-                guard intent?.isCurrent(core: core, profiles: profiles) != false else { return }
+                guard !Task.isCancelled, continueWatchingRequestID == requestID,
+                      presenter.requestGeneration == presentation, presenter.request == nil,
+                      intent?.isCurrent(core: core, profiles: profiles) != false else { return }
                 guard traktSessionID == nil
                         || TraktAuth.storedSessionID == traktSessionID else { return }
                 let groups = bridge.streamGroups(forStreamId: entry.videoId)
@@ -1155,6 +1181,33 @@ struct CoreContinueWatchingRow: View {
                     enginePlayerVideoId: engineVideoID, wasResume: true,
                     startAtSeconds: item.resumeSeconds)
             }
+        }
+    }
+
+    private func resumeDownloaded(_ item: CoreCWItem, entry: LastStreamStore.Entry,
+                                  file: URL, profileID: UUID?) {
+        guard isActive, detailTarget == nil, presenter.request == nil, profiles.activeID == profileID,
+              intent?.isCurrent(core: core, profiles: profiles) != false,
+              LastStreamStore.entry(for: item.id, profileID: profileID) == entry,
+              traktSessionID == nil || TraktAuth.storedSessionID == traktSessionID else { return }
+        resumeHoardTask?.cancel()
+        resumeHoardTask = nil
+        let meta = PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,
+                                name: entry.name, poster: entry.poster,
+                                season: entry.season, episode: entry.episode)
+        guard item.type == entry.type,
+              let candidate = DownloadStore.shared.rememberedPlayableDownload(
+                  for: meta, cardVideoID: item.state.videoId, file: file
+              ) else { openDetails(item); return }
+        let requestID = UUID()
+        continueWatchingRequestID = requestID
+        presenter.presentDownloaded(candidate, core: core, displayedResume: item.resumeSeconds,
+                                    onUnavailable: { openDetails(item) }) {
+            continueWatchingRequestID == requestID && detailTarget == nil && profiles.activeID == profileID
+                && LastStreamStore.entry(for: item.id, profileID: profileID) == entry
+                && candidate.ownsCurrentContext(core: core)
+                && intent?.isCurrent(core: core, profiles: profiles) != false
+                && (traktSessionID == nil || TraktAuth.storedSessionID == traktSessionID)
         }
     }
 

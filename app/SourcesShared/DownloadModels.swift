@@ -195,6 +195,28 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
         records.first { $0.state == .completed && $0.matchesPlayback(target) && fileExists($0) }
     }
 
+    /// A stored file URL is a hint for one indexed copy. Never open or resolve that path itself.
+    static func rememberedPlayableCopy(
+        of target: PlaybackMeta, rememberedFile: URL,
+        in records: [Self], fileExists: (Self) -> Bool
+    ) -> Self? {
+        guard rememberedFile.isFileURL, [nil, "", "localhost"].contains(rememberedFile.host),
+              !target.libraryId.isEmpty, !target.videoId.isEmpty else { return nil }
+        let path = rememberedFile.pathComponents
+        let matches = records.filter { copy in
+            guard copy.state == .completed, copy.matchesPlayback(target) else { return false }
+            if let relative = copy.hlsRelativePath {
+                guard isSafeHLSPackageRelativePath(relative) else { return false }
+                let components = relative.split(separator: "/").map(String.init)
+                return path.suffix(components.count).elementsEqual(components)
+            }
+            return isManagedProgressiveFilename(copy.localFilename, id: copy.id)
+                && path.suffix(3).elementsEqual(["Application Support", "Downloads", copy.localFilename])
+        }
+        guard matches.count == 1, let match = matches.first, fileExists(match) else { return nil }
+        return match
+    }
+
     /// Gate the local handoff after its player has admitted a genuine EOF event.
     static func permitsDownloadedAdvance(position: Double?, duration: Double) -> Bool {
         guard let position, position.isFinite, position > 0,

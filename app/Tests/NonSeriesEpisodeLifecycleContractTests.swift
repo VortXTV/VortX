@@ -105,12 +105,14 @@ private func playback(type: String, season: Int?, episode: Int?, videoID: String
     )
 }
 
-private func download(type: String, season: Int?, episode: Int?, videoID: String) -> DownloadRecord {
-    DownloadRecord(
-        id: UUID(), contentId: "tt-lifecycle", videoId: videoID, type: type,
+private func download(type: String, season: Int?, episode: Int?, videoID: String,
+                      managedFilename: Bool = false) -> DownloadRecord {
+    let id = UUID()
+    return DownloadRecord(
+        id: id, contentId: "tt-lifecycle", videoId: videoID, type: type,
         name: "Lifecycle", poster: nil, season: season, episode: episode,
         sourceName: nil, qualityText: nil, isTorrent: false, headers: nil,
-        remoteURL: "https://media.invalid/video", localFilename: "video.mkv",
+        remoteURL: "https://media.invalid/video", localFilename: managedFilename ? "\(id.uuidString).mkv" : "video.mkv",
         bytesTotal: 100, bytesDone: 100, state: .completed,
         addedAt: Date(timeIntervalSince1970: 1)
     )
@@ -413,6 +415,40 @@ private struct NonSeriesEpisodeLifecycleContractTests {
         expect(!DownloadRecord.isSafeHLSPackageRelativePath("Library/../foreign.movpkg")
                && !DownloadRecord.isSafeHLSPackageRelativePath("/Library/foreign.movpkg"),
                "HLS playback rejects traversal and absolute paths")
+
+        let remembered = download(type: "series", season: 1, episode: 2,
+                                  videoID: "tt-lifecycle:1:2", managedFilename: true)
+        let otherEdition = download(type: "series", season: 1, episode: 2,
+                                     videoID: remembered.videoId, managedFilename: true)
+        let rememberedPath = URL(fileURLWithPath: "/old-container/Library/Application Support/Downloads")
+            .appendingPathComponent(remembered.localFilename)
+        expect(DownloadRecord.rememberedPlayableCopy(of: remembered.playbackMeta,
+            rememberedFile: rememberedPath, in: [otherEdition, remembered], fileExists: { _ in true })?.id == remembered.id,
+            "a relocated container still selects the exact stored edition instead of the first same-video copy")
+        expect(DownloadRecord.rememberedPlayableCopy(of: remembered.playbackMeta,
+            rememberedFile: rememberedPath, in: [otherEdition], fileExists: { _ in true }) == nil,
+            "an absent indexed file does not fall through to another completed edition")
+        expect(DownloadRecord.rememberedPlayableCopy(of: remembered.playbackMeta,
+            rememberedFile: rememberedPath, in: [otherEdition, remembered], fileExists: { $0.id != remembered.id }) == nil,
+            "an evicted remembered file does not fall through to another completed edition")
+        expect(DownloadRecord.rememberedPlayableCopy(of: e3.playbackMeta,
+            rememberedFile: rememberedPath, in: [remembered], fileExists: { _ in true }) == nil,
+            "a filename hint cannot authorize the wrong title or episode coordinates")
+        let unrelatedPath = URL(fileURLWithPath: "/elsewhere").appendingPathComponent(remembered.localFilename)
+        expect(DownloadRecord.rememberedPlayableCopy(of: remembered.playbackMeta,
+            rememberedFile: unrelatedPath, in: [remembered], fileExists: { _ in true }) == nil,
+            "an unrelated file with the same basename is not a managed-path hint")
+        var hls = remembered
+        hls.hlsRelativePath = "Library/OSAssetFolder/package.movpkg"
+        let hlsPath = URL(fileURLWithPath: "/old-container/Library/OSAssetFolder/package.movpkg")
+        expect(DownloadRecord.rememberedPlayableCopy(of: hls.playbackMeta,
+            rememberedFile: hlsPath, in: [hls], fileExists: { _ in true })?.id == hls.id,
+            "HLS selects its exact indexed relative package from a relocated container")
+        var ambiguousHLS = otherEdition
+        ambiguousHLS.hlsRelativePath = hls.hlsRelativePath
+        expect(DownloadRecord.rememberedPlayableCopy(of: hls.playbackMeta,
+            rememberedFile: hlsPath, in: [hls, ambiguousHLS], fileExists: { _ in true }) == nil,
+            "ambiguous HLS package ownership is refused")
 
         let coreModelsSource = source("SourcesShared/CoreModels.swift")
         let accountSource = source("SourcesShared/StremioAccount.swift")

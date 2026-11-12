@@ -3776,6 +3776,7 @@ struct iOSDetailView: View {
         // Movies only (a series episode resumes via its own path); skipped when it is a torrent while torrents
         // are off.
         if let entry = LastStreamStore.entry(for: moviePlaybackMeta.libraryId, profileID: ProfileStore.shared.activeID),
+           URL(string: entry.url)?.isFileURL != true,
            let service = entry.debridService.flatMap(DebridService.init(rawValue:)),
            let hash = entry.infoHash, !hash.isEmpty,
            !(PlaybackSettings.torrentsDisabled && entry.torrent == true) {
@@ -3783,7 +3784,7 @@ struct iOSDetailView: View {
             if let quickWatchScope {
                 guard quickWatchScopeIsCurrent(quickWatchScope) else { return }
             }
-            if refreshed {
+            if refreshed, !url.isFileURL {
                 core.loadEnginePlayer(for: stream)
                 let pm = moviePlaybackMeta
                 let resumeProposal = await proposedResume(

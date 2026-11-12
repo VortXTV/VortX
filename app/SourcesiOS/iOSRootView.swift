@@ -1176,11 +1176,22 @@ struct iOSHomeView: View {
     @State private var overlayHistory = ApplePresentationPublicationCache<[String: WatchEntry],
         (cw: [CoreCWItem], library: [CoreCWItem])>()
     @State private var cachedContinueWatching: iOSCWPresentationSnapshot?
-    @State private var path = NavigationPath()
+    @State private var path = NavigationPath() {
+        didSet { if path != oldValue { continueWatchingRequestID = nil } }
+    }
+    private var pathBinding: Binding<NavigationPath> {
+        Binding(get: { path }, set: { path = $0 })
+    }
     @State private var unavailableContinueWatching: String?
     @State private var showCustomizeHome = false   // presents the Home rows reorder/hide editor
     /// A Continue-Watching card's direct resume launches the player straight from Home (#11).
-    @State private var player: iOSPlayerLaunch?
+    @State private var player: iOSPlayerLaunch? {
+        didSet { if player?.id != oldValue?.id { continueWatchingRequestID = nil } }
+    }
+    private var playerBinding: Binding<iOSPlayerLaunch?> {
+        Binding(get: { player }, set: { player = $0 })
+    }
+    @State private var continueWatchingRequestID: UUID?
     /// Owns the post-playback source contribution started by a direct resume.
     /// Cancellation must follow Home teardown instead of escaping in a detached task.
     @State private var resumeHoardTask: Task<Void, Never>?
@@ -1461,7 +1472,7 @@ struct iOSHomeView: View {
     private var homeNavigation: some View {
         let renderedContinueWatching = continueWatchingRenderSnapshot
         let renderedNextEpisodes = continueWatchingSnapshot.nextEpisodes.filter(TraktNextEpisodeHomeRow.permitsOpening)
-        NavigationStack(path: $path) {
+        NavigationStack(path: pathBinding) {
             // The hero is the first scrolling element (an ambient billboard header), not a
             // behind-the-scroll backdrop: that keeps its Play / Trailer buttons + the tappable poster
             // cards reachable (a ScrollView layered over a hero would otherwise eat the hero's taps).
@@ -1712,10 +1723,10 @@ struct iOSHomeView: View {
                               autoPlayOnAppear: target.autoPlay)
             }
             .navigationDestination(for: HubTarget.self) { target in
-                iOSCategoryBrowse(target: target, path: $path)
+                iOSCategoryBrowse(target: target, path: pathBinding)
             }
             .navigationDestination(for: CinemaBoardCatalogTarget.self) { target in
-                CinemaBoardCatalogBrowse(target: target, path: $path)
+                CinemaBoardCatalogBrowse(target: target, path: pathBinding)
             }
             .navigationDestination(for: XperienceHomeRoute.self) { _ in
                 XperienceCollectionsBrowserView()
@@ -1723,7 +1734,7 @@ struct iOSHomeView: View {
                     .macBackAffordance()
                     #endif
             }
-            .iOSPlayerCover($player, account: account, core: core)
+            .iOSPlayerCover(playerBinding, account: account, core: core)
         }
     }
 
@@ -1736,7 +1747,7 @@ struct iOSHomeView: View {
         .macBleedUnderTitlebar()
         // Re-tapping the active Home tab pops any pushed detail back to root (#22); the scroll-to-top
         // above then lands on the root anchor. Switching tabs never bumps, so pushes survive switches.
-        .popToRootOnBump(TabScrollKeys.home, path: $path)
+        .popToRootOnBump(TabScrollKeys.home, path: pathBinding)
         .onValueChange(of: path.count) { onNavigationDepthChanged?($0) }
         .onAppear { onNavigationDepthChanged?(path.count) }
         // Hidden tabs stay mounted (opacity-switched) and never hit onDisappear, so quiet the ambient
@@ -1746,7 +1757,10 @@ struct iOSHomeView: View {
                 refreshContinueWatchingPresentation(selectionChanged: false)
                 if scenePhase == .active { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
                 hero.seed(heroCandidates, reduceMotion: reduceMotion)
-            } else { hero.stop() }
+            } else {
+                continueWatchingRequestID = nil
+                hero.stop()
+            }
         }
         .onValueChange(of: scenePhase) { phase in
             if phase == .active, isActive {
@@ -1925,6 +1939,7 @@ struct iOSHomeView: View {
     }
 
     private func stopHomeTasks() {
+        continueWatchingRequestID = nil
         hero.stop()
         resumeHoardTask?.cancel()
         resumeHoardTask = nil
@@ -2406,6 +2421,7 @@ struct iOSHomeView: View {
     ) {
         hero.noteInteraction()
         guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return }
+        continueWatchingRequestID = nil
         if let reason = provenance.intent.unavailableReason(id: item.id, type: item.type, videoID: item.cwVideoId) {
             unavailableContinueWatching = reason
             return
@@ -2416,14 +2432,24 @@ struct iOSHomeView: View {
         }
         // Computing the resume offset may await the account, so resolve the direct-resume launch in a
         // Task; fall back to opening detail when no remembered link fits.
-        Task {
-            if let launch = await iOSDirectResume(
+        let requestID = UUID()
+        continueWatchingRequestID = requestID
+        let stillCurrent: @MainActor () -> Bool = {
+            !Task.isCancelled && continueWatchingRequestID == requestID && player == nil
+                && provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID)
+        }
+        Task { @MainActor in
+            guard stillCurrent() else { return }
+            let launch = await iOSDirectResume(
                 for: item,
                 core: core,
                 account: account,
-                expectedTraktSession: provenance.traktSessionID
-            ) {
-                guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return }
+                expectedTraktSession: provenance.traktSessionID,
+                stillCurrent: stillCurrent
+            )
+            guard stillCurrent() else { return }
+            continueWatchingRequestID = nil
+            if let launch {
                 player = launch
                 resumeHoardTask?.cancel()
                 if let contentID = launch.resumeHoardContentID,
@@ -2640,7 +2666,13 @@ struct iOSLibraryView: View {
     // heterogeneous path needs the type-erased container. A typed `[FeaturedHeroItem]` binding also
     // DISABLES any view-destination `NavigationLink` in the subtree (SwiftUI can't encode it into the
     // typed path); that is the root cause of the dead Downloads pill (#25).
-    @State private var path = NavigationPath()
+    @State private var path = NavigationPath() {
+        didSet { if path != oldValue { continueWatchingRequestID = nil } }
+    }
+    private var pathBinding: Binding<NavigationPath> {
+        Binding(get: { path }, set: { path = $0 })
+    }
+    @State private var continueWatchingRequestID: UUID?
     /// Active client-side type segment (Movies / TV / Anime); `.all` keeps the flat, mixed grid.
     @State private var segment: LibrarySegment = .all
     @State private var showAccountRecovery = false
@@ -2662,7 +2694,12 @@ struct iOSLibraryView: View {
     @State private var overlayHeroCandidates: [FeaturedHeroItem] = []
     #if !os(tvOS)
     @ObservedObject private var downloads = DownloadStore.shared   // offline downloads section (#30)
-    @State private var downloadPlayer: iOSPlayerLaunch?            // play-from-local cover
+    @State private var downloadPlayer: iOSPlayerLaunch? {
+        didSet { if downloadPlayer?.id != oldValue?.id { continueWatchingRequestID = nil } }
+    }
+    private var downloadPlayerBinding: Binding<iOSPlayerLaunch?> {
+        Binding(get: { downloadPlayer }, set: { downloadPlayer = $0 })
+    }
     #endif
 
     /// Non-detail Library pushes (value-routed so they work alongside the typed detail destinations).
@@ -2739,16 +2776,20 @@ struct iOSLibraryView: View {
 
     /// The Library's compact Continue Watching shelf uses the same owner/profile source and the same
     /// direct-resume primitive as Home. It is a second entry point, not a second history model.
-    private var libraryContinueWatchingItems: [RailItem] {
+    private var libraryContinueWatching: (items: [RailItem], owner: PlaybackMutationTarget)? {
+        let owner = PlaybackMutationTarget.capture(core: core)
+        guard owner.stillOwnsCurrentContext(core: core) else { return nil }
         let source = core.usesNativeProfileState || profiles.activeUsesEngineHistory
             ? core.continueWatching
             : profiles.cwItems
         let residentCatalog = core.boardRows.flatMap(\.items)
-        return source.map { cinemaHistoryRailItem($0, catalog: residentCatalog, residentMeta: core.metaDetails?.meta) }
+        let items = source.map { cinemaHistoryRailItem($0, catalog: residentCatalog, residentMeta: core.metaDetails?.meta) }
+        guard owner.stillOwnsCurrentContext(core: core) else { return nil }
+        return (items, owner)
     }
 
     var body: some View {
-        NavigationStack(path: $path) {
+        NavigationStack(path: pathBinding) {
             ScrollView {
                 Color.clear.frame(height: 0).scrollToTopAnchor()   // re-tap Library tab -> scroll here
                 #if !os(tvOS)
@@ -2795,10 +2836,13 @@ struct iOSLibraryView: View {
                 .padding(.bottom, Theme.Space.lg)
                 .background(VortXProfileGlassCanvas(tint: Theme.Palette.accent))
                 #endif
-                if !libraryContinueWatchingItems.isEmpty {
+                if let shelf = libraryContinueWatching, !shelf.items.isEmpty {
                     PosterRail(title: "Continue Watching", eyebrow: "Pick up where you left off",
-                               items: libraryContinueWatchingItems, onTap: resumeLibraryContinueWatching,
-                               menu: .continueWatching, onDetails: { path.append(FeaturedHeroItem.from(rail: $0)) })
+                               items: shelf.items, onTap: { resumeLibraryContinueWatching($0, producer: shelf.owner) },
+                               menu: .continueWatching, onDetails: { item in
+                        guard shelf.owner.stillOwnsCurrentContext(core: core) else { return }
+                        path.append(FeaturedHeroItem.from(rail: item))
+                    })
                 }
                 // The owner profile's Library is the account library (engine), with its type/sort filter
                 // chips; an overlay profile's Library is its own private watch overlay, with no engine
@@ -2910,7 +2954,7 @@ struct iOSLibraryView: View {
                 case .networkShares: iOSNetworkSharesView(onPlay: { downloadPlayer = $0 })
                 }
             }
-            .iOSPlayerCover($downloadPlayer, account: account, core: core)
+            .iOSPlayerCover(downloadPlayerBinding, account: account, core: core)
             #endif
             .onAppear { if core.library?.catalog.isEmpty != false { core.loadLibrary() } }
         }
@@ -2969,11 +3013,12 @@ struct iOSLibraryView: View {
         .onDisappear { if randomLibraryRoute == nil { clearRandomLibraryPick() } }
         // END RANDOM PICK LIBRARY LIFECYCLE
         // Re-tapping the active Library tab pops any pushed detail/Downloads back to root (#22).
-        .popToRootOnBump(TabScrollKeys.library, path: $path)
+        .popToRootOnBump(TabScrollKeys.library, path: pathBinding)
         // Quiet the ambient hero while this tab is hidden (mounted but opacity 0, so onDisappear never
         // fires); re-arm on return. Reseeds below are gated the same way so re-emits can't re-arm it.
         .onValueChange(of: isActive) { active in
             #if !os(tvOS)
+            if !active { continueWatchingRequestID = nil }
             // Offline launch routing handoff (#120), already-mounted case: hidden tabs stay mounted
             // forever (opacity-switched, #24), so a Library visited earlier in the session gets NO
             // fresh onAppear when the shell routes back to it; without this, the staged push would be
@@ -3019,7 +3064,12 @@ struct iOSLibraryView: View {
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
         // installed meta add-on. tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
         .onValueChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
-        .onDisappear { hero.stop() }
+        .onDisappear {
+            #if !os(tvOS)
+            continueWatchingRequestID = nil
+            #endif
+            hero.stop()
+        }
     }
 
     /// Tapping a card opens its detail (decoupled hero, #53); it only quiets the billboard rotation.
@@ -3126,11 +3176,27 @@ struct iOSLibraryView: View {
     }
     // END RANDOM PICK LIBRARY HELPERS
 
-    private func resumeLibraryContinueWatching(_ item: RailItem) {
+    private func resumeLibraryContinueWatching(_ item: RailItem, producer: PlaybackMutationTarget) {
+        let owner = PlaybackMutationTarget.capture(core: core)
+        guard isActive, owner == producer, owner.stillOwnsCurrentContext(core: core) else { return }
         hero.noteInteraction()
         #if !os(tvOS)
-        Task {
-            if let launch = await iOSDirectResume(for: item, core: core, account: account, expectedTraktSession: nil) {
+        let requestID = UUID()
+        let profileID = profiles.activeID
+        let accountBoundary = account.credentialBoundaryGeneration
+        continueWatchingRequestID = requestID
+        let stillCurrent: @MainActor () -> Bool = {
+            !Task.isCancelled && continueWatchingRequestID == requestID && downloadPlayer == nil
+                && owner.stillOwnsCurrentContext(core: core) && profiles.activeID == profileID
+                && account.credentialBoundaryGeneration == accountBoundary
+        }
+        Task { @MainActor in
+            guard stillCurrent() else { return }
+            let launch = await iOSDirectResume(for: item, core: core, account: account,
+                                               expectedTraktSession: nil, stillCurrent: stillCurrent)
+            guard stillCurrent() else { return }
+            continueWatchingRequestID = nil
+            if let launch {
                 downloadPlayer = launch
             } else {
                 path.append(FeaturedHeroItem.from(rail: item))
@@ -5012,8 +5078,9 @@ extension View {
 @MainActor
 private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                              account: StremioAccount,
-                             expectedTraktSession: TraktSessionID?) async -> iOSPlayerLaunch? {
-    guard expectedTraktSession == nil
+                             expectedTraktSession: TraktSessionID?,
+                             stillCurrent: @MainActor () -> Bool) async -> iOSPlayerLaunch? {
+    guard stillCurrent(), expectedTraktSession == nil
             || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     let pid = ProfileStore.shared.activeID
     let accountBoundary = account.credentialBoundaryGeneration
@@ -5026,6 +5093,23 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     }
     guard let url = URL(string: entry.url) else {
         LastStreamStore.logResume("badURL", libraryId: item.id, profileID: pid); return nil
+    }
+    if url.isFileURL {
+        let meta = PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,
+                                name: entry.name, poster: entry.poster,
+                                season: entry.season, episode: entry.episode)
+        guard item.type == entry.type,
+              let candidate = DownloadStore.shared.rememberedPlayableDownload(
+                  for: meta, cardVideoID: item.cwVideoId, file: url
+              ) else { return nil }
+        let displayedResume = item.resumeSeconds.flatMap { $0 > 0 ? $0 : nil }
+        guard let prepared = await candidate.prepareForPlayback(core: core, displayedResume: displayedResume),
+              stillCurrent(), ProfileStore.shared.activeID == pid,
+              account.credentialBoundaryGeneration == accountBoundary,
+              expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession,
+              prepared.copy.ownsCurrentContext(core: core),
+              LastStreamStore.entry(for: item.id, profileID: pid) == entry else { return nil }
+        return .downloaded(prepared.copy, resume: prepared.resume)
     }
     if PlaybackSettings.torrentsDisabled && entry.torrent == true {
         LastStreamStore.logResume("torrentDisabled", libraryId: item.id, profileID: pid); return nil
@@ -5066,10 +5150,11 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     // entry carries debrid provenance; a non-debrid entry returns the stored url unchanged (refreshed == false),
     // so torrent / plain-direct resumes are byte-identical to before.
     let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
-    guard (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
+    guard stillCurrent(), (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
           ProfileStore.shared.activeID == pid,
           account.credentialBoundaryGeneration == accountBoundary else { return nil }
     let playURL = refreshed ? resolvedURL : url
+    guard !playURL.isFileURL else { return nil }
     if hasEpisodicPhysicalIdentity, entry.torrent == true, entry.fileIdx == nil, !refreshed {
         LastStreamStore.logResume("episodeTorrentMissingFileIdx", libraryId: item.id, profileID: pid)
         return nil
@@ -5109,7 +5194,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         resume = engine
     } else {
         resume = await account.resumeOffset(for: meta)
-        guard expectedTraktSession == nil
+        guard stillCurrent(), expectedTraktSession == nil
                 || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     }
     // For a MOVIE, kick off loading the title's streams in the background so a stale stored link (debrid URLs
@@ -5144,6 +5229,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
             for _ in 0 ..< 6 {
                 if core.metaDetails?.meta?.id == item.id, !(core.metaDetails?.meta?.videos?.isEmpty ?? true) { break }
                 try? await Task.sleep(for: .milliseconds(250))
+                guard stillCurrent() else { return nil }
             }
         }
         let season = entry.season ?? 1
@@ -5277,7 +5363,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
             )
         }
     }
-    guard (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
+    guard stillCurrent(), (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
           ProfileStore.shared.activeID == pid,
           account.credentialBoundaryGeneration == accountBoundary else { return nil }
     return iOSPlayerLaunch(url: playURL, title: entry.title, headers: entry.headers,

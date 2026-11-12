@@ -95,8 +95,10 @@ final class PlayerPresenter: ObservableObject {
     @Published private(set) var playbackCloseAttempt: PlaybackMeta?
     private var receiptState = EpisodeReturnReceiptState<UUID, PlaybackMeta>()
 
+    private(set) var requestGeneration = UUID()
     @Published var request: PlaybackRequest? {
         didSet {
+            if request?.id != oldValue?.id { requestGeneration = UUID() }
             if request?.torrent == true && PlaybackSettings.torrentsDisabled {
                 request = nil
             }
@@ -124,16 +126,22 @@ final class PlayerPresenter: ObservableObject {
     @MainActor func presentDownloaded(
         _ candidate: AppleDownloadedPlayback, core: CoreBridge,
         replacing expectedRequestID: UUID? = nil,
+        displayedResume: Double? = nil,
+        onUnavailable: (@MainActor () -> Void)? = nil,
         stillCurrent: @escaping @MainActor () -> Bool = { true }
     ) {
         guard request?.id == expectedRequestID, stillCurrent() else { return }
+        let presentation = requestGeneration
         Task { @MainActor in
-            let prepared = await candidate.prepareForPlayback(core: core)
-            guard request?.id == expectedRequestID, stillCurrent() else { return }
+            let prepared = await candidate.prepareForPlayback(core: core, displayedResume: displayedResume)
+            guard !Task.isCancelled, requestGeneration == presentation,
+                  request?.id == expectedRequestID, stillCurrent() else { return }
             if let prepared {
                 request = .downloaded(prepared.copy, resume: prepared.resume)
             } else if let expectedRequestID {
                 close(requestID: expectedRequestID)
+            } else {
+                onUnavailable?()
             }
         }
     }

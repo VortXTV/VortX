@@ -4613,6 +4613,7 @@ struct CoreStreamList: View {
         // failure). Only when the stored source is genuinely gone do we drop to the auto-pick race below.
         if initialTraktNextEpisodeOffer == nil, let m = meta,
            let entry = LastStreamStore.entry(for: m.libraryId, profileID: ProfileStore.shared.activeID),
+           URL(string: entry.url)?.isFileURL != true,
            entry.debridService != nil, let hash = entry.infoHash, !hash.isEmpty,
            // Movie: always this title. Series: only when the stored episode is the one being played.
            (!isEpisodePlayback || entry.videoId == (episodeStreamId ?? m.videoId)),
@@ -4627,7 +4628,7 @@ struct CoreStreamList: View {
                 ) else { return }
             }
             let (url, refreshed) = resumeResult
-            if refreshed, let service = entry.debridService.flatMap(DebridService.init(rawValue:)) {
+            if refreshed, !url.isFileURL, let service = entry.debridService.flatMap(DebridService.init(rawValue:)) {
                 // A fresh link for the SAME source: play it as an EXPLICIT pick (no silent hop) so the resume
                 // honors the user's chosen source, exactly as a manual source-row tap would. Carry the debrid
                 // provenance so the play-record re-stores it and the NEXT resume can reresolve again.

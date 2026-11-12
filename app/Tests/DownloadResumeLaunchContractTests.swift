@@ -29,14 +29,39 @@ import Foundation
         precondition(presenter.components(separatedBy: "ProfileStore.shared.activeID == activeProfileID").count == 3,
                      "an extant inactive overlay may persist history but must never admit this launch")
         precondition(!admission.contains("active?.isKids"), "the existing exact Downloads entry stays available")
-        precondition(store.components(separatedBy: "guard ProfileStore.shared.active?.isKids != true").count == 4,
-                     "both new lookup paths and local successor respect Kids mode")
+        precondition(store.components(separatedBy: "guard ProfileStore.shared.active?.isKids != true").count == 5,
+                     "all inferred lookup paths and local successor respect Kids mode")
         precondition(store.contains("isKids == (ProfileStore.shared.active?.isKids == true)"),
                      "a Kids setting change invalidates an asynchronous launch")
         precondition(store.contains("core.engineResumeSecondsByLibraryId(for: meta)"))
         precondition(store.contains("await core.nativeResumeSeconds(for: meta, target: current.owner)"))
         precondition(store.contains("ProfileStore.shared.resumeOffset(for: meta)"))
         precondition(store.contains("let final = current.revalidated()"))
+        precondition(store.contains("if let displayedResume, displayedResume.isFinite, displayedResume >= 0"))
+        let iosCW = root.components(separatedBy: "private func iOSDirectResume(for item:")[1]
+            .components(separatedBy: "private func iOSDirectStream")[0]
+        precondition(iosCW.range(of: "if url.isFileURL")!.lowerBound < iosCW.range(of: "CWResume.resolvedURL")!.lowerBound)
+        precondition(iosCW.contains("return .downloaded(prepared.copy, resume: prepared.resume)"))
+        precondition(iosCW.contains("prepared.copy.ownsCurrentContext(core: core)"))
+        precondition(iosCW.contains("stillCurrent(), ProfileStore.shared.activeID == pid"))
+        precondition(root.components(separatedBy: "didSet { if path != oldValue { continueWatchingRequestID = nil } }").count == 3)
+        precondition(root.components(separatedBy: "Binding(get: { path }, set: { path = $0 })").count == 3)
+        precondition(root.contains("didSet { if player?.id != oldValue?.id { continueWatchingRequestID = nil } }"))
+        precondition(root.contains("didSet { if downloadPlayer?.id != oldValue?.id { continueWatchingRequestID = nil } }"))
+        let libraryCW = root.components(separatedBy: "private func resumeLibraryContinueWatching(_ item:")[1]
+            .components(separatedBy: "private func sortChips")[0]
+        let ownerCheck = libraryCW.range(of: "owner == producer, owner.stillOwnsCurrentContext(core: core)")!.lowerBound
+        let libraryTask = libraryCW.range(of: "Task { @MainActor in")!.lowerBound
+        precondition(ownerCheck < libraryTask && libraryCW.contains("&& owner.stillOwnsCurrentContext(core: core)"))
+        precondition(libraryCW.components(separatedBy: "guard stillCurrent() else { return }").count == 3)
+        precondition(root.contains("items: shelf.items, onTap: { resumeLibraryContinueWatching($0, producer: shelf.owner) }"))
+        let tvCW = try String(contentsOfFile: "app/SourcesTV/HomeView.swift", encoding: .utf8)
+        let tvResume = tvCW.components(separatedBy: "private func directResume(_ item:")[1]
+            .components(separatedBy: "private func resumeSource")[0]
+        precondition(tvResume.range(of: "if url.isFileURL")!.lowerBound < tvResume.range(of: "CWResume.resolvedURL")!.lowerBound)
+        precondition(tvResume.contains("presenter.presentDownloaded(candidate, core: core, displayedResume: item.resumeSeconds"))
+        precondition(tvResume.contains("continueWatchingRequestID == requestID"))
+        precondition(tvResume.contains("candidate.ownsCurrentContext(core: core)"))
         precondition(presenter.contains("iOSPlayerLaunch.downloaded(prepared.copy, resume: prepared.resume)"))
         precondition(store.contains("attributes.isRegularFile == true"))
         precondition(store.contains("attributes.isSymbolicLink == false"))
@@ -102,6 +127,8 @@ import Foundation
         let tvRoot = try String(contentsOfFile: "app/SourcesTV/RootTabView.swift", encoding: .utf8)
         precondition(tvRoot.contains("startAtSeconds: resume, downloadedPlayback: playback"))
         precondition(tvRoot.contains("guard request?.id == expectedRequestID, stillCurrent()"))
+        precondition(tvRoot.contains("if request?.id != oldValue?.id { requestGeneration = UUID() }"))
+        precondition(tvRoot.contains("guard !Task.isCancelled, requestGeneration == presentation,"))
         precondition(tvPlayer.contains("if !downloadHandoffProgressFlushed"))
         precondition(tvPlayer.contains("$0.owner == coordinator.player?.activeLoadToken && $0.mountGeneration == mountGeneration"),
                      "paused EOF cannot authorize a new AVPlayer physical item under the same logical load")

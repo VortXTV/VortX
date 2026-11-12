@@ -143,6 +143,22 @@ final class DownloadStore: ObservableObject {
             .flatMap { playableDownload(id: $0.id, expected: $0.playbackMeta) }
     }
 
+    func rememberedPlayableDownload(
+        for target: PlaybackMeta, cardVideoID: String?, file: URL
+    ) -> AppleDownloadedPlayback? {
+        guard ProfileStore.shared.active?.isKids != true else { return nil }
+        let episode = EpisodePlaybackIdentity.isEpisodicContext(
+            type: target.type, season: target.season, episode: target.episode, videoID: target.videoId
+        )
+        if episode || cardVideoID != nil {
+            guard cardVideoID == target.videoId else { return nil }
+        }
+        return DownloadRecord.rememberedPlayableCopy(
+            of: target, rememberedFile: file, in: records,
+            fileExists: hasValidPlaybackFile
+        ).flatMap { playableDownload(id: $0.id, expected: $0.playbackMeta) }
+    }
+
     func playableDownloads(libraryID: String, type: String) -> [AppleDownloadedPlayback] {
         guard ProfileStore.shared.active?.isKids != true else { return [] }
         var seen = Set<String>()
@@ -352,11 +368,15 @@ struct AppleDownloadedPlayback {
         return current
     }
 
-    @MainActor func prepareForPlayback(core: CoreBridge) async -> (copy: Self, resume: Double)? {
+    @MainActor func prepareForPlayback(
+        core: CoreBridge, displayedResume: Double? = nil
+    ) async -> (copy: Self, resume: Double)? {
         guard !Task.isCancelled, let current = revalidated() else { return nil }
         let meta = current.record.playbackMeta
         let resume: Double
-        if let cached = core.engineResumeSecondsByLibraryId(for: meta), cached.isFinite, cached > 5 {
+        if let displayedResume, displayedResume.isFinite, displayedResume >= 0 {
+            resume = displayedResume
+        } else if let cached = core.engineResumeSecondsByLibraryId(for: meta), cached.isFinite, cached > 5 {
             resume = cached
         } else if core.usesNativeProfileState {
             resume = await core.nativeResumeSeconds(for: meta, target: current.owner)
