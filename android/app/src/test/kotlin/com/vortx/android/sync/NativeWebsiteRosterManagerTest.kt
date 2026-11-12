@@ -97,6 +97,17 @@ class NativeWebsiteRosterManagerTest {
         assertEquals(0L, f.appliedVersion())
     }
 
+    @Test fun existingPendingWebsiteReceiptMakesMissingBackupUnavailable() = withFixture { f ->
+        val pending = f.seedPendingReceipt()
+        f.backupMissing = true
+        assertFalse(f.manager.syncDown(force = true))
+        assertEquals(listOf("GET"), f.requests)
+        assertTrue(f.attempts.isEmpty())
+        assertTrue(f.gateway.applied.isEmpty())
+        assertEquals(0L, f.appliedVersion())
+        assertEquals(pending, f.firstReceipt())
+    }
+
     @Test fun uploadPathUsesOrdinaryAckOnlyAfterSeparateOrdinaryPut() = withFixture { f ->
         f.ordinaryPutFails = true
         assertFalse(f.manager.syncUp())
@@ -141,8 +152,20 @@ class NativeWebsiteRosterManagerTest {
         var loseAcceptance = false
         var ordinaryPutFails = false
         var switchAccountDuringFirstPut = false
+        var backupMissing = false
         private fun state() = context.getSharedPreferences("vortx_sync_state", Context.MODE_PRIVATE)
-        fun firstReceipt() = state().getString("websiteRosterDenialReceipt.${account.id}", null)
+        private val receiptKey = NativeWebsiteRosterReceiptStore.storageKey(account.id, key)
+        fun firstReceipt() = state().getString(receiptKey, null)
+        fun seedPendingReceipt(): String {
+            assertEquals(0L, appliedVersion())
+            assertFalse(state().getBoolean("nativeBackupSeen.${account.id}", false))
+            assertNull(firstReceipt())
+            val projected = requireNotNull(NativeWebsiteRosterProjection.project(original))
+            val encoded = NativeWebsiteRosterDenialReceipt.create(account.id, key, revision, original, revision + 1, projected).encode()
+            assertTrue(encoded.startsWith("v1:"))
+            assertTrue(state().edit().putString(receiptKey, encoded).commit())
+            return encoded
+        }
         fun appliedVersion() = state().getLong("lastSyncedVersion.${account.id}", 0)
         fun fullRoster(name: String): ByteArray {
             val row = UserProfile(id = UserProfile.OWNER_ID, name = name, avatar = "star", isOwner = true)
@@ -156,7 +179,10 @@ class NativeWebsiteRosterManagerTest {
             manager.installSyncTestSeam(VortXSyncManager.Session("fixture-only", account, key), 0, transport = { method, path, body, _ ->
                 assertEquals("/v1/backup", path)
                 requests += method
-                if (method == "GET") {
+                if (method == "GET" && backupMissing) {
+                    assertNull(body)
+                    404 to null
+                } else if (method == "GET") {
                     200 to JSONObject().put("version", revision).put("document",
                         VortXCrypto.sealDocument(key, cloud, account.id, revision, writeV2 = true))
                 } else {
