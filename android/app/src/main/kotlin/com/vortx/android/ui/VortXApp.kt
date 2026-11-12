@@ -202,6 +202,7 @@ import com.vortx.android.ui.screens.WhosWatchingScreen
 import com.vortx.android.ui.screens.WatchlistScreen
 import com.vortx.android.sync.AccountLibrarySync
 import com.vortx.android.sync.VortXSyncManager
+import com.vortx.android.sync.presentationKey
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.theme.vortxGlassPanel
@@ -293,9 +294,6 @@ fun VortXApp(
     val liveFileRecoveryPause = syncManager?.pickerFileRecoveryPaused
     val fileRecoveryPausedNow = rememberPickerFileRecoveryPause(liveFileRecoveryPause)
     val appContext = LocalContext.current.applicationContext
-    // VortXApplication binds the persistence-backed owner before either the phone or TV launcher creates
-    // consumers. Compose only reads the shared binding; it must never redefine process ownership.
-    val debridKeys = remember(appContext) { DebridKeys(appContext) }
     val vortxSessionUi by (
         syncManager?.sessionUiState?.collectAsStateWithLifecycle()
             ?: remember { mutableStateOf<VortXSyncManager.SessionUiState?>(null) }
@@ -310,10 +308,10 @@ fun VortXApp(
         profileStore?.activeProfile?.collectAsStateWithLifecycle()
             ?: remember { mutableStateOf(null) }
     )
-    // Reading the bound identity after collecting account makes Compose reset the debrid editor at the same
-    // account transition that every resolver/coordinator/view-model DebridKeys instance observes.
-    val debridAccountIdentity = debridKeys.ownerIdentity()
-    val debridOwnerEpoch = debridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
+    // The manager publishes the exact owner generation with session changes. Detail only uses it
+    // as a screen key; playback and credentials still perform their own owner admission.
+    val debridOwnerEpoch = syncManager?.sessionOwnerPresentation?.collectAsStateWithLifecycle()
+        ?.value?.presentationKey ?: "unknown"
     val debridCredentialRevision by DebridKeys.credentialRevision.collectAsStateWithLifecycle()
     val sourceSettingsRevision by SourceSettingsRevision.observe(appContext).collectAsStateWithLifecycle()
     val detailSourceEpoch = "$debridOwnerEpoch:$debridCredentialRevision:$sourceSettingsRevision"
@@ -1723,9 +1721,10 @@ fun VortXApp(
 
         if (showDebridKeys) {
             BackHandler(onBack = closeDebridKeys)
+            val keys = remember(appContext) { DebridKeys(appContext) }
             DebridKeysScreen(
-                keys = debridKeys,
-                accountIdentity = debridAccountIdentity,
+                keys = keys,
+                accountIdentity = keys.ownerIdentity(),
                 onBack = closeDebridKeys,
             )
             return@VortXTheme
@@ -1734,11 +1733,12 @@ fun VortXApp(
         if (showDebridLibrary) {
             // Settings > Debrid > Your cloud: browse + play what is already in the user's debrid accounts.
             // Self-contained like the other settings overlays: it builds its own DebridCoordinator off the
-            // shared [debridKeys] and hands a resolved DIRECT url up to the same `playing` slot the Downloads
+            // account's keys and hands a resolved DIRECT url up to the same `playing` slot the Downloads
             // screen uses, so a chosen cloud item covers everything with the standard player.
             BackHandler { showDebridLibrary = false }
+            val keys = remember(appContext) { DebridKeys(appContext) }
             DebridLibraryScreen(
-                keys = debridKeys,
+                keys = keys,
                 onPlay = {
                     playingEngineOverride = automaticEngineFor(it)
                     playing = it

@@ -295,6 +295,14 @@ internal sealed interface SessionOwnerSnapshot {
     data class Account(val id: String, override val generation: Long) : SessionOwnerSnapshot
 }
 
+/** For replacing screen state only. Consequential operations still require current owner admission. */
+internal val SessionOwnerSnapshot.presentationKey: String
+    get() = when (this) {
+        is SessionOwnerSnapshot.Account -> "account:$id:$generation"
+        is SessionOwnerSnapshot.SignedOutLocal -> "local:$generation"
+        is SessionOwnerSnapshot.UnknownOrUnavailable -> "unknown"
+    }
+
 /** Stable identity of the exact captured command scope; deliberately has no value-bearing toString. */
 internal class LocalLibraryMutationIdentity(
     private val manager: Any,
@@ -1535,11 +1543,29 @@ class VortXSyncManager internal constructor(
     val account: StateFlow<Account?> = _account.asStateFlow()
 
     private val _sessionUiState = MutableStateFlow(initialSessionLoad.uiState())
+    private val _sessionOwnerPresentation = MutableStateFlow(_sessionUiState.value.ownerPresentation())
     // Guarded by operations. A temporary secure-store failure retires a drain even if
     // the same original session becomes available before it can rewrite the queue.
     @Volatile private var providerRetryDrainAvailability = Any()
     /** Tri-state persistence truth for account surfaces, including an explicit unavailable/retry state. */
     val sessionUiState: StateFlow<SessionUiState> = _sessionUiState.asStateFlow()
+
+    /** Last published account identity and owner generation, for rendering without secure-store I/O. */
+    internal val sessionOwnerPresentation: StateFlow<SessionOwnerSnapshot> = _sessionOwnerPresentation.asStateFlow()
+
+    private fun SessionUiState.ownerPresentation(): SessionOwnerSnapshot = when (this) {
+        is SessionUiState.SignedIn -> SessionOwnerSnapshot.Account(account.id, sessionState.ownerEpoch)
+        SessionUiState.SignedOut -> SessionOwnerSnapshot.SignedOutLocal(sessionState.ownerEpoch)
+        SessionUiState.UnknownOrUnavailable -> SessionOwnerSnapshot.UnknownOrUnavailable(sessionState.ownerEpoch)
+    }
+
+    /** Called under the same owner serialization as the original UI state publication. */
+    private fun publishSessionUiState(state: SessionUiState): SessionOwnerSnapshot {
+        val owner = state.ownerPresentation()
+        _sessionOwnerPresentation.value = owner
+        _sessionUiState.value = state
+        return owner
+    }
 
     /** True whenever a session is present (a token + data key were adopted and persisted). */
     val isSignedIn: Boolean get() = session != null
@@ -1602,7 +1628,7 @@ class VortXSyncManager internal constructor(
             if (_sessionUiState.value != SessionUiState.UnknownOrUnavailable) {
                 com.vortx.android.player.PlaybackOwnerEpoch.transition {
                     providerRetryDrainAvailability = Any()
-                    _sessionUiState.value = SessionUiState.UnknownOrUnavailable
+                    publishSessionUiState(SessionUiState.UnknownOrUnavailable)
                 }
             }
             return@serialized SessionOwnerSnapshot.UnknownOrUnavailable(sessionState.ownerEpoch)
@@ -1630,19 +1656,17 @@ class VortXSyncManager internal constructor(
         ) {
             com.vortx.android.player.PlaybackOwnerEpoch.transition {
                 providerRetryDrainAvailability = Any()
-                _sessionUiState.value = SessionUiState.UnknownOrUnavailable
+                publishSessionUiState(SessionUiState.UnknownOrUnavailable)
             }
             return@serialized SessionOwnerSnapshot.UnknownOrUnavailable(sessionState.ownerEpoch)
         }
         val current = sessionState.value
         if (current == null) {
             _account.value = null
-            _sessionUiState.value = SessionUiState.SignedOut
-            SessionOwnerSnapshot.SignedOutLocal(sessionState.ownerEpoch)
+            publishSessionUiState(SessionUiState.SignedOut)
         } else {
             _account.value = current.account
-            _sessionUiState.value = SessionUiState.SignedIn(current.account)
-            SessionOwnerSnapshot.Account(current.account.id, sessionState.ownerEpoch)
+            publishSessionUiState(SessionUiState.SignedIn(current.account))
         }
     } }
 
@@ -2278,7 +2302,7 @@ class VortXSyncManager internal constructor(
                 AddonTombstones.activateAccount(null)
                 AddonPrefsStore.activateAccount(null)
                 _account.value = null
-                _sessionUiState.value = SessionUiState.SignedOut
+                publishSessionUiState(SessionUiState.SignedOut)
                 nativeGateway?.retire()
             }
         }
@@ -2315,7 +2339,7 @@ class VortXSyncManager internal constructor(
         AddonTombstones.activateAccount(testSession.account.id)
         AddonPrefsStore.activateAccount(testSession.account.id)
         _account.value = testSession.account
-        _sessionUiState.value = SessionUiState.SignedIn(testSession.account)
+        publishSessionUiState(SessionUiState.SignedIn(testSession.account))
         syncState.setLastVersion(testSession.account.id, highWaterVersion)
         requestTestSeam = transport
         versionedPayloadTestObserver = onVersionedPayloadApply
@@ -4760,7 +4784,7 @@ class VortXSyncManager internal constructor(
                     AddonTombstones.activateAccount(account.id)
                     AddonPrefsStore.activateAccount(account.id)
                     _account.value = account
-                    _sessionUiState.value = SessionUiState.SignedIn(account)
+                    publishSessionUiState(SessionUiState.SignedIn(account))
                     completion?.record(capturePickerCompletionOwner())
                 }
             }

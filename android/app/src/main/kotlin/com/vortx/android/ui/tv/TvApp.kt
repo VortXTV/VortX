@@ -80,6 +80,7 @@ import com.vortx.android.ui.profilepicker.ProfilePickerToolsHost
 import com.vortx.android.ui.viewmodel.rememberPickerToolsModel
 import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.sync.VortXSyncManager
+import com.vortx.android.sync.presentationKey
 import com.vortx.android.update.UpdatePromptHost
 import com.vortx.android.ui.detailViewModelKey
 import com.vortx.android.ui.detailEpisodeRouteKey
@@ -371,12 +372,10 @@ fun TvApp(
         }
 
         val appContext = LocalContext.current.applicationContext
-        val debridKeys = remember(appContext) { DebridKeys(appContext) }
         // Collect session truth so an account-generation transition recreates the title ViewModel and drops
         // account-derived cache badges/resume refs on TV just as it does in the phone shell.
-        val debridOwnerEpoch = remember(sessionUiState) {
-            debridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
-        }
+        val debridOwnerEpoch = syncManager?.sessionOwnerPresentation?.collectAsStateWithLifecycle()
+            ?.value?.presentationKey ?: "unknown"
         val debridCredentialRevision by DebridKeys.credentialRevision.collectAsStateWithLifecycle()
         val sourceSettingsRevision by SourceSettingsRevision.observe(appContext).collectAsStateWithLifecycle()
         val detailSourceEpoch = "$debridOwnerEpoch:$debridCredentialRevision:$sourceSettingsRevision"
@@ -592,8 +591,12 @@ fun TvApp(
             }
             // A warm task belongs to this accepted episode and complete profile/source owner.
             // Disposing or replacing either cancels real I/O, not just its eventual publication.
-            val playerOwnerKey = "${activeProfile?.id}:$detailSourceEpoch:${playerDetail?.type}:${playerDetail?.id}"
-            val currentPlayerPrincipal = activeProfile?.id to debridOwnerEpoch
+            val keys = remember(appContext) { DebridKeys(appContext) }
+            val playerDebridOwner = remember(sessionUiState, debridOwnerEpoch) {
+                keys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
+            }
+            val playerOwnerKey = "${activeProfile?.id}:$detailSourceEpoch:$playerDebridOwner:${playerDetail?.type}:${playerDetail?.id}"
+            val currentPlayerPrincipal = activeProfile?.id to playerDebridOwner
             val launchedPlayerPrincipal = remember(playable) { currentPlayerPrincipal }
             val launchedPlayerViewModel = remember(playable) { playerVm }
             val preloadPolicy = remember(historyIdentity, playerOwnerKey) { NextEpisodePreloadPolicy() }

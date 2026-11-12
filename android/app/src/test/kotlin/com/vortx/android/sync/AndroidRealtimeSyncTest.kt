@@ -1437,6 +1437,27 @@ class AndroidRealtimeSyncTest {
         } finally { f.close() }
     }
 
+    @Test fun `owner presentation changes on confirmed same account recovery and clears on unavailable storage`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val manager = f.manager
+            val session = requireNotNull(manager.currentSession())
+            val original = SessionOwnerSnapshot.Account(account.id, INITIAL_SESSION_OWNER_EPOCH)
+            assertEquals(original, manager.sessionOwnerSnapshot())
+            assertEquals(original, manager.sessionOwnerPresentation.value)
+
+            manager.installUnavailableSessionRestoreTestSeam()
+            assertTrue(manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.UnknownOrUnavailable)
+            assertTrue(manager.sessionOwnerPresentation.value is SessionOwnerSnapshot.UnknownOrUnavailable)
+
+            val replacement = original.copy(generation = original.generation + 1)
+            manager.installSessionRestoreTestSeam(session, ownerEpoch = replacement.generation)
+            assertEquals(replacement, manager.sessionOwnerSnapshot())
+            assertEquals(SessionUiState.SignedIn(account), manager.sessionUiState.value)
+            assertEquals(replacement, manager.sessionOwnerPresentation.value)
+        } finally { f.close() }
+    }
+
     @Test fun `cold signed-out and unavailable owners cannot open a checkpoint request or socket`() = test {
         for (signedOut in listOf(true, false)) {
             val f = Fixture(testScheduler)
