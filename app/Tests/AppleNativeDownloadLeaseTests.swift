@@ -104,7 +104,7 @@ enum AppleNativeDownloadLeaseTests {
         if baseline.isEmpty {
             for marker in ["private func releaseNativeSource(", "private func nativeSourceDidClose(", "private func failNativeSource(",
                            "nonisolated static func nativeDownloadFailureDetail(", "private func startMacExternalTask(",
-                           "private func parkMacDownload(", "private func recordMacDownloadComplete(", "private func finishMacExternalTask("] {
+                           "private func parkMacDownload(", "private func finishMacExternalTask("] {
                 source += try function(manager, marker) + "\n"
             }
         }
@@ -260,9 +260,8 @@ let NSURLSessionDownloadTaskResumeData = "synthetic-resume-data"
     #if !BASELINE
     func storedFileURL(for record: DownloadRecord) -> URL? {
         guard let location = record.macDownloadLocationID else { return fileURL(for: record) }
-        return MacDownloadLocations.shared.directory(for: location)?.appendingPathComponent(record.localFilename)
+        return MacDownloadLocations.shared.directory(for: location)?.appendingPathComponent(record.macDownloadFilename ?? record.localFilename)
     }
-    func hasInstalledMacTransfer(_ record: DownloadRecord) -> Bool { false }
     func updateMacTransfer(id: UUID, _ change: (inout DownloadRecord) -> Void) throws { update(id: id, change) }
     #endif
     func record(id: UUID) -> DownloadRecord? { records.first { $0.id == id } }
@@ -280,13 +279,14 @@ let NSURLSessionDownloadTaskResumeData = "synthetic-resume-data"
         var errorDescription: String? { "Disconnected" }
     }
     func directory(for id: UUID) -> URL? { roots[id] }
-    func discardIncomplete(location: UUID, attempt: UUID) -> Bool { roots[location] != nil }
+    func removeOwnedFile(location: UUID, filename: String, fileID: UInt64, bytes: Int64? = nil) -> Bool { roots[location] != nil }
 }
 final class MacExternalDownloadTransfer: Sendable {
     struct StagedFile: Sendable {
         let bytes: Int64
         var fileIdentity: UInt64 { 1 }
-        func commit(to file: URL) throws { try Data(repeating: 42, count: Int(bytes)).write(to: file, options: .withoutOverwriting) }
+        func verify(at file: URL) throws { try Data(repeating: 42, count: Int(bytes)).write(to: file, options: .withoutOverwriting) }
+        func keep() {}
         func discard() {}
     }
     enum Failure: Error, Sendable {
@@ -294,9 +294,11 @@ final class MacExternalDownloadTransfer: Sendable {
         var message: String { "Cancelled" }
     }
     let completion: @Sendable (Result<StagedFile, Failure>) -> Void
-    init(request: URLRequest, directory: URL, locationID: UUID, stagingID: UUID, progress: @escaping @Sendable (Int64, Int64) -> Void,
+    @MainActor private var reserve: (@Sendable (UInt64) async -> Bool)?
+    init(request: URLRequest, directory: URL, locationID: UUID, filename: String, progress: @escaping @Sendable (Int64, Int64) -> Void,
          completion: @escaping @Sendable (Result<StagedFile, Failure>) -> Void) { self.completion = completion }
-    func start() {}
+    @MainActor func start(reserve: @escaping @Sendable (UInt64) async -> Bool) { self.reserve = reserve }
+    @MainActor func reserveFile() async -> Bool { await reserve?(1) ?? false }
     func cancel() {}
 }
 func makeLease(owner: Owner = Owner(), monitor: Bool = false) -> UsenetNodeClient.OperationLease {
@@ -470,8 +472,10 @@ func makeLease(owner: Owner = Owner(), monitor: Bool = false) -> UsenetNodeClien
         let external = await mac.download(stream: CoreStream(), meta: meta(), resolvedURL: mediaURL,
                                           sourceName: nil, qualityText: nil)
         let oldAttempt = mac.macExternalTasks[external.id]!
+        let reservedFirst = await oldAttempt.transfer.reserveFile()
         check("external row freezes the chosen drive and bypasses the OS temp download task",
-              external.macDownloadLocationID == locationA && mac.taskForRecord[external.id] == nil)
+              external.macDownloadLocationID == locationA && mac.taskForRecord[external.id] == nil &&
+              reservedFirst && mac.store.record(id: external.id)?.macDownloadStagedFileID == 1)
         mac.pause(id: external.id)
         MacDownloadLocations.shared.selectedLocationID = locationB
         mac.resume(id: external.id)
@@ -480,14 +484,20 @@ func makeLease(owner: Owner = Owner(), monitor: Bool = false) -> UsenetNodeClien
         oldAttempt.transfer.completion(.success(.init(bytes: 8)))
         await flush()
         let finalAttempt = mac.macExternalTasks[external.id]!
-        let finalFile = driveA.appendingPathComponent(external.localFilename)
+        let finalFile = driveA.appendingPathComponent(external.macDownloadFilename(for: finalAttempt.attempt)!)
         check("stale completion does not install over a resumed transfer",
               finalAttempt.attempt != oldAttempt.attempt && !FileManager.default.fileExists(atPath: finalFile.path))
+        let reservedFinal = await finalAttempt.transfer.reserveFile()
+        check("latest attempt durably reserves the exact filename before reading", reservedFinal)
         finalAttempt.transfer.completion(.success(.init(bytes: 9)))
         await flush()
         check("final completion stays on the original drive after the default changes",
               mac.store.record(id: external.id)?.state == .completed &&
               (try? Data(contentsOf: finalFile).count) == 9)
+        var previousCompletion = mac.store.record(id: external.id)!
+        previousCompletion.macDownloadAttemptID = nil
+        check("previous completed Mac records keep their verified original filename",
+              previousCompletion.macDownloadFilename == previousCompletion.localFilename)
 
         let removed = await mac.download(stream: CoreStream(), meta: meta(), resolvedURL: mediaURL,
                                          sourceName: nil, qualityText: nil)

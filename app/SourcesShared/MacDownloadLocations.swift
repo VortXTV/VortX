@@ -26,13 +26,12 @@ final class MacDownloadLocations: ObservableObject {
     }
 
     enum LocationError: LocalizedError {
-        case unavailable, cannotPrepare, unsupportedFormat
+        case unavailable, cannotPrepare
 
         var errorDescription: String? {
             switch self {
             case .unavailable: return String(localized: "Reconnect the download drive and try again.")
             case .cannotPrepare: return String(localized: "VortX could not prepare a downloads folder at this location.")
-            case .unsupportedFormat: return String(localized: "This drive’s format does not support safely finishing downloads. Choose another drive.")
             }
         }
     }
@@ -80,8 +79,7 @@ final class MacDownloadLocations: ObservableObject {
 
         // Create a child exclusively. Never take ownership of an existing folder or replace its files.
         let id = UUID()
-        let volume = try parent.resourceValues(forKeys: [.volumeUUIDStringKey, .volumeSupportsExclusiveRenamingKey])
-        guard volume.volumeSupportsExclusiveRenaming != false else { throw LocationError.unsupportedFormat }
+        let volume = try parent.resourceValues(forKeys: [.volumeUUIDStringKey])
         guard Darwin.mkdir(directory.path, 0o700) == 0 else { throw LocationError.cannotPrepare }
         do {
             let marker = directory.appendingPathComponent(Self.markerName)
@@ -114,28 +112,15 @@ final class MacDownloadLocations: ObservableObject {
         state.locations.first { $0.id == id }.flatMap(resolve)
     }
 
-    /// Remove only a partial tied to a persisted attempt on its original, verified volume.
-    func discardIncomplete(location: UUID, attempt: UUID) -> Bool {
-        removeManagedFile(location: location, filename: MacExternalDownloadTransfer.stagingFilename(for: attempt))
-    }
-
-    /// A final file is owned only when it matches the persisted installation receipt.
-    func removeInstalledFile(location: UUID, filename: String, fileID: UInt64, bytes: Int64) -> Bool {
-        removeManagedFile(location: location, filename: filename, receipt: (fileID, bytes))
-    }
-
-    private func removeManagedFile(
-        location: UUID, filename: String, receipt: (fileID: UInt64, bytes: Int64)? = nil
-    ) -> Bool {
+    /// Remove only a file with a persisted reservation on its original, verified volume.
+    /// A completed file additionally has to match its recorded byte count.
+    func removeOwnedFile(location: UUID, filename: String, fileID: UInt64, bytes: Int64? = nil) -> Bool {
         guard !filename.isEmpty, filename != ".", filename != "..", !filename.contains("/") else { return false }
         return withLocationDirectory(location) { descriptor in
             var info = stat()
             guard fstatat(descriptor, filename, &info, AT_SYMLINK_NOFOLLOW) == 0 else { return errno == ENOENT }
-            if let receipt, info.st_mode & S_IFMT != S_IFREG ||
-                UInt64(info.st_ino) != receipt.fileID || info.st_size != receipt.bytes {
-                return true // Preserve a file VortX cannot establish ownership of.
-            }
-            guard info.st_mode & S_IFMT == S_IFREG else { return false }
+            guard info.st_mode & S_IFMT == S_IFREG, UInt64(info.st_ino) == fileID,
+                  bytes.map({ $0 == info.st_size }) ?? true else { return true }
             return unlinkat(descriptor, filename, 0) == 0
         }
     }

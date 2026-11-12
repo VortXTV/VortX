@@ -3,7 +3,8 @@ import Darwin
 import Foundation
 
 /// A foreground transfer that writes directly to an admitted download directory.
-/// The manager owns the launch generation and commits the returned stage only while that launch is current.
+/// The manager admits the exclusively created file before the request and publishes it in the index
+/// only when the completed file still belongs to the current launch.
 final class MacExternalDownloadTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     enum Failure: Error, LocalizedError, Equatable, Sendable {
         case cancelled
@@ -43,7 +44,7 @@ final class MacExternalDownloadTransfer: NSObject, URLSessionDataDelegate, @unch
         }
     }
 
-    /// Owns a private, uniquely named stage on the selected volume. Dropping it discards the stage.
+    /// Owns the exclusively created file on the selected volume until the index commits it.
     /// Descriptor-relative operations keep cleanup on the originally opened directory.
     final class StagedFile: @unchecked Sendable {
         let url: URL
@@ -64,35 +65,67 @@ final class MacExternalDownloadTransfer: NSObject, URLSessionDataDelegate, @unch
 
         var fileIdentity: UInt64 { UInt64(inode) }
 
-        fileprivate init(directory: URL, locationID: UUID, stagingID: UUID) throws {
+        fileprivate init(directory: URL, locationID: UUID, filename: String) throws {
+            guard !filename.isEmpty, filename != ".", filename != "..",
+                  !filename.utf8.contains(0), !filename.contains("/") else {
+                throw Failure.destinationUnavailable
+            }
             let directoryFD = try Self.openDirectory(directory)
             guard MacExternalDownloadTransfer.directoryHasMarker(directoryFD, locationID: locationID) else {
                 Darwin.close(directoryFD)
                 throw Failure.destinationUnavailable
             }
-            let name = MacExternalDownloadTransfer.stagingFilename(for: stagingID)
             let fileFD = Darwin.openat(
-                directoryFD, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600)
+                directoryFD, filename, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600)
             )
             guard fileFD >= 0 else {
-                let failure = Failure.disk(errno)
+                let code = errno
+                let failure = code == EEXIST ? Failure.destinationExists : Failure.disk(code)
                 Darwin.close(directoryFD)
                 throw failure
             }
-            var info = stat()
-            guard Darwin.fstat(fileFD, &info) == 0 else {
-                let failure = Failure.disk(errno)
+            let info: stat
+            do {
+                info = try Self.allocateFileIdentity(fileFD)
+            } catch {
+                // On failure remove only the directory entry that still names our open file.
+                var openFile = stat()
+                var entry = stat()
+                if Darwin.fstat(fileFD, &openFile) == 0,
+                   Darwin.fstatat(directoryFD, filename, &entry, AT_SYMLINK_NOFOLLOW) == 0,
+                   openFile.st_dev == entry.st_dev, openFile.st_ino == entry.st_ino,
+                   entry.st_mode & S_IFMT == S_IFREG, entry.st_nlink == 1 {
+                    _ = Darwin.unlinkat(directoryFD, filename, 0)
+                }
                 Darwin.close(fileFD)
                 Darwin.close(directoryFD)
-                throw failure
+                throw error
             }
             self.directoryFD = directoryFD
             self.fileFD = fileFD
-            self.name = name
+            self.name = filename
             self.locationID = locationID
             self.device = info.st_dev
             self.inode = info.st_ino
-            self.url = directory.appendingPathComponent(name)
+            self.url = directory.appendingPathComponent(filename)
+        }
+
+        private static func allocateFileIdentity(_ fileFD: Int32) throws -> stat {
+            // exFAT gives an empty file a temporary inode until it allocates its first cluster.
+            // Reserve that cluster without advancing the write offset. Media overwrites this byte.
+            var placeholder: UInt8 = 0
+            while true {
+                let count = Darwin.pwrite(fileFD, &placeholder, 1, 0)
+                if count == 1 { break }
+                if count < 0 && errno == EINTR { continue }
+                throw count < 0 ? Failure.disk(errno) : Failure.writeFailed
+            }
+            while Darwin.fsync(fileFD) != 0 {
+                guard errno == EINTR else { throw Failure.disk(errno) }
+            }
+            var info = stat()
+            guard Darwin.fstat(fileFD, &info) == 0 else { throw Failure.disk(errno) }
+            return info
         }
 
         fileprivate func append(_ data: Data) throws {
@@ -127,14 +160,11 @@ final class MacExternalDownloadTransfer: NSObject, URLSessionDataDelegate, @unch
             sealed = true
         }
 
-        /// Publish within the same admitted directory, using an atomic rename that refuses any existing name.
-        func commit(to destination: URL) throws {
+        /// Recheck the sealed file before publishing it in the index.
+        func verify(at destination: URL) throws {
             lock.lock(); defer { lock.unlock() }
-            let finalName = destination.lastPathComponent
             guard sealed, directoryFD >= 0, destination.isFileURL,
-                  !finalName.isEmpty, finalName != ".", finalName != "..",
-                  !finalName.utf8.contains(0), !finalName.contains("/"),
-                  ownsEntry(name) else { throw Failure.destinationUnavailable }
+                  destination.lastPathComponent == name else { throw Failure.destinationUnavailable }
 
             let currentFD = try Self.openDirectory(destination.deletingLastPathComponent())
             defer { Darwin.close(currentFD) }
@@ -142,14 +172,16 @@ final class MacExternalDownloadTransfer: NSObject, URLSessionDataDelegate, @unch
             var current = stat()
             guard Darwin.fstat(directoryFD, &opened) == 0, Darwin.fstat(currentFD, &current) == 0,
                   opened.st_dev == current.st_dev, opened.st_ino == current.st_ino,
-                  MacExternalDownloadTransfer.directoryHasMarker(directoryFD, locationID: locationID) else {
+                  MacExternalDownloadTransfer.directoryHasMarker(currentFD, locationID: locationID),
+                  ownsEntry(name) else {
                 throw Failure.destinationUnavailable
             }
-            guard Darwin.renameatx_np(directoryFD, name, directoryFD, finalName, UInt32(RENAME_EXCL)) == 0 else {
-                let code = errno
-                throw code == EEXIST ? Failure.destinationExists : Failure.disk(code)
-            }
-            guard ownsEntry(finalName) else { throw Failure.destinationUnavailable }
+        }
+
+        /// Relinquish cleanup only after the manager durably published the completed index record.
+        func keep() {
+            lock.lock(); defer { lock.unlock() }
+            guard sealed else { return }
             closeDescriptors()
         }
 
@@ -206,7 +238,7 @@ final class MacExternalDownloadTransfer: NSObject, URLSessionDataDelegate, @unch
     private let request: URLRequest
     private let directory: URL
     private let locationID: UUID
-    private let stagingID: UUID
+    private let filename: String
     private let progress: @Sendable (Int64, Int64) -> Void
     private let completion: @Sendable (Result<StagedFile, Failure>) -> Void
 
@@ -214,6 +246,7 @@ final class MacExternalDownloadTransfer: NSObject, URLSessionDataDelegate, @unch
     private let queue = DispatchQueue(label: "com.vortx.external-download", qos: .utility)
     private var session: URLSession?
     private var stage: StagedFile?
+    private var reservation: Task<Void, Never>?
     private var finished = false
     private var receivedResponse = false
     private var expectedBytes: Int64 = 0
@@ -224,56 +257,66 @@ final class MacExternalDownloadTransfer: NSObject, URLSessionDataDelegate, @unch
         request: URLRequest,
         directory: URL,
         locationID: UUID,
-        stagingID: UUID,
+        filename: String,
         progress: @escaping @Sendable (Int64, Int64) -> Void,
         completion: @escaping @Sendable (Result<StagedFile, Failure>) -> Void
     ) {
         self.request = request
         self.directory = directory
         self.locationID = locationID
-        self.stagingID = stagingID
+        self.filename = filename
         self.progress = progress
         self.completion = completion
     }
 
-    func start() {
+    func start(reserve: @escaping @Sendable (UInt64) async -> Bool) {
         queue.async { [self] in
-            guard session == nil, !finished else { return }
+            guard stage == nil, !finished else { return }
             guard let scheme = request.url?.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
                 finish(.failure(.invalidResponse))
                 return
             }
             do {
-                stage = try StagedFile(directory: directory, locationID: locationID, stagingID: stagingID)
+                let staged = try StagedFile(directory: directory, locationID: locationID, filename: filename)
+                stage = staged
+                reservation = Task(priority: .utility) { [self] in
+                    let admitted = !Task.isCancelled ? await reserve(staged.fileIdentity) : false
+                    queue.async { [self] in
+                        reservation = nil
+                        guard !finished else { return }
+                        guard admitted else {
+                            finish(.failure(.cancelled))
+                            return
+                        }
+                        startRequest()
+                    }
+                }
             } catch let failure as Failure {
                 finish(.failure(failure))
-                return
             } catch {
                 finish(.failure(.writeFailed))
-                return
             }
-            let configuration = URLSessionConfiguration.default
-            configuration.urlCache = nil
-            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-            let delegateQueue = OperationQueue()
-            delegateQueue.maxConcurrentOperationCount = 1
-            delegateQueue.underlyingQueue = queue
-            let session = URLSession(configuration: configuration, delegate: self, delegateQueue: delegateQueue)
-            self.session = session
-            var byteRequest = request
-            byteRequest.cachePolicy = .reloadIgnoringLocalCacheData
-            // File lengths and Content-Range are in the on-disk representation.
-            byteRequest.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-            session.dataTask(with: byteRequest).resume()
         }
+    }
+
+    private func startRequest() {
+        let configuration = URLSessionConfiguration.default
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        let delegateQueue = OperationQueue()
+        delegateQueue.maxConcurrentOperationCount = 1
+        delegateQueue.underlyingQueue = queue
+        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: delegateQueue)
+        self.session = session
+        var byteRequest = request
+        byteRequest.cachePolicy = .reloadIgnoringLocalCacheData
+        // File lengths and Content-Range are in the on-disk representation.
+        byteRequest.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        session.dataTask(with: byteRequest).resume()
     }
 
     func cancel() {
         queue.async { [self] in finish(.failure(.cancelled)) }
-    }
-
-    static func stagingFilename(for stagingID: UUID) -> String {
-        ".vortx-download-\(stagingID.uuidString).partial"
     }
 
     /// Verify the selected folder using the same descriptor that will receive writes.
@@ -407,6 +450,8 @@ final class MacExternalDownloadTransfer: NSObject, URLSessionDataDelegate, @unch
     private func finish(_ result: Result<StagedFile, Failure>) {
         guard !finished else { return }
         finished = true
+        reservation?.cancel()
+        reservation = nil
         let active = session
         session = nil
         active?.invalidateAndCancel()

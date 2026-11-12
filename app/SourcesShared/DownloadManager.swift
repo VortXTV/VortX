@@ -851,14 +851,6 @@ final class DownloadManager: NSObject, ObservableObject {
 
     private func startQueued(_ record: DownloadRecord) -> DownloadStartDisposition {
         guard record.state == .queued else { return .deferred }
-        #if os(macOS)
-        if record.macDownloadLocationID != nil, macExternalTasks[record.id] == nil,
-           store.hasInstalledMacTransfer(record), let bytes = record.macDownloadStagedBytes {
-            recordMacDownloadComplete(record.id, bytes: bytes)
-            releaseNativeSource(id: record.id)
-            return .rejected
-        }
-        #endif
         if record.remoteURL == Self.nativeSourceMarker,
            nativeSources[record.id]?.lease.isClosed != false || nativeSources[record.id]?.owner.isCurrent != true {
             failNativeSource(id: record.id)
@@ -898,8 +890,8 @@ final class DownloadManager: NSObject, ObservableObject {
             parkMacDownload(id, message: MacDownloadLocations.LocationError.unavailable.errorDescription)
             return .rejected
         }
-        if let attempt = record.macDownloadAttemptID,
-           !MacDownloadLocations.shared.discardIncomplete(location: location, attempt: attempt) {
+        if let filename = record.macDownloadFilename, let fileID = record.macDownloadStagedFileID,
+           !MacDownloadLocations.shared.removeOwnedFile(location: location, filename: filename, fileID: fileID) {
             parkMacDownload(id, message: String(localized: "VortX couldn’t remove the previous partial download. Check the drive and try again."))
             return .rejected
         }
@@ -910,6 +902,7 @@ final class DownloadManager: NSObject, ObservableObject {
             return .rejected
         }
         let attempt = UUID()
+        guard let filename = record.macDownloadFilename(for: attempt) else { return .rejected }
         do {
             try store.updateMacTransfer(id: id) {
                 $0.macDownloadAttemptID = attempt
@@ -928,7 +921,7 @@ final class DownloadManager: NSObject, ObservableObject {
         if nativeSources[id] == nil {
             for (name, value) in record.headers ?? [:] { request.setValue(value, forHTTPHeaderField: name) }
         }
-        let transfer = MacExternalDownloadTransfer(request: request, directory: directory, locationID: location, stagingID: attempt,
+        let transfer = MacExternalDownloadTransfer(request: request, directory: directory, locationID: location, filename: filename,
             progress: { [weak self] done, total in
                 Task { @MainActor in
                     guard let self, self.macExternalTasks[id]?.attempt == attempt,
@@ -942,7 +935,23 @@ final class DownloadManager: NSObject, ObservableObject {
                 Task { @MainActor in self?.finishMacExternalTask(id, attempt: attempt, result: result) }
             })
         macExternalTasks[id] = MacExternalTask(attempt: attempt, transfer: transfer)
-        transfer.start()
+        transfer.start { @MainActor [weak self] fileID in
+            guard let self, self.macExternalTasks[id]?.attempt == attempt,
+                  let record = self.store.record(id: id), record.macDownloadAttemptID == attempt,
+                  record.state == .downloading else { return false }
+            if record.remoteURL == Self.nativeSourceMarker,
+               self.nativeSources[id]?.lease.isClosed != false || self.nativeSources[id]?.owner.isCurrent != true {
+                self.failNativeSource(id: id)
+                return false
+            }
+            do {
+                try self.store.updateMacTransfer(id: id) { $0.macDownloadStagedFileID = fileID }
+                return true
+            } catch {
+                self.parkMacDownload(id, message: String(localized: "VortX couldn’t save the download queue. Free up a little space on this Mac and try again."))
+                return false
+            }
+        }
         return .started
     }
 
@@ -952,21 +961,6 @@ final class DownloadManager: NSObject, ObservableObject {
             $0.bytesDone = 0
             $0.errorText = message
             $0.taskIdentifier = nil
-        }
-    }
-
-    private func recordMacDownloadComplete(_ id: UUID, bytes: Int64) {
-        let update: (inout DownloadRecord) -> Void = {
-            $0.state = .completed
-            $0.bytesDone = bytes
-            $0.bytesTotal = bytes
-            $0.macDownloadAttemptID = nil
-            $0.errorText = nil
-        }
-        do { try store.updateMacTransfer(id: id, update) }
-        catch {
-            // The earlier durable install intent can recover the already-installed file on relaunch.
-            store.update(id: id, persistIndex: false, update)
         }
     }
 
@@ -998,17 +992,29 @@ final class DownloadManager: NSObject, ObservableObject {
         }
         switch result {
         case .success(let staged):
+            guard record.macDownloadStagedFileID == staged.fileIdentity else {
+                staged.discard()
+                parkMacDownload(id, message: MacDownloadLocations.LocationError.unavailable.errorDescription)
+                return
+            }
             do {
+                try staged.verify(at: destination)
+                let bytes = staged.bytes
                 try store.updateMacTransfer(id: id) {
-                    $0.macDownloadStagedBytes = staged.bytes
-                    $0.macDownloadStagedFileID = staged.fileIdentity
+                    $0.macDownloadStagedBytes = bytes
+                    $0.bytesDone = bytes
+                    $0.bytesTotal = bytes
+                    $0.state = .completed
+                    $0.errorText = nil
                 }
-                try staged.commit(to: destination)
-                recordMacDownloadComplete(id, bytes: staged.bytes)
+                staged.keep()
                 releaseNativeSource(id: id)
+            } catch let failure as MacExternalDownloadTransfer.Failure {
+                staged.discard()
+                parkMacDownload(id, message: failure.message)
             } catch {
                 staged.discard()
-                parkMacDownload(id, message: String(localized: "VortX couldn’t finish saving to the selected drive. Check that it’s connected and writable, then try again."))
+                parkMacDownload(id, message: String(localized: "VortX couldn’t save the download queue. Free up a little space on this Mac and try again."))
             }
         case .failure(let failure):
             switch failure {
@@ -1214,11 +1220,7 @@ final class DownloadManager: NSObject, ObservableObject {
             #if os(macOS)
             if record.macDownloadLocationID != nil {
                 if macExternalTasks[record.id] != nil { continue }
-                if store.hasInstalledMacTransfer(record), let bytes = record.macDownloadStagedBytes {
-                    recordMacDownloadComplete(record.id, bytes: bytes)
-                } else {
-                    parkMacDownload(record.id, message: String(localized: "This download stopped when VortX closed. Resume starts it again."))
-                }
+                parkMacDownload(record.id, message: String(localized: "This download stopped when VortX closed. Resume starts it again."))
                 continue
             }
             #endif

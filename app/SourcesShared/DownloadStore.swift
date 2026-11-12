@@ -63,7 +63,7 @@ final class DownloadStore: ObservableObject {
         guard record.hlsRelativePath == nil,
               DownloadRecord.isManagedProgressiveFilename(record.localFilename, id: record.id),
               let root = MacDownloadLocations.shared.directory(for: location) else { return nil }
-        return root.appendingPathComponent(record.localFilename)
+        return root.appendingPathComponent(record.macDownloadFilename ?? record.localFilename)
         #else
         return nil
         #endif
@@ -335,7 +335,7 @@ final class DownloadStore: ObservableObject {
         let resolved = candidate.resolvingSymlinksInPath()
         let managedDirectory = candidate.deletingLastPathComponent().resolvingSymlinksInPath()
         guard resolved.deletingLastPathComponent().path == managedDirectory.path,
-              resolved.lastPathComponent == record.localFilename,
+              resolved.lastPathComponent == candidate.lastPathComponent,
               let attributes = try? candidate.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]),
               attributes.isRegularFile == true, attributes.isSymbolicLink == false,
               let size = attributes.fileSize, size > 0,
@@ -351,8 +351,8 @@ final class DownloadStore: ObservableObject {
         guard let location = record.macDownloadLocationID,
               let expected = record.macDownloadStagedBytes, expected > 0,
               let expectedFileID = record.macDownloadStagedFileID,
-              DownloadRecord.isManagedProgressiveFilename(record.localFilename, id: record.id) else { return false }
-        return MacDownloadLocations.shared.matchesInstalledFile(location: location, filename: record.localFilename,
+              let filename = record.macDownloadFilename else { return false }
+        return MacDownloadLocations.shared.matchesInstalledFile(location: location, filename: filename,
                                                                  fileID: expectedFileID, bytes: expected)
     }
     #endif
@@ -427,11 +427,9 @@ final class DownloadStore: ObservableObject {
         #if os(macOS)
         if let location = record.macDownloadLocationID {
             let locations = MacDownloadLocations.shared
-            if let attempt = record.macDownloadAttemptID,
-               !locations.discardIncomplete(location: location, attempt: attempt) { return }
-            if let fileID = record.macDownloadStagedFileID, let bytes = record.macDownloadStagedBytes,
-               !locations.removeInstalledFile(location: location, filename: record.localFilename,
-                                             fileID: fileID, bytes: bytes) { return }
+            if let filename = record.macDownloadFilename, let fileID = record.macDownloadStagedFileID,
+               !locations.removeOwnedFile(location: location, filename: filename, fileID: fileID,
+                                          bytes: record.macDownloadStagedBytes) { return }
         } else {
             try? fileManager.removeItem(at: url)
         }

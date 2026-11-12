@@ -281,10 +281,11 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
 
     /// Mac-only destination selected when this transfer was queued. Older indexes decode this as nil.
     let macDownloadLocationID: UUID?
-    /// Exact hidden partial owned by one Mac transfer.
+    /// Identifies the exact file reserved for the current or completed Mac transfer.
     var macDownloadAttemptID: UUID? = nil
-    /// Installation receipt, recorded before rename and kept to identify the completed file.
+    /// A completed byte count is published atomically with the completed state.
     var macDownloadStagedBytes: Int64? = nil
+    /// The exact file identity is recorded before the transfer may write media.
     var macDownloadStagedFileID: UInt64? = nil
 
     /// HLS offline downloads (iOS only, via `AVAssetDownloadTask`) land in a system-managed `.movpkg`
@@ -400,6 +401,21 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
                 (48...57).contains($0.value) || (65...90).contains($0.value) || (97...122).contains($0.value)
             }
     }
+
+    #if os(macOS)
+    var macDownloadFilename: String? {
+        if let attempt = macDownloadAttemptID { return macDownloadFilename(for: attempt) }
+        // The first implementation kept completed files under the record's original filename.
+        guard state == .completed, macDownloadStagedBytes != nil, macDownloadStagedFileID != nil else { return nil }
+        return macDownloadFilename(for: id)
+    }
+
+    func macDownloadFilename(for attempt: UUID) -> String? {
+        guard macDownloadLocationID != nil, hlsRelativePath == nil,
+              Self.isManagedProgressiveFilename(localFilename, id: id) else { return nil }
+        return "\(attempt.uuidString).\((localFilename as NSString).pathExtension)"
+    }
+    #endif
 
     static func isSafeHLSPackageRelativePath(_ path: String) -> Bool {
         (path as NSString).pathExtension.lowercased() == "movpkg"
