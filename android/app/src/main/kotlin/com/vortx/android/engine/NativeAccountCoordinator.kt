@@ -101,6 +101,7 @@ internal class NativeAccountCoordinator(
         playlistAccountProducer = producer
     }
     private val mounted = AtomicReference<Mounted?>()
+    @Volatile private var pickerMount: Mounted? = null
     private val retired = ConcurrentLinkedQueue<VortxNativeSession>()
     private val lifecycleLock = Any()
     private val mutex = Mutex()
@@ -331,6 +332,12 @@ internal class NativeAccountCoordinator(
     }
     /** Opaque identity only, with no native read or credential/session monitor. */
     internal fun streamingPresentationIdentity(): Any? = mounted.get() ?: pendingImport
+
+    /** Scalar presentation check. A provisional mount is invisible until its roster is installed. */
+    internal fun isPickerMountCurrent(identity: Any, account: SessionOwnerSnapshot.Account): Boolean {
+        val current = pickerMount ?: return false
+        return current.session === identity && current.account == account && mounted.get() === current
+    }
 
     /** Read-only picker metadata. This is never a selection, credential or mutation capability. */
     internal class StreamingPresentation internal constructor(
@@ -981,6 +988,7 @@ internal class NativeAccountCoordinator(
             playlistReceipts.retire()
             onAuthorityChanged()
             if (mounted.get() != null) com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
+            pickerMount = null
             mounted.getAndSet(null).also { if (it != null) { it.retireRead(); retired.add(it.session) } }
         }
         playlistReceiptChanges.update { value -> value + 1 }
@@ -1244,7 +1252,11 @@ internal class NativeAccountCoordinator(
         }
         try {
             project(candidate)
-            check(isCurrent() && accountCurrent(account) && mounted.get() === next) { "Native account changed" }
+            check(isCurrent() && accountCurrent(account)) { "Native account changed" }
+            synchronized(lifecycleLock) {
+                check(mounted.get() === next) { "Native account changed" }
+                pickerMount = next
+            }
             playlistMountRevisions.value += 1
             changes.value += 1
             return true
@@ -1252,6 +1264,7 @@ internal class NativeAccountCoordinator(
             val removed = synchronized(lifecycleLock) {
                 if (mounted.get() !== next) false else {
                     com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
+                    if (pickerMount === next) pickerMount = null
                     mounted.compareAndSet(next, null)
                 }
             }

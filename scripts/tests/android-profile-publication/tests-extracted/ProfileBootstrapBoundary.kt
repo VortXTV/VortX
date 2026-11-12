@@ -105,6 +105,9 @@ internal class ExtractedBootstrapStore {
     var profiles: List<UserProfile> = emptyList()
     var activeID: String? = null
     var pickedThisLaunch = false
+    var selectionPending = false
+    @Suppress("UNUSED_PARAMETER")
+    private fun publishPickerRoster(account: SessionOwnerSnapshot.Account?) = Unit
     val active get() = profiles.firstOrNull { it.id == activeID }
     val continueWatchingMigration = ContinueWatchingMigrationCheckpoint<SessionOwnerSnapshot.Account>()
     private var acknowledgedNativeAccount: SessionOwnerSnapshot.Account? = null
@@ -299,6 +302,7 @@ internal class ExtractedBootstrapStore {
         }
         acknowledgedNativeAccount = effects.account; acknowledgedNativeTraktEpoch = effects.traktEpoch
         initialNativeMigrationProfile = null
+        publishPickerRoster(effects.account)
     }
     internal fun clearNativeProjection(retireLegacy: Boolean = true, retireMigration: Boolean = true) =
         RestoreProfileDirectWriters.retirement { clearNativeProjectionAsWriter(retireLegacy, retireMigration) }
@@ -318,6 +322,8 @@ internal class ExtractedBootstrapStore {
                 if (prefs.contains(legacyKey)) prefs.edit().putBoolean(legacyKey, false).apply()
             }
             profiles = emptyList(); activeID = null; pickedThisLaunch = false
+            selectionPending = false
+            publishPickerRoster(null)
             notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(PlaylistScopeTransition.AUTHORITY_BOUNDARY)
             publishActiveProfile(); notifySwitchListeners()
         }

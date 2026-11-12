@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.ActivityManager
 import android.app.Application
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Process
@@ -66,6 +67,8 @@ import com.vortx.android.sync.ApplicationAccountFileRestoreExclusion
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.sync.SessionOwnerSnapshot
 import com.vortx.android.tv.WatchNextPublisher
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -73,6 +76,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /// Owns the process-lifetime VortX engine session ([NativeAccountCoordinator]) and the repositories built on
 /// it. An `Activity` can be torn down and recreated within the same process, so every `MainActivity.onCreate`
@@ -156,6 +162,15 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
 
     internal fun clearWatchNextIfDisabled() {
         applicationScope.launch { WatchNextPublisher.clearWhenDisabled(this@VortXApplication) }
+    }
+
+    /** IO only. Unavailable encrypted state is never allowed to retire launcher rows. */
+    private fun retireWatchNextAfterSignOut(manager: VortXSyncManager, owner: SessionOwnerSnapshot.SignedOutLocal) {
+        if (!runCatching { packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) }.getOrDefault(false)) return
+        val admit = manager.captureLocalLibraryMutationAdmission() ?: return
+        WatchNextPublisher.clearAfterSignOut(this) { delete ->
+            admit { syncManager === manager && manager.sessionOwnerSnapshot() == owner && delete() }
+        }
     }
 
     /** Admit one launcher provider mutation under the actual session, account and mount fences. */
@@ -336,6 +351,9 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         )
     }
 
+    private val downloadStoresReady = CompletableDeferred<Boolean>()
+    private val downloadRecoveryMutex = Mutex()
+
     /**
      * Stand up the offline-downloads subsystem: hydrate the local index, restore the queue-manager settings, then do
      * the two things that need the process to be alive.
@@ -350,26 +368,36 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
      *  2. [com.vortx.android.downloads.DownloadManager.retryDownloadsAwaitingUnlock] is the app-foreground leg of the
      *     #132 recovery. Apple wires three triggers for this (`protectedDataDidBecomeAvailable`, `didBecomeActive`,
      *     `willEnterForeground`); [com.vortx.android.downloads.DownloadUnlockReceiver] covers the unlock/boot legs,
-     *     and this covers the "unlocked while the app was dead, so the broadcast was missed" case. It no-ops when
-     *     nothing is parked, so an ordinary launch pays nothing.
+     *     and this covers the "unlocked while the app was dead, so the broadcast was missed" case.
      */
     private fun initDownloads() {
         runCatching {
             DownloadStore.init(this)
             DownloadManager.init(this)
         }.onFailure {
+            downloadStoresReady.complete(false)
             Log.w(TAG, "Download store init failed; downloads stay dormant this launch", it)
             return
         }
-        CoroutineScope(Dispatchers.IO).launch {
-            runCatching {
-                DownloadManager.reconcileInFlight()
-                DownloadManager.retryDownloadsAwaitingUnlock()
-            }.onFailure {
-                // Fail-soft: a record that could not be reconciled stays as it is and remains resumable by hand,
-                // which is exactly Apple's fallback. Never let download bookkeeping break app start.
-                Log.w(TAG, "Download reconcile failed; in-flight rows stay as they are and remain resumable", it)
+        downloadStoresReady.complete(true)
+        applicationScope.launch {
+            retryDownloadRecovery()
+        }
+    }
+
+    /** Both callers run on the application IO scope after releasing the session owner locks. */
+    private suspend fun retryDownloadRecovery(expectedManager: VortXSyncManager? = null) {
+        if (!downloadStoresReady.await()) return
+
+        try {
+            downloadRecoveryMutex.withLock {
+                if (expectedManager != null && syncManager !== expectedManager) return@withLock
+                DownloadManager.retryDownloadsAfterOwnerReady()
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            Log.w(TAG, "Download recovery deferred; pending transfers remain retryable")
         }
     }
 
@@ -390,13 +418,28 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 sourceIndexSessionObserver?.cancel()
                 sourceIndexSessionObserver = value?.let { manager -> applicationScope.launch(Dispatchers.IO) {
                     var observed = runCatching { manager.sessionOwnerSnapshot() }.getOrNull()
-                    manager.sessionUiState.collect { state ->
+                    var recoveredDownloadOwner: SessionOwnerSnapshot? = null
+                    manager.sessionUiState.combine(manager.pickerAccountRevision) { state, _ ->
+                        state
+                    }.collect { state ->
                         if (syncManager !== manager) return@collect
                         val current = runCatching { manager.sessionOwnerSnapshot() }.getOrNull()
+                        if (current is SessionOwnerSnapshot.SignedOutLocal) retireWatchNextAfterSignOut(manager, current)
                         if (current != observed || state !is VortXSyncManager.SessionUiState.SignedIn) {
                             com.vortx.android.singularity.SourceIndexLifecycle.invalidateDeferred()
                         }
                         observed = current
+
+                        if (state === VortXSyncManager.SessionUiState.UnknownOrUnavailable) {
+                            recoveredDownloadOwner = null
+                        }
+                        val confirmedOwner = current?.takeIf {
+                            it is SessionOwnerSnapshot.Account || it is SessionOwnerSnapshot.SignedOutLocal
+                        }
+                        if (confirmedOwner != recoveredDownloadOwner) {
+                            recoveredDownloadOwner = confirmedOwner
+                            if (confirmedOwner != null) applicationScope.launch { retryDownloadRecovery(manager) }
+                        }
                     }
                 } }
             }

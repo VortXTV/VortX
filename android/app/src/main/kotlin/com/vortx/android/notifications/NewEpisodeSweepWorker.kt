@@ -10,8 +10,6 @@ import com.vortx.android.home.UpcomingMetaResponse
 import com.vortx.android.home.upcomingMetaBases
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
-import com.vortx.android.profile.ProfileStore
-import com.vortx.android.profile.UserProfile
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -33,10 +31,8 @@ import java.time.ZoneId
  * calendar uses), and hands the results to [NewEpisodeNotifications.applySchedules] to arm one delayed
  * notification per series.
  *
- * PER-PROFILE BOUNDARY (mirrors `ReleaseCalendarOwner`): the active profile id is captured at the start and
- * re-checked before publishing. If the user switched profiles while the add-on fetches were in flight, the
- * results are discarded and NOTHING is scheduled -- a sweep that outlives a switch must never schedule the
- * previous profile's shows. The fire-time guard in [NewEpisodeNotifyWorker] is the second line of defence.
+ * The library snapshot must belong to the captured native account and profile. The original
+ * mount and profile publication witness also fence scheduling after the add-on fetches.
  */
 class NewEpisodeSweepWorker(context: Context, params: WorkerParameters) :
     CoroutineWorker(context, params) {
@@ -51,40 +47,40 @@ class NewEpisodeSweepWorker(context: Context, params: WorkerParameters) :
         }
 
         val app = context as? VortXApplication ?: return@withContext Result.success()
-        // Capture the owner BEFORE any repository read begins (the ReleaseCalendarOwner discipline).
-        val ownerProfileId = ProfileStore.sharedOrNull()?.activeProfileId ?: UserProfile.OWNER_ID
+        val captured = when (val owner = captureEpisodeNotificationOwner(app)) {
+            is EpisodeNotificationOwnerObservation.Mounted -> owner
+            EpisodeNotificationOwnerObservation.Unavailable -> return@withContext Result.retry()
+            EpisodeNotificationOwnerObservation.SignedOut -> return@withContext Result.success()
+        }
         val repo = app.catalogRepository
-
-        val library = repo.library().getOrElse {
-            // A transient engine/read failure: let WorkManager retry rather than wiping the schedule.
-            return@withContext Result.retry()
-        }.items
+        val library = repo.library().getOrElse { return@withContext Result.retry() }
+        if (!captured.owner.matchesLibrary(library.owner)) return@withContext Result.retry()
         val addons = repo.installedAddons().getOrElse { emptyList() }
         val bases = upcomingMetaBases(addons)
         if (bases.isEmpty()) return@withContext Result.success()
 
         val now = Instant.now()
         val horizon = now.plusSeconds(NewEpisodeNotifications.HORIZON_DAYS * SECONDS_PER_DAY)
-        val series = library.asSequence()
-            .filter { it.type == MediaType.SERIES && (it.id.startsWith("tt") || it.id.startsWith("tmdb:")) }
-            .distinctBy { it.id }
-            .take(NewEpisodeNotifications.MAX_SERIES)
-            .toList()
+        val series = library.items.filter {
+            it.type == MediaType.SERIES && (it.id.startsWith("tt") || it.id.startsWith("tmdb:"))
+        }.distinctBy { it.id }
+        val eligibleSeries = series.mapTo(hashSetOf()) { it.id }
 
         val alerts = coroutineScope {
             val slots = Semaphore(NewEpisodeNotifications.MAX_CONCURRENT_FETCHES)
-            series
+            series.take(NewEpisodeNotifications.MAX_SERIES)
                 .map { seed -> async { slots.withPermit { nextEpisodeAlert(seed, bases, now, horizon) } } }
                 .awaitAll()
         }.filterNotNull()
 
-        // BOUNDARY re-check: refuse to publish another profile's shows if the active profile changed while
-        // the fetches were running. Exactly the `activeOwner != owner` guard ReleaseCalendarModel applies.
-        val currentOwner = ProfileStore.sharedOrNull()?.activeProfileId ?: UserProfile.OWNER_ID
-        if (currentOwner != ownerProfileId) return@withContext Result.success()
-
-        NewEpisodeNotifications.applySchedules(context, ownerProfileId, alerts)
-        Result.success()
+        val scheduled = try {
+            NewEpisodeNotifications.applySchedules(context, captured, eligibleSeries, alerts)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            false
+        }
+        if (scheduled) Result.success() else Result.retry()
     }
 
     /** One series' soonest upcoming episode, or null when it has nothing within the horizon / no meta. */

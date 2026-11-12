@@ -224,16 +224,68 @@ class DownloadPlaybackRoutingTest {
         val decision = DownloadTransferClaimPolicy.decide(
             record = ownerBound,
             requestedGeneration = "generation-a",
-            isOwnerCurrent = {
-                DownloadDebridOwnerPolicy.isCurrent(
+            readOwnerStatus = {
+                DownloadDebridOwnerPolicy.status(
                     it.debridOwnerIdentity,
                     it.debridOwnerGeneration,
-                    currentOwner,
-                )
+                ) { currentOwner }
             },
         )
 
         assertEquals(DownloadTransferClaimDecision.OwnerChanged, decision)
+    }
+
+    @Test
+    fun `first unavailable read inside locked claim is retryable and cannot become changed on a second read`() {
+        val row = record().copy(
+            state = DownloadState.DOWNLOADING,
+            transferGeneration = "live-generation",
+            debridOwnerIdentity = "account:account-a",
+            debridOwnerGeneration = 7,
+        )
+        var reads = 0
+        val binding = DebridAccountOwnerBinding().apply {
+            bind {
+                if (++reads == 1) {
+                    DebridAccountOwnerState.UnknownOrUnavailable
+                } else {
+                    DebridAccountOwnerState.Account("account-b", 8)
+                }
+            }
+        }
+        val decision = DownloadTransferClaimPolicy.decide(row, "live-generation") {
+            DownloadDebridOwnerPolicy.status(it.debridOwnerIdentity, it.debridOwnerGeneration) {
+                binding.currentOwner()?.let { owner ->
+                    DownloadDebridOwnerPolicy.Owner(owner.identity, owner.generation)
+                }
+            }
+        }
+
+        assertEquals(DownloadTransferClaimDecision.OwnerUnavailable, decision)
+        assertEquals(1, reads)
+    }
+
+    @Test
+    fun `ownerless transfers are eligible without reading account persistence`() {
+        val owner = DownloadDebridOwnerPolicy.status(null, null) {
+            error("Direct transfer tried to read account persistence")
+        }
+
+        assertEquals(DownloadDebridOwnerPolicy.Status.CURRENT, owner)
+    }
+
+    @Test
+    fun `bound row distinguishes unavailable same owner and confirmed different owner`() {
+        val matching = DownloadDebridOwnerPolicy.Owner("account:account-a", 7)
+        val changedEpoch = matching.copy(generation = 8)
+        val signedOut = DownloadDebridOwnerPolicy.Owner("local", 8)
+        fun read(owner: DownloadDebridOwnerPolicy.Owner?) =
+            DownloadDebridOwnerPolicy.status(matching.identity, matching.generation) { owner }
+
+        assertEquals(DownloadDebridOwnerPolicy.Status.UNAVAILABLE, read(null))
+        assertEquals(DownloadDebridOwnerPolicy.Status.CURRENT, read(matching))
+        assertEquals(DownloadDebridOwnerPolicy.Status.CHANGED, read(changedEpoch))
+        assertEquals(DownloadDebridOwnerPolicy.Status.CHANGED, read(signedOut))
     }
 
     @Test
@@ -247,14 +299,26 @@ class DownloadPlaybackRoutingTest {
                 debridOwnerGeneration = 7,
             ),
             requestedGeneration = "obsolete-generation",
-            isOwnerCurrent = {
+            readOwnerStatus = {
                 ownerChecks += 1
-                false
+                DownloadDebridOwnerPolicy.Status.CHANGED
             },
         )
 
         assertEquals(DownloadTransferClaimDecision.Rejected, decision)
         assertEquals(0, ownerChecks)
+    }
+
+    @Test
+    fun `genuine transfer retry budget survives index round trip and old rows default to zero`() {
+        val row = record().copy(transferGeneration = "active", transferRetryCount = 1)
+        val restored = requireNotNull(DownloadStore.recordFromJson(DownloadStore.recordToJson(row)))
+        val legacy = requireNotNull(DownloadStore.recordFromJson(authenticLegacyJson()))
+
+        assertEquals(1, restored.transferRetryCount)
+        assertFalse(DownloadTransferPolicy.canRetryWrite(restored.transferRetryCount))
+        assertEquals(0, legacy.transferRetryCount)
+        assertTrue(DownloadTransferPolicy.canRetryWrite(legacy.transferRetryCount))
     }
 
     @Test

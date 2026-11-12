@@ -284,17 +284,17 @@ class DownloadTransferPolicyTest {
     }
 
     @Test
-    fun `write retry budget allows only the initial durable work attempt`() {
-        assertTrue(DownloadTransferPolicy.canRetryWrite(runAttemptCount = 0))
-        assertFalse(DownloadTransferPolicy.canRetryWrite(runAttemptCount = 1))
-        assertFalse(DownloadTransferPolicy.canRetryWrite(runAttemptCount = 2))
+    fun `write retry budget allows only the first genuine transfer failure`() {
+        assertTrue(DownloadTransferPolicy.canRetryWrite(retryCount = 0))
+        assertFalse(DownloadTransferPolicy.canRetryWrite(retryCount = 1))
+        assertFalse(DownloadTransferPolicy.canRetryWrite(retryCount = 2))
     }
 
     @Test
     fun `process recreation cannot regrant write retry within the same work generation`() {
-        val persistedRunAttemptCount = 1
+        val persistedRetryCount = 1
 
-        assertFalse(DownloadTransferPolicy.canRetryWrite(persistedRunAttemptCount))
+        assertFalse(DownloadTransferPolicy.canRetryWrite(persistedRetryCount))
     }
 
     @Test
@@ -564,19 +564,19 @@ class DownloadTransferPolicyTest {
         assertTrue(
             DownloadTransferPolicy.shouldRetry(
                 SocketTimeoutException("read timed out"),
-                runAttemptCount = 0,
+                retryCount = 0,
             ),
         )
         assertTrue(
             DownloadTransferPolicy.shouldRetry(
                 RuntimeException(EOFException("short body")),
-                runAttemptCount = DownloadTransferPolicy.MAX_RETRIES - 1,
+                retryCount = DownloadTransferPolicy.MAX_RETRIES - 1,
             ),
         )
         assertTrue(
             DownloadTransferPolicy.shouldRetry(
                 ProtocolException("unexpected end of stream"),
-                runAttemptCount = 0,
+                retryCount = 0,
             ),
         )
     }
@@ -586,7 +586,7 @@ class DownloadTransferPolicyTest {
         assertFalse(
             DownloadTransferPolicy.shouldRetry(
                 SocketTimeoutException("read timed out"),
-                runAttemptCount = DownloadTransferPolicy.MAX_RETRIES,
+                retryCount = DownloadTransferPolicy.MAX_RETRIES,
             ),
         )
     }
@@ -596,19 +596,19 @@ class DownloadTransferPolicyTest {
         assertTrue(
             DownloadTransferPolicy.shouldRetry(
                 DownloadHttpStatusException(503, "unavailable"),
-                runAttemptCount = 0,
+                retryCount = 0,
             ),
         )
         assertTrue(
             DownloadTransferPolicy.shouldRetry(
                 DownloadHttpStatusException(429, "rate limited"),
-                runAttemptCount = 0,
+                retryCount = 0,
             ),
         )
         assertFalse(
             DownloadTransferPolicy.shouldRetry(
                 DownloadHttpStatusException(404, "not found"),
-                runAttemptCount = 0,
+                retryCount = 0,
             ),
         )
     }
@@ -618,7 +618,7 @@ class DownloadTransferPolicyTest {
         assertFalse(
             DownloadTransferPolicy.shouldRetry(
                 IllegalArgumentException("invalid source"),
-                runAttemptCount = 0,
+                retryCount = 0,
             ),
         )
     }

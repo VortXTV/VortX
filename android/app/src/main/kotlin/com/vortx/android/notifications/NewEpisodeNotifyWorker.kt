@@ -3,37 +3,47 @@ package com.vortx.android.notifications
 import android.content.Context
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
-import com.vortx.android.profile.ProfileStore
-import com.vortx.android.profile.UserProfile
+import com.vortx.android.VortXApplication
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 
-/**
- * Posts one series' "new episode is out" notification when its scheduled air time arrives. Enqueued with an
- * initial delay by [NewEpisodeNotifications.applySchedules]; WorkManager fires it approximately at air time
- * and survives process death and reboot.
- *
- * FIRE-TIME PER-PROFILE GUARD: this can run days after it was scheduled, across any number of profile
- * switches. It re-reads the current active profile and posts only when it still matches the profile that
- * scheduled it, so a profile-A alert can never surface while profile B is active -- the second line of the
- * per-profile boundary the sweep opens. It also honours a since-flipped enable toggle: a disabled state
- * suppresses the post.
- */
+/** Deliver a scheduled alert offline once the original account and profile are mounted. */
 class NewEpisodeNotifyWorker(context: Context, params: WorkerParameters) :
     CoroutineWorker(context, params) {
 
-    override suspend fun doWork(): Result {
+    override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val context = applicationContext
-        if (!NewEpisodeNotifications.isEnabled(context)) return Result.success()
+        if (!NewEpisodeNotifications.isEnabled(context)) return@withContext Result.success()
 
-        val ownerProfileId = inputData.getString(NewEpisodeNotifications.KEY_OWNER_PROFILE)
-            ?: return Result.success()
-        val currentProfileId = ProfileStore.sharedOrNull()?.activeProfileId ?: UserProfile.OWNER_ID
-        // The boundary: never post one profile's alert while a different profile is active.
-        if (currentProfileId != ownerProfileId) return Result.success()
-
-        val seriesId = inputData.getString(NewEpisodeNotifications.KEY_SERIES_ID) ?: return Result.success()
+        // A pre-upgrade job has only a profile ID, which can be shared by multiple accounts.
+        val expected = EpisodeNotificationOwner.parse(
+            inputData.getString(NewEpisodeNotifications.KEY_OWNER_SCOPE),
+            inputData.getString(NewEpisodeNotifications.KEY_OWNER_PROFILE),
+        ) ?: return@withContext Result.success()
+        val seriesId = inputData.getString(NewEpisodeNotifications.KEY_SERIES_ID) ?: return@withContext Result.success()
+        val airEpochMillis = inputData.getLong(NewEpisodeNotifications.KEY_AIR_EPOCH_MILLIS, 0L)
+        val notificationTag = expected.notificationTag(seriesId, airEpochMillis) ?: return@withContext Result.success()
+        if (expected.eventKey(seriesId, airEpochMillis) !in tags) return@withContext Result.success()
         val seriesName = inputData.getString(NewEpisodeNotifications.KEY_SERIES_NAME).orEmpty()
         val episodeLabel = inputData.getString(NewEpisodeNotifications.KEY_EPISODE_LABEL).orEmpty()
-        NewEpisodeNotifications.postEpisodeAlert(context, seriesId, seriesName, episodeLabel)
-        return Result.success()
+        val app = context as? VortXApplication ?: return@withContext Result.success()
+        val captured = when (val owner = captureEpisodeNotificationOwner(app)) {
+            is EpisodeNotificationOwnerObservation.Mounted -> owner
+            EpisodeNotificationOwnerObservation.Unavailable -> return@withContext Result.retry()
+            EpisodeNotificationOwnerObservation.SignedOut -> return@withContext Result.success()
+        }
+        if (expected != captured.owner) return@withContext Result.success()
+
+        val operation = this.coroutineContext
+        val posted = NewEpisodeNotifications.postEpisodeAlert(
+            context, seriesId, seriesName, episodeLabel, notificationTag,
+        ) { post ->
+            captured.publishIfCurrent {
+                operation.ensureActive()
+                if (NewEpisodeNotifications.isEnabled(context)) post()
+            }
+        }
+        if (posted) Result.success() else Result.retry()
     }
 }

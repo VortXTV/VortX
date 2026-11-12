@@ -2270,6 +2270,12 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     /** Exercise an expired transient sync operation without changing the authenticated account. */
     internal fun expireSyncOperationTestSeam() { operations.invalidate {} }
 
+    /** Main-thread picker checks use already published session truth, with no encrypted-store read. */
+    internal fun isPickerRosterOwner(expected: SessionOwnerSnapshot.Account): Boolean = sessionState.serialized {
+        _sessionUiState.value is SessionUiState.SignedIn &&
+            sessionState.ownerEpoch == expected.generation && sessionState.value?.account?.id == expected.id
+    }
+
     /** Capture invocation ownership even while signed out; a queued action cannot adopt a later session. */
     internal fun captureLocalLibraryMutationAdmission(): ((() -> Boolean) -> Boolean)? =
         operations.snapshot { generation ->

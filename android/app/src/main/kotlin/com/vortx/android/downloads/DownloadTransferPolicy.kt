@@ -29,7 +29,7 @@ object DownloadTransferPolicy {
     )
 
     /**
-     * WorkManager's runAttemptCount starts at zero. Counts 0, 1, and 2 may retry; count 3 is terminal.
+     * WorkManager's retryCount starts at zero. Counts 0, 1, and 2 may retry; count 3 is terminal.
      */
     const val MAX_RETRIES = 3
 
@@ -141,17 +141,17 @@ object DownloadTransferPolicy {
     fun mayRetryRecord(state: DownloadState): Boolean = state == DownloadState.DOWNLOADING
 
     /**
-     * WorkManager persists runAttemptCount with the work row, so this one-write retry ceiling survives process death.
-     * A user resume creates a fresh generation and WorkRequest whose attempt count starts at zero again.
+     * The record persists accepted transfer retries. WorkManager owner waits cannot spend this budget.
+     * A user resume creates a fresh generation with a new budget.
      */
-    fun canRetryWrite(runAttemptCount: Int): Boolean = runAttemptCount == 0
+    fun canRetryWrite(retryCount: Int): Boolean = retryCount == 0
 
     /**
      * Retry only failures that can plausibly recover without changing the source. The partial file remains the resume
      * token, so each retry continues with a Range request instead of redownloading the completed prefix.
      */
-    fun shouldRetry(cause: Throwable, runAttemptCount: Int): Boolean {
-        if (runAttemptCount >= MAX_RETRIES) return false
+    fun shouldRetry(cause: Throwable, retryCount: Int): Boolean {
+        if (retryCount >= MAX_RETRIES) return false
 
         var cursor: Throwable? = cause
         var depth = 0

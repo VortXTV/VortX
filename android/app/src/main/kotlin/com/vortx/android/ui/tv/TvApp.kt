@@ -8,6 +8,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -61,6 +62,11 @@ import com.vortx.android.profile.ProfileStore
 import com.vortx.android.BuildConfig
 import com.vortx.android.profile.ProfileSelectionRequest
 import com.vortx.android.profile.ProfileSelectionHandoff
+import com.vortx.android.profile.ProfilePickerEntry
+import com.vortx.android.profile.profilePickerEntry
+import com.vortx.android.ui.profilepicker.PickerProfilesUnavailable
+import com.vortx.android.ui.profilepicker.isPickerRosterCurrent
+import com.vortx.android.ui.profilepicker.rememberAdmittedPickerRoster
 import com.vortx.android.ui.profilepicker.ProfileSelectionSurface
 import com.vortx.android.ui.profilepicker.PickerFileRecoveryLanding
 import com.vortx.android.ui.profilepicker.PickerRestoreStatusLanding
@@ -105,6 +111,7 @@ fun TvApp(
     auth: AuthRepository = PreviewAuthRepository(),
     syncManager: VortXSyncManager? = null,
     deepLinkEvent: VortXDeepLinkEvent? = null,
+    onDeepLinkHandled: (VortXDeepLinkEvent) -> Unit = {},
 ) {
     val fileRecoveryPausedNow = rememberPickerFileRecoveryPause(syncManager?.pickerFileRecoveryPaused)
     val profileStore = ProfileStore.sharedOrNull()
@@ -114,12 +121,8 @@ fun TvApp(
         accentId = activeProfile?.accentID ?: VortXAccents.default.id,
         oled = activeProfile?.oled ?: false,
     ) {
-        // WHO'S WATCHING launch gate (the 10-foot mirror of VortXApp's): with more than one profile and no
-        // pick yet this cold launch, cover everything with the picker until a profile settles, so no title's
-        // Home wall leaks before the viewer is known. Back keeps the current profile (re-selects it, which
-        // marks the launch picked) and dismisses. A single-profile install and a pick already made this launch
-        // skip it by construction, because ProfileStore.needsPicker is false in both cases.
-        var showPicker by remember { mutableStateOf(profileStore?.needsPicker == true) }
+        var handledDeepLinkSequence by remember { mutableStateOf(Long.MIN_VALUE) }
+        val latestDeepLinkEvent by rememberUpdatedState(deepLinkEvent)
         // Ordinary browse navigation is metadata and survives the pre-profile Tools return.
         var shellDestination by rememberSaveable { mutableStateOf(TvDestination.HOME) }
         val pickerAccountModel = rememberPickerAccountModel(syncManager)
@@ -131,6 +134,14 @@ fun TvApp(
             syncManager?.sessionUiState?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf<VortXSyncManager.SessionUiState?>(null) }
         )
+        val app = LocalContext.current.applicationContext as? VortXApplication
+        val nativePickerHost = app != null && repo !is PreviewCatalogRepository
+        val pickerRoster = rememberAdmittedPickerRoster(app, profileStore, syncManager, sessionUiState)
+        val pickerEntry = profilePickerEntry(nativePickerHost,
+            sessionUiState == VortXSyncManager.SessionUiState.SignedOut, pickerRoster)
+        var manualPicker by remember(pickerRoster?.mount) { mutableStateOf(false) }
+        val showPicker = pickerEntry == ProfilePickerEntry.CHOOSE || (manualPicker && pickerRoster != null)
+        val pickerUnavailable = pickerEntry == ProfilePickerEntry.UNAVAILABLE
         val pickerFileRecoveryPaused = fileRecoveryPausedNow()
         val pickerAccountOpen by (pickerAccountModel?.pickerPresentationOpen?.collectAsStateWithLifecycle()
             ?: remember { mutableStateOf(false) })
@@ -160,15 +171,15 @@ fun TvApp(
             }
             return@VortXTheme
         }
-        var profileSelection by remember(pickerFileRecoveryPaused) { mutableStateOf<ProfileSelectionRequest?>(null) }
+        var profileSelection by remember(pickerFileRecoveryPaused, pickerRoster?.mount) { mutableStateOf<ProfileSelectionRequest?>(null) }
         if (!pickerFileRecoveryPaused) profileSelection?.let { request ->
             val handoff = remember(request, auth) { ProfileSelectionHandoff(auth, native = true) }
             ProfileSelectionSurface(request, handoff,
-                onComplete = { profileSelection = null; showPicker = false },
-                onChooseAgain = { profileSelection = null; showPicker = true })
+                onComplete = { profileSelection = null; manualPicker = false },
+                onChooseAgain = { profileSelection = null; manualPicker = true })
             return@VortXTheme
         }
-        if (showPicker || pickerAccountOpen || (pickerToolsState.open && pickerToolsModel.state.value.open) ||
+        if (showPicker || pickerUnavailable || pickerAccountOpen || (pickerToolsState.open && pickerToolsModel.state.value.open) ||
             pickerFileRecoveryPaused || showFileRecoveryEntry) {
             // The picker owns Back, its nested editor and exact native selection admission.
             ProfilePickerAccountHost(syncManager, pickerAccountModel, diagnosticAdmission = ::currentPickerDiagnosticExportAllowed, retirePickerUi = { profileSelection = null },
@@ -185,7 +196,10 @@ fun TvApp(
                     if (pickerFileRecoveryPaused || showFileRecoveryEntry) {
                         PickerFileRecoveryLanding(isTv = true, accountControl = control,
                             onContinue = if (pickerFileRecoveryPaused) null else ({ dismissedFileRecoveryEntry = true }))
-                    } else TvWhosWatching(onDone = { showPicker = false }, onSelected = { profileSelection = it }, accountControl = control)
+                    } else if (pickerUnavailable || pickerRoster == null) {
+                        PickerProfilesUnavailable(isTv = true, accountControl = control)
+                    } else TvWhosWatching(pickerRoster, onDone = { manualPicker = false },
+                        onSelected = { profileSelection = it }, accountControl = control)
                 }
             }
             return@VortXTheme
@@ -338,9 +352,11 @@ fun TvApp(
             }
         }
 
-        LaunchedEffect(deepLinkEvent) {
+        LaunchedEffect(deepLinkEvent, pickerRoster) {
             val event = deepLinkEvent ?: return@LaunchedEffect
-            if (fileRecoveryPausedNow()) return@LaunchedEffect
+            if (event.sequence <= handledDeepLinkSequence || latestDeepLinkEvent != event || fileRecoveryPausedNow()) return@LaunchedEffect
+            if (nativePickerHost && (pickerRoster == null || app?.isPickerRosterCurrent(syncManager, pickerRoster) != true ||
+                    pickerRoster.needsSelection)) return@LaunchedEffect
             val target = event.target
             retireLibraryPlayRoute()
             importedCollectionsEntry = null
@@ -350,6 +366,8 @@ fun TvApp(
             autoAdvanceStreak[0] = 0
             detailGeneration += 1
             detail = target.toMetaItem()
+            handledDeepLinkSequence = event.sequence
+            onDeepLinkHandled(event)
         }
 
         val appContext = LocalContext.current.applicationContext

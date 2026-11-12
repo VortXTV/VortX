@@ -98,6 +98,23 @@ object WatchNextPublisher {
         }
     }
 
+    /** A completed sign-out retires prior app-owned rows even when a native roster is absent. */
+    internal fun clearAfterSignOut(context: Context, admit: (() -> Boolean) -> Boolean) {
+        runCatching {
+            val owned = synchronized(mutationLock) { ownedRows(context) } ?: return
+            for (rowId in owned.values) {
+                val current = synchronized(mutationLock) {
+                    admit {
+                        // One failed row must not prevent retirement of other old-owner rows.
+                        runCatching { deleteRow(context, rowId) }
+                        true
+                    }
+                }
+                if (!current) return
+            }
+        }
+    }
+
     // ---- internals ----
 
     private fun internalId(item: Item): String = "$INTERNAL_ID_PREFIX${item.type.id}:${item.id}"

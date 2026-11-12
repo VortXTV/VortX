@@ -51,7 +51,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -125,7 +124,13 @@ import com.vortx.android.player.PlayerEpisodeHandoffRequest
 import com.vortx.android.player.advancePlayerEpisodeHistory
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.BuildConfig
+import com.vortx.android.VortXApplication
 import com.vortx.android.profile.ProfileSelectionHandoff
+import com.vortx.android.profile.ProfilePickerEntry
+import com.vortx.android.profile.profilePickerEntry
+import com.vortx.android.ui.profilepicker.PickerProfilesUnavailable
+import com.vortx.android.ui.profilepicker.isPickerRosterCurrent
+import com.vortx.android.ui.profilepicker.rememberAdmittedPickerRoster
 import com.vortx.android.ui.profilepicker.ProfileSelectionSurface
 import com.vortx.android.ui.profilepicker.PickerFileRecoveryLanding
 import com.vortx.android.ui.profilepicker.PickerRestoreStatusLanding
@@ -223,7 +228,6 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.launch
@@ -284,6 +288,7 @@ fun VortXApp(
     // hidden and everything else is unchanged -- sync is off the critical path by design.
     syncManager: VortXSyncManager? = null,
     deepLinkEvent: VortXDeepLinkEvent? = null,
+    onDeepLinkHandled: (VortXDeepLinkEvent) -> Unit = {},
 ) {
     val liveFileRecoveryPause = syncManager?.pickerFileRecoveryPaused
     val fileRecoveryPausedNow = rememberPickerFileRecoveryPause(liveFileRecoveryPause)
@@ -296,6 +301,11 @@ fun VortXApp(
             ?: remember { mutableStateOf<VortXSyncManager.SessionUiState?>(null) }
     )
     val profileStore = ProfileStore.sharedOrNull()
+    val app = appContext as? VortXApplication
+    val nativePickerHost = app != null && repo !is PreviewCatalogRepository
+    val pickerRoster = rememberAdmittedPickerRoster(app, profileStore, syncManager, vortxSessionUi)
+    val pickerEntry = profilePickerEntry(nativePickerHost,
+        vortxSessionUi == VortXSyncManager.SessionUiState.SignedOut, pickerRoster)
     val activeProfile by (
         profileStore?.activeProfile?.collectAsStateWithLifecycle()
             ?: remember { mutableStateOf(null) }
@@ -509,10 +519,9 @@ fun VortXApp(
         var showWhatsNew by remember { mutableStateOf(false) }
         // SD-1: the "Play a link / magnet" sheet, reachable from the top of Search.
         var showPlayLink by remember { mutableStateOf(false) }
-        // Cold-launch "Who's watching?" picker (ACC-3): shown once per launch only when there is a real
-        // choice (more than one profile, not yet picked). Seeded from ProfileStore.needsPicker at first
-        // composition so it never re-appears after the user has picked (select() sets pickedThisLaunch).
-        var showWhosWatching by remember { mutableStateOf(profileStore?.needsPicker == true) }
+        var showWhosWatching by remember(pickerRoster?.mount) { mutableStateOf(false) }
+        val showAdmittedPicker = pickerEntry == ProfilePickerEntry.CHOOSE || (showWhosWatching && pickerRoster != null)
+        val pickerUnavailable = pickerEntry == ProfilePickerEntry.UNAVAILABLE
         // SD-2: re-read "Combine Discover & Search" whenever the Home & Discover settings screen closes (the
         // only place it is toggled) so the combined surface flips without a relaunch, matching Apple's
         // reactive @AppStorage. When it turns ON while the (now-dropped) Search tab is selected, heal
@@ -524,65 +533,6 @@ fun VortXApp(
         var discoverReselect by remember { mutableStateOf(0) }
         var handledDeepLinkSequence by remember { mutableStateOf(Long.MIN_VALUE) }
         val latestDeepLinkEvent by rememberUpdatedState(deepLinkEvent)
-        LaunchedEffect(deepLinkEvent, fileRecoveryPausedNow) {
-            val event = deepLinkEvent ?: return@LaunchedEffect
-            if (event.sequence <= handledDeepLinkSequence) return@LaunchedEffect
-            // Intent targets have no profile admission or unavailable-message branch. A false
-            // openDetail result here means the live recovery pause won the final route check.
-            val target = event.target.toMetaItem()
-            while (true) {
-                if (fileRecoveryPausedNow()) {
-                    val livePause = liveFileRecoveryPause ?: return@LaunchedEffect
-                    // Either source can wake the wait. Re-read the combined predicate at delivery.
-                    combine(livePause, snapshotFlow(fileRecoveryPausedNow)) { _, _ -> fileRecoveryPausedNow() }
-                        .first { !it }
-                }
-                ensureActive()
-                if (latestDeepLinkEvent != event || event.sequence <= handledDeepLinkSequence) return@LaunchedEffect
-                if (openDetail(target)) break
-            }
-            handledDeepLinkSequence = event.sequence
-            playing = null
-            playingMeta = null
-            showGallery = false
-            showAccount = false
-            showVortxAccount = false
-            showAddons = false
-            showAddonStore = false
-            showAddonPairing = false
-            showIntegrations = false
-            showMediaServers = false
-            showDownloads = false
-            showWatchlist = false
-            showPreviouslyWatched = false
-            catalogBrowseTarget = null
-            quickViewItem = null
-            quickWatchIdentity = null
-            showDownloadQueue = false
-            showPlayback = false
-            showSources = false
-            showUsenetServers = false
-            showNzbIndexers = false
-            showMetadataKeys = false
-            showPosterStyle = false
-            showHomeDiscover = false
-            showDebridKeys = false
-            showDebridLibrary = false
-            restoreDebridServicesFocus = false
-            showLiveTv = false
-            showLibraryTransfer = false
-            importedCollectionsEntry = null
-            showBackup = false
-            showDiagnostics = false
-            showProfiles = false
-            showAppearance = false
-            showCustomizeHome = false
-            showWatchStats = false
-            showWhatsNew = false
-            showTabBar = false
-            showPlayLink = false
-            detailGeneration += 1
-        }
         val onItem: (MetaItem) -> Unit = {
             detailGeneration += 1
             openDetail(it)
@@ -673,7 +623,7 @@ fun VortXApp(
             }
             return@VortXTheme
         }
-        var profileSelection by remember(pickerFileRecoveryPaused) { mutableStateOf<ProfileSelectionPresentation?>(null) }
+        var profileSelection by remember(pickerFileRecoveryPaused, pickerRoster?.mount) { mutableStateOf<ProfileSelectionPresentation?>(null) }
         if (!pickerFileRecoveryPaused) profileSelection?.let { presentation ->
             val request = presentation.request
             val handoff = remember(request, auth) { ProfileSelectionHandoff(auth, native = true) }
@@ -684,7 +634,7 @@ fun VortXApp(
                 onReturnToProfiles = { showProfiles = true })
             return@VortXTheme
         }
-        if (showWhosWatching || pickerAccountOpen || (pickerToolsState.open && pickerToolsModel.state.value.open) ||
+        if (showAdmittedPicker || pickerUnavailable || pickerAccountOpen || (pickerToolsState.open && pickerToolsModel.state.value.open) ||
             pickerFileRecoveryPaused || showFileRecoveryEntry) {
             ProfilePickerAccountHost(syncManager, pickerAccountModel, diagnosticAdmission = ::currentPickerDiagnosticExportAllowed, retirePickerUi = { profileSelection = null },
                 fileRecoveryPaused = pickerFileRecoveryPaused,
@@ -701,7 +651,9 @@ fun VortXApp(
                     if (pickerFileRecoveryPaused || showFileRecoveryEntry) {
                         PickerFileRecoveryLanding(isTv = false, accountControl = control,
                             onContinue = if (pickerFileRecoveryPaused) null else ({ dismissedFileRecoveryEntry = true }))
-                    } else WhosWatchingScreen(onDone = { showWhosWatching = false }, onSelected = {
+                    } else if (pickerUnavailable || pickerRoster == null) {
+                        PickerProfilesUnavailable(isTv = false, accountControl = control)
+                    } else WhosWatchingScreen(pickerRoster, onDone = { showWhosWatching = false }, onSelected = {
                         profileSelection = ProfileSelectionPresentation(it,
                             if (showProfiles) ProfileSelectionOrigin.PROFILE_MANAGEMENT else ProfileSelectionOrigin.PICKER)
                     }, accountControl = control)
@@ -710,6 +662,55 @@ fun VortXApp(
             return@VortXTheme
         }
 
+        LaunchedEffect(deepLinkEvent, pickerRoster, fileRecoveryPausedNow) {
+            val event = deepLinkEvent ?: return@LaunchedEffect
+            if (event.sequence <= handledDeepLinkSequence || latestDeepLinkEvent != event || fileRecoveryPausedNow()) return@LaunchedEffect
+            if (nativePickerHost && (pickerRoster == null || app?.isPickerRosterCurrent(syncManager, pickerRoster) != true ||
+                    pickerRoster.needsSelection)) return@LaunchedEffect
+            if (!openDetail(event.target.toMetaItem())) return@LaunchedEffect
+            handledDeepLinkSequence = event.sequence
+            playing = null
+            playingMeta = null
+            showGallery = false
+            showAccount = false
+            showVortxAccount = false
+            showAddons = false
+            showAddonStore = false
+            showAddonPairing = false
+            showIntegrations = false
+            showMediaServers = false
+            showDownloads = false
+            showWatchlist = false
+            showPreviouslyWatched = false
+            catalogBrowseTarget = null
+            quickViewItem = null
+            quickWatchIdentity = null
+            showDownloadQueue = false
+            showPlayback = false
+            showSources = false
+            showUsenetServers = false
+            showNzbIndexers = false
+            showMetadataKeys = false
+            showPosterStyle = false
+            showHomeDiscover = false
+            showDebridKeys = false
+            showDebridLibrary = false
+            restoreDebridServicesFocus = false
+            showLiveTv = false
+            showLibraryTransfer = false
+            importedCollectionsEntry = null
+            showBackup = false
+            showDiagnostics = false
+            showProfiles = false
+            showAppearance = false
+            showCustomizeHome = false
+            showWatchStats = false
+            showWhatsNew = false
+            showTabBar = false
+            showPlayLink = false
+            detailGeneration += 1
+            onDeepLinkHandled(event)
+        }
         LaunchedEffect(activeProfile, fileRecoveryPausedNow) {
             if (fileRecoveryPausedNow()) return@LaunchedEffect
             appearancePrefs.applyProfile(activeProfile)

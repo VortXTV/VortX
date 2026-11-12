@@ -150,9 +150,9 @@ object DownloadStore {
      * bytes are flushed (`fd.sync`) and finalized, so a process death cannot turn a media tombstone into a claimed
      * committed deletion merely because a direct index overwrite was torn.
      */
-    private fun persistLocked(): Boolean {
+    private fun persistLocked(records: List<DownloadRecord> = _records.value): Boolean {
         val array = JSONArray()
-        _records.value.forEach { array.put(recordToJson(it)) }
+        records.forEach { array.put(recordToJson(it)) }
         return runCatching {
             ensureDownloadsDirectoryExists()
             val atomic = AtomicFile(indexFile())
@@ -208,19 +208,23 @@ object DownloadStore {
     /**
      * Atomically mutate only when the current row still satisfies [predicate]. Returns the published row, or null
      * when the id disappeared or its ownership changed before this callback arrived.
+     * With [requireDurable], a failed disk commit leaves the published row untouched and returns null.
      */
     internal fun updateIf(
         id: String,
         persistIndex: Boolean = true,
         predicate: (DownloadRecord) -> Boolean,
+        requireDurable: Boolean = false,
         mutate: (DownloadRecord) -> DownloadRecord,
     ): DownloadRecord? = hydrationGate.withLock {
         val current = _records.value
         val index = current.indexOfFirst { it.id == id }
         if (index < 0 || !predicate(current[index])) return@withLock null
         val updated = mutate(current[index])
-        _records.value = current.toMutableList().also { it[index] = updated }
-        if (persistIndex) persistLocked()
+        val updatedRecords = current.toMutableList().also { it[index] = updated }
+        if (requireDurable && !persistLocked(updatedRecords)) return@withLock null
+        _records.value = updatedRecords
+        if (persistIndex && !requireDurable) persistLocked()
         updated
     }
 
@@ -463,6 +467,7 @@ object DownloadStore {
         put("bytesDone", record.bytesDone)
         put("state", record.state.wireValue)
         record.transferGeneration?.let { put("transferGeneration", it) }
+        if (record.transferRetryCount > 0) put("transferRetryCount", record.transferRetryCount)
         record.representationETag?.let { put("representationETag", it) }
         put("addedAt", record.addedAt)
         record.errorText?.let { put("errorText", it) }
@@ -504,6 +509,7 @@ object DownloadStore {
             bytesDone = json.optLong("bytesDone", 0L),
             state = DownloadState.fromWire(json.optString("state")),
             transferGeneration = json.optStringOrNull("transferGeneration"),
+            transferRetryCount = json.optInt("transferRetryCount", 0).coerceAtLeast(0),
             representationETag = json.optStringOrNull("representationETag"),
             // Read as LONG, never optInt: this is epoch millis and exceeds 2^31, which an Int read would
             // truncate (the same trap the sync engine documents for its document `version`). A truncated

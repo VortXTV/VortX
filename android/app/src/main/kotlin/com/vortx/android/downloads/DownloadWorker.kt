@@ -122,12 +122,11 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
         DownloadManager.init(applicationContext)
         val id = recordId ?: return@withContext Result.failure()
         val generation = transferGeneration ?: return@withContext Result.success()
-        val queuedRecord = DownloadStore.record(id) ?: return@withContext Result.success()
-        if (!DownloadManager.isDebridOwnerCurrent(queuedRecord)) {
-            DownloadManager.handleDebridOwnerChanged(id, generation)
-            return@withContext Result.success()
+        when (DownloadManager.claimTransfer(id, generation)) {
+            DownloadTransferAdmission.RETRY -> return@withContext Result.retry()
+            DownloadTransferAdmission.REJECTED -> return@withContext Result.success()
+            DownloadTransferAdmission.AUTHORIZED -> Unit
         }
-        if (!DownloadManager.claimTransfer(id, generation)) return@withContext Result.success()
         val record = DownloadStore.record(id) ?: run {
             DownloadManager.handleTransferStopped(id, generation)
             return@withContext Result.success()
@@ -144,17 +143,14 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
                 DownloadManager.handleTransferStopped(id, generation)
                 return@withContext Result.success()
             }
-            ensureDebridOwner(record)
             DownloadManager.handleTransferComplete(id, generation, prepared.completedBytes) {
-                ensureDebridOwner(record)
                 finalize(prepared.partFile, prepared.destination)
-            }
+            }.requireAccess()
             Result.success()
         } catch (_: StaleTransferGenerationException) {
             Result.success()
-        } catch (_: StaleDebridOwnerException) {
-            DownloadManager.handleDebridOwnerChanged(id, generation)
-            Result.success()
+        } catch (_: DownloadOwnerReadUnavailableException) {
+            Result.retry()
         } catch (cancellation: kotlinx.coroutines.CancellationException) {
             // pause() / cancel() cancelled the work, or WorkManager reclaimed it. The partial file stays on disk and
             // a Range resume continues from it. Apple's analogue is the `NSURLErrorCancelled` branch it deliberately
@@ -171,7 +167,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
             // the retry budget and the parked set.
             // The worker only executes the verdict. RETRY re-runs THIS work through WorkManager's own backoff, which
             // is the one restart mechanism that does not collide with the unique work name this worker still holds.
-            when (DownloadManager.handleTransferFailure(id, generation, error, runAttemptCount)) {
+            when (DownloadManager.handleTransferFailure(id, generation, error)) {
                 DownloadManager.FailureVerdict.RETRY -> Result.retry()
                 DownloadManager.FailureVerdict.TERMINAL -> Result.failure()
                 DownloadManager.FailureVerdict.IGNORED -> Result.success()
@@ -188,8 +184,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
     private suspend fun transfer(record: DownloadRecord, generation: String): PreparedDownload {
         val partFile = DownloadStore.partFileFor(record)
         val destination = DownloadStore.fileFor(record)
-        ensureOwnsTransfer(record.id, generation)
-        ensureDebridOwner(record)
+        ensureTransferAccess(record.id, generation)
 
         // Directory creation is a WRITE, and it is the first write that fails when the user is locked. Typing it as a
         // DownloadWriteException is what routes a Direct-Boot start into the park ladder instead of an opaque failure.
@@ -202,7 +197,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
         var existing = if (partFile.isFile) partFile.length() else 0L
         if (DownloadTransferPolicy.shouldFinalizeLocalPartial(record.bytesTotal, existing)) {
             if (!isStopped) {
-                ensureOwnsTransfer(record.id, generation)
+                ensureTransferAccess(record.id, generation)
                 validateCompletedPartial(record.id, generation, partFile)
             }
             return PreparedDownload(partFile, destination, existing)
@@ -221,19 +216,18 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
 
         var connection: HttpURLConnection? = null
         while (connection == null) {
-            ensureDebridOwner(record)
+            ensureTransferAccess(record.id, generation)
             val candidate = openConnection(
                 record = record,
                 offset = requestedOffset,
                 ifRangeETag = requestETag?.takeIf { requestedOffset > 0 },
             )
             val status = try {
-                candidate.responseCode
+                candidate.responseCode.also { ensureTransferAccess(record.id, generation) }
             } catch (error: Throwable) {
                 runCatching { candidate.disconnect() }
                 throw error
             }
-            ensureDebridOwner(record)
             if (status !in 200..299) {
                 val failure = DownloadHttpStatusException(status, candidate.responseMessage.orEmpty())
                 runCatching { candidate.disconnect() }
@@ -348,8 +342,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
         }
 
         if (isStopped) return PreparedDownload(partFile, destination, partFile.length())
-        ensureOwnsTransfer(record.id, generation)
-        ensureDebridOwner(record)
+        ensureTransferAccess(record.id, generation)
 
         val actualBytes = partFile.length()
         if (!DownloadTransferPolicy.hasCompleteLength(declaredTotal, actualBytes)) {
@@ -371,14 +364,13 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
         generation: String,
         partFile: File,
     ) {
-        val reset = try {
-            DownloadManager.performTransferFileMutation(recordId, generation) {
+        DownloadManager.performTransferFileMutation(recordId, generation) {
+            try {
                 RandomAccessFile(partFile, "rw").use { it.setLength(0L) }
+            } catch (error: Throwable) {
+                throw DownloadWriteException("Could not reset the partial download", error)
             }
-        } catch (error: Throwable) {
-            throw DownloadWriteException("Could not reset the partial download", error)
-        }
-        if (!reset) throw StaleTransferGenerationException()
+        }.requireAccess()
         DownloadManager.handleTransferProgress(
             id = recordId,
             generation = generation,
@@ -399,10 +391,9 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
         // An add-on that hands back an HLS playlist or a web embed page yields a few-KB non-media "download". Reject
         // it instead of "completing" with garbage, and delete the bogus file so it never appears playable offline.
         if (looksLikeNonMedia(partFile)) {
-            val deleted = DownloadManager.performTransferFileMutation(recordId, generation) {
+            DownloadManager.performTransferFileMutation(recordId, generation) {
                 runCatching { partFile.delete() }
-            }
-            if (!deleted) throw StaleTransferGenerationException()
+            }.requireAccess()
             throw java.io.IOException(
                 "This source isn't a downloadable file (it streams or resolves through a web page). " +
                     "Downloads work with direct and debrid file sources.",
@@ -473,39 +464,35 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
         // not writable (no Downloads dir, no permission, credential-encrypted storage still locked). Typing it here
         // is what routes that case into the park ladder; left bare it would surface as a FileNotFoundException, which
         // DownloadManager deliberately does not treat as a write failure because a 404 throws the same class.
-        val out = try {
-            var opened: RandomAccessFile? = null
-            val accepted = DownloadManager.performTransferFileMutation(record.id, generation) {
+        var opened: RandomAccessFile? = null
+        DownloadManager.performTransferFileMutation(record.id, generation) {
+            try {
                 opened = RandomAccessFile(partFile, "rw")
+            } catch (error: Throwable) {
+                throw DownloadWriteException("Could not open the download file for writing", error)
             }
-            if (!accepted) throw StaleTransferGenerationException()
-            requireNotNull(opened)
-        } catch (stale: StaleTransferGenerationException) {
-            throw stale
-        } catch (error: Throwable) {
-            throw DownloadWriteException("Could not open the download file for writing", error)
-        }
+        }.requireAccess()
+        val out = requireNotNull(opened)
 
         try {
             out.use { out ->
                 // Truncate BEFORE seeking: setLength can move the file pointer when it shortens the file past it, so
                 // seeking first and truncating second would leave the pointer's position depending on the old length.
                 // This drops any bytes past the resume point (a truncated or corrupt earlier attempt).
-                val positioned = DownloadManager.performTransferFileMutation(record.id, generation) {
+                DownloadManager.performTransferFileMutation(record.id, generation) {
                     out.setLength(startAt)
                     out.seek(startAt)
-                }
-                if (!positioned) throw StaleTransferGenerationException()
+                }.requireAccess()
                 connection.inputStream.use { input ->
                     val buffer = ByteArray(BUFFER_BYTES)
-                    ensureDebridOwner(record)
+                    ensureTransferAccess(record.id, generation)
                     while (true) {
                         if (isStopped) return
-                        ensureOwnsTransfer(record.id, generation)
+                        if (!DownloadManager.ownsTransfer(record.id, generation)) {
+                            throw StaleTransferGenerationException()
+                        }
                         val read = input.read(buffer)
                         if (read < 0) break
-                        ensureOwnsTransfer(record.id, generation)
-                        ensureDebridOwner(record)
                         if (
                             expectedResponseBytes != null &&
                             read.toLong() > expectedResponseBytes - responseBytes
@@ -514,16 +501,15 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
                                 "Range response exceeded its declared $expectedResponseBytes-byte extent",
                             )
                         }
-                        val accepted = DownloadManager.performTransferFileMutation(record.id, generation) {
+                        DownloadManager.performTransferFileMutation(record.id, generation) {
                             out.write(buffer, 0, read)
-                        }
-                        if (!accepted) throw StaleTransferGenerationException()
+                        }.requireAccess()
                         written += read
                         responseBytes += read
 
                         val now = System.currentTimeMillis()
                         if (written - lastPushBytes >= PROGRESS_MIN_BYTES || now - lastPushAt >= PROGRESS_MIN_INTERVAL_MS) {
-                            ensureDebridOwner(record)
+                            ensureTransferAccess(record.id, generation)
                             lastPushBytes = written
                             lastPushAt = now
                             val total = if (declaredTotal > 0) declaredTotal else 0L
@@ -555,7 +541,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
                 }
             }
         } catch (error: Throwable) {
-            if (error is StaleTransferGenerationException || error is StaleDebridOwnerException) throw error
+            if (error is StaleTransferGenerationException || error is DownloadOwnerReadUnavailableException) throw error
             // A failure here is ambiguous: it could be the socket dying mid-read (network) or the volume refusing the
             // write (ours). Only classify it as a WRITE failure -- which routes it into the park / self-heal ladder --
             // when the evidence says so: an errno-bearing exception, or a user who cannot write CE storage right now.
@@ -572,15 +558,14 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
         }
     }
 
-    private fun ensureOwnsTransfer(id: String, generation: String) {
-        if (!DownloadManager.ownsTransfer(id, generation)) {
-            throw StaleTransferGenerationException()
-        }
-    }
+    private fun ensureTransferAccess(id: String, generation: String) =
+        DownloadManager.checkTransferAccess(id, generation).requireAccess()
 
-    private fun ensureDebridOwner(record: DownloadRecord) {
-        if (!DownloadManager.isDebridOwnerCurrent(record)) {
-            throw StaleDebridOwnerException()
+    private fun DownloadTransferAdmission.requireAccess() {
+        when (this) {
+            DownloadTransferAdmission.AUTHORIZED -> Unit
+            DownloadTransferAdmission.REJECTED -> throw StaleTransferGenerationException()
+            DownloadTransferAdmission.RETRY -> throw DownloadOwnerReadUnavailableException()
         }
     }
 
@@ -619,4 +604,4 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
 }
 
 private class StaleTransferGenerationException : IllegalStateException()
-private class StaleDebridOwnerException : IllegalStateException()
+private class DownloadOwnerReadUnavailableException : IllegalStateException()

@@ -542,6 +542,9 @@ class DebridKeys private constructor(
             mutation()
         }
 
+    /** One persistence-backed observation, without credential adoption or cached owner state. */
+    internal fun readDownloadOwner(): DebridOwnerToken? = currentOwner()
+
     internal fun isCurrent(owner: DebridOwnerToken): Boolean = currentOwner() == owner
 
     internal fun isCurrent(ownerIdentity: String, ownerGeneration: Long): Boolean =

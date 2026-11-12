@@ -12,14 +12,14 @@ class ProfileSelectionWiringTest {
     @Test fun `both cold hosts gate content on typed completion and return Back to picker`() {
         val phone = source("ui/VortXApp.kt")
         val tv = source("ui/tv/TvApp.kt")
-        assertTrue(phone.contains("WhosWatchingScreen(onDone = { showWhosWatching = false }, onSelected = {"))
+        assertTrue(phone.contains("WhosWatchingScreen(pickerRoster, onDone = { showWhosWatching = false }, onSelected = {"))
         assertTrue(phone.contains("if (showProfiles) ProfileSelectionOrigin.PROFILE_MANAGEMENT else ProfileSelectionOrigin.PICKER"))
-        assertTrue(tv.contains("TvWhosWatching(onDone = { showPicker = false }, onSelected = { profileSelection = it }, accountControl = control)"))
+        assertTrue(tv.contains("TvWhosWatching(pickerRoster, onDone = { manualPicker = false },"))
         for (host in listOf(phone, tv)) {
             val selection = host.substringAfter("profileSelection?.let {").substringBefore("// The title currently")
             assertTrue(selection.contains("ProfileSelectionSurface(request, handoff,"))
             assertTrue(selection.contains("return@VortXTheme"))
-            assertTrue(selection.contains("onChooseAgain = { profileSelection = null; show"))
+            assertTrue(selection.contains("onChooseAgain = { profileSelection = null;"))
         }
         for (host in listOf(phone, tv)) {
             assertTrue(host.contains("ProfilePickerAccountHost(syncManager, pickerAccountModel, diagnosticAdmission = ::currentPickerDiagnosticExportAllowed, retirePickerUi = { profileSelection = null }"))
@@ -113,9 +113,48 @@ class ProfileSelectionWiringTest {
     @Test fun `pending selection survives composition recreation without bypassing native authority`() {
         assertTrue(source("profile/ProfileStore.kt").contains("selectionPending || (profiles.size > 1 && !pickedThisLaunch)"))
         val request = source("profile/ProfileSelectionRequest.kt")
-        assertTrue(request.contains("store.selectionPending = true"))
-        assertTrue(request.contains("store.selectionPending = false"))
+        val store = source("profile/ProfileStore.kt")
+        assertTrue(store.contains("selectionPending = true"))
+        assertTrue(store.contains("selectionPending = false"))
         assertTrue(request.contains("checkNotNull(nativeAdmission)"))
-        assertTrue(request.contains("store.activeID == selected.id && nativeAdmission()"))
+        assertTrue(request.contains("stillSelected() && admit(store::completePickerSelection)"))
+    }
+
+    @Test fun `late admitted roster controls launch while absence never substitutes for signed out`() {
+        val account = com.vortx.android.sync.SessionOwnerSnapshot.Account("test-account", 7L)
+        val adult = UserProfile(id = "owner", name = "Adult", avatar = "emoji:🎬")
+        val child = UserProfile(id = "child", name = "Child", avatar = "emoji:🌸")
+        val mount = Any()
+        fun roster(profiles: List<UserProfile>, pending: Boolean = false, picked: Boolean = false) =
+            AdmittedPickerRoster(mount, account, profiles, adult.id, pending, picked)
+
+        assertEquals(ProfilePickerEntry.UNAVAILABLE, profilePickerEntry(true, false, null))
+        assertEquals(ProfilePickerEntry.CONTENT, profilePickerEntry(true, true, null))
+        assertEquals(ProfilePickerEntry.CONTENT, profilePickerEntry(true, false, roster(listOf(adult))))
+        assertEquals(ProfilePickerEntry.CHOOSE, profilePickerEntry(true, false, roster(listOf(adult, child))))
+        assertEquals(ProfilePickerEntry.CONTENT, profilePickerEntry(true, false, roster(listOf(adult, child), picked = true)))
+        assertEquals(ProfilePickerEntry.CHOOSE, profilePickerEntry(true, false, roster(listOf(adult), pending = true, picked = true)))
+    }
+
+    @Test fun `launch confirmation follows the exact account generation and selected profile`() {
+        val account = com.vortx.android.sync.SessionOwnerSnapshot.Account("test-account", 7L)
+        val chosen = PickerLaunchSelection(account, "child")
+        assertTrue(chosen.matches(account.copy(), "child"))
+        assertFalse(chosen.matches(account.copy(generation = 8L), "child"))
+        assertFalse(chosen.matches(account.copy(id = "other-account"), "child"))
+        assertFalse(chosen.matches(account, "owner"))
+    }
+
+    @Test fun `phone and TV hold title delivery until picker return and acknowledge applied detail`() {
+        for (path in listOf("ui/VortXApp.kt", "ui/tv/TvApp.kt")) {
+            val host = source(path)
+            val picker = host.indexOf(if (path == "ui/VortXApp.kt") "if (showAdmittedPicker ||" else "if (showPicker ||")
+            val route = host.indexOf("LaunchedEffect(deepLinkEvent, pickerRoster")
+            assertTrue(picker >= 0 && route > picker)
+            val delivery = host.substring(route, host.indexOf("onDeepLinkHandled(event)", route))
+            assertTrue(delivery.contains("event.sequence <= handledDeepLinkSequence"))
+            assertTrue(delivery.contains("app?.isPickerRosterCurrent(syncManager, pickerRoster)"))
+            assertTrue(delivery.contains("handledDeepLinkSequence = event.sequence"))
+        }
     }
 }

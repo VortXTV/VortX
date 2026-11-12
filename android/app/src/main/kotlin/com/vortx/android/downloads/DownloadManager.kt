@@ -202,7 +202,8 @@ object DownloadManager {
             val persistedRecords = DownloadStore.records.value
             val startupReservedIds = DownloadQueuePolicy.startupReservedIds(persistedRecords)
             persistedRecords
-                .filter { it.id in startupReservedIds }
+                // A bound worker must prove its owner before reserving a slot after a process restart.
+                .filter { it.id in startupReservedIds && !hasDebridOwner(it) }
                 .forEach { record ->
                     val generation = record.transferGeneration
                     if (generation == null) {
@@ -250,35 +251,32 @@ object DownloadManager {
     ): DownloadRecord = synchronized(lock) {
         DownloadStore.records.value.firstOrNull { it.videoId == videoId && it.state != DownloadState.FAILED }
             ?.let { existing ->
-                if (
-                    existing.state != DownloadState.COMPLETED &&
-                    !isDebridOwnerCurrent(existing)
-                ) {
-                    cancelWork(existing.id)
-                    releaseSlotReservation(existing.id, existing.transferGeneration)
-                    DownloadStore.update(existing.id) {
-                        it.copy(
-                            state = DownloadState.FAILED,
-                            transferGeneration = null,
-                            errorText = OWNER_CHANGED_ERROR,
-                        )
+                if (existing.state == DownloadState.COMPLETED) return@synchronized existing
+                val owner = debridOwnerStatus(existing)
+                when (owner) {
+                    DownloadDebridOwnerPolicy.Status.CHANGED -> {
+                        if (!failChangedOwnerLocked(existing)) return@synchronized existing
+                        cancelWork(existing.id)
+                        afterSlotFreed()
                     }
-                } else {
-                    if (existing.state == DownloadState.PAUSED) resume(existing.id)
-                    return@synchronized existing
+                    DownloadDebridOwnerPolicy.Status.CURRENT,
+                    DownloadDebridOwnerPolicy.Status.UNAVAILABLE,
+                    -> {
+                        if (existing.state == DownloadState.PAUSED) resumeLocked(existing, owner)
+                        return@synchronized DownloadStore.record(existing.id) ?: existing
+                    }
                 }
             }
 
         val id = UUID.randomUUID().toString()
         val ext = fileExtension(resolvedUrl)
         val headers = requestHeaders?.takeIf { it.isNotEmpty() }
-        if (
-            !DownloadDebridOwnerPolicy.isCurrent(
-                expectedIdentity = debridOwnerIdentity,
-                expectedGeneration = debridOwnerGeneration,
-                current = currentDebridOwner(),
-            )
-        ) {
+        val owner = DownloadDebridOwnerPolicy.status(
+            expectedIdentity = debridOwnerIdentity,
+            expectedGeneration = debridOwnerGeneration,
+            readCurrent = ::currentDebridOwner,
+        )
+        if (owner == DownloadDebridOwnerPolicy.Status.CHANGED) {
             val failed = DownloadRecord(
                 id = id, contentId = contentId, videoId = videoId, type = type, name = name, poster = poster,
                 season = season, episode = episode, sourceName = sourceName, qualityText = qualityText,
@@ -315,7 +313,7 @@ object DownloadManager {
 
         // Honor the concurrency cap: start now only if a slot is free, else create the record QUEUED and let it
         // start when a running download finishes / fails / is cancelled / paused (start-next-on-finish).
-        val canStartNow = hasFreeSlot()
+        val canStartNow = owner == DownloadDebridOwnerPolicy.Status.CURRENT && hasFreeSlot()
         val generation = if (canStartNow) newTransferGeneration() else null
         val record = DownloadRecord(
             id = id, contentId = contentId, videoId = videoId, type = type, name = name, poster = poster,
@@ -349,6 +347,7 @@ object DownloadManager {
         synchronized(lock) {
             val record = DownloadStore.record(id) ?: return
             val pausedState = DownloadTransferStatePolicy.pause(record.state) ?: return
+            if (awaitingUnlock.remove(id)) persistAwaitingUnlock()
             if (record.state == DownloadState.QUEUED) {
                 DownloadStore.update(id) { it.copy(state = pausedState, transferGeneration = null) }
                 return
@@ -368,36 +367,43 @@ object DownloadManager {
         synchronized(lock) {
             val record = DownloadStore.record(id) ?: return
             if (!DownloadTransferStatePolicy.mayResume(record.state)) return
-            if (!isDebridOwnerCurrent(record)) {
-                DownloadStore.update(id) {
-                    it.copy(
-                        state = DownloadState.FAILED,
-                        transferGeneration = null,
-                        errorText = OWNER_CHANGED_ERROR,
-                    )
-                }
+            resumeLocked(record, debridOwnerStatus(record))
+        }
+    }
+
+    private fun resumeLocked(record: DownloadRecord, owner: DownloadDebridOwnerPolicy.Status) {
+        val id = record.id
+        when (owner) {
+            DownloadDebridOwnerPolicy.Status.UNAVAILABLE -> {
+                if (awaitingUnlock.add(id)) persistAwaitingUnlock()
                 return
             }
-            awaitingUnlock.remove(id)
-            persistAwaitingUnlock()
-            if (!hasFreeSlot()) {
-                DownloadStore.update(id) {
-                    it.copy(
-                        state = DownloadState.QUEUED,
-                        transferGeneration = null,
-                        errorText = null,
-                    )
-                }
-                appendToQueueOrder(id)
+            DownloadDebridOwnerPolicy.Status.CHANGED -> {
+                failChangedOwnerLocked(record)
                 return
             }
-            val updated = record.copy(
-                state = DownloadState.DOWNLOADING,
-                transferGeneration = newTransferGeneration(),
+            DownloadDebridOwnerPolicy.Status.CURRENT -> Unit
+        }
+
+        val canStart = hasFreeSlot()
+        val updated = DownloadStore.updateIf(
+            id = id,
+            predicate = { it == record },
+            requireDurable = id in awaitingUnlock,
+        ) {
+            it.copy(
+                state = if (canStart) DownloadState.DOWNLOADING else DownloadState.QUEUED,
+                transferGeneration = if (canStart) newTransferGeneration() else null,
+                transferRetryCount = 0,
                 errorText = null,
             )
-            DownloadStore.update(id) { updated }
+        } ?: return
+        if (canStart) {
+            // Keep the parked ID until the replacement worker actually claims it or scheduling fails durably.
             if (startTransfer(updated).freesSlot) afterSlotFreed()
+        } else {
+            appendToQueueOrder(id)
+            if (awaitingUnlock.remove(id)) persistAwaitingUnlock()
         }
     }
 
@@ -540,54 +546,35 @@ object DownloadManager {
     }
 
     /**
-     * Pull queued downloads into EVERY free slot. A cap raise opens several slots at once, so loop until the cap is
-     * met or the queue is empty. Guarded against a no-progress spin: if a pass neither starts a transfer nor shrinks
-     * the queue (e.g. every remaining record has a broken URL and was failed), stop.
+     * Fill every available slot in queue order, skipping rows whose account owner cannot be read yet.
      */
     private fun fillAvailableSlots() {
-        fun queuedCount() = DownloadStore.records.value.count { it.state == DownloadState.QUEUED }
-        while (hasFreeSlot()) {
-            val beforeActive = activeGenerations.size
-            val beforeQueued = queuedCount()
-            startNextQueued()
-            if (activeGenerations.size == beforeActive && queuedCount() == beforeQueued) break
-        }
-    }
-
-    /**
-     * Start the next queued download if a slot is free. Picks the head of the reorderable drain order, so the queue
-     * drains in the order the user set, or request order when untouched. Fail-soft: a queued record whose source URL
-     * no longer parses is marked failed and skipped, so one bad URL can't wedge the queue.
-     */
-    private fun startNextQueued() {
-        if (!hasFreeSlot()) return
-        val next = orderedQueuedRecords().firstOrNull() ?: return
-        if (!isDebridOwnerCurrent(next)) {
-            DownloadStore.update(next.id) {
-                it.copy(
-                    state = DownloadState.FAILED,
-                    transferGeneration = null,
-                    errorText = OWNER_CHANGED_ERROR,
-                )
+        // Leave unavailable rows in their original order and examine each only once in this drain.
+        for (next in orderedQueuedRecords()) {
+            if (!hasFreeSlot()) return
+            when (debridOwnerStatus(next)) {
+                DownloadDebridOwnerPolicy.Status.UNAVAILABLE -> continue
+                DownloadDebridOwnerPolicy.Status.CHANGED -> {
+                    failChangedOwnerLocked(next)
+                    continue
+                }
+                DownloadDebridOwnerPolicy.Status.CURRENT -> Unit
             }
-            return
-        }
-        if (next.remoteURL.toHttpUrlOrNull() == null) {
-            DownloadStore.update(next.id) {
-                it.copy(
-                    state = DownloadState.FAILED,
-                    transferGeneration = null,
-                    errorText = "Invalid source URL",
-                )
+            if (next.remoteURL.toHttpUrlOrNull() == null) {
+                DownloadStore.updateIf(next.id, predicate = { it == next }) {
+                    it.copy(state = DownloadState.FAILED, transferGeneration = null, errorText = "Invalid source URL")
+                }
+                continue
             }
-            return
+            val started = DownloadStore.updateIf(next.id, predicate = { it == next }) {
+                it.copy(
+                    state = DownloadState.DOWNLOADING,
+                    transferGeneration = newTransferGeneration(),
+                    transferRetryCount = 0,
+                )
+            } ?: continue
+            startTransfer(started)
         }
-        val started = next.copy(
-            state = DownloadState.DOWNLOADING,
-            transferGeneration = newTransferGeneration(),
-        )
-        DownloadStore.update(next.id) { started }
-        startTransfer(started)
     }
 
     /** Common tail for every terminal/slot-freeing transition: prune the order, then fill the freed slot(s). */
@@ -659,31 +646,15 @@ object DownloadManager {
             Log.w(TAG, "startTransfer without generation; record ${record.id} not scheduled")
             return DownloadTransferStartResult.NOT_STARTED
         }
-        if (!isDebridOwnerCurrent(record)) {
-            releaseActive(record.id, generation)
-            DownloadStore.updateIf(
-                id = record.id,
-                predicate = { it.transferGeneration == generation },
-            ) {
-                it.copy(
-                    state = DownloadState.FAILED,
-                    transferGeneration = null,
-                    errorText = OWNER_CHANGED_ERROR,
-                )
-            }
-            return DownloadTransferStartResult.PREFLIGHT_FAILED
-        }
-        val current = DownloadStore.record(record.id)
-        if (
-            current?.state != DownloadState.DOWNLOADING ||
-            current.transferGeneration != generation
-        ) {
+        // The caller admitted the exact row under this same lock. The worker makes a fresh owner read at claim.
+        if (DownloadStore.record(record.id) != record || record.state != DownloadState.DOWNLOADING) {
             return DownloadTransferStartResult.NOT_STARTED
         }
         if (storageShortfall(record)) {
             val failed = DownloadStore.updateIf(
                 id = record.id,
-                predicate = { it.transferGeneration == generation },
+                predicate = { it == record },
+                requireDurable = record.id in awaitingUnlock,
             ) {
                 it.copy(
                     state = DownloadState.FAILED,
@@ -692,6 +663,7 @@ object DownloadManager {
                 )
             }
             return if (failed != null) {
+                if (awaitingUnlock.remove(record.id)) persistAwaitingUnlock()
                 DownloadTransferStartResult.PREFLIGHT_FAILED
             } else {
                 DownloadTransferStartResult.NOT_STARTED
@@ -744,13 +716,14 @@ object DownloadManager {
             return DownloadTransferStartResult.NOT_STARTED
         }
         Log.w(TAG, "could not enqueue download ${record.id}", cause)
-        releaseActive(record.id, generation)
+        val released = releaseActive(record.id, generation)
         val failed = DownloadStore.updateIf(
             id = record.id,
             predicate = {
                 it.state == DownloadState.DOWNLOADING &&
                     it.transferGeneration == generation
             },
+            requireDurable = record.id in awaitingUnlock,
         ) {
             it.copy(
                 state = DownloadState.FAILED,
@@ -758,7 +731,8 @@ object DownloadManager {
                 errorText = "Could not schedule this download. Try again.",
             )
         }
-        return if (failed != null) {
+        if (failed != null && awaitingUnlock.remove(record.id)) persistAwaitingUnlock()
+        return if (failed != null || released) {
             DownloadTransferStartResult.ENQUEUE_FAILED
         } else {
             DownloadTransferStartResult.NOT_STARTED
@@ -775,84 +749,114 @@ object DownloadManager {
      * Atomically claim a record before any transfer or local finalization. WorkManager may deliver stale work after
      * pause, failure, or completion; only QUEUED and DOWNLOADING remain authorized to run.
      */
-    fun claimTransfer(id: String, generation: String): Boolean {
+    internal fun claimTransfer(id: String, generation: String): DownloadTransferAdmission {
         synchronized(lock) {
-            val record = DownloadStore.record(id) ?: return false
-            when (
-                val claim = DownloadTransferClaimPolicy.decide(
-                    record = record,
-                    requestedGeneration = generation,
-                    isOwnerCurrent = ::isDebridOwnerCurrent,
-                )
-            ) {
-                DownloadTransferClaimDecision.OwnerChanged -> {
-                    handleDebridOwnerChangedLocked(id, generation)
-                    return false
-                }
-                DownloadTransferClaimDecision.Rejected -> return false
-                is DownloadTransferClaimDecision.Claimed -> if (claim.state != record.state) {
-                    DownloadStore.updateIf(
-                        id = id,
-                        predicate = { it.transferGeneration == generation },
-                    ) {
-                        it.copy(state = claim.state)
-                    } ?: return false
+            val record = DownloadStore.record(id) ?: return DownloadTransferAdmission.REJECTED
+            val claim = DownloadTransferClaimPolicy.decide(
+                record = record,
+                requestedGeneration = generation,
+                readOwnerStatus = ::debridOwnerStatus,
+            )
+            when (claim) {
+                DownloadTransferClaimDecision.OwnerChanged -> return rejectChangedOwnerLocked(record)
+                DownloadTransferClaimDecision.OwnerUnavailable -> return deferOwnerReadLocked(record)
+                DownloadTransferClaimDecision.Rejected -> return DownloadTransferAdmission.REJECTED
+                is DownloadTransferClaimDecision.Claimed -> {
+                    if (activeGenerations[id] != generation && !hasFreeSlot()) {
+                        return DownloadTransferAdmission.RETRY
+                    }
+                    if (claim.state != record.state) {
+                        DownloadStore.updateIf(
+                            id = id,
+                            predicate = { it == record },
+                            requireDurable = id in awaitingUnlock,
+                        ) {
+                            it.copy(state = claim.state)
+                        } ?: return if (DownloadStore.record(id) == record) {
+                            DownloadTransferAdmission.RETRY
+                        } else {
+                            DownloadTransferAdmission.REJECTED
+                        }
+                    }
                 }
             }
             activeGenerations[id] = generation
             legacyStartupReservations.remove(id)
-            return true
+            if (awaitingUnlock.remove(id)) persistAwaitingUnlock()
+            return DownloadTransferAdmission.AUTHORIZED
         }
     }
 
-    /** Fail a revived/in-flight native-debrid transfer whose capability URL belongs to another owner epoch. */
-    fun handleDebridOwnerChanged(id: String, generation: String) {
-        synchronized(lock) {
-            handleDebridOwnerChangedLocked(id, generation)
-        }
-    }
-
-    private fun handleDebridOwnerChangedLocked(id: String, generation: String) {
-        releaseSlotReservation(id, generation)
+    /** A caller may only reach this transition after observing a confirmed changed owner under [lock]. */
+    private fun failChangedOwnerLocked(record: DownloadRecord): Boolean {
         DownloadStore.updateIf(
-            id = id,
-            predicate = { it.transferGeneration == generation },
+            id = record.id,
+            predicate = { it == record },
+            requireDurable = record.id in awaitingUnlock,
         ) {
-            it.copy(
-                state = DownloadState.FAILED,
-                transferGeneration = null,
-                errorText = OWNER_CHANGED_ERROR,
-            )
-        }
-        afterSlotFreed()
+            it.copy(state = DownloadState.FAILED, transferGeneration = null, errorText = OWNER_CHANGED_ERROR)
+        } ?: return false
+        releaseSlotReservation(record.id, record.transferGeneration)
+        if (awaitingUnlock.remove(record.id)) persistAwaitingUnlock()
+        return true
     }
 
-    fun isDebridOwnerCurrent(record: DownloadRecord): Boolean {
-        val identity = record.debridOwnerIdentity
-        val generation = record.debridOwnerGeneration
-        if (identity == null && generation == null) return true
-        if (identity == null || generation == null) return false
-        return debridKeys?.isCurrent(identity, generation) == true
+    private fun rejectChangedOwnerLocked(record: DownloadRecord): DownloadTransferAdmission {
+        if (!failChangedOwnerLocked(record)) return DownloadTransferAdmission.RETRY
+        afterSlotFreed()
+        return DownloadTransferAdmission.REJECTED
     }
+
+    private fun deferOwnerReadLocked(record: DownloadRecord): DownloadTransferAdmission {
+        // WorkManager retries the same generation. If it loses this work, reconciliation can replay the parked ID.
+        if (awaitingUnlock.add(record.id)) persistAwaitingUnlock()
+        if (releaseSlotReservation(record.id, record.transferGeneration)) afterSlotFreed()
+        return DownloadTransferAdmission.RETRY
+    }
+
+    private fun hasDebridOwner(record: DownloadRecord): Boolean =
+        record.debridOwnerIdentity != null || record.debridOwnerGeneration != null
+
+    private fun debridOwnerStatus(record: DownloadRecord): DownloadDebridOwnerPolicy.Status =
+        DownloadDebridOwnerPolicy.status(
+            expectedIdentity = record.debridOwnerIdentity,
+            expectedGeneration = record.debridOwnerGeneration,
+            readCurrent = ::currentDebridOwner,
+        )
 
     private fun currentDebridOwner(): DownloadDebridOwnerPolicy.Owner? {
-        val token = debridKeys?.ownerToken() ?: return null
+        val token = debridKeys?.readDownloadOwner() ?: return null
         return DownloadDebridOwnerPolicy.Owner(token.identity, token.generation)
     }
 
-    fun ownsTransfer(id: String, generation: String): Boolean =
+    private fun checkTransferAccessLocked(record: DownloadRecord, generation: String): DownloadTransferAdmission {
+        if (!ownsTransferLocked(record, generation)) return DownloadTransferAdmission.REJECTED
+        return when (debridOwnerStatus(record)) {
+            DownloadDebridOwnerPolicy.Status.CURRENT -> DownloadTransferAdmission.AUTHORIZED
+            DownloadDebridOwnerPolicy.Status.CHANGED -> rejectChangedOwnerLocked(record)
+            DownloadDebridOwnerPolicy.Status.UNAVAILABLE -> deferOwnerReadLocked(record)
+        }
+    }
+
+    internal fun ownsTransfer(id: String, generation: String): Boolean =
         synchronized(lock) { ownsTransferLocked(DownloadStore.record(id), generation) }
 
-    /**
-     * Couple a partial-file mutation to the same generation lock as pause/resume. This closes the small window where
-     * an old worker could pass an ownership check, get paused, then truncate or append to the new generation's file.
-     */
-    fun performTransferFileMutation(id: String, generation: String, mutate: () -> Unit): Boolean {
+    internal fun checkTransferAccess(id: String, generation: String): DownloadTransferAdmission =
         synchronized(lock) {
-            if (!ownsTransferLocked(DownloadStore.record(id), generation)) return false
-            mutate()
-            return true
+            val record = DownloadStore.record(id) ?: return@synchronized DownloadTransferAdmission.REJECTED
+            checkTransferAccessLocked(record, generation)
         }
+
+    /** Authorize a partial-file write against the exact live generation and owner in the same locked decision. */
+    internal fun performTransferFileMutation(
+        id: String,
+        generation: String,
+        mutate: () -> Unit,
+    ): DownloadTransferAdmission = synchronized(lock) {
+        val record = DownloadStore.record(id) ?: return@synchronized DownloadTransferAdmission.REJECTED
+        val admission = checkTransferAccessLocked(record, generation)
+        if (admission == DownloadTransferAdmission.AUTHORIZED) mutate()
+        admission
     }
 
     /**
@@ -879,6 +883,7 @@ object DownloadManager {
                 mutate(live).copy(
                     state = live.state,
                     transferGeneration = live.transferGeneration,
+                    transferRetryCount = live.transferRetryCount,
                 )
             }
         }
@@ -888,39 +893,24 @@ object DownloadManager {
      * Finalize and publish completion as one locked state transition. If pause/cancel/failure won first, the callback
      * is not run and that resting state is preserved.
      */
-    fun handleTransferComplete(
+    internal fun handleTransferComplete(
         id: String,
         generation: String,
         completedBytes: Long,
         finalize: () -> Unit,
-    ): Boolean {
+    ): DownloadTransferAdmission {
         synchronized(lock) {
-            val current = DownloadStore.record(id)
-            if (current != null && !isDebridOwnerCurrent(current)) {
-                releaseActive(id, generation)
-                DownloadStore.updateIf(
-                    id = id,
-                    predicate = { it.transferGeneration == generation },
-                ) {
-                    it.copy(
-                        state = DownloadState.FAILED,
-                        transferGeneration = null,
-                        errorText = OWNER_CHANGED_ERROR,
-                    )
-                }
-                afterSlotFreed()
-                return false
-            }
-            val completedState = current?.let {
-                DownloadTransferStatePolicy.complete(
-                    state = it.state,
-                    recordGeneration = it.transferGeneration,
-                    activeGeneration = activeGenerations[id],
-                    requestedGeneration = generation,
-                    onAuthorized = finalize,
-                )
-            }
-            if (current == null || completedState == null) return false
+            val current = DownloadStore.record(id) ?: return DownloadTransferAdmission.REJECTED
+            val admission = checkTransferAccessLocked(current, generation)
+            if (admission != DownloadTransferAdmission.AUTHORIZED) return admission
+
+            val completedState = DownloadTransferStatePolicy.complete(
+                state = current.state,
+                recordGeneration = current.transferGeneration,
+                activeGeneration = activeGenerations[id],
+                requestedGeneration = generation,
+                onAuthorized = finalize,
+            ) ?: return DownloadTransferAdmission.REJECTED
 
             releaseActive(id, generation)
             DownloadStore.updateIf(
@@ -936,7 +926,7 @@ object DownloadManager {
                 )
             }
             afterSlotFreed()
-            return true
+            return DownloadTransferAdmission.AUTHORIZED
         }
     }
 
@@ -950,8 +940,8 @@ object DownloadManager {
      */
     fun handleTransferStopped(id: String, generation: String) {
         synchronized(lock) {
-            val current = DownloadStore.record(id)
-            if (!ownsTransferLocked(current, generation)) return
+            val current = DownloadStore.record(id) ?: return
+            if (checkTransferAccessLocked(current, generation) != DownloadTransferAdmission.AUTHORIZED) return
             releaseActive(id, generation)
             DownloadStore.updateIf(
                 id = id,
@@ -1002,12 +992,15 @@ object DownloadManager {
         id: String,
         generation: String,
         cause: Throwable,
-        runAttemptCount: Int,
     ): FailureVerdict {
         synchronized(lock) {
             val detail = failureDetail(cause)
             val current = DownloadStore.record(id) ?: return FailureVerdict.IGNORED
-            if (!ownsTransferLocked(current, generation)) return FailureVerdict.IGNORED
+            when (checkTransferAccessLocked(current, generation)) {
+                DownloadTransferAdmission.RETRY -> return FailureVerdict.RETRY
+                DownloadTransferAdmission.REJECTED -> return FailureVerdict.IGNORED
+                DownloadTransferAdmission.AUTHORIZED -> Unit
+            }
             if (!DownloadTransferPolicy.mayRetryRecord(current.state)) {
                 // pause/cancel can win while a socket failure is being delivered. Never turn that resting state back
                 // into DOWNLOADING or ask WorkManager to retry work the user explicitly stopped.
@@ -1052,20 +1045,15 @@ object DownloadManager {
                 // because its resume state is an OPAQUE blob produced by a background daemon whose staging just
                 // misbehaved, so re-staging fresh is the only lever it has. Our resume state is the .part file we
                 // wrote ourselves; it is not suspect just because one write failed. So the retry RESUMES from it
-                // rather than re-downloading gigabytes. The persisted WorkManager attempt count grants it once.
-                if (DownloadTransferPolicy.canRetryWrite(runAttemptCount)) {
+                // rather than re-downloading gigabytes. The persistent transfer-generation counter grants it once.
+                if (
+                    DownloadTransferPolicy.canRetryWrite(current.transferRetryCount) &&
+                    recordAcceptedRetryLocked(current)
+                ) {
                     Log.w(TAG, "write failure retry id=$id attempt=1 detail=$detail")
-                    // Keep the slot: the SAME work retries, so releasing it here would let a queued download start
-                    // alongside and momentarily exceed the cap.
-                    DownloadStore.updateIf(
-                        id = id,
-                        predicate = { it.transferGeneration == generation },
-                    ) {
-                        it.copy(state = DownloadState.DOWNLOADING, errorText = null)
-                    }
                     return FailureVerdict.RETRY
                 }
-                // (3b) The one retry ALSO failed. Do NOT dead-fail (the #132 behaviour that stranded a
+                // (3b) The retry failed, or the retry budget could not be durably recorded. Do NOT dead-fail (the #132 behaviour that stranded a
                 // 100%-downloaded title at "couldn't save"). Park it: it auto-retries on the next unlock / app
                 // foreground. A later user resume creates a fresh generation and WorkRequest, so that explicit cycle
                 // gets one new retry without process death regranting retries to this generation.
@@ -1080,19 +1068,19 @@ object DownloadManager {
                 return FailureVerdict.TERMINAL
             }
 
-            if (DownloadTransferPolicy.shouldRetry(cause, runAttemptCount)) {
-                Log.w(
-                    TAG,
-                    "transient transfer retry id=$id attempt=${runAttemptCount + 1} detail=$detail",
-                )
-                // Keep the slot: WorkManager retries this same work. Its .part resumes only with a matching ETag.
-                DownloadStore.updateIf(
-                    id = id,
-                    predicate = { it.transferGeneration == generation },
-                ) {
-                    it.copy(state = DownloadState.DOWNLOADING, errorText = null)
+            if (DownloadTransferPolicy.shouldRetry(cause, current.transferRetryCount)) {
+                if (recordAcceptedRetryLocked(current)) {
+                    Log.w(
+                        TAG,
+                        "transient transfer retry id=$id attempt=${current.transferRetryCount + 1} detail=$detail",
+                    )
+                    return FailureVerdict.RETRY
                 }
-                return FailureVerdict.RETRY
+                // Keep partial bytes and avoid an unbounded retry loop if the counter cannot be written.
+                releaseActive(id, generation)
+                parkForUnlock(id, generation, "Waiting to save download progress. Reopen the app to retry.")
+                afterSlotFreed()
+                return FailureVerdict.TERMINAL
             }
 
             Log.w(TAG, "transfer FAILED id=$id detail=$detail")
@@ -1112,9 +1100,19 @@ object DownloadManager {
         }
     }
 
+    /** Only a genuine admitted I/O failure can spend this generation's durable retry budget. */
+    private fun recordAcceptedRetryLocked(record: DownloadRecord): Boolean =
+        DownloadStore.updateIf(
+            id = record.id,
+            predicate = { it == record },
+            requireDurable = true,
+        ) {
+            it.copy(transferRetryCount = it.transferRetryCount + 1, errorText = null)
+        } != null
+
     /** What [DownloadWorker] should do with a failure, decided by [handleTransferFailure]. */
     enum class FailureVerdict {
-        /** Let WorkManager re-run the SAME work on its backoff; the record stays DOWNLOADING and keeps its slot. */
+        /** Re-run the same WorkManager generation on its backoff. Owner waits can release the active slot. */
         RETRY,
 
         /** The record has reached a resting state (failed or parked); do not re-run. */
@@ -1145,28 +1143,31 @@ object DownloadManager {
     }
 
     /**
-     * Resume every download parked by a locked-write failure, once the user is unlocked again. Each still-paused
-     * record goes back through [resume] (which continues from the partial file via a Range request) and its holding
-     * message is cleared. A record the user cancelled or that changed state is skipped. No-op when nothing is parked
-     * (the common case), so an ordinary unlock / foreground pays nothing.
-     *
-     * Apple wires three triggers (`protectedDataDidBecomeAvailable`, `didBecomeActive`, `willEnterForeground`); the
-     * Android equivalents are [DownloadUnlockReceiver] (`ACTION_USER_UNLOCKED` + `ACTION_BOOT_COMPLETED`) and the
-     * app-foreground call in [com.vortx.android.VortXApplication].
+     * Revisit parked downloads after unlock or confirmed account-owner readiness. An unavailable owner or failed
+     * index commit leaves its parked ID intact. Queue draining can still start independently eligible rows.
      */
     fun retryDownloadsAwaitingUnlock() {
-        val ids = synchronized(lock) {
-            if (awaitingUnlock.isEmpty() || !isUserUnlocked()) return
-            awaitingUnlock.toList().also {
-                awaitingUnlock.clear()
-                persistAwaitingUnlock()
+        synchronized(lock) {
+            if (!isUserUnlocked()) return
+            for (id in awaitingUnlock.toList()) {
+                val record = DownloadStore.record(id)
+                if (record?.state == DownloadState.DOWNLOADING) continue
+                if (record == null || !DownloadTransferStatePolicy.mayResume(record.state)) {
+                    if (awaitingUnlock.remove(id)) persistAwaitingUnlock()
+                    continue
+                }
+                resumeLocked(record, debridOwnerStatus(record))
             }
+            fillAvailableSlots()
         }
-        for (id in ids) {
-            val record = DownloadStore.record(id) ?: continue
-            if (record.state != DownloadState.PAUSED) continue
-            DownloadStore.update(id) { it.copy(errorText = null) }
-            resume(id)
+    }
+
+    /** Call from IO after account readiness, once the persistence snapshot has released its own locks. */
+    internal fun retryDownloadsAfterOwnerReady() {
+        try {
+            reconcileInFlight()
+        } finally {
+            retryDownloadsAwaitingUnlock()
         }
     }
 
@@ -1209,21 +1210,13 @@ object DownloadManager {
                 generation != null &&
                 DownloadReconciliationPolicy.hasLiveGeneration(generation, work)
             ) {
-                synchronized(lock) {
-                    val current = DownloadStore.record(record.id)
-                    if (
-                        current?.state == DownloadState.DOWNLOADING &&
-                        current.transferGeneration == generation
-                    ) {
-                        activeGenerations[record.id] = generation
-                    }
-                }
+                // The worker claims its own slot. Reconciliation must not restore an owner-deferred reservation.
                 continue
             }
             val exactWorkIds = DownloadReconciliationPolicy.cancellableWorkIds(generation, work)
             val demoted = synchronized(lock) {
                 val current = DownloadStore.record(record.id)
-                if (pendingEnqueueGenerations[record.id] == generation) {
+                if (generation != null && pendingEnqueueGenerations[record.id] == generation) {
                     return@synchronized false
                 }
                 if (
@@ -1232,6 +1225,15 @@ object DownloadManager {
                 ) {
                     return@synchronized false
                 }
+                when (debridOwnerStatus(current)) {
+                    DownloadDebridOwnerPolicy.Status.UNAVAILABLE -> {
+                        if (awaitingUnlock.add(record.id)) persistAwaitingUnlock()
+                        releaseSlotReservation(record.id, generation)
+                        return@synchronized false
+                    }
+                    DownloadDebridOwnerPolicy.Status.CHANGED -> return@synchronized failChangedOwnerLocked(current)
+                    DownloadDebridOwnerPolicy.Status.CURRENT -> Unit
+                }
                 releaseSlotReservation(record.id, generation)
                 DownloadStore.updateIf(
                     id = record.id,
@@ -1239,6 +1241,7 @@ object DownloadManager {
                         it.state == DownloadState.DOWNLOADING &&
                             it.transferGeneration == generation
                     },
+                    requireDurable = record.id in awaitingUnlock,
                 ) {
                     it.copy(state = DownloadState.PAUSED, transferGeneration = null)
                 } != null
@@ -1357,47 +1360,58 @@ object DownloadManager {
     }
 }
 
+internal enum class DownloadTransferAdmission { AUTHORIZED, RETRY, REJECTED }
+
 internal object DownloadDebridOwnerPolicy {
     data class Owner(val identity: String, val generation: Long)
+    enum class Status { CURRENT, CHANGED, UNAVAILABLE }
 
     /**
-     * Missing fields are a compatible pre-owner-schema record. A partially written owner is invalid; a complete
-     * owner must match both opaque scope and mutation generation.
+     * Ownerless rows are compatible pre-owner-schema or direct records and need no credential read.
+     * A bound or partially bound row can be rejected only after a confirmed owner observation.
      */
-    fun isCurrent(
+    fun status(
         expectedIdentity: String?,
         expectedGeneration: Long?,
-        current: Owner?,
-    ): Boolean {
-        if (expectedIdentity == null && expectedGeneration == null) return true
-        if (expectedIdentity == null || expectedGeneration == null) return false
-        return current?.identity == expectedIdentity && current.generation == expectedGeneration
+        readCurrent: () -> Owner?,
+    ): Status {
+        if (expectedIdentity == null && expectedGeneration == null) return Status.CURRENT
+        val current = readCurrent() ?: return Status.UNAVAILABLE
+        return if (current.identity == expectedIdentity && current.generation == expectedGeneration) {
+            Status.CURRENT
+        } else {
+            Status.CHANGED
+        }
     }
+
+    fun isCurrent(expectedIdentity: String?, expectedGeneration: Long?, current: Owner?): Boolean =
+        status(expectedIdentity, expectedGeneration) { current } == Status.CURRENT
 }
 
 internal sealed interface DownloadTransferClaimDecision {
     data class Claimed(val state: DownloadState) : DownloadTransferClaimDecision
     data object OwnerChanged : DownloadTransferClaimDecision
+    data object OwnerUnavailable : DownloadTransferClaimDecision
     data object Rejected : DownloadTransferClaimDecision
 }
 
-/**
- * Evaluate ownership as part of the claim decision, after the manager reloads the durable row under its lifecycle
- * lock. A successful worker precheck therefore cannot authorize a later claim after the account has changed.
- */
+/** Evaluate one fresh owner observation only after validating the exact transfer generation and state. */
 internal object DownloadTransferClaimPolicy {
     fun decide(
         record: DownloadRecord,
         requestedGeneration: String,
-        isOwnerCurrent: (DownloadRecord) -> Boolean,
+        readOwnerStatus: (DownloadRecord) -> DownloadDebridOwnerPolicy.Status,
     ): DownloadTransferClaimDecision {
         val state = DownloadTransferStatePolicy.claim(
             state = record.state,
             recordGeneration = record.transferGeneration,
             requestedGeneration = requestedGeneration,
         ) ?: return DownloadTransferClaimDecision.Rejected
-        if (!isOwnerCurrent(record)) return DownloadTransferClaimDecision.OwnerChanged
-        return DownloadTransferClaimDecision.Claimed(state)
+        return when (readOwnerStatus(record)) {
+            DownloadDebridOwnerPolicy.Status.CURRENT -> DownloadTransferClaimDecision.Claimed(state)
+            DownloadDebridOwnerPolicy.Status.CHANGED -> DownloadTransferClaimDecision.OwnerChanged
+            DownloadDebridOwnerPolicy.Status.UNAVAILABLE -> DownloadTransferClaimDecision.OwnerUnavailable
+        }
     }
 }
 

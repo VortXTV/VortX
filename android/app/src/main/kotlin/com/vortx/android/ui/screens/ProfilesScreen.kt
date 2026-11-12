@@ -172,7 +172,7 @@ fun ProfilesScreen(
             val after = checkNotNull(nativeModel.captureSelection(selected)) {
                 "Choose the profile again."
             }
-            val nativeAdmission = { nativeModel.commitEditor(after) {} }
+            val nativeAdmission: (() -> Unit) -> Boolean = { action -> nativeModel.commitEditor(after, action) }
             onSelected(captureProfileSelection(store, profile, outcome, nativeAdmission = nativeAdmission))
         } catch (cancelled: CancellationException) {
             throw cancelled

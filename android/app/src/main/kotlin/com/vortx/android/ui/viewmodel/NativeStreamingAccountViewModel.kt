@@ -139,12 +139,20 @@ internal class NativeStreamingAccountViewModel(private val accounts: NativeAccou
     fun captureSelection(profile: UserProfile): Editor? = runCatching {
         val captured = profiles.captureSelection(profile)
         Editor(captured, checkNotNull(accounts.accountFor(captured.runtime)))
-    }.getOrElse { mutable.value = mutable.value.copy(message = "The profile changed. Unlock the current profile again."); null }
+    }.getOrElse { failure ->
+        if (failure is CancellationException) throw failure
+        mutable.value = mutable.value.copy(message = "The profile changed. Unlock the current profile again.")
+        null
+    }
     fun commitEditor(editor: Editor, action: () -> Unit): Boolean = runCatching {
         profiles.withEditTarget(editor.target) {
             check(accounts.withProfileMutation(editor.target.runtime, editor.account) { action(); true }) { "Account changed" }
         }; refresh(); true
-    }.getOrElse { mutable.value = mutable.value.copy(message = "The profile changed. Reopen its editor before saving."); false }
+    }.getOrElse { failure ->
+        if (failure is CancellationException) throw failure
+        mutable.value = mutable.value.copy(message = "The profile changed. Reopen its editor before saving.")
+        false
+    }
     fun close() {
         request?.cancel(); request = null; target = null; retryTarget = null
         mutable.value = mutable.value.copy(formProfile = null, busy = false, message = null)
