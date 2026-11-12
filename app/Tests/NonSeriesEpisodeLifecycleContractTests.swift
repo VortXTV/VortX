@@ -389,11 +389,11 @@ private struct NonSeriesEpisodeLifecycleContractTests {
                "a definitive canonical correction removes the stale proof")
         expect(DownloadSeasonBoundary.Refresh.verified(refreshedProof).replacement(for: proof) == refreshedProof,
                "new verified evidence replaces the prior proof")
-        var incomplete = DownloadSeasonBoundary.RefreshObservations(saved: proof)
-        incomplete.observe(seriesID: 100, finaleEpisode: 2, finaleID: nil, successorID: 201)
-        expect(incomplete.incompleteResult.replacement(for: proof) == proof,
+        var partialObservation = DownloadSeasonBoundary.RefreshObservations(saved: proof)
+        partialObservation.observe(seriesID: 100, finaleEpisode: 2, finaleID: nil, successorID: 201)
+        expect(partialObservation.incompleteResult.replacement(for: proof) == proof,
                "a missing outgoing season and unchanged observed successor preserve the proof")
-        var changedNext = incomplete
+        var changedNext = partialObservation
         changedNext.observe(successorID: 202)
         expect(changedNext.incompleteResult.replacement(for: proof) == nil,
                "a changed authenticated next E1 revokes the proof with the outgoing season unavailable")
