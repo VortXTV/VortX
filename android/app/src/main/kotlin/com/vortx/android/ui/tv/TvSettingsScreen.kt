@@ -103,7 +103,6 @@ import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.ProfileSelectionRequest
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.tv.TopShelfSettings
-import com.vortx.android.tv.WatchNextPublisher
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -542,8 +541,6 @@ fun TvSettingsScreen(
                             val next = !showCwOnHome
                             showCwOnHome = next
                             TopShelfSettings.setShowContinueWatching(appContext, next)
-                            // Turning it off clears the rows now; turning it on lets the next CW update publish.
-                            if (!next) WatchNextPublisher.clearOwnedRows(appContext)
                         },
                     )
                 }

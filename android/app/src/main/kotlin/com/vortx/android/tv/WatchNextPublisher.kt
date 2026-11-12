@@ -4,7 +4,28 @@ import android.content.Context
 import android.net.Uri
 import androidx.tvprovider.media.tv.TvContractCompat
 import androidx.tvprovider.media.tv.WatchNextProgram
+import com.vortx.android.data.ContinueWatchingOwner
+import com.vortx.android.data.ContinueWatchingSnapshot
+import com.vortx.android.home.continueWatchingOwnerIsKnown
 import com.vortx.android.model.MediaType
+
+internal data class WatchNextPublication(
+    val owner: ContinueWatchingOwner,
+    val items: List<WatchNextPublisher.Item>,
+)
+
+/** A failed local read leaves the launcher alone. An authoritative empty read can clear it. */
+internal fun watchNextPublication(
+    expectedOwner: ContinueWatchingOwner,
+    snapshot: Result<ContinueWatchingSnapshot>,
+): WatchNextPublication? {
+    if (!continueWatchingOwnerIsKnown(expectedOwner, expectedOwner.profileId)) return null
+    val current = snapshot.getOrNull()?.takeIf { it.owner == expectedOwner } ?: return null
+    val items = current.items.filterNot { it.watched }.map {
+        WatchNextPublisher.Item(it.type, it.id, it.name, it.poster, it.resumeSeconds, it.progress)
+    }
+    return WatchNextPublication(expectedOwner, items)
+}
 
 /**
  * Publishes profile-aware Continue Watching onto the Android TV home "Play Next" row (TV-2), the Android
@@ -24,6 +45,7 @@ import com.vortx.android.model.MediaType
 object WatchNextPublisher {
 
     private const val MAX_ROWS = 8
+    private val mutationLock = Any()
 
     /** The `internalProviderId` namespace for the rows this app owns, so reconcile never touches foreign rows. */
     private const val INTERNAL_ID_PREFIX = "vortx-cw:"
@@ -39,34 +61,41 @@ object WatchNextPublisher {
     )
 
     /**
-     * Reconcile the Play Next row with [items]. When the Show Continue Watching setting is off, this clears
-     * every owned row instead. Only movie/series entries with a non-blank id are published (the deep link and
-     * WatchNext type are defined for those); channels and blanks are dropped.
+     * Reconcile on a worker. Query before entering the owner fence, then admit each provider write
+     * independently. A profile change during a slow query cannot authorize that query's old rows.
      */
-    fun publish(context: Context, items: List<Item>) {
+    internal fun publish(context: Context, items: List<Item>, admit: (() -> Boolean) -> Boolean): Boolean =
         runCatching {
-            if (!TopShelfSettings.showContinueWatching(context)) {
-                clearOwnedRows(context)
-                return
+            fun mutate(write: () -> Boolean): Boolean = synchronized(mutationLock) {
+                TopShelfSettings.showContinueWatching(context) && admit(write)
             }
+            if (!TopShelfSettings.showContinueWatching(context)) return false
             val desired = items
                 .filter { it.id.isNotBlank() && (it.type == MediaType.MOVIE || it.type == MediaType.SERIES) }
                 .distinctBy(::internalId)
                 .take(MAX_ROWS)
-            val owned = ownedRows(context)
+            val owned = synchronized(mutationLock) { ownedRows(context) } ?: return false
             val desiredIds = desired.mapTo(HashSet(), ::internalId)
-            owned.forEach { (providerId, rowId) -> if (providerId !in desiredIds) deleteRow(context, rowId) }
+            owned.forEach { (providerId, rowId) ->
+                if (providerId !in desiredIds && !mutate { deleteRow(context, rowId) }) return false
+            }
             // Decreasing engagement time preserves the incoming order (most-recent first) on the home row.
             val now = System.currentTimeMillis()
             desired.forEachIndexed { index, item ->
-                upsert(context, item, owned[internalId(item)], engagementTime = now - index)
+                if (!mutate { upsert(context, item, owned[internalId(item)], engagementTime = now - index) }) return false
+            }
+            true
+        }.getOrDefault(false)
+
+    /** Remove app-owned rows for an explicit opt-out, even when account storage is unavailable. */
+    internal fun clearWhenDisabled(context: Context) {
+        synchronized(mutationLock) {
+            runCatching {
+                if (!TopShelfSettings.showContinueWatching(context)) {
+                    ownedRows(context)?.values?.forEach { runCatching { deleteRow(context, it) } }
+                }
             }
         }
-    }
-
-    /** Remove every Play Next row this app owns (used on disable and on an empty Continue Watching list). */
-    fun clearOwnedRows(context: Context) {
-        runCatching { ownedRows(context).values.forEach { deleteRow(context, it) } }
     }
 
     // ---- internals ----
@@ -77,7 +106,7 @@ object WatchNextPublisher {
         "vortx://open?type=${item.type.id}&id=${Uri.encode(item.id)}"
 
     /** internalProviderId -> WatchNext row id, for the rows this app authored. */
-    private fun ownedRows(context: Context): Map<String, Long> {
+    private fun ownedRows(context: Context): Map<String, Long>? {
         val out = LinkedHashMap<String, Long>()
         context.contentResolver.query(
             TvContractCompat.WatchNextPrograms.CONTENT_URI,
@@ -95,11 +124,11 @@ object WatchNextPublisher {
                     }
                 } while (cursor.moveToNext())
             }
-        }
+        } ?: return null
         return out
     }
 
-    private fun upsert(context: Context, item: Item, existingRowId: Long?, engagementTime: Long) {
+    private fun upsert(context: Context, item: Item, existingRowId: Long?, engagementTime: Long): Boolean {
         val builder = WatchNextProgram.Builder()
             .setType(
                 if (item.type == MediaType.MOVIE) {
@@ -127,15 +156,15 @@ object WatchNextPublisher {
         }
 
         val values = builder.build().toContentValues()
-        if (existingRowId != null) {
+        return if (existingRowId != null) {
             context.contentResolver.update(
                 TvContractCompat.buildWatchNextProgramUri(existingRowId),
                 values,
                 null,
                 null,
-            )
+            ) > 0
         } else {
-            context.contentResolver.insert(TvContractCompat.WatchNextPrograms.CONTENT_URI, values)
+            context.contentResolver.insert(TvContractCompat.WatchNextPrograms.CONTENT_URI, values) != null
         }
     }
 
@@ -148,9 +177,8 @@ object WatchNextPublisher {
         return (total * 1000).toLong()
     }
 
-    private fun deleteRow(context: Context, rowId: Long) {
-        runCatching {
-            context.contentResolver.delete(TvContractCompat.buildWatchNextProgramUri(rowId), null, null)
-        }
+    private fun deleteRow(context: Context, rowId: Long): Boolean {
+        context.contentResolver.delete(TvContractCompat.buildWatchNextProgramUri(rowId), null, null)
+        return true
     }
 }

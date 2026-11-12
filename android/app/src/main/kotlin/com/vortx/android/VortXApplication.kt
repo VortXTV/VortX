@@ -28,6 +28,7 @@ import com.vortx.android.net.VortXEdgeAuth
 import com.vortx.android.ui.prefs.PosterStylePreferences
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
 import com.vortx.android.downloads.DownloadManager
@@ -57,11 +58,14 @@ import com.vortx.android.notifications.NewEpisodeNotifications
 import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.PlaylistScopeTransition
+import com.vortx.android.player.PlaybackOwnerEpoch
+import com.vortx.android.player.PlaybackOwnerToken
 import com.vortx.android.update.UpdateChecker
 import com.vortx.android.sync.AccountFileRestoreExternalExclusion
 import com.vortx.android.sync.ApplicationAccountFileRestoreExclusion
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.sync.SessionOwnerSnapshot
+import com.vortx.android.tv.WatchNextPublisher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -149,6 +153,30 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             gate
         } }) }
     internal fun nativeStreamingAccounts(): NativeAccountCoordinator = nativeAccounts
+
+    internal fun clearWatchNextIfDisabled() {
+        applicationScope.launch { WatchNextPublisher.clearWhenDisabled(this@VortXApplication) }
+    }
+
+    /** Admit one launcher provider mutation under the actual session, account and mount fences. */
+    internal fun publishWatchNextIfCurrent(
+        expected: ContinueWatchingOwner,
+        epoch: PlaybackOwnerToken,
+        publication: () -> Boolean,
+    ): Boolean = runCatching {
+        val session = nativeAccounts.session()
+        session.withCurrentRead { read ->
+            val owner = read.owner
+            if (!expected.usesEngineHistory || expected.profileId != owner.profileID ||
+                expected.accountSlot != owner.scope.digest || expected.principal != owner.scope.accountID ||
+                expected.revision != owner.revision
+            ) return@withCurrentRead false
+            val account = nativeAccounts.accountFor(session) ?: return@withCurrentRead false
+            nativeAccounts.withProfileMutation(session, account) {
+                PlaybackOwnerEpoch.isCurrent(epoch) && publication()
+            }
+        }
+    }.getOrDefault(false)
     private val xperienceCatalogDelegate = lazy {
         com.vortx.android.engine.NativeXperienceCatalogAccess(nativeAccounts, nativeRepository, applicationScope)
     }

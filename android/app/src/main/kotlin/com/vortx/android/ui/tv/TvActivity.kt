@@ -15,10 +15,22 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.vortx.android.VortXApplication
 import com.vortx.android.deeplink.DeepLinkDeliveryState
 import com.vortx.android.deeplink.VortXDeepLinkEvent
+import com.vortx.android.home.continueWatchingOwnerIsKnown
+import com.vortx.android.player.PlaybackOwnerEpoch
+import com.vortx.android.player.PlaybackOwnerToken
+import com.vortx.android.tv.TopShelfSettings
+import com.vortx.android.tv.WatchNextPublication
 import com.vortx.android.tv.WatchNextPublisher
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.map
+import com.vortx.android.tv.watchNextPublication
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.UUID
 
 /// Android TV (10-foot / D-pad) entry point. This is the activity the `LEANBACK_LAUNCHER` intent lands on
@@ -66,30 +78,35 @@ class TvActivity : ComponentActivity() {
             )
         }
 
-        // TV-2: mirror profile-aware Continue Watching onto the Android TV home "Play Next" row. Collect the
-        // SAME reactive Home stream the shell uses and republish whenever the CW row changes, only while the
-        // Activity is STARTED (so it publishes on resume too, and stops when backgrounded). distinctUntilChanged
-        // keeps an unchanged CW list from writing to the provider on every unrelated engine tick. The publisher
-        // is fully fail-soft (a phone with no TvProvider is a no-op), so this is safe on any device.
+        // Observe the local playback projection without competing for the visible Home catalog load.
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
-                app.catalogRepository.homeUpdates()
-                    .map { update ->
-                        update.rows.firstOrNull { it.id == CONTINUE_WATCHING_ROW_ID }?.items.orEmpty()
-                            .filterNot { it.watched }
-                            .map {
-                                WatchNextPublisher.Item(
-                                    type = it.type,
-                                    id = it.id,
-                                    title = it.name,
-                                    poster = it.poster,
-                                    resumeSeconds = it.resumeSeconds,
-                                    progress = it.progress,
-                                )
+                val repo = app.catalogRepository
+                TopShelfSettings.observeShowContinueWatching(applicationContext)
+                    .flowOn(Dispatchers.IO)
+                    .collectLatest { enabled ->
+                        if (!enabled) {
+                            app.clearWatchNextIfDisabled()
+                            return@collectLatest
+                        }
+                        var published: Pair<PlaybackOwnerToken, WatchNextPublication>? = null
+                        repo.ctxUpdates().onStart { emit(Unit) }.flowOn(Dispatchers.IO).conflate().collect {
+                            val previous = published
+                            published = withContext(Dispatchers.IO) {
+                                val epoch = PlaybackOwnerEpoch.capture() ?: return@withContext null
+                                val owner = repo.continueWatchingOwner()
+                                if (!continueWatchingOwnerIsKnown(owner, owner.profileId)) return@withContext null
+                                val candidate = watchNextPublication(owner, repo.continueWatchingSnapshot(owner))
+                                    ?: return@withContext null
+                                val projection = epoch to candidate
+                                if (projection == previous) return@withContext previous
+                                val success = WatchNextPublisher.publish(applicationContext, candidate.items) { write ->
+                                    app.publishWatchNextIfCurrent(candidate.owner, epoch) { isActive && write() }
+                                }
+                                projection.takeIf { success }
                             }
+                        }
                     }
-                    .distinctUntilChanged()
-                    .collect { WatchNextPublisher.publish(applicationContext, it) }
             }
         }
     }
@@ -144,9 +161,5 @@ class TvActivity : ComponentActivity() {
     private companion object {
         const val STATE_DEEP_LINK_DELIVERY_ID = "vortx.deepLinkDeliveryId"
         const val EXTRA_DEEP_LINK_DELIVERY_ID = "com.vortx.android.extra.DEEP_LINK_DELIVERY_ID"
-
-        // The engine's Continue Watching Home row id (EngineState builds it under "continue"; the shell reads
-        // the same in CatalogViewModels). This is the profile-aware CW list the Play Next row mirrors.
-        const val CONTINUE_WATCHING_ROW_ID = "continue"
     }
 }
