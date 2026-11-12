@@ -1,5 +1,11 @@
 package com.vortx.android.engine
 
+import com.vortx.android.downloads.playableDownloadResumeMs
+import com.vortx.android.downloads.DownloadedPlaybackPolicy
+import com.vortx.android.downloads.DownloadedPolicyWitness
+import com.vortx.android.model.PlaybackContext
+import com.vortx.android.player.PlaybackOwnerEpoch
+import com.vortx.android.player.PlaybackOwnerToken
 import com.vortx.android.sync.SessionOwnerSnapshot
 import com.vortx.android.diagnostics.DiagnosticsLog
 import com.vortx.android.data.*
@@ -750,6 +756,50 @@ internal class NativeCatalogRepository(
     }
     private fun owner(value: VortxNativeOwner) = ContinueWatchingOwner(value.profileID, value.scope.digest, value.scope.accountID, true, value.revision)
     override fun continueWatchingOwner() = runCatching { owner(session().read().owner) }.getOrDefault(unavailableOwner)
+
+    /** Read the owner’s local policy and only its already approved metadata. No add-on request. */
+    internal suspend fun downloadedPlaybackPolicy(
+        targets: List<PlaybackContext>,
+        token: PlaybackOwnerToken,
+    ): DownloadedPlaybackPolicy? = attempt {
+        check(PlaybackOwnerEpoch.isCurrent(token))
+        val session = session()
+        val read = session.read()
+        val capturedOwner = read.owner
+        session.owned(capturedOwner) {
+            check(PlaybackOwnerEpoch.isCurrent(token) && sessionProvider() === session)
+            val restricted = parental(read)
+            val permitted = targets.filterTo(mutableSetOf()) { target ->
+                target.owner.profileId == read.owner.profileID &&
+                    (!restricted || nativePlaybackIdentityCanRecord(target) &&
+                        hasApprovedPlaybackMetadata(read, target, strictEpisode = true))
+            }
+            val witness = DownloadedPolicyWitness {
+                runCatching { sessionProvider() === session && session.accepts(capturedOwner) }.getOrDefault(false)
+            }
+            DownloadedPlaybackPolicy(restricted, permitted, witness)
+        }
+    }.getOrNull()
+
+    /** Query the local kernel only. The token predates the download probe and cannot be replaced. */
+    internal suspend fun downloadedResumePositionMs(
+        context: PlaybackContext,
+        token: PlaybackOwnerToken,
+    ): Long = attempt {
+        check(PlaybackOwnerEpoch.isCurrent(token))
+        val session = session()
+        val read = session.read()
+        check(read.owner.profileID == context.owner.profileId)
+        session.owned(read.owner) {
+            check(PlaybackOwnerEpoch.isCurrent(token))
+            check(!parental(read) || hasApprovedPlaybackMetadata(read, context, strictEpisode = true))
+            val reply = session.resolve(JSONObject().put("kind", "resume_point").put("id", context.videoId), read.owner)
+            check(reply.getString("kind") == "resume_point")
+            val resume = reply.optJSONObject("resume") ?: return@owned 0L
+            playableDownloadResumeMs(resume.getLong("offsetMs"), resume.getLong("durationMs"))
+        }
+    }.getOrDefault(0L)
+
     override fun admitClientHomeRows(rows: List<Catalog>, expectedOwner: ContinueWatchingOwner): Result<List<Catalog>> = runCatching {
         val session = session(); val read = session.read()
         check(owner(read.owner) == expectedOwner) { "Native client rail owner changed" }
@@ -1578,6 +1628,21 @@ internal class NativeCatalogRepository(
     }
     suspend fun mergeNativeSync(document: String) = attempt { session().dispatch(listOf(action("merge_native_sync").put("document", JSONObject(document)))); Unit }
 
+    private fun hasApprovedPlaybackMetadata(
+        read: VortxNativeRead,
+        context: PlaybackContext,
+        strictEpisode: Boolean = false,
+    ): Boolean = synchronized(this) {
+        val type = MediaType.fromId(context.type)
+        val (cachedOwner, detail) = detailCache[type to context.contentId] ?: return@synchronized false
+        if (cachedOwner != read.owner || detail.type != type || detail.id != context.contentId) return@synchronized false
+        if (strictEpisode && type == MediaType.SERIES) {
+            detail.videos.any { it.id == context.videoId && it.season == context.season && it.episode == context.episode }
+        } else {
+            context.videoId == detail.id || detail.videos.any { it.id == context.videoId }
+        }
+    }
+
     override suspend fun beginPlaybackSession(context: PlaybackContext?, ownerToken: ContinueWatchingOwner?) = attempt {
         val session = session(); val read = session.read()
         val captured = context ?: return@attempt PlaybackSessionToken.NOOP
@@ -1586,11 +1651,9 @@ internal class NativeCatalogRepository(
         require(captured.type in setOf("movie", "series"))
         requireWatchIdentity(read, MediaType.fromId(captured.type), captured.contentId)
         require(nativePlaybackIdentityCanRecord(captured)) { "Exact native episode identity required for playback history" }
-        if (parental(read)) check(synchronized(this) {
-            detailCache[MediaType.fromId(captured.type) to captured.contentId]?.let { (cachedOwner, detail) ->
-                cachedOwner == read.owner && (captured.videoId == detail.id || detail.videos.any { it.id == captured.videoId })
-            } == true
-        }) { "Approved native metadata required for playback" }
+        if (parental(read)) check(hasApprovedPlaybackMetadata(read, captured)) {
+            "Approved native metadata required for playback"
+        }
         session.owned(read.owner) { synchronized(this) {
             PlaybackSessionToken(playbackSequence.incrementAndGet()).also { playing = Playing(it, read.owner, captured) }
         } }

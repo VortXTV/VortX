@@ -11,23 +11,65 @@ import Foundation
         let presenter = root.components(separatedBy: "struct iOSDownloadsScreen: View {")[1]
             .components(separatedBy: "struct iOSSearchView")[0]
         precondition(presenter.contains("DownloadsView(onPlay: playDownload)"))
-        precondition(presenter.contains("core.engineResumeSecondsByLibraryId(for: meta)"))
-        precondition(presenter.contains("await account.resumeOffset(for: meta)"))
+        precondition(presenter.contains("await candidate.prepareForPlayback(core: core)"))
+        precondition(!presenter.contains("await account.resumeOffset(for: meta)"), "local resume must not query account providers")
         for gate in ["!Task.isCancelled", "downloadLaunchRequest == request",
-                     "owner.stillOwnsCurrentContext(core: core)", "current.state == .completed",
-                     "current.playbackMeta == meta", "DownloadStore.shared.fileExists(for: current)"] {
+                     "owner.stillOwnsCurrentContext(core: core)",
+                     "DownloadStore.shared.playableDownload(id: record.id, expected: meta)"] {
             precondition(presenter.contains(gate), "missing download launch gate: \(gate)")
         }
-        precondition(presenter.contains("DownloadStore.shared.fileURL(for: current)"))
+        let store = try String(contentsOfFile: "app/SourcesShared/DownloadStore.swift", encoding: .utf8)
+        let admission = store.components(separatedBy: "func playableDownload(id: UUID, expected: PlaybackMeta)")[1]
+            .components(separatedBy: "func playableDownload(for target:")[0]
+        for gate in ["current.state == .completed", "current.playbackMeta == expected",
+                     "validatedPlaybackURL(for: current)", "url: url"] {
+            precondition(admission.contains(gate), "missing exact download admission check")
+        }
         precondition(presenter.contains("let activeProfileID = ProfileStore.shared.activeID"))
         precondition(presenter.components(separatedBy: "ProfileStore.shared.activeID == activeProfileID").count == 3,
                      "an extant inactive overlay may persist history but must never admit this launch")
-        precondition(presenter.contains("meta: meta"))
-        precondition(presenter.contains("isTorrent: false"))
+        precondition(!admission.contains("active?.isKids"), "the existing exact Downloads entry stays available")
+        precondition(store.components(separatedBy: "guard ProfileStore.shared.active?.isKids != true").count == 4,
+                     "both new lookup paths and local successor respect Kids mode")
+        precondition(store.contains("isKids == (ProfileStore.shared.active?.isKids == true)"),
+                     "a Kids setting change invalidates an asynchronous launch")
+        precondition(store.contains("core.engineResumeSecondsByLibraryId(for: meta)"))
+        precondition(store.contains("await core.nativeResumeSeconds(for: meta, target: current.owner)"))
+        precondition(store.contains("ProfileStore.shared.resumeOffset(for: meta)"))
+        precondition(store.contains("let final = current.revalidated()"))
+        precondition(presenter.contains("iOSPlayerLaunch.downloaded(prepared.copy, resume: prepared.resume)"))
+        precondition(store.contains("attributes.isRegularFile == true"))
+        precondition(store.contains("attributes.isSymbolicLink == false"))
+        precondition(store.contains("resolved.deletingLastPathComponent().path == managedDirectory.path"))
+        precondition(store.contains("resolved.path.hasPrefix(home.path +"))
+        precondition(root.contains("meta: playback.record.playbackMeta"))
+        precondition(root.contains("isTorrent: false, wasExplicitPick: true"))
         precondition(presenter.contains("downloadLaunchTask?.cancel()"))
         let player = try String(contentsOfFile: "app/Sources/PlayerScreen.swift", encoding: .utf8)
         let leave = player.components(separatedBy: "private func leavePlayback() {")[1]
             .components(separatedBy: "#if os(macOS)")[0]
+        let backDuringHandoff = leave.components(separatedBy: "invalidateWatchPartyOwner()")[0]
+        let activePresentation = backDuringHandoff.range(of: "guard ownsDownloadedPresentation?() == true")!.lowerBound
+        let fullscreenExit = backDuringHandoff.range(of: "exitPlayerFullScreenIfNeeded()")!.lowerBound
+        let close = backDuringHandoff.range(of: "onClose()")!.lowerBound
+        precondition(activePresentation < fullscreenExit && fullscreenExit < close)
+        precondition(leave.contains("onDownloadedAdvance(successor) { exitPlayerFullScreenIfNeeded() }"))
+        let mount = player.components(separatedBy: "// A rejected new mount must still unwind")[1]
+            .components(separatedBy: "downloadMountAdmitted = true")[0]
+        precondition(mount.contains("macWasFullScreenAtOpen = downloadedPlayback.macWasFullScreenAtOpen"))
+        precondition(mount.contains("downloadedPlayback.revalidated()?.url == url"))
+        let detail = try String(contentsOfFile: "app/SourcesiOS/iOSDetailView.swift", encoding: .utf8)
+        let handoffs = [root, detail].flatMap {
+            $0.components(separatedBy: "onDownloadedAdvance: { candidate, onFailure in").dropFirst()
+        }
+        precondition(handoffs.count == 3)
+        for handoff in handoffs {
+            let afterAwait = handoff.components(separatedBy: "await candidate.prepareForPlayback(core: core)")[1]
+                .components(separatedBy: "onClose:")[0]
+            let requestFence = afterAwait.range(of: "?.id == item.id else { return }")!.lowerBound
+            let failure = afterAwait.range(of: "onFailure()")!.lowerBound
+            precondition(requestFence < failure)
+        }
         let previewStop = leave.range(of: "if skipDBPreviewing { stopSkipDBPreview() }")!.lowerBound
         precondition(previewStop < leave.range(of: "reportProgress(")!.lowerBound)
         precondition(previewStop < leave.range(of: "playbackStopped(")!.lowerBound)
@@ -56,6 +98,33 @@ import Foundation
         precondition(setup < pause && pause < firstLoad)
         let tv = try String(contentsOfFile: "app/SourcesTV/TVDownloadsView.swift", encoding: .utf8)
         precondition(tv.contains("record.playbackMeta"), "retain TV's existing download identity")
+        let tvPlayer = try String(contentsOfFile: "app/SourcesTV/TVPlayerView.swift", encoding: .utf8)
+        let tvRoot = try String(contentsOfFile: "app/SourcesTV/RootTabView.swift", encoding: .utf8)
+        precondition(tvRoot.contains("startAtSeconds: resume, downloadedPlayback: playback"))
+        precondition(tvRoot.contains("guard request?.id == expectedRequestID, stillCurrent()"))
+        precondition(tvPlayer.contains("if !downloadHandoffProgressFlushed"))
+        precondition(tvPlayer.contains("$0.owner == coordinator.player?.activeLoadToken && $0.mountGeneration == mountGeneration"),
+                     "paused EOF cannot authorize a new AVPlayer physical item under the same logical load")
+        let tvLeave = tvPlayer.components(separatedBy: "private func leavePlayback() {")[1]
+        let handoff = tvLeave.range(of: "let isDownloadedHandoff = downloadedSuccessor != nil")!.lowerBound
+        let flush = tvLeave.range(of: "flushExitProgress(integrityOwner: exitLoadToken")!.lowerBound
+        let invalidate = tvLeave.range(of: "coordinator.player?.invalidateLoadToken()")!.lowerBound
+        precondition(handoff < flush && flush < invalidate)
+        for source in [player, tvPlayer] {
+            precondition(source.contains("nextPlayableDownload(after: meta)"))
+            precondition(source.contains("meta == downloadedPlayback?.record.playbackMeta"))
+            precondition(source.contains("downloadProfileID == ProfileStore.shared.activeID"))
+            precondition(source.contains("successor.consecutiveAutoAdvances = consecutiveAutoAdvances"))
+            precondition(source.contains("pendingDownloadedAdvance = true"))
+            precondition(source.contains("guard confirmed || !downloadedBoundaryConsumed else { return }"))
+            precondition(source.contains("guard confirmed || eligibleEOF else"))
+            precondition(source.contains("DownloadRecord.permitsDownloadedAdvance("))
+            precondition(source.contains("completionEvidence.settledProgress(owner:"))
+            precondition(source.contains("transportSettled: event.transportSettled"))
+            precondition(source.contains("downloadedPlayback.revalidated()?.url == url"))
+            precondition(source.contains("if downloadedPlayback == nil || downloadMountAdmitted"))
+            precondition(source.contains("guard downloadedPlayback == nil else { return [] }"))
+        }
         print("PASS downloaded Apple resume lookup, owner/cancel/file guards and preview-exit persistence ordering")
     }
 }

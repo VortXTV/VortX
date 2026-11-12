@@ -60,6 +60,7 @@ internal class EngineSessionPlayer(
     private val engine: PlayerEngine,
     private val playable: Playable,
     private val setUserPlaying: (Boolean) -> Unit,
+    private val onUserSeek: () -> Unit,
     looper: Looper,
 ) : SimpleBasePlayer(looper) {
 
@@ -149,6 +150,7 @@ internal class EngineSessionPlayer(
     }
 
     override fun handleSeek(mediaItemIndex: Int, positionMs: Long, seekCommand: Int): ListenableFuture<*> {
+        onUserSeek()
         // TIME_UNSET is "the default position" (a seek-to-start class command); everything else is
         // an absolute target, which the engine clamps against its own duration.
         engine.seekTo(if (positionMs == C.TIME_UNSET) 0L else positionMs.coerceAtLeast(0L))
@@ -240,12 +242,13 @@ internal fun PlayerMediaSessionEffect(
     playable: Playable,
     speed: Float,
     setUserPlaying: (Boolean) -> Unit,
+    onUserSeek: () -> Unit,
 ) {
     val context = LocalContext.current
     val currentSpeed by rememberUpdatedState(speed)
     DisposableEffect(engine, playable.url) {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-        val player = EngineSessionPlayer(engine, playable, setUserPlaying, Looper.getMainLooper())
+        val player = EngineSessionPlayer(engine, playable, setUserPlaying, onUserSeek, Looper.getMainLooper())
         // Fail-soft: a session build failure (an OEM MediaSessionManager quirk) must never take
         // playback down with it; the player simply runs session-less, as it did before this file.
         val session = runCatching {

@@ -49,6 +49,8 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import coil3.compose.AsyncImage
 import com.vortx.android.model.Episode
+import com.vortx.android.model.DownloadRecord
+import com.vortx.android.downloads.downloadedEpisode
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.person.CastMember
@@ -86,6 +88,8 @@ fun TvSeasonEpisodeSection(
     onSelectEpisode: (String) -> Unit,
     onToggleWatched: (Episode, Boolean) -> Unit,
     onMarkSeasonWatched: (Int, Boolean) -> Unit,
+    downloads: List<DownloadRecord> = emptyList(),
+    playDownloaded: (DownloadRecord) -> Unit = {},
 ) {
     val seasons = remember(detail.videos) {
         detail.videos.map { it.season }.distinct().sorted()
@@ -148,13 +152,19 @@ fun TvSeasonEpisodeSection(
 
         // Bulk mark-the-season control (mirrors the phone SeasonSelector's season-level toggle).
         if (episodes.isNotEmpty()) {
-            Row(modifier = Modifier.padding(horizontal = TvDimens.edge)) {
+            Row(
+                modifier = Modifier.padding(horizontal = TvDimens.edge),
+                horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+            ) {
                 TvFilterChip(
                     label = if (seasonAllWatched) "Mark season unwatched" else "Mark season watched",
                     selected = false,
                     onClick = { onMarkSeasonWatched(activeSeason, !seasonAllWatched) },
                     modifier = if (seasons.size <= 1) Modifier.focusRequester(seasonFocus) else Modifier,
                 )
+                episodes.firstNotNullOfOrNull { downloadedEpisode(downloads, it) }?.let { record ->
+                    TvFilterChip("Play Downloaded Season", false, onClick = { playDownloaded(record) })
+                }
             }
         }
 
@@ -196,6 +206,7 @@ fun TvSeasonEpisodeSection(
                             isCurrent = episode.id == selectedEpisodeId,
                             onSelect = { onSelectEpisode(episode.id) },
                             onToggleWatched = { onToggleWatched(episode, !watched) },
+                            onPlayDownloaded = downloadedEpisode(downloads, episode)?.let { record -> { playDownloaded(record) } },
                             focusRequester = episodeFocusRequesters[index],
                             // The grid's first row hands Up to the season posters, as on Apple TV; deeper rows
                             // keep native grid navigation.
@@ -313,6 +324,7 @@ private fun TvEpisodeCard(
     onToggleWatched: () -> Unit,
     focusRequester: FocusRequester,
     upFocusRequester: FocusRequester,
+    onPlayDownloaded: (() -> Unit)? = null,
     modifier: Modifier = Modifier.width(288.dp),
     scores: MdbListRatings? = null,
 ) {
@@ -419,6 +431,7 @@ private fun TvEpisodeCard(
             selected = watched,
             onClick = onToggleWatched,
         )
+        onPlayDownloaded?.let { TvFilterChip("Play Downloaded", false, onClick = it) }
     }
 }
 

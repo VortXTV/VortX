@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
@@ -42,6 +43,9 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.Episode
+import com.vortx.android.model.DownloadRecord
+import com.vortx.android.downloads.downloadedEpisode
+import com.vortx.android.downloads.openDownloadedPlayback
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
@@ -74,6 +78,9 @@ import com.vortx.android.ui.viewmodel.DetailNavigationFence
 import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.resolveRelatedDetailTitle
 import kotlinx.coroutines.Job
+import com.vortx.android.ui.screens.DownloadedDetailFallback
+import com.vortx.android.ui.screens.heroDownload
+import com.vortx.android.ui.screens.rememberCompletedTitleDownloads
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -126,6 +133,7 @@ fun TvDetailScreen(
     title: String,
     onBack: () -> Unit,
     onPlay: (Playable, MetaDetail, PlayerEngineRouter.Override) -> Unit,
+    onPlayDownloaded: ((Playable, PlayerEngineRouter.Override) -> Unit)? = null,
     modifier: Modifier = Modifier,
     onOpenTitle: (MetaItem) -> Unit = {},
     autoWatch: Boolean = false,
@@ -142,12 +150,39 @@ fun TvDetailScreen(
     val streamsState by viewModel.streams.collectAsStateWithLifecycle()
     val playback by viewModel.playback.collectAsStateWithLifecycle()
     val watchlisted by viewModel.watchlisted.collectAsStateWithLifecycle()
+    val detailScope = rememberCoroutineScope()
+    val downloadContext = LocalContext.current
     val launchPlayerChoices = remember { PlayerLaunchPolicy.choices(MpvEngineFactory.isBundled) }
     var launchEnginePreference by remember {
         mutableStateOf(PlayerLaunchPolicy.defaultPreference(MpvEngineFactory.isBundled))
     }
     var pendingLaunchEnginePreference by remember { mutableStateOf(launchEnginePreference) }
+    var downloadLaunch by remember(viewModel) { mutableStateOf<Job?>(null) }
+    DisposableEffect(viewModel) { onDispose { downloadLaunch?.cancel() } }
+    val downloadDetail = (metaState as? UiState.Success)?.data
+    val downloadTitleIds = setOfNotNull(viewModel.routeId, downloadDetail?.id)
+    val downloadAvailability = rememberCompletedTitleDownloads(downloadTitleIds, viewModel.routeType, downloadDetail != null)
+    val downloads = downloadAvailability.records
+    val beginDetailInteraction: () -> Boolean = {
+        downloadLaunch?.cancel()
+        onQueueInteraction()
+    }
+    val playDownloaded: (DownloadRecord) -> Unit = { record ->
+        val onReady = onPlayDownloaded
+        if (onReady != null && beginDetailInteraction()) {
+            viewModel.abandonPlaybackRoute()
+            val preference = launchEnginePreference
+            val episodeTitle = downloadDetail?.videos?.firstOrNull {
+                it.id == record.videoId && it.season == record.season && it.episode == record.episode
+            }?.title
+            downloadLaunch = detailScope.launch {
+                val local = openDownloadedPlayback(downloadContext, record, episodeTitle)
+                if (local != null && viewModel.isRouteAdmissionCurrent()) onReady(local, preference)
+            }
+        }
+    }
     val beginPlayback: (() -> Unit) -> Unit = { action ->
+        downloadLaunch?.cancel()
         pendingLaunchEnginePreference = launchEnginePreference
         action()
     }
@@ -158,6 +193,7 @@ fun TvDetailScreen(
         if (onQueueInteraction()) beginPlayback(action)
     }
     val beginPlaybackWithEngine: (PlayerEngineRouter.Override, () -> Unit) -> Unit = { engine, action ->
+        downloadLaunch?.cancel()
         if (onAutoWatchCancelled()) {
             pendingLaunchEnginePreference = engine
             action()
@@ -193,7 +229,24 @@ fun TvDetailScreen(
 
     val colors = VortXTheme.colors
     Box(modifier = modifier.fillMaxSize().background(colors.canvas)) {
-        when (val meta = metaState) {
+        if (onPlayDownloaded != null && downloads.isNotEmpty() && downloadDetail == null &&
+            downloadAvailability.allowsMetadataFallback) {
+            val localFocus = remember { FocusRequester() }
+            DownloadedDetailFallback(
+                title = title,
+                records = downloads,
+                action = { record ->
+                    TvPlayButton(
+                        label = if (record.type == "movie") "Play Downloaded" else "Play Downloaded · ${record.displayTitle}",
+                        enabled = true,
+                        onClick = { playDownloaded(record) },
+                        focusRequester = localFocus.takeIf { record == downloads.first() },
+                    )
+                },
+                retry = { TvFilterChip(label = "Retry Details", selected = false, onClick = viewModel::retryMeta) },
+            )
+            LaunchedEffect(localFocus) { runCatching { localFocus.requestFocus() } }
+        } else when (val meta = metaState) {
             is UiState.Loading -> TvDetailLoading(title)
             // Retry must retain this detail route. Sending the remote Back here used to discard the title
             // instead of retrying its failed metadata request.
@@ -212,7 +265,9 @@ fun TvDetailScreen(
                 beginPlaybackWithEngine = beginPlaybackWithEngine,
                 onOpenTitle = onOpenTitle,
                 onManualAction = onAutoWatchCancelled,
-                onQueueInteraction = onQueueInteraction,
+                onQueueInteraction = beginDetailInteraction,
+                downloads = if (onPlayDownloaded != null) downloads else emptyList(),
+                playDownloaded = playDownloaded,
                 queueCount = queueCount,
                 queueAvailable = queueAvailable,
                 onQueueAdd = onQueueAdd,
@@ -238,6 +293,8 @@ private fun TvDetailContent(
     onOpenTitle: (MetaItem) -> Unit,
     onManualAction: () -> Boolean,
     onQueueInteraction: () -> Boolean,
+    downloads: List<DownloadRecord>,
+    playDownloaded: (DownloadRecord) -> Unit,
     queueCount: Int,
     queueAvailable: Boolean,
     onQueueAdd: (MetaDetail, Episode?, Boolean) -> Unit,
@@ -445,6 +502,14 @@ private fun TvDetailContent(
                         onClick = { beginPlayback { viewModel.playBest() } },
                         focusRequester = playFocus,
                     )
+                    heroDownload(
+                        downloads, detail.type,
+                        if (selectedEpisodeId == null) viewModel.primaryEpisode()?.first
+                        else detail.videos.firstOrNull { it.id == selectedEpisodeId },
+                    )?.let { record ->
+                        Spacer(Modifier.width(VortXTheme.spacing.sm))
+                        TvPlayButton(label = "Play Downloaded", enabled = true, onClick = { playDownloaded(record) })
+                    }
                     Spacer(Modifier.width(VortXTheme.spacing.sm))
                     // Trailer sits beside Watch with its clapperboard, as on Apple TV: free 1080p from the user's
                     // own IP via the client resolver (worker fallback on a miss), through the shared player latch.
@@ -665,6 +730,20 @@ private fun TvDetailContent(
                     modifier = Modifier.padding(horizontal = TvDimens.edge, vertical = VortXTheme.spacing.sm),
                 )
             }
+            if (detail.type == MediaType.SERIES && detail.videos.isEmpty() && downloads.isNotEmpty()) {
+                LazyRow(
+                    contentPadding = PaddingValues(horizontal = TvDimens.edge),
+                    horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                ) {
+                    items(downloads, key = { it.id }) { record ->
+                        TvPlayButton(
+                            label = "Play Downloaded · ${record.displayTitle}",
+                            enabled = true,
+                            onClick = { playDownloaded(record) },
+                        )
+                    }
+                }
+            }
             if (detail.type == MediaType.SERIES && detail.videos.isNotEmpty()) {
                 TvSeasonEpisodeSection(
                     detail = detail,
@@ -683,6 +762,8 @@ private fun TvDetailContent(
                     },
                     onToggleWatched = viewModel::setVideoWatched,
                     onMarkSeasonWatched = viewModel::setSeasonWatched,
+                    downloads = downloads,
+                    playDownloaded = playDownloaded,
                 )
             }
 

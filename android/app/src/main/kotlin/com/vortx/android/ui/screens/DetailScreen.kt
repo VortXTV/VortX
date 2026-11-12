@@ -98,6 +98,9 @@ import com.vortx.android.sources.SourceQuickFilters
 import com.vortx.android.ui.components.SourceQuickFilterControls
 import com.vortx.android.library.WatchlistStore
 import com.vortx.android.model.Episode
+import com.vortx.android.model.DownloadRecord
+import com.vortx.android.downloads.downloadedEpisode
+import com.vortx.android.downloads.openDownloadedPlayback
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
@@ -189,6 +192,7 @@ fun DetailScreen(
     title: String,
     onBack: () -> Unit,
     onPlay: (Playable, MetaDetail, PlayerEngineRouter.Override) -> Unit,
+    onPlayDownloaded: ((Playable, PlayerEngineRouter.Override) -> Unit)? = null,
     modifier: Modifier = Modifier,
     /** A one-shot request from Cinema Quick View; normal detail visits retain manual playback. */
     autoWatch: Boolean = false,
@@ -277,6 +281,7 @@ fun DetailScreen(
             title = target.name,
             onBack = { titleTarget = null },
             onPlay = onPlay,
+            onPlayDownloaded = onPlayDownloaded,
             modifier = modifier,
         )
         return
@@ -478,7 +483,32 @@ fun DetailScreen(
         mutableStateOf(PlayerLaunchPolicy.defaultPreference(MpvEngineFactory.isBundled))
     }
     var pendingLaunchEnginePreference by remember { mutableStateOf(launchEnginePreference) }
+    var downloadLaunch by remember(viewModel) { mutableStateOf<Job?>(null) }
+    DisposableEffect(viewModel) { onDispose { downloadLaunch?.cancel() } }
+    val downloadDetail = (metaState as? UiState.Success)?.data
+    val downloadTitleIds = setOfNotNull(viewModel.routeId, downloadDetail?.id)
+    val downloadAvailability = rememberCompletedTitleDownloads(downloadTitleIds, viewModel.routeType, downloadDetail != null)
+    val downloads = downloadAvailability.records
+    val beginDetailInteraction: () -> Boolean = {
+        downloadLaunch?.cancel()
+        onQueueInteraction()
+    }
+    val playDownloaded: (DownloadRecord) -> Unit = { record ->
+        val onReady = onPlayDownloaded
+        if (onReady != null && beginDetailInteraction()) {
+            viewModel.abandonPlaybackRoute()
+            val preference = launchEnginePreference
+            val episodeTitle = downloadDetail?.videos?.firstOrNull {
+                it.id == record.videoId && it.season == record.season && it.episode == record.episode
+            }?.title
+            downloadLaunch = scope.launch {
+                val local = openDownloadedPlayback(context, record, episodeTitle)
+                if (local != null && viewModel.isRouteAdmissionCurrent()) onReady(local, preference)
+            }
+        }
+    }
     val beginPlayback: (() -> Unit) -> Unit = { action ->
+        downloadLaunch?.cancel()
         pendingLaunchEnginePreference = launchEnginePreference
         action()
     }
@@ -490,6 +520,7 @@ fun DetailScreen(
         if (onQueueInteraction()) beginPlayback(action)
     }
     val beginPlaybackWithEngine: (PlayerEngineRouter.Override, () -> Unit) -> Unit = { engine, action ->
+        downloadLaunch?.cancel()
         if (onAutoWatchCancelled()) {
             pendingLaunchEnginePreference = engine
             action()
@@ -557,7 +588,21 @@ fun DetailScreen(
         value = VortXRatingsClient.episodes(id, season) ?: emptyMap()
     }
     Box(modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
-        when (val m = metaState) {
+        if (onPlayDownloaded != null && downloads.isNotEmpty() && downloadDetail == null &&
+            downloadAvailability.allowsMetadataFallback) {
+            DownloadedDetailFallback(
+                title = title,
+                records = downloads,
+                action = { record ->
+                    PrimaryButton(
+                        text = if (record.type == "movie") "Play Downloaded" else "Play Downloaded · ${record.displayTitle}",
+                        onClick = { playDownloaded(record) },
+                        leadingIcon = VortXIcons.playFill,
+                    )
+                },
+                retry = { Chip(label = "Retry Details", selected = false, onClick = viewModel::retryMeta) },
+            )
+        } else when (val m = metaState) {
             // A non-`tt` catalog id that neither an add-on nor the one-shot recovery could resolve sits in
             // Loading with [metaUnavailable] set: show the terminal "Details unavailable" page (Try Again
             // genuinely re-attempts) instead of a permanent skeleton. A `tt` never reaches here (it gets a
@@ -587,6 +632,11 @@ fun DetailScreen(
                         launchEnginePreference = launchEnginePreference,
                         onSelectLaunchEngine = { launchEnginePreference = it },
                         onWatch = { beginManualPlayback { viewModel.playBest() } },
+                        onPlayDownloaded = heroDownload(
+                            downloads, m.data.type,
+                            if (selectedEpisodeId == null) viewModel.primaryEpisode()?.first
+                            else m.data.videos.firstOrNull { it.id == selectedEpisodeId },
+                        )?.takeIf { onPlayDownloaded != null }?.let { record -> { playDownloaded(record) } },
                         playFromStartEnabled = viewModel.resumeAvailable() && !resolving,
                         onPlayFromStart = { beginManualPlayback { viewModel.playBest(fromStart = true) } },
                         onToggleSources = { if (onAutoWatchCancelled()) sourcesOpen = !sourcesOpen },
@@ -739,13 +789,23 @@ fun DetailScreen(
                         )
                     }
                 }
+                if (m.data.type == MediaType.SERIES && m.data.videos.isEmpty() && onPlayDownloaded != null) {
+                    items(downloads, key = { "downloaded-${it.id}" }) { record ->
+                        Chip(
+                            label = "Play Downloaded · ${record.displayTitle}",
+                            selected = false,
+                            onClick = { playDownloaded(record) },
+                            modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
+                        )
+                    }
+                }
                 if (m.data.type == MediaType.SERIES && m.data.videos.isNotEmpty()) {
                     item {
                         SeasonSelector(
                             detail = m.data,
                             wide = wideDetail,
                             selectedSeason = selectedSeason ?: m.data.videos.first().season,
-                            onSelectSeason = { season -> if (onQueueInteraction()) viewModel.selectSeason(season) },
+                            onSelectSeason = { season -> if (beginDetailInteraction()) viewModel.selectSeason(season) },
                             onMarkSeasonWatched = viewModel::setSeasonWatched,
                             onMarkSeriesWatched = viewModel::setWatched,
                         )
@@ -754,6 +814,18 @@ fun DetailScreen(
                         .filter { it.season == (selectedSeason ?: m.data.videos.first().season) }
                         .sortedBy { it.episode }
                     val seasonForEpisodes = selectedSeason ?: m.data.videos.first().season
+                    val seasonDownload = episodes.firstNotNullOfOrNull { downloadedEpisode(downloads, it) }
+                    if (seasonDownload != null && onPlayDownloaded != null) {
+                        item(key = "downloaded-season-$seasonForEpisodes") {
+                            Chip(
+                                label = "Play Downloaded Season",
+                                selected = false,
+                                leadingIcon = VortXIcons.playFill,
+                                onClick = { playDownloaded(seasonDownload) },
+                                modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
+                            )
+                        }
+                    }
                     // One episode card, shared by the phone rail and the tablet grid.
                     val episodeCard: @Composable (Episode, Modifier) -> Unit = { episode, cardModifier ->
                         val episodeFocus = remember(episode.id) { FocusRequester() }
@@ -777,13 +849,15 @@ fun DetailScreen(
                                 if (veiled) {
                                     revealedEpisodeIds = revealedEpisodeIds + episode.id
                                 } else {
-                                    if (onQueueInteraction()) {
+                                    if (beginDetailInteraction()) {
                                         if (viewModel.autoPickEnabled) sourcesOpen = true
                                         viewModel.selectEpisode(episode.id)
                                     }
                                 }
                             },
                             onToggleWatched = { viewModel.setVideoWatched(episode, episode.id !in m.data.watchedVideoIds) },
+                            onPlayDownloaded = downloadedEpisode(downloads, episode)?.takeIf { onPlayDownloaded != null }
+                                ?.let { record -> { playDownloaded(record) } },
                             runtime = m.data.runtime,
                             quality = if (currentForSources) {
                                 (streamsState as? UiState.Success<List<StreamGroup>>)?.data
@@ -1240,6 +1314,7 @@ private fun ActionsCluster(
     launchEnginePreference: PlayerEngineRouter.Override,
     onSelectLaunchEngine: (PlayerEngineRouter.Override) -> Unit,
     onWatch: () -> Unit,
+    onPlayDownloaded: (() -> Unit)?,
     playFromStartEnabled: Boolean,
     onPlayFromStart: () -> Unit,
     onToggleSources: () -> Unit,
@@ -1297,6 +1372,7 @@ private fun ActionsCluster(
                 selected = launchEnginePreference,
                 onSelect = onSelectLaunchEngine,
             )
+            onPlayDownloaded?.let { Chip(label = "Play Downloaded", selected = false, leadingIcon = VortXIcons.playFill, onClick = it) }
             Chip(
                 label = if (inLibrary) "Saved" else "Save",
                 selected = inLibrary,

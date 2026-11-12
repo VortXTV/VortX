@@ -120,8 +120,10 @@ internal fun prepareAndLoadEngine(
     lifecycleStarted: () -> Boolean,
     pausePlaybackInBackground: () -> Boolean,
     playbackIntent: PlaybackIntentController,
+    mayStart: () -> Boolean = { true },
     refreshAudioRoute: () -> Unit = {},
-) {
+): Boolean {
+    if (!mayStart()) return false
     reconcileEngineLifecycle(
         engine,
         lifecycleStarted(),
@@ -129,8 +131,10 @@ internal fun prepareAndLoadEngine(
         playbackIntent,
         refreshAudioRoute,
     )
+    if (!mayStart()) return false
     engine.load(playable)
     // Async/non-cancellable construction can cross START/STOP. The post-load sample is authoritative.
+    if (!mayStart()) return false
     reconcileEngineLifecycle(
         engine,
         lifecycleStarted(),
@@ -138,6 +142,7 @@ internal fun prepareAndLoadEngine(
         playbackIntent,
         refreshAudioRoute,
     )
+    return true
 }
 
 internal fun reconcileEngineLifecycle(
@@ -170,9 +175,11 @@ internal suspend fun reconcileAndPublishEngine(
     playbackIntent: PlaybackIntentController,
     refreshAudioRoute: () -> Unit = {},
     beforePublication: suspend () -> Unit = {},
+    mayStart: () -> Boolean = { true },
     publish: (PlayerEngine) -> Unit,
 ) {
     beforePublication()
+    if (!mayStart()) return
     reconcileEngineLifecycle(
         engine = engine,
         lifecycleStarted = lifecycleStarted(),
@@ -180,5 +187,5 @@ internal suspend fun reconcileAndPublishEngine(
         playbackIntent = playbackIntent,
         refreshAudioRoute = refreshAudioRoute,
     )
-    publish(engine)
+    if (mayStart()) publish(engine)
 }

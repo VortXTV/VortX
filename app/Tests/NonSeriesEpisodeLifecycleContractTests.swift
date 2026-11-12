@@ -5,6 +5,9 @@
 //     app/SourcesShared/CatalogRowResolution.swift \
 //     app/SourcesShared/AppleCWSeasonRolloverPolicy.swift \
 //     app/SourcesShared/UsenetStreamValidation.swift \
+//     app/SourcesShared/DebridPlaybackAvailability.swift \
+//     app/SourcesShared/ProfileAddonPreferences.swift \
+//     app/SourcesShared/DiagnosticPlaybackIntegrityPolicy.swift \
 //     app/SourcesShared/CoreModels.swift \
 //     app/SourcesShared/SubtitleReleaseFingerprint.swift \
 //     app/SourcesShared/DownloadModels.swift \
@@ -45,6 +48,17 @@ actor DebridCoordinator {
 enum StubError: Error { case unavailable }
 enum VortXSyncManager { static let appliedAddonOrder: [String] = [] }
 enum AddonTombstones { static func normalize(_ value: String) -> String { value } }
+
+enum ProfileStore {
+    static func activeDisabledAddons() -> Set<String> { [] }
+    static func activeAddonOrder(accountOrder: [String]) -> [String] { accountOrder }
+}
+
+// This executable exercises the model's identity and local download resolver, not provider transport.
+struct CommunityStreamGateway: Sendable {
+    static let shared = Self()
+    func localURLIfReady(for stream: CoreStream, upstream: URL) -> URL? { nil }
+}
 
 final class DebridKeys {
     static let shared = DebridKeys()
@@ -326,6 +340,79 @@ private struct NonSeriesEpisodeLifecycleContractTests {
                && movieDownload.displayTitle == "Lifecycle"
                && movieDownload.groupingKey == "movie:tt-movie",
                "normal movie download behavior remains unchanged")
+
+        let e1 = download(type: "series", season: 1, episode: 1, videoID: "tt-lifecycle:1:1")
+        let e3 = download(type: "series", season: 1, episode: 3, videoID: "tt-lifecycle:1:3")
+        let season2 = download(type: "series", season: 2, episode: 1, videoID: "tt-lifecycle:2:1")
+        var incomplete = download(type: "series", season: 1, episode: 2, videoID: "tt-lifecycle:1:2")
+        incomplete.state = .downloading
+        let alias = download(type: "series", season: 1, episode: 2, videoID: "other-provider-id")
+        expect(DownloadRecord.playableCopy(
+            of: seriesDownload.playbackMeta, in: [e1, incomplete, alias, seriesDownload], fileExists: { $0.id == seriesDownload.id }
+        )?.id == seriesDownload.id, "exact download requires completed identity and actual file")
+        expect(DownloadRecord.playableCopy(
+            of: seriesDownload.playbackMeta, in: [incomplete, alias], fileExists: { _ in true }
+        ) == nil, "no coordinate-only replacement for explicit playback")
+        expect(DownloadRecord.playableSuccessor(
+            after: e1.playbackMeta, in: [e3, seriesDownload], fileExists: { _ in true }
+        )?.id == seriesDownload.id, "download autoplay chooses immediate E+1")
+        expect(DownloadRecord.playableSuccessor(
+            after: e1.playbackMeta, in: [incomplete, e3, season2], fileExists: { _ in true }
+        ) == nil, "missing E+1 cannot jump a gap or season")
+        expect(DownloadRecord.playableSuccessor(
+            after: e1.playbackMeta, in: [alias, seriesDownload], fileExists: { _ in true }
+        ) == nil, "ambiguous local successor identities are refused")
+        expect(DownloadRecord.playableSuccessor(
+            after: e1.playbackMeta, in: [seriesDownload], fileExists: { _ in false }
+        ) == nil, "evicted immediate successor is not playable")
+        expect(DownloadRecord.playableSuccessor(
+            after: e3.playbackMeta, in: [season2], fileExists: { _ in true }
+        ) == nil, "download inventory alone cannot prove cross-season adjacency")
+        expect(DownloadRecord.permitsDownloadedAdvance(position: 2_160, duration: 2_400),
+               "a valid local EOF at the 90 percent boundary admits handoff")
+        expect(!DownloadRecord.permitsDownloadedAdvance(position: 10, duration: 2_400)
+               && !DownloadRecord.permitsDownloadedAdvance(position: 2_159, duration: 2_400),
+               "a premature local EOF never advances")
+        expect(!DownloadRecord.permitsDownloadedAdvance(position: nil, duration: 2_400)
+               && !DownloadRecord.permitsDownloadedAdvance(position: .infinity, duration: 2_400)
+               && !DownloadRecord.permitsDownloadedAdvance(position: 10, duration: 0)
+               && !DownloadRecord.permitsDownloadedAdvance(position: 10, duration: .nan),
+               "missing, non-finite or non-positive EOF evidence never advances")
+        var evidence = PlaybackCompletionEvidence<Int>()
+        evidence.begin(owner: 1, mountGeneration: 1)
+        evidence.recordDuration(2_400, owner: 1)
+        evidence.recordPosition(2_395, owner: 1, transportSettled: false)
+        expect(evidence.settledProgress(owner: 1) == nil
+               && evidence.consumeEOF(owner: 1, isLive: false, isTrailer: false) == .allowCompletion,
+               "optimistic near-end clock cannot advance a download; ordinary EOF policy is unchanged")
+        evidence.recordPosition(2_395, owner: 1, transportSettled: true)
+        let localEOF = evidence.settledProgress(owner: 1)
+        expect(evidence.consumeEOF(owner: 1, isLive: false, isTrailer: false) == .allowCompletion
+               && DownloadRecord.permitsDownloadedAdvance(
+                   position: localEOF?.position, duration: localEOF?.duration ?? 0),
+               "owned settled near-end clock and native duration admit normal downloaded EOF")
+        evidence.invalidateSettledPosition(owner: 1)
+        expect(evidence.settledProgress(owner: 1) == nil, "unsettled Aether event retires prior local witness")
+        evidence.recordPosition(2_395, owner: 1, transportSettled: true)
+        evidence.begin(owner: 1, mountGeneration: 2)
+        expect(evidence.settledProgress(owner: 1) == nil && evidence.settledProgress(owner: 2) == nil,
+               "new physical mount and unrelated owner cannot reuse local EOF evidence")
+        expect(DownloadRecord.playableSuccessor(
+            after: oldCollection.playbackMeta, in: [e3], fileExists: { _ in true }
+        ) == nil, "non-series remains outside download autoplay")
+
+        let generatedName = "\(seriesDownload.id.uuidString).mkv"
+        expect(DownloadRecord.isManagedProgressiveFilename(generatedName, id: seriesDownload.id),
+               "managed progressive filename binds the exact record UUID")
+        expect(!DownloadRecord.isManagedProgressiveFilename("../" + generatedName, id: seriesDownload.id),
+               "relative traversal is refused for progressive playback")
+        expect(!DownloadRecord.isManagedProgressiveFilename(generatedName, id: UUID()),
+               "foreign record file cannot be mounted")
+        expect(DownloadRecord.isSafeHLSPackageRelativePath("Library/OSAssetFolder/digest.movpkg"),
+               "HLS playback accepts Apple's variable parent")
+        expect(!DownloadRecord.isSafeHLSPackageRelativePath("Library/../foreign.movpkg")
+               && !DownloadRecord.isSafeHLSPackageRelativePath("/Library/foreign.movpkg"),
+               "HLS playback rejects traversal and absolute paths")
 
         let coreModelsSource = source("SourcesShared/CoreModels.swift")
         let accountSource = source("SourcesShared/StremioAccount.swift")

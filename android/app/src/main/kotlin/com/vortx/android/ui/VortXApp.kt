@@ -97,6 +97,10 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
+import com.vortx.android.downloads.isDownloadedPlaybackOwnerCurrent
+import com.vortx.android.downloads.isDownloadedPlaybackAdmissionCurrent
+import com.vortx.android.downloads.nextDownloadedPlayback
+import com.vortx.android.downloads.refreshDownloadedPlaybackAdmission
 import com.vortx.android.model.PreferredEpisode
 import com.vortx.android.model.StreamSource
 import com.vortx.android.player.AutoAddLibrarySetting
@@ -213,6 +217,7 @@ import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collect
@@ -1040,7 +1045,7 @@ fun VortXApp(
             // player overlay is up).
             val showForNext = detail
             val advanceVm: DetailViewModel? =
-                if (showForNext != null && !playable.isTrailer) {
+                if (showForNext != null && !playable.isTrailer && playable.downloadedPlaybackAdmission == null) {
                     viewModel(
                         viewModelStoreOwner = detailVmOwner,
                         key = detailViewModelKey(
@@ -1109,6 +1114,11 @@ fun VortXApp(
             // The next episode being offered, set by onEnded. Keyed per playable so advancing into the
             // next episode (a NEW playable) clears the offer automatically.
             var upNext by remember(playable) { mutableStateOf<Episode?>(null) }
+            var downloadedUpNext by remember(playable) {
+                mutableStateOf<Pair<Playable, CompletableDeferred<Boolean?>>?>(null)
+            }
+            fun downloadHandoffCurrent(): Boolean = playing === playable &&
+                repo.continueWatchingOwner() == historyOwnerToken && isDownloadedPlaybackOwnerCurrent(playable)
             var episodeHandoffSequence by remember(playable) { mutableStateOf(0L) }
             var episodeHandoffRequest by remember(playable) { mutableStateOf<PlayerEpisodeHandoffRequest?>(null) }
             // Bad-source ladder surfaces, keyed per playable DELIBERATELY: a successful retry swaps
@@ -1131,11 +1141,13 @@ fun VortXApp(
                 // token is captured SYNCHRONOUSLY here, at play launch, and the repository verifies it
                 // under the owner fence when the async begin runs -- any profile/account/principal/
                 // revision change in between fails closed instead of retargeting the session.
-                if (!historyPlayable.isTrailer) {
+                val beginHistory = !historyPlayable.isTrailer &&
+                    (historyPlayable.downloadedPlaybackAdmission == null || isDownloadedPlaybackAdmissionCurrent(historyPlayable))
+                if (beginHistory) {
                     playbackSessions.begin(playbackSession, historyPlayable.playbackContext, historyOwnerToken)
                 }
                 onDispose {
-                    if (!historyPlayable.isTrailer) {
+                    if (beginHistory) {
                         lastProgress.end { receipt ->
                             onDurableWatchReceipt(receipt)
                         }
@@ -1145,6 +1157,33 @@ fun VortXApp(
             Box {
                 PlayerScreen(
                     playable = playable,
+                    onDownloadedNaturalEnd = downloadedEnd@{ ended, admission ->
+                        fun isCurrent() = admission.isCurrent() && downloadHandoffCurrent()
+                        if (ended !== playable || !isCurrent()) return@downloadedEnd false
+                        val next = nextDownloadedPlayback(appContext, ended) ?: return@downloadedEnd false
+                        if (!isCurrent()) return@downloadedEnd false
+                        val choice = CompletableDeferred<Boolean?>()
+                        val offer = next to choice
+                        downloadedUpNext = offer
+                        try {
+                            val automatic = choice.await()
+                            if (!isCurrent()) return@downloadedEnd false
+                            if (automatic == null) {
+                                autoAdvanceStreak[0] = 0
+                                return@downloadedEnd false
+                            }
+                            val admittedNext = refreshDownloadedPlaybackAdmission(appContext, next) ?: return@downloadedEnd false
+                            if (!isCurrent() || !isDownloadedPlaybackAdmissionCurrent(admittedNext)) return@downloadedEnd false
+                            autoAdvanceStreak[0] = if (automatic) autoAdvanceStreak[0] + 1 else 0
+                            playingEngineOverride = automaticEngineFor(admittedNext)
+                            playingMeta = null
+                            playing = admittedNext
+                            true
+                        } finally {
+                            choice.cancel()
+                            if (downloadedUpNext === offer) downloadedUpNext = null
+                        }
+                    },
                     engineOverride = playingEngineOverride,
                     onResourcesReleased = onWatchedDownloadResourcesReleased,
                     queueCount = visibleQueueState?.entries?.size ?: 0,
@@ -1328,8 +1367,22 @@ fun VortXApp(
                         }
                     },
                 )
-                // Countdown and Play now enter the mounted player's acknowledged episode handoff.
-                // A failure keeps its outgoing revision/history and exposes the exact-target retry.
+                // The player owns this download's terminal job. The overlay only answers its one offer.
+                downloadedUpNext?.let { (next, choice) ->
+                    val nextContext = requireNotNull(next.playbackContext)
+                    UpNextOverlay(
+                        episode = Episode(
+                            id = nextContext.videoId,
+                            title = next.episodeTitle ?: nextContext.title,
+                            season = requireNotNull(nextContext.season),
+                            episode = requireNotNull(nextContext.episode),
+                        ),
+                        resolving = false,
+                        onPlayNow = { choice.complete(false) },
+                        onAutoAdvance = { choice.complete(true) },
+                        onCancel = { choice.complete(null) },
+                    )
+                }
                 val nextEp = upNext
                 if (nextEp != null && advanceVm != null) {
                     fun requestNext(automatic: Boolean) {
@@ -1506,10 +1559,12 @@ fun VortXApp(
                 // identity: clear the binding rather than let the previous play's meta ride along. Auto-add
                 // then skips this play (Apple's `let m = curMeta` skip).
                 onPlay = {
-                    playingEngineOverride = automaticEngineFor(it)
-                    playing = it
-                    playingMeta = null
-                    autoAdvanceStreak[0] = 0
+                    if (showDownloads && !showDownloadQueue && playing == null && isDownloadedPlaybackAdmissionCurrent(it)) {
+                        playingEngineOverride = automaticEngineFor(it)
+                        playingMeta = null
+                        autoAdvanceStreak[0] = 0
+                        playing = it
+                    }
                 },
                 onManageQueue = { showDownloadQueue = true },
             )
@@ -1902,6 +1957,24 @@ fun VortXApp(
                             playing = playable
                             autoAdvanceStreak[0] = if (firstQueueAcceptance && pendingQueueAutomatic) autoAdvanceStreak[0] + 1 else 0
                         } else playable.playbackLease?.close()
+                    },
+                    onPlayDownloaded = { local, requestedEngine ->
+                        if (playing == null && randomDetailRouteIsCurrent() && isDownloadedPlaybackAdmissionCurrent(local)) {
+                            pendingDirectResumeTarget = null
+                            pendingRandomTitlePlayRequest = null
+                            pendingQueueToken = null
+                            pendingQueueAccepted = false
+                            pendingQueueAutomatic = false
+                            quickWatchIdentity = null
+                            playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
+                                requested = requestedEngine,
+                                playable = local,
+                                mpvAvailable = MpvEngineFactory.isBundled,
+                            )
+                            playingMeta = null
+                            autoAdvanceStreak[0] = 0
+                            playing = local
+                        }
                     },
                     queueCount = visibleQueueState?.entries?.size ?: 0,
                     queueAvailable = playbackQueue != null && visibleQueueState?.ready == true &&

@@ -37,8 +37,9 @@ writeFileSync(`${dir}/FixtureTopShelfMapper.swift`, 'import Foundation\nenum Fix
   ['struct PublicationKey:', 'static func publicationKey(', 'static func items(\n', 'private static func shelfProgress(', 'private static func shelfPoster('].map(marker => block(shelf, marker)).join('\n') + '\n}\n');
 // Source wiring only; the Swift cases below execute the actual key/mapper, not a second policy.
 const home = read('app/SourcesTV/HomeView.swift');
-const shelfPublisher = block(home, '.onChange(of: TopShelfSnapshotWriter.publicationKey(for: renderedContinueWatching))');
-if (!shelfPublisher.includes('TopShelfSnapshotWriter.publishCurrent()')) {
+const shelfPublisher = block(home, '.onChange(of: TopShelfSnapshotWriter.publicationKey(for: shelfContinueWatching))');
+if (!shelfPublisher.includes('TopShelfSnapshotWriter.publishCurrent()') ||
+    !home.includes('let shelfContinueWatching = TopShelfSnapshotWriter.publicationSnapshot(')) {
   throw new Error('Home must republish from its exact rendered shelf key');
 }
 const app = read('app/SourcesTV/VortXTVApp.swift');

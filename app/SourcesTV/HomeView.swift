@@ -113,6 +113,9 @@ struct HomeView: View {
     /// as its own expression.
     private var homeShell: some View {
         let renderedContinueWatching = continueWatchingSnapshot
+        let shelfContinueWatching = TopShelfSnapshotWriter.publicationSnapshot(
+            core: core, profiles: profiles, renderedHome: renderedContinueWatching
+        )
         let renderedNextEpisodes = renderedContinueWatching.nextEpisodes.filter(TraktNextEpisodeHomeRow.permitsOpening)
         return NavigationStack {
             ZStack {
@@ -249,7 +252,7 @@ struct HomeView: View {
                 TraktNextEpisodeHomeDestination(offer: target.offer)
             }
         }
-        .onChange(of: TopShelfSnapshotWriter.publicationKey(for: renderedContinueWatching)) {
+        .onChange(of: TopShelfSnapshotWriter.publicationKey(for: shelfContinueWatching)) {
             // Re-read and validate the CURRENT context; never publish rows captured by an older render.
             TopShelfSnapshotWriter.publishCurrent()
         }

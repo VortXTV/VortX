@@ -75,6 +75,13 @@ struct PlaybackRequest: Identifiable {
     /// Identity for a queue-admitted launch. The queue token is not a source URL or a watch receipt;
     /// TVPlayerView uses it only to acknowledge accepted first-frame/completion ownership.
     var playbackQueueToken: PlaybackTitleQueue.Token? = nil
+    var downloadedPlayback: AppleDownloadedPlayback? = nil
+
+    static func downloaded(_ playback: AppleDownloadedPlayback, resume: Double) -> Self {
+        .init(url: playback.url, title: playback.record.displayTitle, meta: playback.record.playbackMeta,
+              sourceHint: playback.record.qualityText, torrent: false, wasExplicitPick: true,
+              startAtSeconds: resume, downloadedPlayback: playback)
+    }
 }
 
 /// Holds the active playback request. Set it to present the player; clear it to dismiss.
@@ -114,6 +121,23 @@ final class PlayerPresenter: ObservableObject {
     /// directly publishes the request edge before didSet finishes, so mounted detail pages could read a nil
     /// receipt and fall back to engine history several episodes behind. Direct nil assignment remains supported
     /// by didSet as a defensive fallback; the player exit path uses this deterministic close operation.
+    @MainActor func presentDownloaded(
+        _ candidate: AppleDownloadedPlayback, core: CoreBridge,
+        replacing expectedRequestID: UUID? = nil,
+        stillCurrent: @escaping @MainActor () -> Bool = { true }
+    ) {
+        guard request?.id == expectedRequestID, stillCurrent() else { return }
+        Task { @MainActor in
+            let prepared = await candidate.prepareForPlayback(core: core)
+            guard request?.id == expectedRequestID, stillCurrent() else { return }
+            if let prepared {
+                request = .downloaded(prepared.copy, resume: prepared.resume)
+            } else if let expectedRequestID {
+                close(requestID: expectedRequestID)
+            }
+        }
+    }
+
     @discardableResult
     func close(requestID: UUID) -> Bool {
         guard let closing = request, closing.id == requestID else { return false }
@@ -245,7 +269,17 @@ struct RootView: View {
                              // cannot absorb the next title's TimeChanged ticks (matches iOS onClose). onClose is
                              // the single user-exit choke point (leavePlayback routes through it); a request-id
                              // rebuild fires onDisappear, not onClose, so an in-session source switch is untouched.
-                             onClose: { core.unloadEnginePlayer(); presenter.close(requestID: req.id) })
+                             downloadedPlayback: req.downloadedPlayback,
+                             onDownloadedAdvance: { candidate in
+                                 guard presenter.request?.id == req.id else { return }
+                                 core.unloadEnginePlayer()
+                                 presenter.presentDownloaded(candidate, core: core, replacing: req.id)
+                             },
+                             onClose: {
+                                 guard presenter.request?.id == req.id else { return }
+                                 core.unloadEnginePlayer()
+                                 presenter.close(requestID: req.id)
+                             })
                     .id(req.id)   // clean player teardown per request
             }
         }

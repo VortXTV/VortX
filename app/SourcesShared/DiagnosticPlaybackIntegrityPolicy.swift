@@ -76,6 +76,7 @@ struct PlaybackCompletionEvidence<Token: Equatable> {
     private(set) var owner: Token?
     private var mountGeneration: UInt64 = 0
     private var position: Double?
+    private var settledPosition: Double?
     private var duration: Double?
     private var rejectedEOF = false
 
@@ -86,13 +87,25 @@ struct PlaybackCompletionEvidence<Token: Equatable> {
         self.owner = owner
         self.mountGeneration = mountGeneration
         position = nil
+        settledPosition = nil
         duration = nil
         rejectedEOF = false
     }
 
-    mutating func recordPosition(_ seconds: Double, owner: Token) {
+    mutating func recordPosition(_ seconds: Double, owner: Token, transportSettled: Bool = true) {
         guard self.owner == owner, seconds.isFinite, seconds >= 0 else { return }
         position = seconds
+        settledPosition = transportSettled ? seconds : nil
+    }
+
+    mutating func invalidateSettledPosition(owner: Token) {
+        guard self.owner == owner else { return }
+        settledPosition = nil
+    }
+
+    func settledProgress(owner: Token) -> (position: Double, duration: Double)? {
+        guard self.owner == owner, !rejectedEOF, let settledPosition, let duration else { return nil }
+        return (settledPosition, duration)
     }
 
     mutating func recordDuration(_ seconds: Double, owner: Token) {

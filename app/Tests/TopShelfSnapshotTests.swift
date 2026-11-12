@@ -545,25 +545,80 @@ check(TopShelfSnapshot.boundedSnapshotData { requested in Data(repeating: 0, cou
 section("the shared group follows what the signed copy was granted")
 
 let canonicalGroup = TopShelfSnapshot.canonicalAppGroupID
-let signerGroup = "group.b0eaaf9ad1ed3ea5.1"
-check(TopShelfSnapshot.selectAppGroup(granted: [signerGroup], canonical: canonicalGroup) { $0 == canonicalGroup } == canonicalGroup,
-      "the project's own group wins when this copy holds it")
-check(TopShelfSnapshot.selectAppGroup(granted: [signerGroup], canonical: canonicalGroup) { $0 == signerGroup } == signerGroup,
-      "a re-signed copy uses the group its signer granted instead of finding no container")
-let grantedA = ["group.zz.second", signerGroup], grantedB = [signerGroup, "group.zz.second"]
-let both = { (id: String) in id == signerGroup || id == "group.zz.second" }
-check(TopShelfSnapshot.selectAppGroup(granted: grantedA, canonical: canonicalGroup, hasContainer: both)
-      == TopShelfSnapshot.selectAppGroup(granted: grantedB, canonical: canonicalGroup, hasContainer: both),
-      "an app and its extension granted the same groups in any order settle on the same one")
-check(TopShelfSnapshot.selectAppGroup(granted: ["group.*", "com.example.notagroup"], canonical: canonicalGroup) { _ in true } == canonicalGroup,
-      "wildcards and non-group identifiers are never used")
-check(TopShelfSnapshot.selectAppGroup(granted: [signerGroup], canonical: canonicalGroup) { _ in false } == nil,
-      "no granted container leaves the feature off")
+let signerGroup = "group.example.signed.2"
+let unrelatedGroup = "group.example.signed.1"
+let team = "ABCDE12345"
+let teamCopy = canonicalGroup + "." + team
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [], profileGroups: [signerGroup, canonicalGroup]) { _ in true } == canonicalGroup,
+      "the explicitly listed canonical group wins")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [], profileGroups: [signerGroup]) { $0 == signerGroup } == signerGroup,
+      "one rewritten group is used when the process can access it")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: ["group.*", "group.", "com.example.notagroup"],
+                                     profileGroups: []) { _ in true } == canonicalGroup,
+      "missing usable hints permit the canonical group only")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [signerGroup], profileGroups: [unrelatedGroup]) { _ in true } == nil,
+      "disjoint signing hints cannot admit either group")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [signerGroup], profileGroups: [unrelatedGroup, signerGroup]) { _ in true } == signerGroup,
+      "a single group supported by both hints wins over the wider profile")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [], profileGroups: [unrelatedGroup, signerGroup]) { _ in true } == nil,
+      "ambiguous generic groups do not select an arbitrary container")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [signerGroup, teamCopy], profileGroups: [teamCopy, signerGroup],
+                                     teamIdentifiers: [team]) { _ in true } == teamCopy,
+      "an explicitly verified VortX-specific group wins over a generic group")
+var probedGroups: [String] = []
+let unavailable = TopShelfSnapshot.selectAppGroup(recordedGroups: [], profileGroups: [signerGroup, canonicalGroup]) { group in
+    probedGroups.append(group)
+    return group == signerGroup
+}
+check(unavailable == nil && probedGroups == [canonicalGroup],
+      "a denied shared choice does not probe a different group")
+
+section("the app and provider use the same exact embedded extension")
+
+do {
+    let fixture = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        .appendingPathComponent("top-shelf-bundle-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: fixture) }
+    let host = fixture.appendingPathComponent("VortX.app", isDirectory: true)
+    let plugins = host.appendingPathComponent("Contents/PlugIns", isDirectory: true)
+    let provider = plugins.appendingPathComponent("VortXTopShelf.appex", isDirectory: true)
+    let other = plugins.appendingPathComponent("Other.appex", isDirectory: true)
+    func writeBundle(_ url: URL, id: String, groups: [String], provider: Bool) throws {
+        let contents = url.appendingPathComponent("Contents", isDirectory: true)
+        try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+        var info: [String: Any] = [
+            "CFBundleIdentifier": id, "CFBundlePackageType": provider ? "XPC!" : "APPL",
+            "ALTAppGroups": groups
+        ]
+        if provider { info["NSExtension"] = ["NSExtensionPointIdentifier": "com.apple.tv-top-shelf"] }
+        let plist = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        try plist.write(to: contents.appendingPathComponent("Info.plist"))
+    }
+    try writeBundle(host, id: "test.vortx.host", groups: [unrelatedGroup, signerGroup], provider: false)
+    try writeBundle(provider, id: "test.vortx.host.topshelf", groups: [signerGroup], provider: true)
+    try writeBundle(other, id: "test.vortx.host.other", groups: [unrelatedGroup], provider: true)
+    if let hostBundle = Bundle(url: host), let providerBundle = Bundle(url: provider), let otherBundle = Bundle(url: other) {
+        check(TopShelfSnapshot.resolveAppGroupID(bundle: hostBundle) { [unrelatedGroup, signerGroup].contains($0) } == signerGroup,
+              "a host with two grants selects the exact provider's group")
+        check(TopShelfSnapshot.resolveAppGroupID(bundle: providerBundle) { $0 == signerGroup } == signerGroup,
+              "the provider selects the same group from its own bundle")
+        check(TopShelfSnapshot.resolveAppGroupID(bundle: hostBundle) { $0 == unrelatedGroup } == nil,
+              "a host that lacks the selected grant cannot publish in another container")
+        check(TopShelfSnapshot.resolveAppGroupID(bundle: otherBundle) { _ in true } == nil,
+              "a differently named extension does not supply a group")
+        let lite = fixture.appendingPathComponent("VortXLite.app", isDirectory: true)
+        try writeBundle(lite, id: "test.vortx.lite", groups: [canonicalGroup], provider: false)
+        check(Bundle(url: lite).map { TopShelfSnapshot.resolveAppGroupID(bundle: $0) { _ in true } == nil } == true,
+              "a bundle without the exact embedded provider has no Top Shelf group")
+    } else {
+        check(false, "fixture bundles open")
+    }
+} catch {
+    check(false, "write disposable fixture bundles")
+}
 
 section("only a group no other app shares carries Trakt and SIMKL rows")
 
-let team = "ABCDE12345"
-let teamCopy = canonicalGroup + "." + team
 func dedicated(_ id: String, recorded: [String]? = nil, teams: [String] = [team]) -> Bool {
     TopShelfSnapshot.isDedicatedSignerGroup(id, recordedGroups: recorded ?? [id], teamIdentifiers: teams)
 }

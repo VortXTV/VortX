@@ -29,6 +29,7 @@ struct HomeContinueWatchingSelectionTests {
         traktSessionRetirement()
         legacySharedProfileKeepsOverlay()
         projectedLocalSelectionPreservesWindows()
+        signerShelfUsesCurrentLocalHistory()
         topShelfLateCommitDenial()
         if CommandLine.arguments.count > 1 { surfaceWiring(root: CommandLine.arguments[1]) }
 #endif
@@ -255,6 +256,29 @@ struct HomeContinueWatchingSelectionTests {
         require(!captured.isCurrent(core: core, profiles: .shared), "cached local projection retires with its original profile")
     }
 
+    private static func signerShelfUsesCurrentLocalHistory() {
+        let core = configure()
+        let loaded = shadow()
+        require(selected(core, loaded).selection.items.map(\.id) == ["trakt-movie"],
+                "the regular Home rail still follows the profile's provider")
+
+        let shelf = HomeContinueWatchingSelection.current(core: core, profiles: .shared, shadow: loaded, localOnly: true)
+        require(shelf.selection.items.map(\.id) == ["native-local"] && shelf.intent.source == .local,
+                "the signer shelf takes only this native profile's VortX history")
+        require(shelf.intent.isCurrent(core: core) && shelf.nextEpisodes.isEmpty,
+                "local-only admits current profile ownership and no provider episode offers")
+
+        TraktAuth.storedSessionID = nil
+        let disconnected = HomeContinueWatchingSelection.current(core: core, profiles: .shared, localOnly: true)
+        require(disconnected.selection.items.map(\.id) == ["native-local"],
+                "the local signer shelf does not need a provider session")
+
+        ProfileStore.shared.activeID = profileB
+        require(!shelf.intent.isCurrent(core: core), "the previous local shelf intent expires on profile change")
+        let changing = HomeContinueWatchingSelection.current(core: core, profiles: .shared, localOnly: true)
+        require(changing.selection.items.isEmpty, "a mismatched owner never leaks the previous profile's local history")
+    }
+
     private static func surfaceWiring(root: String) {
         func read(_ path: String) -> String { (try? String(contentsOfFile: root + "/" + path, encoding: .utf8)) ?? "" }
         let tv = read("app/SourcesTV/HomeView.swift")
@@ -262,7 +286,9 @@ struct HomeContinueWatchingSelectionTests {
         let shelf = read("app/SourcesTV/TopShelfSnapshotWriter.swift")
         let call = "HomeContinueWatchingSelection.current(core: core, profiles: profiles"
         require(tv.contains(call) && ios.contains(call), "TV and iOS/macOS consume the production shared selector")
-        require(shelf.contains("HomeContinueWatchingSelection.current(core: CoreBridge.shared, profiles: profiles)"), "Top Shelf consumes the production shared selector")
+        require(shelf.contains("let localOnly = TopShelfSnapshot.appGroupSource == .signer")
+                && shelf.contains("HomeContinueWatchingSelection.current(core: core, profiles: profiles, localOnly: localOnly)"),
+                "the signer shelf consumes the local-only projection of the production selector")
         require(shelf.components(separatedBy: "HomeContinueWatchingSelection.permitsPrivateArtworkCommit(").count == 3,
                 "both actual Top Shelf storage and final publication call the exercised commit guard")
         require(shelf.contains("lastPrivateContext == context"), "private artwork reuse remains bound to the captured native context")

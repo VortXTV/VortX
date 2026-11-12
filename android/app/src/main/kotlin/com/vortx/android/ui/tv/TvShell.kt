@@ -126,6 +126,7 @@ fun TvShell(
     var libraryRoute by remember { mutableStateOf(TvLibraryRoute.LANDING) }
     var libraryReturnRoute by remember { mutableStateOf(TvLibraryRoute.DOWNLOADS) }
     var libraryRestoreFocusSignal by remember { mutableStateOf(0) }
+    var downloadRouteGeneration by remember { mutableStateOf(0L) }
     val libraryEntryFocus = remember {
         listOf(TvLibraryRoute.DOWNLOADS, TvLibraryRoute.WATCHLIST, TvLibraryRoute.HISTORY, TvLibraryRoute.SMART_COLLECTIONS,
             TvLibraryRoute.NETWORK_SHARES)
@@ -135,11 +136,21 @@ fun TvShell(
     val debridKeys = remember(appContext) { DebridKeys(appContext) }
     val debridLibraryFocus = remember { FocusRequester() }
     val modalVisible = showPlayLinkSheet || showDebridLibrary || importedCollectionsOpen
+    val capturedDownloadRoute = downloadRouteGeneration
+    val onPlayDownloaded: (Playable) -> Unit = { playable ->
+        if (downloadRouteGeneration == capturedDownloadRoute) onPlayLocal(playable)
+    }
+    fun changeDestination(next: TvDestination) {
+        downloadRouteGeneration += 1
+        onDestinationChange(next)
+    }
     fun openLibraryRoute(route: TvLibraryRoute) {
+        downloadRouteGeneration += 1
         libraryReturnRoute = route
         libraryRoute = route
     }
     fun closeLibraryRoute() {
+        downloadRouteGeneration += 1
         libraryRoute = TvLibraryRoute.LANDING
         libraryRestoreFocusSignal++
     }
@@ -187,7 +198,7 @@ fun TvShell(
             homeBrowseSelected = !hiddenTabs.hideDiscover
         }
         if (!mergeHomeDiscover || hiddenTabs.hideDiscover) homeBrowseSelected = false
-        if (destination !in destinations) onDestinationChange(TvDestination.HOME)
+        if (destination !in destinations) changeDestination(TvDestination.HOME)
     }
 
     // SD-8: Discover and Search gate on a sign-in. On TV the available signal is the engine's Stremio
@@ -201,7 +212,7 @@ fun TvShell(
     // system default (leave the app) still applies there. When a detail/player overlay is up it is composed
     // ABOVE this shell with its own BackHandler, so this one is inert underneath it -- the existing
     // Home -> Detail -> Play back stack is unchanged.
-    BackHandler(enabled = destination != TvDestination.HOME) { onDestinationChange(TvDestination.HOME) }
+    BackHandler(enabled = destination != TvDestination.HOME) { changeDestination(TvDestination.HOME) }
     BackHandler(enabled = destination == TvDestination.HOME && homeBrowseSelected) { homeBrowseSelected = false }
     BackHandler(enabled = destination == TvDestination.LIBRARY && libraryRoute != TvLibraryRoute.LANDING, onBack = ::closeLibraryRoute)
 
@@ -226,7 +237,7 @@ fun TvShell(
             // Re-selecting the active tab pops that tab's own stack to root (Add-ons); switching tabs moves.
             onSelect = { dest ->
                 if (dest == TvDestination.LIBRARY && libraryRoute != TvLibraryRoute.LANDING) closeLibraryRoute()
-                if (dest == destination) reselectSignal++ else onDestinationChange(dest)
+                if (dest == destination) reselectSignal++ else changeDestination(dest)
             },
             )
             Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
@@ -285,7 +296,7 @@ fun TvShell(
                         TvLibraryRoute.LANDING -> Unit
                         TvLibraryRoute.DOWNLOADS -> Column(modifier = Modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
                             TvLibraryRouteHeader("Downloads", onBack = ::closeLibraryRoute)
-                            TvDownloadsScreen(onPlay = onPlayLocal, modifier = Modifier.weight(1f))
+                            TvDownloadsScreen(onPlay = onPlayDownloaded, modifier = Modifier.weight(1f))
                         }
                         TvLibraryRoute.WATCHLIST -> TvWatchlistScreen(
                             store = WatchlistStore.shared(appContext),
@@ -303,7 +314,7 @@ fun TvShell(
                     }
                 }
                 TvDestination.DOWNLOADS ->
-                    TvDownloadsScreen(onPlay = onPlayLocal)
+                    TvDownloadsScreen(onPlay = onPlayDownloaded)
                 TvDestination.SEARCH ->
                     TvSearchScreen(
                         viewModel = viewModel<SearchViewModel>(factory = factory),
@@ -319,7 +330,7 @@ fun TvShell(
                     TvAddonsDestination(
                         repo = repo,
                         reselectSignal = reselectSignal,
-                        onExit = { onDestinationChange(TvDestination.HOME) },
+                        onExit = { changeDestination(TvDestination.HOME) },
                     )
                 TvDestination.SETTINGS ->
                     TvSettingsScreen(repo = repo, auth = auth, syncManager = syncManager, onItem = onItem, onProfileSelected = onProfileSelected,

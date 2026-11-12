@@ -240,6 +240,39 @@ class PlaybackIntentControllerTest {
         assertTrue("resource hook precedes publication", "background" in engine.actions)
     }
 
+    @Test fun `a revoked download policy cannot reach the first decoder load`() {
+        val engine = RecordingEngine()
+        var current = true
+        val loaded = prepareAndLoadEngine(
+            engine = engine,
+            playable = com.vortx.android.model.Playable("file:///fixture.mkv", "Video"),
+            lifecycleStarted = { true },
+            pausePlaybackInBackground = { true },
+            playbackIntent = PlaybackIntentController(),
+            mayStart = { current },
+            refreshAudioRoute = { current = false },
+        )
+        assertFalse(loaded)
+        assertFalse("load" in engine.actions)
+    }
+
+    @Test fun `a revoked download policy prevents reconciliation and engine exposure`() = runBlocking {
+        val engine = RecordingEngine()
+        var current = true
+        var published = false
+        reconcileAndPublishEngine(
+            engine = engine,
+            lifecycleStarted = { true },
+            pausePlaybackInBackground = { true },
+            playbackIntent = PlaybackIntentController(),
+            beforePublication = { current = false },
+            mayStart = { current },
+            publish = { published = true },
+        )
+        assertFalse(published)
+        assertTrue(engine.actions.isEmpty())
+    }
+
     private class RecordingEngine : PlayerEngine {
         override val state = MutableStateFlow(PlayerState())
         val actions = mutableListOf<String>()

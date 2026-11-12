@@ -251,6 +251,8 @@ struct TVPlayerView: View {
     /// return to the episode actually watched while engine Continue Watching persistence catches up.
     var playbackQueueToken: PlaybackTitleQueue.Token? = nil
     var onPlaybackIdentityCommitted: (PlaybackMeta) -> Void = { _ in }
+    var downloadedPlayback: AppleDownloadedPlayback? = nil
+    var onDownloadedAdvance: ((AppleDownloadedPlayback) -> Void)? = nil
     var onClose: () -> Void = {}           // dismiss the dedicated player window
 
     /// The pinned source for this title (#15), so in-player failover, auto-next, and preload keep using the
@@ -1012,6 +1014,13 @@ struct TVPlayerView: View {
     @State private var consecutiveAutoAdvances = 0        // back-to-back auto-advances with no interaction between them
     @State private var stillWatchingPendingAdvance = false  // roll to the next episode when Continue is chosen at a binge boundary
     @State private var pendingStillWatchingQueue = false
+    @State private var pendingDownloadedAdvance = false
+    @State private var downloadedBoundaryConsumed = false
+    @State private var downloadedAdvanceEOF: (owner: PlayerLoadToken, mountGeneration: UInt64)?
+    @State private var downloadMountAdmitted = false
+    @State private var downloadHandoffProgressFlushed = false
+    @State private var downloadedSuccessor: AppleDownloadedPlayback?
+    @State private var downloadProfileID: UUID?
     private static let idleWatchTimeout: TimeInterval = 4 * 60 * 60   // 4h of no interaction -> "Still watching?"
     private static let idleAutoAdvanceLimit = 4                       // 4 back-to-back auto-advances, zero input -> same
     @State private var leftPlayback = false             // set the instant leavePlayback() runs, so a pending EOF backfill never resurrects a stopped player
@@ -1169,7 +1178,9 @@ struct TVPlayerView: View {
         ZStack(alignment: .bottom) {
             Color.black.ignoresSafeArea()
 
-            playerSurface
+            if downloadedPlayback == nil || downloadMountAdmitted {
+                playerSurface
+            }
 
             // Shared launch/incoming-episode art replaces the existing pending-advance black gate.
             // Same-media recovery retains the last revealed picture; identity still commits only below.
@@ -1260,6 +1271,7 @@ struct TVPlayerView: View {
         .onAppear {
             refreshAutoSkipSettings()
             firstFrameCover.beginPresentation()
+            if downloadedPlayback != nil { downloadProfileID = ProfileStore.shared.activeID }
             VXProbeState.shared.setRoute("player")
             // #130 mitigation: hold a short background assertion while a loopback (torrent) stream plays, so a
             // quick app-switch away does not immediately suspend us and tear down the server listener. No-op
@@ -1269,6 +1281,14 @@ struct TVPlayerView: View {
             // the meta_details payload while the player is up (the detail page is not on screen). Cleared in
             // onDisappear. Depth-counted so a nested mount cannot clear it early.
             core.setPlayerActive(true)
+            if let downloadedPlayback {
+                guard downloadedPlayback.ownsCurrentContext(core: core),
+                      downloadedPlayback.revalidated()?.url == url else {
+                    leavePlayback()
+                    return
+                }
+                downloadMountAdmitted = true
+            }
             if !engineAttributionInitialized {
                 enginePlayerVideoId = initialEnginePlayerVideoId ?? (isEpisodePlaybackContext ? nil : meta?.videoId)
                 curDebridRef = debridRef
@@ -1319,8 +1339,13 @@ struct TVPlayerView: View {
             }
             startStallWatchdog()
             scheduleHide(); startHideLoop(); noteInteraction()   // arm the "Still watching?" idle deadline at open
-            hydrateDirectResumeMetadataForPlayerUI()
-            hydrateDirectResumeSeriesInventory()
+            if downloadedPlayback == nil {
+                hydrateDirectResumeMetadataForPlayerUI()
+                hydrateDirectResumeSeriesInventory()
+            }
+            if let downloadedPlayback {
+                consecutiveAutoAdvances = downloadedPlayback.consecutiveAutoAdvances
+            }
             showInfo = true; selected = .play; scheduleHide()
             // The AV surface is intentionally withheld while an account resume lookup is unresolved, so its
             // synchronous `makeHostView` cannot mount a remux at zero before the real origin arrives.
@@ -2036,7 +2061,9 @@ struct TVPlayerView: View {
             scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)
         }
         NowPlayingCenter.clear()   // #157: drop the system Now Playing card + its transport targets on close
-        flushExitProgress(integrityOwner: integrityOwner, assetSanityAccepted: assetSanityAccepted)
+        if !downloadHandoffProgressFlushed {
+            flushExitProgress(integrityOwner: integrityOwner, assetSanityAccepted: assetSanityAccepted)
+        }
         exitAcceptedLoadToken = nil
         // The engine is NOT torn down here: RootView presents the player with `.id(req.id)`, so any
         // path that mints a fresh PlaybackRequest id rebuilds the player → onDisappear → would
@@ -2133,6 +2160,7 @@ struct TVPlayerView: View {
         if isAetherEngineActive, name == MPVProperty.timePos,
            let event = data as? PlayerTimePositionEvent,
            event.loadToken == coordinator.player?.activeLoadToken, !event.transportSettled {
+            completionEvidence.invalidateSettledPosition(owner: event.loadToken)
             watchedDwell.reset()
             return
         }
@@ -2181,7 +2209,8 @@ struct TVPlayerView: View {
                 }
             } else if name == MPVProperty.timePos, let event = data as? PlayerTimePositionEvent,
                       event.loadToken == loadToken {
-                completionEvidence.recordPosition(event.seconds, owner: loadToken)
+                completionEvidence.recordPosition(
+                    event.seconds, owner: loadToken, transportSettled: event.transportSettled)
             }
         }
         if pendingAdvance == nil, supersededAdvance == nil,
@@ -2890,6 +2919,12 @@ struct TVPlayerView: View {
                 // ~15 min). If the next source resolves in time, its load clears the flag and cancels this.
                 if armsTerminalDeadline { armTerminalAdvanceDeadline(reason: "persist-completion, next target resolving") }
                 return
+            }
+            if downloadedPlayback != nil, let loadToken,
+               let progress = completionEvidence.settledProgress(owner: loadToken),
+               DownloadRecord.permitsDownloadedAdvance(position: progress.position, duration: progress.duration) {
+                downloadedAdvanceEOF = (
+                    loadToken, (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0)
             }
             if isPaused {
                 pendingBoundaryAdvanceAfterPlay = true
@@ -4023,6 +4058,7 @@ struct TVPlayerView: View {
     /// Episode panels and failover use only the explicitly targeted stream id. Movies retain the resident
     /// fallback because their engine request has no sibling episode slots to leak across.
     private var currentSourceGroups: [CoreStreamSourceGroup] {
+        guard downloadedPlayback == nil else { return [] }
         if isEpisodePlaybackContext, let id = sourceTargetMeta?.videoId {
             if let owned = isolatedEpisodeSources[id] { return isolatedEpisodeSourceOwner?.isCurrent == true ? owned : [] }
             return core.streamGroups(forStreamId: id)
@@ -4354,7 +4390,7 @@ struct TVPlayerView: View {
     /// in-app YouTube fallback. If the chosen app isn't actually installed the open() no-ops and the
     /// built-in player just keeps playing, so a missing app never strands the user on a dead screen.
     private func maybeRouteToDefaultExternalPlayer() {
-        guard let player = ExternalPlayers.defaultPlayer(),
+        guard downloadedPlayback == nil, let player = ExternalPlayers.defaultPlayer(),
               !isTrailer,
               !isTorrentPlayback, (curHeaders?.isEmpty ?? true),
               let u = curURL, let host = u.host, host != "127.0.0.1", host != "localhost", host != "::1"
@@ -4962,6 +4998,7 @@ struct TVPlayerView: View {
         resumeOverride: Double? = nil,
         allowBeyondFailureBudget: Bool = false
     ) -> Bool {
+        guard downloadedPlayback == nil else { return false }
         // FIX I: a TRAILER never fails over to the engine's content streams. The trailer request carries no
         // content stream of its own; nextUntriedStream() would return whatever the engine last loaded for
         // this (or a still-resident) title, so a dead /yt route would silently play the actual/random movie.
@@ -5067,6 +5104,7 @@ struct TVPlayerView: View {
     /// load-error overlay (playback already stopped), never mid-play, so the warmed next-episode lane is never
     /// disturbed. Resets the tried-source budget so the re-queried set gets a clean set of attempts.
     private func refindSourcesAndRetry() {
+        guard downloadedPlayback == nil else { retryPlaybackByUser(); return }
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         guard refindEnabled, !isTrailer, let m = curMeta else { retryPlaybackByUser(); return }
         refindTask?.cancel()
@@ -10131,6 +10169,7 @@ struct TVPlayerView: View {
     }
 
     private func hydrateDirectResumeSeriesInventory(force: Bool = false) {
+        guard downloadedPlayback == nil else { return }
         guard (startedFromResume || force), isEpisodePlaybackContext, let launchMeta = curMeta else { return }
         cancelDirectResumeInventoryRefresh()
         directResumeInventoryRefreshTask = Task { @MainActor in
@@ -10228,6 +10267,7 @@ struct TVPlayerView: View {
     }
 
     private func refreshTerminalSeriesInventory(for m: PlaybackMeta) {
+        guard downloadedPlayback == nil else { return }
         guard let loadToken = coordinator.player?.activeLoadToken else { return }
         let target = terminalRefreshTarget(for: m)
         guard terminalRefreshTargetIsCurrent(target, loadToken: loadToken) else { return }
@@ -10495,6 +10535,14 @@ struct TVPlayerView: View {
             } else if PlaybackTitleQueue.shared.completed(playbackQueueToken, meta: meta) {
                 leavePlayback()
             }
+            return
+        }
+        if downloadedPlayback != nil, isEpisodePlaybackContext {
+            let mountGeneration = (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0
+            let eligibleEOF = downloadedAdvanceEOF.map {
+                $0.owner == coordinator.player?.activeLoadToken && $0.mountGeneration == mountGeneration
+            } ?? false
+            finishDownloadedEpisode(eligibleEOF: eligibleEOF)
             return
         }
         if hasNextEpisode {
@@ -11267,6 +11315,7 @@ struct TVPlayerView: View {
     /// Kick off one owned preload attempt. The pure policy turns the four-Hz player clock into at most three
     /// ordinary attempts plus one last credits attempt, so failure never becomes a fetch storm.
     private func preloadNextIfNeeded() {
+        guard downloadedPlayback == nil else { return }
         guard !switchingEpisode, !leftPlayback,
               let i = episodeIndex, i + 1 < allEpisodes.count else { return }
         let sourceOwner = EpisodeSourceOwner(core: core, account: account)
@@ -12024,6 +12073,7 @@ struct TVPlayerView: View {
     /// exit (Back-to-exit, the close button, the terminal auto-advance) routes through here, so no
     /// engine is leaked.
     private func leavePlayback() {
+        if downloadedPlayback != nil, leftPlayback { onClose(); return }
         invalidateWatchParty()
         invalidateSubtitlePresentationForReplacement()
         pendingAdvance?.debridRef?.nativeUsenetLease?.close()
@@ -12063,8 +12113,10 @@ struct TVPlayerView: View {
         // Aether's settled witness belongs to the active decoder. Flush while that exact
         // owner is still admitted; invalidation below retires it before onDisappear.
         // The later flush fails closed, while this save retains save-then-engine-sync order.
-        if isAetherEngineActive, !persistenceBlockedForExit {
+        let isDownloadedHandoff = downloadedSuccessor != nil
+        if (isAetherEngineActive || isDownloadedHandoff), !persistenceBlockedForExit {
             flushExitProgress(integrityOwner: exitLoadToken, assetSanityAccepted: assetSanityAccepted)
+            downloadHandoffProgressFlushed = isDownloadedHandoff
         }
         coordinator.player?.invalidateLoadToken()
         // External sync (Trakt/SIMKL): scrobble STOP on a genuine user exit (Back / close / terminal
@@ -12099,7 +12151,12 @@ struct TVPlayerView: View {
         // additive: it does not touch the stop() teardown above.
         DiskCacheSetting.clearCache()
         if wasRemuxMounted { Self.replayServerConfigAfterRemux() }
-        onClose()
+        if let successor = downloadedSuccessor, let onDownloadedAdvance {
+            downloadedSuccessor = nil
+            onDownloadedAdvance(successor)
+        } else {
+            onClose()
+        }
     }
 
     /// F5: after a remux-mounted session tears down, re-assert the TV-safe streaming-server cache cap
@@ -12919,11 +12976,48 @@ struct TVPlayerView: View {
 
     /// "Continue": re-arm the guard, then resume -- either roll to the pending next episode (binge boundary)
     /// or un-pause the current title.
+    private func finishDownloadedEpisode(confirmed: Bool = false, eligibleEOF: Bool = false) {
+        guard confirmed || !downloadedBoundaryConsumed else { return }
+        guard confirmed || eligibleEOF else {
+            leavePlayback()
+            return
+        }
+        downloadedBoundaryConsumed = true
+        guard downloadedPlayback != nil, !leftPlayback,
+              let meta = curMeta, meta == downloadedPlayback?.record.playbackMeta,
+              downloadProfileID == ProfileStore.shared.activeID,
+              playbackMutationTarget.stillOwnsCurrentContext(core: core) else {
+            leavePlayback()
+            return
+        }
+        guard var successor = DownloadStore.shared.nextPlayableDownload(after: meta),
+              onDownloadedAdvance != nil else {
+            leavePlayback()
+            return
+        }
+        if !confirmed {
+            consecutiveAutoAdvances += 1
+            if stillWatchingPromptEnabled, consecutiveAutoAdvances >= max(1, stillWatchingAfterEpisodes) {
+                pendingDownloadedAdvance = true
+                presentStillWatching()
+                return
+            }
+        }
+        successor.consecutiveAutoAdvances = consecutiveAutoAdvances
+        downloadedSuccessor = successor
+        leavePlayback()
+    }
+
     private func continueStillWatching() {
         let advance = stillWatchingPendingAdvance
         stillWatchingPendingAdvance = false
         withAnimation { stillWatching = false }
         noteInteraction()
+        if pendingDownloadedAdvance {
+            pendingDownloadedAdvance = false
+            finishDownloadedEpisode(confirmed: true)
+            return
+        }
         if pendingStillWatchingQueue {
             pendingStillWatchingQueue = false
             if let meta = curMeta, PlaybackTitleQueue.shared.completed(playbackQueueToken, meta: meta) {
@@ -12944,6 +13038,7 @@ struct TVPlayerView: View {
         stillWatching = false
         stillWatchingPendingAdvance = false
         pendingStillWatchingQueue = false
+        pendingDownloadedAdvance = false
         saveProgress(at: currentTime)
         leavePlayback()
     }
