@@ -161,7 +161,7 @@ struct DetailView: View {
     private func playDownloadedCopy(_ candidate: AppleDownloadedPlayback) {
         let launchID = UUID()
         downloadLaunchID = launchID
-        presenter.presentDownloaded(candidate, core: core) { downloadLaunchID == launchID }
+        presenter.presentDownloaded(candidate, core: core, stillCurrent: { downloadLaunchID == launchID })
     }
 
     private var newerPlaybackVideoID: String? {
@@ -3611,9 +3611,9 @@ struct CoreStreamList: View {
                         let videoID = episodeStreamId
                         downloadLaunchID = launchID
                         randomPlayIntent?.revoke()
-                        presenter.presentDownloaded(copy, core: core) {
+                        presenter.presentDownloaded(copy, core: core, stillCurrent: {
                             downloadLaunchID == launchID && targetIsCurrent(videoID: videoID, generation: generation)
-                        }
+                        })
                     } label: {
                         Label("Play downloaded", systemImage: "play.fill")
                     }

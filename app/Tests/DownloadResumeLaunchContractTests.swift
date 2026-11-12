@@ -60,6 +60,7 @@ import Foundation
             .components(separatedBy: "private func resumeSource")[0]
         precondition(tvResume.range(of: "if url.isFileURL")!.lowerBound < tvResume.range(of: "CWResume.resolvedURL")!.lowerBound)
         precondition(tvResume.contains("presenter.presentDownloaded(candidate, core: core, displayedResume: item.resumeSeconds"))
+        precondition(tvResume.contains("onUnavailable: { openDetails(item) }, stillCurrent: {"))
         precondition(tvResume.contains("continueWatchingRequestID == requestID"))
         precondition(tvResume.contains("candidate.ownsCurrentContext(core: core)"))
         precondition(presenter.contains("iOSPlayerLaunch.downloaded(prepared.copy, resume: prepared.resume)"))
@@ -123,6 +124,10 @@ import Foundation
         precondition(setup < pause && pause < firstLoad)
         let tv = try String(contentsOfFile: "app/SourcesTV/TVDownloadsView.swift", encoding: .utf8)
         precondition(tv.contains("record.playbackMeta"), "retain TV's existing download identity")
+        precondition(tv.contains("presentDownloaded(playback, core: CoreBridge.shared, stillCurrent: { downloadLaunchID == launchID })"))
+        let tvDetail = try String(contentsOfFile: "app/SourcesTV/DetailView.swift", encoding: .utf8)
+        precondition(tvDetail.contains("presentDownloaded(candidate, core: core, stillCurrent: { downloadLaunchID == launchID })"))
+        precondition(tvDetail.contains("presentDownloaded(copy, core: core, stillCurrent: {"))
         let tvPlayer = try String(contentsOfFile: "app/SourcesTV/TVPlayerView.swift", encoding: .utf8)
         let tvRoot = try String(contentsOfFile: "app/SourcesTV/RootTabView.swift", encoding: .utf8)
         precondition(tvRoot.contains("startAtSeconds: resume, downloadedPlayback: playback"))

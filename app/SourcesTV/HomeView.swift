@@ -1202,13 +1202,13 @@ struct CoreContinueWatchingRow: View {
         let requestID = UUID()
         continueWatchingRequestID = requestID
         presenter.presentDownloaded(candidate, core: core, displayedResume: item.resumeSeconds,
-                                    onUnavailable: { openDetails(item) }) {
+                                    onUnavailable: { openDetails(item) }, stillCurrent: {
             continueWatchingRequestID == requestID && detailTarget == nil && profiles.activeID == profileID
                 && LastStreamStore.entry(for: item.id, profileID: profileID) == entry
                 && candidate.ownsCurrentContext(core: core)
                 && intent?.isCurrent(core: core, profiles: profiles) != false
                 && (traktSessionID == nil || TraktAuth.storedSessionID == traktSessionID)
-        }
+        })
     }
 
     private func resumeSource(entry: LastStreamStore.Entry, url: URL,

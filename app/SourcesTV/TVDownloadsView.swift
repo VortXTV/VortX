@@ -229,6 +229,6 @@ struct TVDownloadsView: View {
         guard let playback = store.playableDownload(id: record.id, expected: record.playbackMeta) else { return }
         let launchID = UUID()
         downloadLaunchID = launchID
-        presenter.presentDownloaded(playback, core: CoreBridge.shared) { downloadLaunchID == launchID }
+        presenter.presentDownloaded(playback, core: CoreBridge.shared, stillCurrent: { downloadLaunchID == launchID })
     }
 }
