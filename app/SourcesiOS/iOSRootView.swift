@@ -3465,6 +3465,10 @@ struct DownloadsView: View {
 
     @ObservedObject private var store = DownloadStore.shared
     private let manager = DownloadManager.shared
+    #if os(macOS)
+    @State private var showsUnavailableExternalDownload = false
+    @ObservedObject private var downloadLocations = MacDownloadLocations.shared
+    #endif
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
@@ -3473,6 +3477,10 @@ struct DownloadsView: View {
                     .font(Theme.Typography.cardTitle)
                     .foregroundStyle(Theme.Palette.textPrimary)
                 Spacer(minLength: 0)
+                #if os(macOS)
+                MacDownloadFolderButton()
+                    .buttonStyle(.bordered)
+                #endif
                 Text(store.formattedTotalSize())
                     .font(Theme.Typography.label)
                     .foregroundStyle(Theme.Palette.textTertiary)
@@ -3488,6 +3496,13 @@ struct DownloadsView: View {
                 }
             }
         }
+        #if os(macOS)
+        .alert("Download unavailable", isPresented: $showsUnavailableExternalDownload) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Reconnect the download drive or check that the file is still in its download folder.")
+        }
+        #endif
     }
 
     // MARK: Show folder
@@ -3604,13 +3619,19 @@ struct DownloadsView: View {
         let parts: [String] = {
             switch record.state {
             case .completed:
+                #if os(macOS)
+                if let location = record.macDownloadLocationID,
+                   downloadLocations.directory(for: location) == nil {
+                    return [String(localized: "Reconnect download drive"), record.qualityText].compactMap { $0 }
+                }
+                #endif
                 let size = ByteCountFormatter.string(fromByteCount: max(record.bytesDone, record.bytesTotal), countStyle: .file)
                 return [record.qualityText, size].compactMap { $0 }
             case .downloading:
                 let pct = Int(record.fractionComplete * 100)
                 return [String(localized: "Downloading \(pct)%"), record.retryNote].compactMap { $0 }
             case .paused:
-                return [String(localized: "Paused"), record.retryNote].compactMap { $0 }
+                return [record.errorText ?? String(localized: "Paused"), record.retryNote].compactMap { $0 }
             case .failed:
                 // Keep the honest retry note alongside the failure, so a doubly-failed batch episode reads
                 // "Failed · Retried with next-best source", not a bare "Failed" that hides the auto-swap (#119).
@@ -3639,7 +3660,15 @@ struct DownloadsView: View {
             case .queued:
                 EmptyView()
             }
-            iconButton("trash", "Delete") { manager.cancel(id: record.id) }
+            iconButton("trash", "Delete") {
+                #if os(macOS)
+                if let location = record.macDownloadLocationID, downloadLocations.directory(for: location) == nil {
+                    showsUnavailableExternalDownload = true
+                    return
+                }
+                #endif
+                manager.cancel(id: record.id)
+            }
         }
     }
 
@@ -3657,11 +3686,17 @@ struct DownloadsView: View {
 
     /// Play a completed download from its LOCAL file. Rebuilds the engine `PlaybackMeta` so progress /
     /// Continue Watching record exactly as for a streamed source; `isTorrent: false` because a finished
-    /// file plays directly (never back through the loopback torrent server). Fail-soft if the file is
-    /// missing (purged out from under us); drop the row.
+    /// file plays directly (never back through the loopback torrent server).
     private func play(_ record: DownloadRecord) {
-        guard record.state == .completed, store.fileExists(for: record) else {
-            if record.state == .completed { manager.cancel(id: record.id) }   // file gone → clean up the stale row
+        guard record.state == .completed else { return }
+        guard store.fileExists(for: record) else {
+            #if os(macOS)
+            if record.macDownloadLocationID != nil {
+                showsUnavailableExternalDownload = true
+                return
+            }
+            #endif
+            manager.cancel(id: record.id)   // Missing default-folder file: clean up the stale row.
             return
         }
         onPlay(record)

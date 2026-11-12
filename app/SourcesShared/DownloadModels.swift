@@ -279,6 +279,14 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
     /// offline download (those live in a system-managed `.movpkg`, tracked by `hlsRelativePath` instead).
     let localFilename: String
 
+    /// Mac-only destination selected when this transfer was queued. Older indexes decode this as nil.
+    let macDownloadLocationID: UUID?
+    /// Exact hidden partial owned by one Mac transfer.
+    var macDownloadAttemptID: UUID? = nil
+    /// Installation receipt, recorded before rename and kept to identify the completed file.
+    var macDownloadStagedBytes: Int64? = nil
+    var macDownloadStagedFileID: UInt64? = nil
+
     /// HLS offline downloads (iOS only, via `AVAssetDownloadTask`) land in a system-managed `.movpkg`
     /// bundle whose path we do not choose; we persist its path RELATIVE to the home directory (the
     /// container UUID can change between launches) and rebuild the absolute URL on demand. Non-nil only
@@ -320,7 +328,8 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
          isTorrent: Bool, headers: [String: String]?, remoteURL: String, localFilename: String,
          hlsRelativePath: String? = nil,
          bytesTotal: Int64 = 0, bytesDone: Int64 = 0, state: DownloadState = .queued,
-         addedAt: Date = Date(), errorText: String? = nil, retryNote: String? = nil, taskIdentifier: Int? = nil) {
+         addedAt: Date = Date(), errorText: String? = nil, retryNote: String? = nil, taskIdentifier: Int? = nil,
+         macDownloadLocationID: UUID? = nil) {
         self.id = id
         self.contentId = contentId
         self.videoId = videoId
@@ -335,6 +344,7 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
         self.headers = headers
         self.remoteURL = remoteURL
         self.localFilename = localFilename
+        self.macDownloadLocationID = macDownloadLocationID
         self.hlsRelativePath = hlsRelativePath
         self.bytesTotal = bytesTotal
         self.bytesDone = bytesDone
@@ -440,13 +450,16 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
     /// A stored file URL is a hint for one indexed copy. Never open or resolve that path itself.
     static func rememberedPlayableCopy(
         of target: PlaybackMeta, rememberedFile: URL,
-        in records: [Self], fileExists: (Self) -> Bool
+        in records: [Self], externalURL: (Self) -> URL? = { _ in nil }, fileExists: (Self) -> Bool
     ) -> Self? {
         guard rememberedFile.isFileURL, [nil, "", "localhost"].contains(rememberedFile.host),
               !target.libraryId.isEmpty, !target.videoId.isEmpty else { return nil }
         let path = rememberedFile.pathComponents
         let matches = records.filter { copy in
             guard copy.state == .completed, copy.matchesPlayback(target) else { return false }
+            if copy.macDownloadLocationID != nil {
+                return externalURL(copy)?.standardizedFileURL.path == rememberedFile.standardizedFileURL.path
+            }
             if let relative = copy.hlsRelativePath {
                 guard isSafeHLSPackageRelativePath(relative) else { return false }
                 let components = relative.split(separator: "/").map(String.init)

@@ -169,6 +169,14 @@ final class DownloadManager: NSObject, ObservableObject {
     /// arrives with only a task) resolves to a record id, and a pause/cancel(id:) resolves to its task.
     private var taskForRecord: [UUID: URLSessionDownloadTask] = [:]
     private var recordForTask: [String: UUID] = [:]
+    #if os(macOS)
+    private struct MacExternalTask {
+        let attempt: UUID
+        let transfer: MacExternalDownloadTransfer
+        var removeWhenClosed = false
+    }
+    private var macExternalTasks: [UUID: MacExternalTask] = [:]
+    #endif
 
     /// Native NZB URLs and operation authority are process-local resources, owned by one accepted row.
     /// Queueing/pausing keeps them alive; terminal transitions explicitly retire that exact operation.
@@ -338,7 +346,8 @@ final class DownloadManager: NSObject, ObservableObject {
                   sourceName: String?, qualityText: String?,
                   nativeUsenetLease: UsenetNodeClient.OperationLease? = nil,
                   nativeOwner: NativeDownloadOwner? = nil,
-                  requiresNativeOwner: Bool = false) async -> DownloadRecord {
+                  requiresNativeOwner: Bool = false,
+                  replacingDownloadID: UUID? = nil) async -> DownloadRecord {
         let seasonBoundaryOwner = meta.usesSeriesLifecycle ? PlaybackMutationTarget.capture(core: CoreBridge.shared) : nil
         var nativeAdmissionFailed = requiresNativeOwner && nativeOwner?.isCurrent != true
         if let nativeUsenetLease {
@@ -366,6 +375,14 @@ final class DownloadManager: NSObject, ObservableObject {
         case .byte: localFilename = "\(id.uuidString).\(fileExtension(for: resolvedURL))"
         case .hls: localFilename = "\(id.uuidString).movpkg"
         }
+        #if os(macOS)
+        let replaced = replacingDownloadID.flatMap { store.record(id: $0) }.flatMap { previous in
+            previous.state == .failed && previous.matchesPlayback(meta) ? previous : nil
+        }
+        let location = if let replaced { replaced.macDownloadLocationID } else { MacDownloadLocations.shared.selectedLocationID }
+        #else
+        let location: UUID? = nil
+        #endif
         let record = DownloadRecord(
             id: id, contentId: meta.libraryId, videoId: meta.videoId, type: meta.type,
             name: meta.name, poster: meta.poster, season: meta.season, episode: meta.episode,
@@ -374,7 +391,8 @@ final class DownloadManager: NSObject, ObservableObject {
             remoteURL: nativeUsenetLease == nil ? resolvedURL.absoluteString : Self.nativeSourceMarker,
             localFilename: localFilename,
             state: nativeAdmissionFailed ? .failed : .queued,
-            errorText: nativeAdmissionFailed ? Self.nativeSourceExpired : nil)
+            errorText: nativeAdmissionFailed ? Self.nativeSourceExpired : nil,
+            macDownloadLocationID: location)
         if let nativeUsenetLease, let nativeOwner, !nativeAdmissionFailed {
             nativeSources[id] = NativeSource(url: resolvedURL, lease: nativeUsenetLease, owner: nativeOwner)
             nativeUsenetLease.onClose { [weak self] in
@@ -400,6 +418,18 @@ final class DownloadManager: NSObject, ObservableObject {
     }
 
     func pause(id: UUID) {
+        #if os(macOS)
+        if let task = macExternalTasks[id] {
+            guard !task.removeWhenClosed else { return }
+            store.update(id: id) {
+                $0.state = .paused
+                $0.bytesDone = 0
+                $0.errorText = String(localized: "Resume starts this download again.")
+            }
+            task.transfer.cancel()
+            return
+        }
+        #endif
         #if os(iOS)
         // HLS asset downloads pause by suspending the live task (no resume-data mechanism). Clear the
         // persisted identifier: a paused record must never be reconnected as in-flight (resume re-creates the
@@ -435,6 +465,9 @@ final class DownloadManager: NSObject, ObservableObject {
 
     func resume(id: UUID) {
         guard store.record(id: id) != nil else { return }
+        #if os(macOS)
+        guard macExternalTasks[id]?.removeWhenClosed != true else { return }
+        #endif
         pauseGenerations[id] = nil
         store.update(id: id) { $0.state = .queued; $0.errorText = nil; $0.taskIdentifier = nil }
         appendToQueueOrder(id)
@@ -443,6 +476,15 @@ final class DownloadManager: NSObject, ObservableObject {
 
     /// Cancel and remove the download entirely (task + record + on-disk file).
     func cancel(id: UUID) {
+        #if os(macOS)
+        if var task = macExternalTasks[id] {
+            task.removeWhenClosed = true
+            macExternalTasks[id] = task
+            parkMacDownload(id, message: String(localized: "This download was interrupted. Resume starts it again."))
+            task.transfer.cancel()
+            return
+        }
+        #endif
         taskForRecord[id]?.cancel()
         #if os(iOS)
         cancelAssetTask(id: id)
@@ -454,6 +496,15 @@ final class DownloadManager: NSObject, ObservableObject {
         unlockedSaveFailures[id] = nil
         awaitingUnlockRetry.remove(id)
         store.remove(id: id)
+        #if os(macOS)
+        if let record = store.record(id: id), record.macDownloadLocationID != nil,
+           record.state != .completed {
+            store.update(id: id) {
+                $0.state = .paused
+                $0.errorText = MacDownloadLocations.LocationError.unavailable.errorDescription
+            }
+        }
+        #endif
         pruneQueueOrder()
         fillAvailableSlots()
     }
@@ -761,6 +812,9 @@ final class DownloadManager: NSObject, ObservableObject {
     }
 
     private func failNativeSource(id: UUID) {
+        #if os(macOS)
+        macExternalTasks[id]?.transfer.cancel()
+        #endif
         taskForRecord[id]?.cancel()
         clearTask(id: id, drainQueue: false)
         releaseNativeSource(id: id)
@@ -775,6 +829,9 @@ final class DownloadManager: NSObject, ObservableObject {
 
     private var activeWeight: Int {
         var weight = taskForRecord.count
+        #if os(macOS)
+        weight += macExternalTasks.count
+        #endif
         #if os(iOS)
         weight += assetTaskForRecord.keys.reduce(into: 0) { total, id in
             if store.record(id: id)?.state == .downloading { total += DownloadSchedulerCoordinator.Transport.hls.weight }
@@ -794,6 +851,14 @@ final class DownloadManager: NSObject, ObservableObject {
 
     private func startQueued(_ record: DownloadRecord) -> DownloadStartDisposition {
         guard record.state == .queued else { return .deferred }
+        #if os(macOS)
+        if record.macDownloadLocationID != nil, macExternalTasks[record.id] == nil,
+           store.hasInstalledMacTransfer(record), let bytes = record.macDownloadStagedBytes {
+            recordMacDownloadComplete(record.id, bytes: bytes)
+            releaseNativeSource(id: record.id)
+            return .rejected
+        }
+        #endif
         if record.remoteURL == Self.nativeSourceMarker,
            nativeSources[record.id]?.lease.isClosed != false || nativeSources[record.id]?.owner.isCurrent != true {
             failNativeSource(id: record.id)
@@ -815,8 +880,151 @@ final class DownloadManager: NSObject, ObservableObject {
             return .rejected
             #endif
         }
+        #if os(macOS)
+        if record.macDownloadLocationID != nil {
+            return startMacExternalTask(for: record, url: url)
+        }
+        #endif
         return startTask(for: record, url: url)
     }
+
+    #if os(macOS)
+    private func startMacExternalTask(for record: DownloadRecord, url: URL) -> DownloadStartDisposition {
+        let id = record.id
+        // The prior attempt still owns its worker and queue slot until cancellation has closed its file.
+        guard macExternalTasks[id] == nil else { return .deferred }
+        guard let location = record.macDownloadLocationID,
+              let destination = store.storedFileURL(for: record) else {
+            parkMacDownload(id, message: MacDownloadLocations.LocationError.unavailable.errorDescription)
+            return .rejected
+        }
+        if let attempt = record.macDownloadAttemptID,
+           !MacDownloadLocations.shared.discardIncomplete(location: location, attempt: attempt) {
+            parkMacDownload(id, message: String(localized: "VortX couldn’t remove the previous partial download. Check the drive and try again."))
+            return .rejected
+        }
+        let directory = destination.deletingLastPathComponent()
+        if let free = (try? directory.resourceValues(forKeys: [.volumeAvailableCapacityKey]))?.volumeAvailableCapacity,
+           record.bytesTotal > Int64(free) {
+            parkMacDownload(id, message: String(localized: "Free up space on the selected download drive and try again."))
+            return .rejected
+        }
+        let attempt = UUID()
+        do {
+            try store.updateMacTransfer(id: id) {
+                $0.macDownloadAttemptID = attempt
+                $0.macDownloadStagedBytes = nil
+                $0.macDownloadStagedFileID = nil
+                $0.state = .downloading
+                $0.bytesDone = 0
+                $0.errorText = nil
+                $0.taskIdentifier = nil
+            }
+        } catch {
+            parkMacDownload(id, message: String(localized: "VortX couldn’t save the download queue. Free up a little space on this Mac and try again."))
+            return .rejected
+        }
+        var request = URLRequest(url: url)
+        if nativeSources[id] == nil {
+            for (name, value) in record.headers ?? [:] { request.setValue(value, forHTTPHeaderField: name) }
+        }
+        let transfer = MacExternalDownloadTransfer(request: request, directory: directory, locationID: location, stagingID: attempt,
+            progress: { [weak self] done, total in
+                Task { @MainActor in
+                    guard let self, self.macExternalTasks[id]?.attempt == attempt,
+                          self.store.record(id: id)?.state == .downloading else { return }
+                    self.store.update(id: id, persistIndex: false) {
+                        $0.bytesDone = done
+                        if total > 0 { $0.bytesTotal = total }
+                    }
+                }
+            }, completion: { [weak self] result in
+                Task { @MainActor in self?.finishMacExternalTask(id, attempt: attempt, result: result) }
+            })
+        macExternalTasks[id] = MacExternalTask(attempt: attempt, transfer: transfer)
+        transfer.start()
+        return .started
+    }
+
+    private func parkMacDownload(_ id: UUID, message: String?) {
+        store.update(id: id) {
+            $0.state = .paused
+            $0.bytesDone = 0
+            $0.errorText = message
+            $0.taskIdentifier = nil
+        }
+    }
+
+    private func recordMacDownloadComplete(_ id: UUID, bytes: Int64) {
+        let update: (inout DownloadRecord) -> Void = {
+            $0.state = .completed
+            $0.bytesDone = bytes
+            $0.bytesTotal = bytes
+            $0.macDownloadAttemptID = nil
+            $0.errorText = nil
+        }
+        do { try store.updateMacTransfer(id: id, update) }
+        catch {
+            // The earlier durable install intent can recover the already-installed file on relaunch.
+            store.update(id: id, persistIndex: false, update)
+        }
+    }
+
+    private func finishMacExternalTask(
+        _ id: UUID, attempt: UUID,
+        result: Result<MacExternalDownloadTransfer.StagedFile, MacExternalDownloadTransfer.Failure>
+    ) {
+        guard let task = macExternalTasks[id], task.attempt == attempt else { return }
+        macExternalTasks[id] = nil
+        if task.removeWhenClosed {
+            if case .success(let staged) = result { staged.discard() }
+            cancel(id: id)
+            return
+        }
+        defer {
+            pruneQueueOrder()
+            fillAvailableSlots()
+        }
+        guard let record = store.record(id: id), record.macDownloadAttemptID == attempt,
+              record.state == .downloading else { return }
+        if record.remoteURL == Self.nativeSourceMarker,
+           nativeSources[id]?.lease.isClosed != false || nativeSources[id]?.owner.isCurrent != true {
+            failNativeSource(id: id)
+            return
+        }
+        guard let destination = store.storedFileURL(for: record) else {
+            parkMacDownload(id, message: MacDownloadLocations.LocationError.unavailable.errorDescription)
+            return
+        }
+        switch result {
+        case .success(let staged):
+            do {
+                try store.updateMacTransfer(id: id) {
+                    $0.macDownloadStagedBytes = staged.bytes
+                    $0.macDownloadStagedFileID = staged.fileIdentity
+                }
+                try staged.commit(to: destination)
+                recordMacDownloadComplete(id, bytes: staged.bytes)
+                releaseNativeSource(id: id)
+            } catch {
+                staged.discard()
+                parkMacDownload(id, message: String(localized: "VortX couldn’t finish saving to the selected drive. Check that it’s connected and writable, then try again."))
+            }
+        case .failure(let failure):
+            switch failure {
+            case .invalidResponse, .httpStatus, .incompleteResponse, .notMedia, .network:
+                store.update(id: id) {
+                    $0.state = .failed
+                    $0.bytesDone = 0
+                    $0.errorText = failure.message
+                }
+                releaseNativeSource(id: id)
+            default:
+                parkMacDownload(id, message: failure.message)
+            }
+        }
+    }
+    #endif
 
     private func recordID(for task: URLSessionTask, on session: URLSession) -> UUID? { recordForTask[Self.taskKey(session, task.taskIdentifier)] }
 
@@ -1003,6 +1211,17 @@ final class DownloadManager: NSObject, ObservableObject {
             let recordIsHLS = false
             #endif
             if hlsOnly != recordIsHLS { continue }
+            #if os(macOS)
+            if record.macDownloadLocationID != nil {
+                if macExternalTasks[record.id] != nil { continue }
+                if store.hasInstalledMacTransfer(record), let bytes = record.macDownloadStagedBytes {
+                    recordMacDownloadComplete(record.id, bytes: bytes)
+                } else {
+                    parkMacDownload(record.id, message: String(localized: "This download stopped when VortX closed. Resume starts it again."))
+                }
+                continue
+            }
+            #endif
             // Still has a live task from THIS process (never lost); leave it alone.
             if taskForRecord[record.id] != nil { continue }
             #if os(iOS)
@@ -1019,7 +1238,7 @@ final class DownloadManager: NSObject, ObservableObject {
     /// then the filename we serialized on `taskDescription` matched against `localFilename`. Both survive a
     /// relaunch; the pair makes a stale identifier fall back to the filename rather than orphaning a task.
     private func reconnectRecordID(for task: URLSessionTask, filename: String?) -> UUID? {
-        let candidates = store.records.map(recoveryCandidate(for:))
+        let candidates = store.records.filter { $0.macDownloadLocationID == nil }.map(recoveryCandidate(for:))
         if let id = HLSBackgroundRecoveryPolicy.matchingID(
             taskIdentifier: task.taskIdentifier, session: .byteBackground, records: candidates),
            let uuid = UUID(uuidString: id) {
@@ -1027,7 +1246,7 @@ final class DownloadManager: NSObject, ObservableObject {
         }
         guard let filename else { return nil }
         return store.records.first {
-            $0.localFilename == filename
+            $0.macDownloadLocationID == nil && $0.localFilename == filename
                 && HLSBackgroundRecoveryPolicy.accepts(recoveryCandidate(for: $0), for: .byteBackground)
         }?.id
     }
@@ -1060,7 +1279,7 @@ final class DownloadManager: NSObject, ObservableObject {
         // native/torrent task and let its late callback corrupt a resumed task with the same record id.
         guard session.configuration.identifier == Self.backgroundSessionIdentifier else { return nil }
         guard let filename else { return nil }
-        return store.records.first { $0.localFilename == filename }?.id
+        return store.records.first { $0.macDownloadLocationID == nil && $0.localFilename == filename }?.id
     }
 
     // MARK: Foreground assertion (torrent mode only)

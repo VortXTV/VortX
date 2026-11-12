@@ -478,7 +478,7 @@ final class BatchDownloadCoordinator: ObservableObject {
                                                          sourceName: plan.alternate.name,
                                                          qualityText: StreamRanking.signature(plan.alternate),
                                                          nativeUsenetLease: ref?.nativeUsenetLease, nativeOwner: plan.owner,
-                                                         requiresNativeOwner: replacingNative)
+                                                         requiresNativeOwner: replacingNative, replacingDownloadID: id)
             guard (!replacingNative || plan.owner.isCurrent),
                   DownloadStore.shared.record(id: record.id)?.state != .failed else { return }
             // Replacement is queued: now drop the failed download via the canonical DownloadManager path

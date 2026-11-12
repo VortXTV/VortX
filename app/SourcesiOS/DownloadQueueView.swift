@@ -37,6 +37,9 @@ struct DownloadQueueView: View {
     @ObservedObject private var store = DownloadStore.shared
     @ObservedObject private var manager = DownloadManager.shared
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #if os(macOS)
+    @State private var showsDisconnectedDrive = false
+    #endif
 
     private var usesWideQueueLayout: Bool {
         #if os(macOS)
@@ -74,6 +77,13 @@ struct DownloadQueueView: View {
             .padding(.vertical, usesWideQueueLayout ? Theme.Space.lg : Theme.Space.md)
             .frame(maxWidth: usesWideQueueLayout ? 1120 : .infinity, alignment: .center)
         }
+        #if os(macOS)
+        .alert("Download drive unavailable", isPresented: $showsDisconnectedDrive) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Reconnect the download drive before removing this item.")
+        }
+        #endif
         .background(Theme.Palette.canvas.ignoresSafeArea())
         #if os(iOS)
         .navigationTitle("Download Queue")
@@ -247,7 +257,7 @@ struct DownloadQueueView: View {
                 return [String(localized: "Waiting"), record.qualityText, record.retryNote].compactMap { $0 }
             case .paused:
                 let pct = Int(record.fractionComplete * 100)
-                return [String(localized: "Paused at \(pct)%"), record.retryNote].compactMap { $0 }
+                return [record.errorText ?? String(localized: "Paused at \(pct)%"), record.retryNote].compactMap { $0 }
             case .failed:
                 return [record.errorText ?? String(localized: "Failed"), record.retryNote].compactMap { $0 }
             case .completed:
@@ -282,7 +292,15 @@ struct DownloadQueueView: View {
             case .completed:
                 EmptyView()
             }
-            iconButton("trash", "Remove") { manager.cancel(id: record.id) }
+            iconButton("trash", "Remove") {
+                #if os(macOS)
+                if record.macDownloadLocationID != nil, store.storedFileURL(for: record) == nil {
+                    showsDisconnectedDrive = true
+                    return
+                }
+                #endif
+                manager.cancel(id: record.id)
+            }
         }
     }
 

@@ -81,6 +81,7 @@ enum AppleNativeDownloadLeaseTests {
         source += "\n@MainActor final class DownloadManager {\n" + managerFields + "\n"
         if baseline.isEmpty {
             source += try section(manager, "private struct NativeSource {", "/// A session-namespaced task key")
+            source += try section(manager, "private struct MacExternalTask {", "#endif")
         }
         let markers = [
             "private nonisolated static func taskKey(", "func download(", "func pause(id:",
@@ -101,7 +102,9 @@ enum AppleNativeDownloadLeaseTests {
             source += try function(manager, marker) + "\n"
         }
         if baseline.isEmpty {
-            for marker in ["private func releaseNativeSource(", "private func nativeSourceDidClose(", "private func failNativeSource(", "nonisolated static func nativeDownloadFailureDetail("] {
+            for marker in ["private func releaseNativeSource(", "private func nativeSourceDidClose(", "private func failNativeSource(",
+                           "nonisolated static func nativeDownloadFailureDetail(", "private func startMacExternalTask(",
+                           "private func parkMacDownload(", "private func recordMacDownloadComplete(", "private func finishMacExternalTask("] {
                 source += try function(manager, marker) + "\n"
             }
         }
@@ -152,7 +155,16 @@ let mediaURL = URL(string: "http://127.0.0.1:11470/nzb/stream?key=synthetic-oper
 enum DebridService: Sendable, Equatable { case torBox }
 enum DebridUsenetRoute: Sendable, Equatable { case native }
 struct DebridEpisode { let season: Int; let episode: Int }
-struct PlaybackMeta { let libraryId: String; let videoId: String; let type: String; let name: String; let poster: String?; let season: Int?; let episode: Int? }
+struct PlaybackMeta: Hashable {
+    let libraryId: String; let videoId: String; let type: String; let name: String
+    let poster: String?; let season: Int?; let episode: Int?
+    var usesSeriesLifecycle: Bool { EpisodePlaybackIdentity.usesSeriesLifecycle(type: type) }
+}
+struct CoreCWItem {
+    struct State { var videoId: String? }
+    let id: String; let type: String; let state: State; let resumeSeconds: Double
+    let progress: Double; let isFinished: Bool; let isUpNext: Bool
+}
 struct MovieMeta { let id: String; let name: String; let poster: String? }
 struct CoreStream {
     struct Hints { var filename: String? = nil }
@@ -165,15 +177,24 @@ struct CoreStream {
 enum StreamRanking { static func signature(_ stream: CoreStream) -> String? { nil } }
 enum EpisodePlaybackIdentity {
     static func usesSeriesLifecycle(type: String) -> Bool { type == "series" }
+    static func provenEpisodeNumbers(season: Int?, episode: Int?) -> (season: Int, episode: Int)? {
+        guard let season, season >= 0, let episode, episode > 0 else { return nil }
+        return (season, episode)
+    }
+    static func isEpisodicContext(type: String, season: Int?, episode: Int?, videoID: String) -> Bool {
+        let parts = videoID.split(separator: ":")
+        return usesSeriesLifecycle(type: type) || provenEpisodeNumbers(season: season, episode: episode) != nil ||
+            (parts.count >= 3 && provenEpisodeNumbers(season: Int(parts[parts.count - 2]), episode: Int(parts[parts.count - 1])) != nil)
+    }
     static func resolvedEpisodeMediaURL(isUsenet: Bool, resolvedURL: URL?, fallbackURL: URL?) -> URL? { resolvedURL ?? (isUsenet ? nil : fallbackURL) }
 }
 func prepareTorrentStream(_ stream: CoreStream) -> Task<Void, Never>? { nil }
-@MainActor final class CoreBridge { static let shared = CoreBridge(); var generation = 1 }
+@MainActor final class CoreBridge { static let shared = CoreBridge(); var generation: Int? = 1 }
 @MainActor enum StremioServer { static var nativeTransportSelected = true }
 struct PlaybackMutationTarget {
-    let generation: Int
+    let generation: Int?
     @MainActor static func capture(core: CoreBridge) -> Self { Self(generation: core.generation) }
-    @MainActor func stillOwnsCurrentContext(core: CoreBridge) -> Bool { generation == core.generation }
+    @MainActor func stillOwnsCurrentContext(core: CoreBridge) -> Bool { generation != nil && generation == core.generation }
 }
 final class Owner: @unchecked Sendable {
     private let lock = NSLock(); private var live = true
@@ -236,10 +257,47 @@ let NSURLSessionDownloadTaskResumeData = "synthetic-resume-data"
     nonisolated static func fileURL(forFilename filename: String) -> URL { fixtureRoot.appendingPathComponent(filename) }
     nonisolated static func ensureDownloadsDirectoryExists() throws { try FileManager.default.createDirectory(at: fixtureRoot, withIntermediateDirectories: true) }
     func fileURL(for record: DownloadRecord) -> URL { Self.fileURL(forFilename: record.localFilename) }
+    #if !BASELINE
+    func storedFileURL(for record: DownloadRecord) -> URL? {
+        guard let location = record.macDownloadLocationID else { return fileURL(for: record) }
+        return MacDownloadLocations.shared.directory(for: location)?.appendingPathComponent(record.localFilename)
+    }
+    func hasInstalledMacTransfer(_ record: DownloadRecord) -> Bool { false }
+    func updateMacTransfer(id: UUID, _ change: (inout DownloadRecord) -> Void) throws { update(id: id, change) }
+    #endif
     func record(id: UUID) -> DownloadRecord? { records.first { $0.id == id } }
+    func refreshSeasonBoundaries(libraryID: String, type: String, owner: PlaybackMutationTarget, afterEnqueuing: DownloadRecord) {}
     func upsert(_ record: DownloadRecord) { records.removeAll { $0.id == record.id }; records.append(record) }
     func update(id: UUID, persistIndex: Bool = true, _ mutation: (inout DownloadRecord) -> Void) { guard let index = records.firstIndex(where: { $0.id == id }) else { return }; mutation(&records[index]) }
     func remove(id: UUID) { if let record = record(id: id) { try? FileManager.default.removeItem(at: fileURL(for: record)) }; records.removeAll { $0.id == id } }
+}
+@MainActor final class MacDownloadLocations {
+    static let shared = MacDownloadLocations()
+    var selectedLocationID: UUID?
+    var roots: [UUID: URL] = [:]
+    enum LocationError: LocalizedError {
+        case unavailable
+        var errorDescription: String? { "Disconnected" }
+    }
+    func directory(for id: UUID) -> URL? { roots[id] }
+    func discardIncomplete(location: UUID, attempt: UUID) -> Bool { roots[location] != nil }
+}
+final class MacExternalDownloadTransfer: Sendable {
+    struct StagedFile: Sendable {
+        let bytes: Int64
+        var fileIdentity: UInt64 { 1 }
+        func commit(to file: URL) throws { try Data(repeating: 42, count: Int(bytes)).write(to: file, options: .withoutOverwriting) }
+        func discard() {}
+    }
+    enum Failure: Error, Sendable {
+        case cancelled, invalidResponse, httpStatus(Int), incompleteResponse, notMedia, network
+        var message: String { "Cancelled" }
+    }
+    let completion: @Sendable (Result<StagedFile, Failure>) -> Void
+    init(request: URLRequest, directory: URL, locationID: UUID, stagingID: UUID, progress: @escaping @Sendable (Int64, Int64) -> Void,
+         completion: @escaping @Sendable (Result<StagedFile, Failure>) -> Void) { self.completion = completion }
+    func start() {}
+    func cancel() {}
 }
 func makeLease(owner: Owner = Owner(), monitor: Bool = false) -> UsenetNodeClient.OperationLease {
     let lease = UsenetNodeClient.OperationLease(origin: URL(string: "http://127.0.0.1:11470")!, session: URLSession(configuration: .default), ownerIsCurrent: { owner.current })
@@ -395,20 +453,77 @@ func makeLease(owner: Owner = Owner(), monitor: Bool = false) -> UsenetNodeClien
         manager.cancel(id: activeRow.id)
         await flush()
         check("exact native operation cancellation is sent once", ControlLedger.shared.count(active.id) == 1)
-        let ownerCapture = NativeDownloadOwner(); CoreBridge.shared.generation += 1
+        let ownerCapture = NativeDownloadOwner()
+        CoreBridge.shared.generation = (CoreBridge.shared.generation ?? 0) + 1
         check("captured caller cannot use successor native authority", !ownerCapture.allows(CoreStream()))
         let resolvedBefore = DebridCoordinator.shared.lastOperationID
         await MovieCaller().downloadStream(CoreStream(), url: mediaURL, owner: ownerCapture)
         check("actual delayed movie caller rejects owner before resolver entry", DebridCoordinator.shared.lastOperationID == resolvedBefore)
+
+        let mac = reset()
+        let locationA = UUID(), locationB = UUID()
+        let driveA = fixtureRoot.appendingPathComponent("drive-A", isDirectory: true)
+        let driveB = fixtureRoot.appendingPathComponent("drive-B", isDirectory: true)
+        for folder in [driveA, driveB] { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false) }
+        MacDownloadLocations.shared.roots = [locationA: driveA, locationB: driveB]
+        MacDownloadLocations.shared.selectedLocationID = locationA
+        let external = await mac.download(stream: CoreStream(), meta: meta(), resolvedURL: mediaURL,
+                                          sourceName: nil, qualityText: nil)
+        let oldAttempt = mac.macExternalTasks[external.id]!
+        check("external row freezes the chosen drive and bypasses the OS temp download task",
+              external.macDownloadLocationID == locationA && mac.taskForRecord[external.id] == nil)
+        mac.pause(id: external.id)
+        MacDownloadLocations.shared.selectedLocationID = locationB
+        mac.resume(id: external.id)
+        check("resume waits for the old direct writer to close", mac.macExternalTasks[external.id]?.attempt == oldAttempt.attempt
+              && mac.store.record(id: external.id)?.state == .queued)
+        oldAttempt.transfer.completion(.success(.init(bytes: 8)))
+        await flush()
+        let finalAttempt = mac.macExternalTasks[external.id]!
+        let finalFile = driveA.appendingPathComponent(external.localFilename)
+        check("stale completion does not install over a resumed transfer",
+              finalAttempt.attempt != oldAttempt.attempt && !FileManager.default.fileExists(atPath: finalFile.path))
+        finalAttempt.transfer.completion(.success(.init(bytes: 9)))
+        await flush()
+        check("final completion stays on the original drive after the default changes",
+              mac.store.record(id: external.id)?.state == .completed &&
+              (try? Data(contentsOf: finalFile).count) == 9)
+
+        let removed = await mac.download(stream: CoreStream(), meta: meta(), resolvedURL: mediaURL,
+                                         sourceName: nil, qualityText: nil)
+        let pendingRemoval = mac.macExternalTasks[removed.id]!
+        mac.cancel(id: removed.id)
+        check("cancel retains attempt and slot until the writer acknowledges closure",
+              mac.store.record(id: removed.id)?.macDownloadAttemptID == pendingRemoval.attempt &&
+              mac.macExternalTasks[removed.id]?.removeWhenClosed == true)
+        pendingRemoval.transfer.completion(.failure(.cancelled))
+        await flush()
+        check("cancel removes only after the exact writer closes",
+              mac.store.record(id: removed.id) == nil && mac.macExternalTasks[removed.id] == nil)
+
+        MacDownloadLocations.shared.roots[locationB] = nil
+        let disconnected = await mac.download(stream: CoreStream(), meta: meta(), resolvedURL: mediaURL,
+                                              sourceName: nil, qualityText: nil)
+        check("disconnected location pauses without falling back to the Mac disk",
+              mac.store.record(id: disconnected.id)?.state == .paused &&
+              mac.macExternalTasks[disconnected.id] == nil && mac.taskForRecord[disconnected.id] == nil)
+        MacDownloadLocations.shared.roots[locationB] = driveB
+        mac.resume(id: disconnected.id)
+        mac.macExternalTasks[disconnected.id]!.transfer.completion(.failure(.network))
+        await flush()
+        check("external source failure reaches the existing retry state",
+              mac.store.record(id: disconnected.id)?.state == .failed)
+        MacDownloadLocations.shared.selectedLocationID = nil
         let retiredCallerLease = makeLease()
         let retiredCaller = await manager.download(stream: CoreStream(), meta: meta(), resolvedURL: mediaURL, sourceName: nil, qualityText: nil, nativeUsenetLease: retiredCallerLease, nativeOwner: ownerCapture)
         check("manager synchronously rejects original caller even if lease monitor has not closed", retiredCaller.state == .failed && retiredCallerLease.isClosed)
-        let nativeModeOwner = NativeDownloadOwner()
-        StremioServer.nativeTransportSelected = false
-        check("native to legacy mode change cannot revive captured authority", !nativeModeOwner.isCurrent)
-        let legacyModeOwner = NativeDownloadOwner()
-        StremioServer.nativeTransportSelected = true
-        check("legacy to native mode change cannot acquire successor authority", !legacyModeOwner.isCurrent)
+        let boundOwner = NativeDownloadOwner()
+        let nextGeneration = (CoreBridge.shared.generation ?? 0) + 1
+        CoreBridge.shared.generation = nil
+        check("detaching the native account retires captured authority", !boundOwner.isCurrent)
+        let unboundOwner = NativeDownloadOwner()
+        CoreBridge.shared.generation = nextGeneration
+        check("an unbound request cannot acquire successor account authority", !unboundOwner.isCurrent && !boundOwner.isCurrent)
         var direct = CoreStream(); direct.isUsenet = false
         direct.requestHeaders = ["Authorization": "ordinary-direct-header"]
         check("native owner gate leaves ordinary direct download unchanged", ownerCapture.allows(direct))

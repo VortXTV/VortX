@@ -309,7 +309,7 @@ final class DownloadPickCoordinator: ObservableObject {
                                                          sourceName: head.name,
                                                          qualityText: StreamRanking.signature(head),
                                                          nativeUsenetLease: ref?.nativeUsenetLease, nativeOwner: owner,
-                                                         requiresNativeOwner: nativeOrigin)
+                                                         requiresNativeOwner: nativeOrigin, replacingDownloadID: failedID)
             guard !nativeOrigin || owner.isCurrent else { return }
             // download() can refuse synchronously (an HLS source on a device that can't save HLS, or a storage
             // shortfall): that record is born `.failed`. Discard it and try the next candidate.

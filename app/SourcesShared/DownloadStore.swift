@@ -56,6 +56,19 @@ final class DownloadStore: ObservableObject {
         return directory.appendingPathComponent(record.localFilename)
     }
 
+    /// Resolve the recorded media location. A missing chosen drive never redirects a file to the default.
+    func storedFileURL(for record: DownloadRecord) -> URL? {
+        guard let location = record.macDownloadLocationID else { return fileURL(for: record) }
+        #if os(macOS)
+        guard record.hlsRelativePath == nil,
+              DownloadRecord.isManagedProgressiveFilename(record.localFilename, id: record.id),
+              let root = MacDownloadLocations.shared.directory(for: location) else { return nil }
+        return root.appendingPathComponent(record.localFilename)
+        #else
+        return nil
+        #endif
+    }
+
     /// Off-main destination resolver for a known media filename (`<id>.<ext>`). Lets the background
     /// URLSession delegate recover a download's destination after an app relaunch wiped the in-memory
     /// task->destination map. Pure path math, so it is `nonisolated`.
@@ -91,7 +104,8 @@ final class DownloadStore: ObservableObject {
     /// True when the media file for a completed record actually exists on disk (guards play-from-local
     /// against a row whose file was purged out from under us).
     func fileExists(for record: DownloadRecord) -> Bool {
-        fileManager.fileExists(atPath: fileURL(for: record).path)
+        if record.macDownloadLocationID != nil { return validatedPlaybackURL(for: record) != nil }
+        return fileManager.fileExists(atPath: fileURL(for: record).path)
     }
 
     private func ensureDirectory() {
@@ -123,9 +137,26 @@ final class DownloadStore: ObservableObject {
     }
 
     private func persist() {
-        guard let data = try? JSONEncoder.downloads.encode(records) else { return }
-        try? data.write(to: indexURL, options: .atomic)
+        try? writeIndex(records)
     }
+
+    private func writeIndex(_ snapshot: [DownloadRecord]) throws {
+        try JSONEncoder.downloads.encode(snapshot).write(to: indexURL, options: .atomic)
+    }
+
+    #if os(macOS)
+    /// The Mac external writer must have a durable attempt before it creates any file on the chosen volume.
+    func updateMacTransfer(id: UUID, _ change: (inout DownloadRecord) -> Void) throws {
+        guard let index = records.firstIndex(where: { $0.id == id }) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        var next = records
+        change(&next[index])
+        try writeIndex(next)
+        pendingProgressRecords.removeValue(forKey: id)
+        records = next
+    }
+    #endif
 
     // MARK: CRUD
 
@@ -155,7 +186,7 @@ final class DownloadStore: ObservableObject {
             guard cardVideoID == target.videoId else { return nil }
         }
         return DownloadRecord.rememberedPlayableCopy(
-            of: target, rememberedFile: file, in: records,
+            of: target, rememberedFile: file, in: records, externalURL: validatedPlaybackURL(for:),
             fileExists: hasValidPlaybackFile
         ).flatMap { playableDownload(id: $0.id, expected: $0.playbackMeta) }
     }
@@ -284,6 +315,7 @@ final class DownloadStore: ObservableObject {
 
     private func validatedPlaybackURL(for record: DownloadRecord) -> URL? {
         if let relative = record.hlsRelativePath {
+            guard record.macDownloadLocationID == nil else { return nil }
             #if os(iOS)
             guard DownloadRecord.isSafeHLSPackageRelativePath(relative) else { return nil }
             let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).resolvingSymlinksInPath()
@@ -299,17 +331,31 @@ final class DownloadStore: ObservableObject {
             #endif
         }
         guard DownloadRecord.isManagedProgressiveFilename(record.localFilename, id: record.id) else { return nil }
-        let candidate = fileURL(for: record)
+        guard let candidate = storedFileURL(for: record) else { return nil }
         let resolved = candidate.resolvingSymlinksInPath()
-        let managedDirectory = directory.resolvingSymlinksInPath()
+        let managedDirectory = candidate.deletingLastPathComponent().resolvingSymlinksInPath()
         guard resolved.deletingLastPathComponent().path == managedDirectory.path,
               resolved.lastPathComponent == record.localFilename,
               let attributes = try? candidate.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]),
               attributes.isRegularFile == true, attributes.isSymbolicLink == false,
               let size = attributes.fileSize, size > 0,
               fileManager.isReadableFile(atPath: resolved.path) else { return nil }
+        #if os(macOS)
+        if record.macDownloadLocationID != nil, !hasInstalledMacTransfer(record) { return nil }
+        #endif
         return resolved
     }
+
+    #if os(macOS)
+    func hasInstalledMacTransfer(_ record: DownloadRecord) -> Bool {
+        guard let location = record.macDownloadLocationID,
+              let expected = record.macDownloadStagedBytes, expected > 0,
+              let expectedFileID = record.macDownloadStagedFileID,
+              DownloadRecord.isManagedProgressiveFilename(record.localFilename, id: record.id) else { return false }
+        return MacDownloadLocations.shared.matchesInstalledFile(location: location, filename: record.localFilename,
+                                                                 fileID: expectedFileID, bytes: expected)
+    }
+    #endif
 
     /// True when a completed (or in-flight) download already exists for this exact video; drives the
     /// "Downloaded" / "Downloading" state on a source row so a user can't queue a title twice.
@@ -376,9 +422,23 @@ final class DownloadStore: ObservableObject {
     /// any live URLSession task first.
     func remove(id: UUID) {
         guard let idx = records.firstIndex(where: { $0.id == id }) else { return }
-        pendingProgressRecords.removeValue(forKey: id)
         let record = records[idx]
-        try? fileManager.removeItem(at: fileURL(for: record))
+        guard let url = storedFileURL(for: record) else { return }
+        #if os(macOS)
+        if let location = record.macDownloadLocationID {
+            let locations = MacDownloadLocations.shared
+            if let attempt = record.macDownloadAttemptID,
+               !locations.discardIncomplete(location: location, attempt: attempt) { return }
+            if let fileID = record.macDownloadStagedFileID, let bytes = record.macDownloadStagedBytes,
+               !locations.removeInstalledFile(location: location, filename: record.localFilename,
+                                             fileID: fileID, bytes: bytes) { return }
+        } else {
+            try? fileManager.removeItem(at: url)
+        }
+        #else
+        try? fileManager.removeItem(at: url)
+        #endif
+        pendingProgressRecords.removeValue(forKey: id)
         records.remove(at: idx)
         persist()
     }
@@ -389,8 +449,12 @@ final class DownloadStore: ObservableObject {
     /// totals, so a partially-deleted file reports honestly).
     func totalBytesOnDisk() -> Int64 {
         records.reduce(0) { sum, record in
-            let url = fileURL(for: record)
-            guard let attrs = try? fileManager.attributesOfItem(atPath: url.path),
+            #if os(macOS)
+            if record.macDownloadLocationID != nil,
+               record.state != .completed || !hasInstalledMacTransfer(record) { return sum }
+            #endif
+            guard let url = storedFileURL(for: record),
+                  let attrs = try? fileManager.attributesOfItem(atPath: url.path),
                   let size = (attrs[.size] as? NSNumber)?.int64Value else { return sum }
             return sum + size
         }
