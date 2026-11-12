@@ -1,554 +1,241 @@
-name: Build Android APK
+name: Verify Android Watch Next with real host JNI
+run-name: Android Watch Next completed-owner JNI proof
 
-# CI-first Android artifact build. Local source/unit validation is also possible with a configured
-# SDK/JDK; this lane supplies the pinned private-engine packaging proof. It builds BOTH flavors when
-# an integration-branch push touches android/, verifies the native-only VortX .so for every shipped
-# ABI, and enforces the GPL licensing boundary: the Play-Store `play` flavor must never carry the GPLv3
-# libmpv native libs. The engine workspace lives in a PRIVATE repo (moved out of the public tree in
-# 33ff9b5) and is fetched below at a pinned commit; bumping the engine pin means editing this file,
-# which is itself a path trigger, so the old `core/**` path filters are gone (that dir no longer
-# exists in the public tree).
-#
-# No `pull_request` trigger, DELIBERATELY: the engine-fetch steps below hold ENGINE_REPO_TOKEN in
-# the same job that executes repo-controlled code (gradle build scripts, cargo build scripts), so
-# building PR heads here would hand any same-repo PR author's code a credential / private-source
-# exfiltration lane. Fork PRs never received secrets anyway, so their builds could only die at the
-# token preflight; nothing of value is lost. The dev flow is push-to-branch (which triggers this
-# workflow); PR contracts belong in separate SECRETLESS validation lanes, not in this engine build.
-# Do not re-add `pull_request` -- and never
-# `pull_request_target` -- to THIS workflow.
-
-# PRIVILEGED-LANE TRIGGER SURFACE. This job holds ENGINE_REPO_TOKEN plus the Trakt and SIMKL
-# secrets, so the push trigger is constrained to the EXACT integration branches, main and beta, and
-# nothing else. The former "android/**" glob is REMOVED: it let a push to ANY android/* feature
-# branch reach the token-bearing job, which means unreviewed branch code executing next to the
-# credential (gradle and cargo build scripts run in the same job that reads the token). That token
-# grants access to the PRIVATE engine repositories, so the blast radius was the engine source, not
-# just this build. Feature-branch build feedback belongs to a future SECRETLESS workflow (no engine
-# fetch, no secrets in the job), not this lane.
-#
-# This closes the WORKFLOW half only. The REPO-SETTINGS half is the owner's and is still open:
-#   - `workflow_dispatch` below can be launched from ANY ref. Only an `engine-ci` environment with a
-#     deployment-branch policy stops a dispatch from an unlisted ref reaching the token. That
-#     environment must exist and list only main, beta and the release tag lane.
-#   - main and beta need branch protection with required review. A direct push to beta today is
-#     unreviewed code running beside the secret.
-#   - ENGINE_REPO_TOKEN should live INSIDE the `engine-ci` environment (value re-entry) so no job
-#     that has not passed the environment gate can read it.
-on:
-  push:
-    branches: [main, beta]
-    paths:
-      - "android/**"
-      - "scripts/acquire-android-mpv-component.py"
-      - "scripts/test-android-native-sync-host.sh"
-      - ".github/workflows/android.yml"
-  workflow_dispatch:
+on: workflow_dispatch
 
 permissions:
   contents: read
 
 jobs:
-  build-android:
-    # Environment gate for the token-bearing job (trust boundary): the `engine-ci` environment
-    # carries explicit deployment protection policies: BRANCH entries (beta, main, ci/engine-token)
-    # plus a `v*` TAG policy (the tag lane is used by the release workflow; this workflow only ever
-    # runs on branch refs, which enter via the branch entries). A push to any OTHER branch -- e.g.
-    # the android/** trigger patterns above -- still starts the workflow but the job BLOCKS at this
-    # gate before any step runs, which makes ENGINE_REPO_TOKEN unreachable from arbitrary branches.
-    # The ci/engine-token entry in that policy is TEMPORARY, for proof runs on the CI branch, and
-    # is removed at integration. Moving the ENGINE_REPO_TOKEN secret itself INTO the environment
-    # (value re-entry) is a queued owner step; until then the gate still stops arbitrary-branch jobs
-    # from ever reaching the fetch steps that read it.
-    environment: engine-ci
-    # Pinned explicit runner label: `ubuntu-latest` is a MOVING alias (it means ubuntu-24.04 today,
-    # per actions/runner-images), and a silent alias flip would swap the whole toolchain -- JDK
-    # packages, kernel -- under a runtime-proven lane with no diff in this file. (The APK gate below
-    # no longer leans on the image's binutils readelf; it uses the pinned NDK's own llvm-readelf, so
-    # its provenance is tied to the NDK pin, not this image.) Moving to a newer image is a
-    # deliberate edit here, verified by a run, not an alias drift.
+  watch-next-host-jni:
+    if: >-
+      github.event_name == 'workflow_dispatch' && github.repository == 'VortXTV/VortX' &&
+      github.repository_id == '1261501126' && github.actor == 'mamaclapper' &&
+      github.actor_id == '50227842' && github.run_attempt == '1' &&
+      github.ref == 'refs/tags/vortx-android-watch-next-jni-20261112'
     runs-on: ubuntu-24.04
-    # GitHub-owned actions are SHA-pinned too (finishing the supply-chain pass that already pinned
-    # the third-party actions): a mutable tag -- even on an actions/* repo -- can be repointed, and
-    # this job holds ENGINE_REPO_TOKEN. Each pin carries the tag it resolved from.
+    environment: engine-ci
+    timeout-minutes: 75
+    env:
+      APP_SOURCE: adf06caf797710d680e51ca5dbcb01cc18d61d6b
+      FIXTURE_SOURCE_SHA: 751dc1c43d607b09fc806487b52a05adec867ce97f6cd8a5c30cbd391b34ff4c
+      ENGINE_SOURCE: 2ea2e0f27dd2e53b7b28228435ca35a70f92831f
+      HOST_TOOLCHAIN: nightly-2026-07-19
+      HOST_TARGET: x86_64-unknown-linux-gnu
+      FIXTURE_CLASS: com.vortx.android.engine.NativeOwnAccountCoordinatorTest
+      FIXTURE_METHOD: Play Next callbacks run only for completed and still mounted roster
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 2
           persist-credentials: false
 
-      - name: Acquire reviewed Android mpv component (baseline is a no-op)
-        run: /usr/bin/python3 -I scripts/acquire-android-mpv-component.py
-
-      # ---- Private engine fetch (moved out of the public tree in 33ff9b5) --------------------------
-      # Android artifacts use libvortx_ffi.so only, built with jni,server,resource-host from the
-      # reviewed vortx-core pin.
-      #
-      # The fetch uses actions/checkout (GitHub's own auth path: the token is injected through an
-      # env-sourced local git config, never argv, and persist-credentials: false wipes it after the
-      # step), pinned to the exact commit the current build links. Requires the ENGINE_REPO_TOKEN
-      # secret (fine-grained PAT, Contents:read on the private repo; deploy keys are disabled by the
-      # VortXTV org). The immutable source pin is checked; a missing manifest/toolchain fails closed.
-      - name: Preflight the engine token (fail closed)
-        env:
-          ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
+      - name: Verify the exact Watch Next source and operation
+        shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${ENGINE_REPO_TOKEN:-}" ]; then
-            echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine repo (VortXTV/vortx-core)"
-            exit 1
-          fi
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = VortXTV/VortX && test "$GITHUB_REPOSITORY_ID" = 1261501126
+          test "$GITHUB_ACTOR" = mamaclapper && test "$GITHUB_ACTOR_ID" = 50227842
+          test "$GITHUB_TRIGGERING_ACTOR" = mamaclapper && test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_REF" = refs/tags/vortx-android-watch-next-jni-20261112
+          test "$GITHUB_WORKFLOW_REF" = "VortXTV/VortX/.github/workflows/android.yml@$GITHUB_REF"
+          test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $APP_SOURCE"
+          test "$(git diff --name-only HEAD^ HEAD)" = .github/workflows/android.yml
+          test -z "$(git status --porcelain --untracked-files=all)"
+          fixture=android/app/src/test/kotlin/com/vortx/android/engine/NativeOwnAccountCoordinatorTest.kt
+          printf '%s  %s\n' "$FIXTURE_SOURCE_SHA" "$fixture" | sha256sum --check --status
+          grep -Fq "@Test fun \`$FIXTURE_METHOD\`" "$fixture"
 
-      # vortx-core is a MONOREPO whose engine workspace is its vortx-core/ SUBDIR (the engine manifest
-      # sits at vortx-core/vortx-core/Cargo.toml inside the repo). Check out to a temp path, then
-      # promote only that subdir to the app-root vortx-core/ the gradle task builds from.
-      - name: Fetch vortx-core (private monorepo, pinned)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: VortXTV/vortx-core
-          ref: 2ea2e0f27dd2e53b7b28228435ca35a70f92831f
-          token: ${{ secrets.ENGINE_REPO_TOKEN }}
-          path: _vortx_core_src
-          persist-credentials: false
-
-      - name: Promote the vortx-core workspace + record the exact private source pin
-        run: |
-          set -euo pipefail
-          vortx_sha="$(git -C _vortx_core_src rev-parse HEAD^{commit})"
-          test "$vortx_sha" = "2ea2e0f27dd2e53b7b28228435ca35a70f92831f" \
-            || { echo "::error::vortx-core checkout does not match the reviewed private pin"; exit 1; }
-          echo "VORTX_ENGINE_SOURCE_SHA=$vortx_sha" >> "$GITHUB_ENV"
-          rm -rf vortx-core
-          mv _vortx_core_src/vortx-core vortx-core
-          rm -rf _vortx_core_src
-          test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine workspace missing after promote (vortx-core/Cargo.toml)"; exit 1; }
-          test -d vortx-core/crates     || { echo "::error::vortx-core engine crates/ missing after promote (vortx-core/crates)"; exit 1; }
-          echo "pinned private source: vortx-core@$vortx_sha (promoted monorepo subdir)"
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: '21'
 
-      # Non-GitHub-owned actions below are pinned to full commit SHAs (mutable tags on third-party
-      # repos are a supply-chain hole; GitHub-owned actions/* stay on major tags).
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
-          packages: "platform-tools platforms;android-37.0 build-tools;36.0.0 cmake;4.1.2"
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0 cmake;4.1.2'
 
-      # No gradle-version here: the committed wrapper (android/gradle/wrapper/gradle-wrapper.properties)
-      # is the single Gradle-version truth. setup-gradle is kept only for its build cache; the build
-      # runs via ./gradlew below.
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+      - name: Select the pinned Android NDK for Gradle configuration
+        run: sdkmanager 'ndk;30.0.16248370'
 
-      # Android artifacts cross-compile vortx-ffi from the reviewed VortX workspace. The pinned NDK,
-      # Rust nightly Android targets and cargo-ndk are required for that output.
-      - name: Install Android NDK (must match ndkVersion in app/build.gradle.kts)
-        run: |
-          yes | sdkmanager "ndk;30.0.16248370"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
-          # The runner image also exports an older NDK as ANDROID_NDK_ROOT; point it at the same pin
-          # so no tool can pick the other one.
-          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
-
-      # SHA-pinned (see the pin note above). Pinning drops the toolchain-from-ref-name convention
-      # (@nightly), so the toolchain is passed explicitly.
-      #
-      # Toolchain truth: rust-toolchain.toml IS the Rust-version authority, not this step. The
-      # promoted engine checkout carries one (vortx-core/rust-toolchain.toml, `channel =
-      # "nightly-2026-07-19"` + rust-src; verified at the pinned engine commit), and rustup's
-      # directory-override rule means every cargo invocation inside that dir resolves the toolchain
-      # through that file. This step is ONLY
-      # the installer that puts that DATED toolchain + the Android targets on the runner for those
-      # files to select; it MUST name the same dated channel the engine toolchain files pin,
-      # because the Android targets are installed per-toolchain. Drift fails closed, not silently:
-      # if the files pin a different date, rustup auto-installs that toolchain WITHOUT the Android
-      # targets and the cargo-ndk build dies with a missing-target error.
-      - name: Install Rust nightly + Android targets
-        uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly branch, 2026-07-19
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2
         with:
           toolchain: nightly-2026-07-19
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+          targets: x86_64-unknown-linux-gnu
           components: rust-src
 
-      # Second workspace line: the vortx-ffi cross-build's CARGO_TARGET_DIR is pinned by the gradle
-      # task to <engine>/target-andx (build.gradle.kts:407), not the default target/.
-      #
-      # Ref-scoped cache key (private-intermediate containment): the workspace `target` dirs cached
-      # here hold compiled output of the PRIVATE engine crates. `key` is folded into rust-cache's
-      # cache key (and into its restore-key prefixes), so each ref gets its OWN cache partition and a
-      # run on one branch cannot restore another branch's private-engine intermediates -- not via an
-      # exact hit and not via the lockfile-dropped prefix fallback. Include the fetched private
-      # source content in that prefix too: even a same-ref engine update must not restore old
-      # private targets. Public app-only edits can still reuse identical engine/dependency work.
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: ${{ github.ref_name }}-native-${{ env.VORTX_ENGINE_SOURCE_SHA }}-${{ hashFiles('vortx-core/Cargo.*', 'vortx-core/rust-toolchain.toml', 'vortx-core/.cargo/**', 'vortx-core/crates/**', 'android/app/build.gradle.kts') }}
-          workspaces: |
-            vortx-core -> target-andx
-
-      # Pinned EXACTLY: "^3" is a moving target (a new 3.x release would swap the build tool under
-      # this runtime-proven lane with no diff here). =3.5.4 is what "^3" resolves to at pin time,
-      # i.e. the version the proven runs actually installed. cargo-ndk 4.x exists (4.1.2 today);
-      # that major bump is a deliberate future change with its own verifying run, not a pin.
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --version "=3.5.4" --locked
-
-      # Host JNI is distinct from Android APK libraries: do not load an Android .so in the JVM.
-      # Only the authenticated normal private pin is built; no private sources/binaries are uploaded.
-      - name: Build exact host JNI for owner-history integration
-        id: owner_history_host
-        timeout-minutes: 45
+      - name: Fetch the exact private engine with isolated credentials
+        timeout-minutes: 5
+        env:
+          ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
+        shell: bash
         run: |
           set -euo pipefail
-          test "$VORTX_ENGINE_SOURCE_SHA" = 2ea2e0f27dd2e53b7b28228435ca35a70f92831f
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          target="$(mktemp -d "$RUNNER_TEMP/owner-history-host.XXXXXXXX")"
-          proof="$GITHUB_WORKSPACE/android/app/build/reports/owner-history-host"
-          mkdir -p "$proof"
-          # Paths/source contents remain private on the runner. Retain only this manifest's digest.
-          source_manifest="$target/source-inputs.sha256"
-          find vortx-core \( -path vortx-core/target -o -path vortx-core/target-andx \) -prune -o \
-            -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$source_manifest"
-          test -s "$source_manifest"
-          nice -n 15 cargo +nightly-2026-07-19 build --locked \
-            --manifest-path vortx-core/Cargo.toml -p vortx-ffi --no-default-features \
-            --features jni,server,resource-host --release --target x86_64-unknown-linux-gnu \
-            --target-dir "$target" --jobs 1
-          find vortx-core \( -path vortx-core/target -o -path vortx-core/target-andx \) -prune -o \
-            -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$target/source-inputs.after.sha256"
-          cmp --silent "$source_manifest" "$target/source-inputs.after.sha256"
-          library="$target/x86_64-unknown-linux-gnu/release/libvortx_ffi.so"
+          umask 077
+          test -n "${ENGINE_REPO_TOKEN:-}"
+          scratch="$(mktemp -d "$RUNNER_TEMP/vortx-watch-next-private.XXXXXXXX")"
+          trap 'rm -rf -- "$scratch"' EXIT
+          checkout="$scratch/engine"
+          mkdir "$checkout"
+          (
+            export LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+            unset GIT_TRACE GIT_TRACE_PACKET GIT_TRACE_CURL GIT_CURL_VERBOSE
+            askpass="$scratch/askpass"
+            cat > "$askpass" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' x-access-token ;;
+            *Password*) printf '%s\n' "$ENGINE_REPO_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SH
+            chmod 700 "$askpass"
+            export GIT_ASKPASS="$askpass"
+            git -C "$checkout" init --quiet
+            git -C "$checkout" -c credential.helper= -c http.followRedirects=false \
+              -c protocol.allow=never -c protocol.https.allow=always fetch --no-tags --depth=1 \
+              https://github.com/VortXTV/vortx-core.git "$ENGINE_SOURCE"
+            git -C "$checkout" -c core.hooksPath=/dev/null checkout --detach --quiet FETCH_HEAD
+          ) >"$scratch/private-fetch.log" 2>&1
+          rm "$scratch/askpass"
+          test "$(git -C "$checkout" rev-parse HEAD)" = "$ENGINE_SOURCE"
+          test -z "$(git -C "$checkout" status --porcelain --untracked-files=all)"
+          printf 'VORTX_WATCH_NEXT_PRIVATE_DIR=%s\n' "$scratch" >> "$GITHUB_ENV"
+          trap - EXIT
+
+      - name: Run the exact completed-roster Watch Next callback with real host JNI
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(uname -m)" = x86_64
+          test -z "${ENGINE_REPO_TOKEN+x}"
+          scratch="$VORTX_WATCH_NEXT_PRIVATE_DIR"
+          prefix="$RUNNER_TEMP/vortx-watch-next-private."
+          suffix="${scratch#"$prefix"}"
+          [[ "$suffix" =~ ^[A-Za-z0-9]{8}$ && "$scratch" == "$prefix$suffix" ]] || exit 1
+          test -d "$scratch" && test ! -L "$scratch"
+          checkout="$scratch/engine"
+          workspace="$checkout/vortx-core"
+          test -f "$workspace/Cargo.toml" && test -f "$workspace/Cargo.lock"
+          test -z "$(find "$workspace" -type l -print -quit)"
+
+          verify_checkout() {
+            test "$(git -C "$checkout" rev-parse HEAD)" = "$ENGINE_SOURCE" &&
+              test -z "$(git -C "$checkout" status --porcelain --untracked-files=all)"
+          }
+          hash_source() {
+            (cd "$checkout" && git ls-files -z -- vortx-core | xargs -0 sha256sum)
+          }
+          echo 'Building the reviewed Linux host JNI library.'
+          verify_checkout
+          hash_source > "$scratch/source-before.sha256" 2> "$scratch/private-manifest.log"
+          test -s "$scratch/source-before.sha256"
+          (
+            cd "$workspace"
+            timeout --signal=TERM --kill-after=30s 36m nice -n 15 \
+              cargo "+$HOST_TOOLCHAIN" build --locked --manifest-path "$workspace/Cargo.toml" \
+              -p vortx-ffi --no-default-features --features jni,server,resource-host \
+              --release --target "$HOST_TARGET" --target-dir "$scratch/target" --jobs 1
+          ) > "$scratch/private-cargo.log" 2>&1
+          verify_checkout
+          hash_source > "$scratch/source-after-build.sha256" 2>> "$scratch/private-manifest.log"
+          cmp --silent "$scratch/source-before.sha256" "$scratch/source-after-build.sha256"
+          library="$scratch/target/$HOST_TARGET/release/libvortx_ffi.so"
           test -s "$library" && test ! -L "$library"
+          readelf -h "$library" > "$scratch/private-elf.log" 2>&1
+          grep -Eq 'Machine:[[:space:]]+Advanced Micro Devices X86-64' "$scratch/private-elf.log"
+          grep -Eq 'Type:[[:space:]]+DYN' "$scratch/private-elf.log"
+          READELF=readelf bash scripts/verify-native-engine-abi.sh android "$library" owner-history \
+            > "$scratch/private-abi.log" 2>&1
           library_sha="$(sha256sum "$library" | cut -d' ' -f1)"
-          source_sha="$(sha256sum "$source_manifest" | cut -d' ' -f1)"
-          jq -n --arg app "$GITHUB_SHA" --arg source "$VORTX_ENGINE_SOURCE_SHA" \
-            --arg path "$library" --arg sha "$library_sha" --arg inputs "$source_sha" \
-            '{schema:1,appSource:$app,engineSource:$source,features:"jni,server,resource-host",
-              toolchain:"nightly-2026-07-19",hostTarget:"x86_64-unknown-linux-gnu",
-              libraryPath:$path,librarySha256:$sha,sourceInputsSha256:$inputs}' > "$proof/host-jni.json"
-          echo "VORTX_JNI_LIBRARY=$library" >> "$GITHUB_ENV"
-          echo "VORTX_JNI_EXPECTED_SHA256=$library_sha" >> "$GITHUB_ENV"
-          echo "VORTX_JNI_RECEIPT=$proof/host-jni.json" >> "$GITHUB_ENV"
-          echo "VORTX_JNI_SOURCE_MANIFEST=$source_manifest" >> "$GITHUB_ENV"
+          [[ "$library_sha" =~ ^[0-9a-f]{64}$ ]]
 
-      # Execute the exact release sync gate before owner-history reuses the JUnit output path.
-      # The authenticated host library/receipt above are reused; no additional native build runs.
-      - name: Require real native sync revision and account tests before packaging
-        timeout-minutes: 30
-        working-directory: android
-        env:
-          JAVA_TOOL_OPTIONS: "-XX:ActiveProcessorCount=1"
-          VORTX_JNI_SYNC: "1"
-          SOURCE_COMMIT: ${{ github.sha }}
-        run: |
-          mkdir -p app/build/reports/native-sync-host
-          bash ../scripts/test-android-native-sync-host.sh
-
-      - name: Retain native sync pretag JUnit before owner-history execution
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: VortX-Android-native-sync-host-tests
-          path: |
-            android/app/build/test-results/testPlayDebugUnitTest/*.xml
-            android/app/build/reports/owner-history-host/host-jni.json
-            android/app/build/reports/native-sync-host/host-jni-accepted.json
-          if-no-files-found: warn
-          retention-days: 90
-
-      - name: Run owner-history44 and separate Media3 17 with real host JNI
-        timeout-minutes: 30
-        working-directory: android
-        env:
-          JAVA_TOOL_OPTIONS: "-XX:ActiveProcessorCount=1"
-        run: |
-          set -euo pipefail
-          # Keep the original exit on a test failure, but never accept changed native/source bytes.
-          verify_inputs() {
-            (cd "$GITHUB_WORKSPACE" &&
-              find vortx-core \( -path vortx-core/target -o -path vortx-core/target-andx \) -prune -o \
-                -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$VORTX_JNI_SOURCE_MANIFEST.current") || return 1
-            cmp --silent "$VORTX_JNI_SOURCE_MANIFEST" "$VORTX_JNI_SOURCE_MANIFEST.current" || return 1
-            test "$(sha256sum "$VORTX_JNI_LIBRARY" | cut -d' ' -f1)" = "$VORTX_JNI_EXPECTED_SHA256"
+          cat > "$scratch/host-only.init.gradle" <<'GRADLE'
+          gradle.taskGraph.whenReady { graph ->
+              def forbidden = graph.allTasks.findAll { task ->
+                  task.name ==~ /(?i)(cargo.*|.*externalNativeBuild.*|.*CMake.*|merge.*JniLib.*|assemble.*|bundle.*(Aar|Apk|Aab).*|package.*(Apk|Bundle).*|package(Full|Play)?(Debug|Release)|sign.*(Apk|Bundle|Release).*|validateSigning.*|install.*|connected.*|publish.*)/
+              }
+              if (!forbidden.empty) throw new GradleException("Only JVM host tasks are admitted")
+              def tests = graph.allTasks.findAll { it instanceof org.gradle.api.tasks.testing.Test }
+              if (tests*.path != [":app:testPlayDebugUnitTest"])
+                  throw new GradleException("Require the exact Play Debug JVM test task")
+              def testTask = tests[0]
+              testTask.maxParallelForks = 1
+              testTask.filter.failOnNoMatchingTests = true
+              testTask.ignoreFailures = false
+              testTask.outputs.upToDateWhen { false }
+              testTask.outputs.cacheIf { false }
           }
-          finish() {
-            result=$?
-            trap - EXIT
-            if ! verify_inputs; then exit 1; fi
-            exit "$result"
-          }
-          trap finish EXIT
-          verify_inputs
-          nice -n 15 ./gradlew :app:testPlayDebugUnitTest \
-            -Pkotlin.compiler.execution.strategy=in-process \
-            --init-script owner-history-hosted.init.gradle \
-            --tests com.vortx.android.engine.NativeOwnerHistoryRuntimeTest \
-            --tests com.vortx.android.engine.NativeOwnerHistoryCompatibilityTest \
-            --tests com.vortx.android.engine.NativeOwnerHistoryJniTest \
-            --tests 'com.vortx.android.engine.VortxNativeSessionTest.original encrypted checkpoint read cannot cross stores or survive ABA' \
-            --tests 'com.vortx.android.engine.VortxNativeSessionTest.captured absence is create only and tamper never becomes absence' \
-            --tests com.vortx.android.player.PlaybackMetadataTest \
-            --tests com.vortx.android.player.ExoPlayerEngineStatePolicyTest \
-            --no-daemon --max-workers=1 --no-parallel --no-build-cache --no-configuration-cache --stacktrace
+          GRADLE
 
-      - name: Retain actual host integration JUnit and bounded provenance
+          echo 'Running the exact Watch Next callback fixture.'
+          export VORTX_JNI_SYNC=1 VORTX_JNI_LIBRARY="$library"
+          export VORTX_ENGINE_CORE_DIR="$scratch/no-android-cross-build-workspace" VORTX_REQUIRE_ENGINE=0
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/30.0.16248370" ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/30.0.16248370"
+          export JAVA_TOOL_OPTIONS='-XX:ActiveProcessorCount=1'
+          gradle_results=android/app/build/test-results/testPlayDebugUnitTest
+          gradle_reports=android/app/build/reports/tests/testPlayDebugUnitTest
+          test ! -e "$gradle_results" && test ! -e "$gradle_reports"
+          status=0
+          (
+            cd android
+            timeout --signal=TERM --kill-after=30s 23m nice -n 15 \
+              ./gradlew :app:testPlayDebugUnitTest -I "$scratch/host-only.init.gradle" \
+              --no-daemon --max-workers=1 --no-parallel --no-configuration-cache --no-build-cache \
+              -Pkotlin.compiler.execution.strategy=in-process -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true \
+              --tests "$FIXTURE_CLASS.$FIXTURE_METHOD"
+          ) > "$scratch/private-gradle.log" 2>&1 || status=$?
+
+          results="$scratch/private-junit"
+          if [ -d "$gradle_results" ]; then mv -- "$gradle_results" "$results"; fi
+          if [ -d "$gradle_reports" ]; then mv -- "$gradle_reports" "$scratch/private-junit-html"; fi
+          verify_checkout
+          hash_source > "$scratch/source-after-runtime.sha256" 2>> "$scratch/private-manifest.log"
+          cmp --silent "$scratch/source-before.sha256" "$scratch/source-after-runtime.sha256"
+          test "$(sha256sum "$library" | cut -d' ' -f1)" = "$library_sha"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          if [ "$status" -ne 0 ]; then
+            echo 'Watch Next JVM fixture failed. Runner-private diagnostics were withheld.'
+            exit "$status"
+          fi
+          python3 -B - "$results" > "$scratch/private-junit-check.log" 2>&1 <<'PY'
+          import os
+          from pathlib import Path
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = Path(sys.argv[1])
+          name = os.environ['FIXTURE_CLASS']
+          report = root / f'TEST-{name}.xml'
+          assert set(root.rglob('*.xml')) == {report} and not report.is_symlink()
+          assert 0 < report.stat().st_size <= 1024 * 1024
+          suite = ET.parse(report).getroot()
+          assert suite.tag == 'testsuite' and suite.get('name') == name
+          assert suite.get('tests') == '1' and all(suite.get(key) == '0' for key in ('failures', 'errors', 'skipped'))
+          case, = suite.findall('testcase')
+          assert case.get('classname') == name and case.get('name') == os.environ['FIXTURE_METHOD']
+          assert suite.get('disabled', '0') == case.get('disabled', '0') == '0'
+          assert case.get('status', 'run').lower() in ('run', 'passed')
+          assert not any(suite.findall('.//' + key) for key in ('failure', 'error', 'skipped', 'disabled', 'ignored'))
+          PY
+          echo 'ANDROID_WATCH_NEXT_REAL_JNI: exact completed-roster callback passed (1 executed, 0 skipped, 0 failures, 0 errors)'
+
+      - name: Remove runner-private Watch Next inputs and results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: VortX-Android-owner-history-host-tests
-          path: |
-            android/app/build/test-results/testPlayDebugUnitTest/*.xml
-            android/app/build/reports/owner-history-host/host-jni.json
-          if-no-files-found: warn
-
-      # Build BOTH flavors. lint.abortOnError = true (app/build.gradle.kts) still gates each assemble.
-      #
-      # External sync credentials (Trakt device-code OAuth, SIMKL PIN flow) are injected here as env vars,
-      # which app/build.gradle.kts's externalSyncSecret() reads into BuildConfig (TraktAuth / SIMKLAuth).
-      # These are the SAME GitHub Actions secrets the Apple release CI uses (release-tvos.yml feeds them
-      # into the Info.plist): TRAKT_CLIENT_ID, TRAKT_CLIENT_SECRET, SIMKL_CLIENT_ID, SIMKL_CLIENT_SECRET.
-      # Absent secrets resolve to "" so the build still succeeds with the feature dormant (e.g. on a fork).
-      # Engine wiring:
-      #   VORTX_ENGINE_CORE_DIR  -> cargoNdkBuildVortxFfi's engine workspace.
-      #   VORTX_REQUIRE_ENGINE=1 -> the Vortx FFI task fails closed on missing source, cargo, or
-      #                             per-ABI output, so CI cannot package staged leftovers.
-      # Reproducibility: the cargo-ndk invocation passes --locked against the Cargo.lock at the exact
-      # private commit.
-      - name: Build debug APKs (full + play)
-        working-directory: android
-        env:
-          TRAKT_CLIENT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
-          TRAKT_CLIENT_SECRET: ${{ secrets.TRAKT_CLIENT_SECRET }}
-          SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
-          SIMKL_CLIENT_SECRET: ${{ secrets.SIMKL_CLIENT_SECRET }}
-          VORTX_ENGINE_CORE_DIR: ${{ github.workspace }}/vortx-core
-          VORTX_REQUIRE_ENGINE: "1"
-        run: ./gradlew assembleFullDebug assemblePlayDebug --no-daemon --stacktrace
-
-      # Fail loud if either flavor did not produce an APK (a path drift or a silently-skipped variant
-      # must fail the job, not pass with a missing artifact).
-      - name: Verify per-flavor APK presence
+        shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          full=(android/app/build/outputs/apk/full/debug/*.apk)
-          play=(android/app/build/outputs/apk/play/debug/*.apk)
-          if [ ${#full[@]} -eq 0 ]; then echo "::error::full-flavor debug APK missing"; exit 1; fi
-          if [ ${#play[@]} -eq 0 ]; then echo "::error::play-flavor debug APK missing"; exit 1; fi
-          echo "full APK(s): ${full[*]}"
-          echo "play APK(s): ${play[*]}"
-
-      # Native-only package proof: every APK must contain exactly one libvortx_ffi.so for each shipped
-      # ABI and no libstremiox_core.so, and the packaged bytes must match fresh src/main/jniLibs output
-      # after identical pinned llvm-strip normalization. The shared verifier checks ELF architecture,
-      # kernel/server JNI exports, and the resource-host ABI; it records the exact private source SHA,
-      # feature set, and normalized hashes.
-      - name: Verify native-only .so in every APK
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          READELF="$ANDROID_HOME/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
-          STRIP="$ANDROID_HOME/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-          test -x "$READELF" || { echo "::error::pinned NDK llvm-readelf unavailable"; exit 1; }
-          test -x "$STRIP" || { echo "::error::pinned NDK llvm-strip unavailable"; exit 1; }
-          full_apks=(android/app/build/outputs/apk/full/debug/*.apk)
-          play_apks=(android/app/build/outputs/apk/play/debug/*.apk)
-          if [ ${#full_apks[@]} -ne 1 ] || [ ${#play_apks[@]} -ne 1 ]; then
-            echo "::error::expected exactly one Full APK and one Play APK to verify native-only packaging"
-            exit 1
+          scratch="${VORTX_WATCH_NEXT_PRIVATE_DIR:-}"
+          if [ -n "$scratch" ]; then
+            prefix="$RUNNER_TEMP/vortx-watch-next-private."
+            suffix="${scratch#"$prefix"}"
+            [[ "$suffix" =~ ^[A-Za-z0-9]{8}$ && "$scratch" == "$prefix$suffix" ]] || exit 1
+            test ! -L "$scratch"
+            rm -rf -- "$scratch"
           fi
-          apks=("${full_apks[@]}" "${play_apks[@]}")
-          READELF="$READELF" STRIP="$STRIP" bash scripts/verify-native-android-artifacts.sh \
-            --native-only \
-            --staged-dir android/app/src/main/jniLibs \
-            --source-sha "$VORTX_ENGINE_SOURCE_SHA" \
-            "${apks[@]}"
-
-      # Licensing boundary gate: the `play` flavor must be free of the GPLv3 mpv/ffmpeg native libs
-      # (they ship only via fullImplementation). libmpv.so is the canonical marker; the sibling libs
-      # from the same AAR are scanned too. Any hit fails the build.
-      - name: GPL scan (play flavor must not contain libmpv)
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          gpl_pattern='lib(mpv|player|avcodec|avformat|avutil)\.so'
-          fail=0
-          for apk in android/app/build/outputs/apk/play/debug/*.apk; do
-            # Capture the full listing first so grep never SIGPIPEs unzip under pipefail
-            # (a short-circuiting grep -q on a long listing would make the step falsely pass).
-            listing="$(unzip -l "$apk")"
-            if grep -Eq "$gpl_pattern" <<<"$listing"; then
-              echo "::error::GPL native lib found in play APK: $apk"
-              grep -E "$gpl_pattern" <<<"$listing" || true
-              fail=1
-            fi
-          done
-          if [ "$fail" -ne 0 ]; then exit 1; fi
-          echo "play flavor is clean of libmpv/ffmpeg GPL native libs"
-
-      - name: Upload full-flavor APK
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: VortX-Android-full-debug
-          path: android/app/build/outputs/apk/full/debug/*.apk
-          if-no-files-found: error
-
-      - name: Upload play-flavor APK
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: VortX-Android-play-debug
-          path: android/app/build/outputs/apk/play/debug/*.apk
-          if-no-files-found: error
-
-      # ---- Signed release build (W0-3) -----------------------------------------------------------
-      # Everything above (debug build + engine verification + debug uploads) is unchanged and always
-      # runs. The signed release is ADDITIVE and gated on the upload keystore being provisioned: when
-      # ANDROID_KEYSTORE_BASE64 is absent (a fork, or before the owner sets the secrets) the steps
-      # below skip and the job still succeeds on the debug artifacts. The release is the sideloaded
-      # `full` flavor (mirrors the Apple sideload-IPA model); the GPL-gated `play` flavor is a separate
-      # Play-Store concern. VORTX_REQUIRE_ENGINE=1 requires fresh Vortx FFI output and the native-only
-      # artifact verifier rejects missing, stale, or legacy Stremio JNI libraries.
-      #
-      # Secrets cannot be referenced directly in a step `if:`, so this preflight promotes their
-      # presence to an output the later steps gate on. It reveals only whether the secret is set,
-      # never its value.
-      - name: Preflight release signing (gate on keystore secret)
-        id: signing
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        run: |
-          set -euo pipefail
-          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-            echo "upload keystore secret present; a signed release will be built"
-          else
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::ANDROID_KEYSTORE_BASE64 not set; skipping the signed release build (debug artifacts unaffected)"
-          fi
-
-      # Decode the base64 keystore secret to a temp file OUTSIDE the workspace so it is never picked up
-      # by a gradle source set or an artifact glob. Fail closed if the decode yields an empty file.
-      - name: Decode upload keystore
-        if: steps.signing.outputs.ready == 'true'
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/signing"
-          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/signing/upload.jks"
-          test -s "$RUNNER_TEMP/signing/upload.jks" || { echo "::error::decoded keystore is empty (bad ANDROID_KEYSTORE_BASE64)"; exit 1; }
-
-      # Build the signed release APK + AAB for the sideloaded `full` flavor. Same engine wiring as the
-      # debug build above; the immutable private pin remains checked. The
-      # VORTX_* signing env vars are exactly what app/build.gradle.kts's signingSecret() reads; with all
-      # four set, its release signingConfig activates and signs the outputs.
-      - name: Build signed release (full flavor APK + AAB)
-        if: steps.signing.outputs.ready == 'true'
-        working-directory: android
-        env:
-          TRAKT_CLIENT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
-          TRAKT_CLIENT_SECRET: ${{ secrets.TRAKT_CLIENT_SECRET }}
-          SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
-          SIMKL_CLIENT_SECRET: ${{ secrets.SIMKL_CLIENT_SECRET }}
-          VORTX_ENGINE_CORE_DIR: ${{ github.workspace }}/vortx-core
-          VORTX_REQUIRE_ENGINE: "1"
-          VORTX_KEYSTORE_PATH: ${{ runner.temp }}/signing/upload.jks
-          VORTX_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          VORTX_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          VORTX_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: ./gradlew assembleFullRelease bundleFullRelease --no-daemon --stacktrace
-
-      # Signing-variable mapping assertion (fail-closed): prove the release build exports exactly
-      # the four signing variables Gradle reads (build.gradle.kts:38-43), and Gradle maps exactly
-      # those four names through signingSecret(). The assertion runs unconditionally (not gated on
-      # steps.signing.outputs.ready) because this source contract must hold even when secrets are absent.
-      - name: Assert release signing-variable mapping (exact four canonical vars)
-        run: |
-          set -euo pipefail
-          wf=".github/workflows/android.yml"
-          gradle="android/app/build.gradle.kts"
-          fail=0
-          # Extract the authoritative blocks before checking them. Do not search this whole workflow:
-          # the assertions below intentionally name forbidden values and regular expressions.
-          release_env="$(
-            awk '
-              $0 == "      - name: Build signed release (full flavor APK + AAB)" { in_release_step=1; next }
-              in_release_step && /^      - name:/ { exit }
-              in_release_step && /^        env:$/ { in_env=1; next }
-              in_env && /^          [[:alpha:]_][[:alnum:]_]*:/ { print; next }
-              in_env { exit }
-            ' "$wf"
-          )"
-          gradle_inputs="$(
-            awk '
-              /^val releaseSigningInputs = mapOf\(/ { in_inputs=1 }
-              in_inputs { print }
-              in_inputs && /^\)$/ { exit }
-            ' "$gradle"
-          )"
-          # 1. Gradle declares exactly these four variable names in its release-signing input map.
-          normalized_gradle_inputs="$(tr -d '[:space:]' <<<"$gradle_inputs")"
-          canonical_gradle_inputs='valreleaseSigningInputs=mapOf("VORTX_KEYSTORE_PATH"tosigningSecret("VORTX_KEYSTORE_PATH"),"VORTX_KEYSTORE_PASSWORD"tosigningSecret("VORTX_KEYSTORE_PASSWORD"),"VORTX_KEY_ALIAS"tosigningSecret("VORTX_KEY_ALIAS"),"VORTX_KEY_PASSWORD"tosigningSecret("VORTX_KEY_PASSWORD"),)'
-          for var in VORTX_KEYSTORE_PATH VORTX_KEYSTORE_PASSWORD VORTX_KEY_ALIAS VORTX_KEY_PASSWORD; do
-            grep -qF "\"$var\"tosigningSecret(\"$var\")" <<<"$normalized_gradle_inputs" \
-              || { echo "::error::Gradle signing contract missing $var in $gradle"; fail=1; }
-          done
-          if [ "$normalized_gradle_inputs" != "$canonical_gradle_inputs" ]; then
-            echo "::error::$gradle releaseSigningInputs must exactly match the canonical four-entry signing map"
-            fail=1
-          fi
-          # 2. This workflow exports exactly those four signing keys under the release-build step.
-          for var in VORTX_KEYSTORE_PATH VORTX_KEYSTORE_PASSWORD VORTX_KEY_ALIAS VORTX_KEY_PASSWORD; do
-            grep -qE "^[[:space:]]*${var}:" <<<"$release_env" \
-              || { echo "::error::$wf does not export $var for the release build"; fail=1; }
-          done
-          release_signing_key_count="$(grep -Ec '^[[:space:]]*VORTX_KEY[[:alnum:]_]*:' <<<"$release_env" || true)"
-          if [ "$release_signing_key_count" -ne 4 ]; then
-            echo "::error::$wf release build must export exactly four VORTX_KEY* signing variables"
-            fail=1
-          fi
-          if [ "$fail" -ne 0 ]; then exit 1; fi
-          echo "ok: release signing-variable mapping holds (exactly 4 canonical vars)"
-
-      # Remove the decoded keystore as soon as the build is done, whatever the outcome.
-      - name: Shred decoded keystore
-        if: always()
-        run: rm -f "$RUNNER_TEMP/signing/upload.jks" || true
-
-      # Run the same v2 + PEM certificate + pinned-production-identity verifier used by the release
-      # lane, so candidate CI catches signer-policy and parser regressions before publication.
-      - name: Verify signed release artifacts against the pinned production signer
-        if: steps.signing.outputs.ready == 'true'
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          apks=(android/app/build/outputs/apk/full/release/*.apk)
-          bundles=(android/app/build/outputs/bundle/fullRelease/*.aab)
-          if [ ${#apks[@]} -ne 1 ] || [ ${#bundles[@]} -ne 1 ]; then
-            echo "::error::expected one signed full release APK and one signed full release AAB"; exit 1
-          fi
-          scripts/verify-android-release-signing.sh verify "${apks[@]}" "${bundles[@]}"
-          READELF="$ANDROID_HOME/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
-          STRIP="$ANDROID_HOME/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
-            bash scripts/verify-native-android-artifacts.sh \
-              --native-only --staged-dir android/app/src/main/jniLibs \
-              --source-sha "$VORTX_ENGINE_SOURCE_SHA" "${apks[@]}" "${bundles[@]}"
-
-      - name: Upload signed release APK
-        if: steps.signing.outputs.ready == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: VortX-Android-full-release-signed
-          path: android/app/build/outputs/apk/full/release/*.apk
-          if-no-files-found: error
-
-      - name: Upload signed release AAB
-        if: steps.signing.outputs.ready == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: VortX-Android-full-release-bundle
-          path: android/app/build/outputs/bundle/fullRelease/*.aab
-          if-no-files-found: error
