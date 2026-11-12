@@ -20,7 +20,7 @@ class NativeWebsiteRosterReceiptStoreTest {
     private val accountId = UUID.randomUUID().toString()
     private val anotherAccount = UUID.randomUUID().toString()
     private val key = ByteArray(32) { it.toByte() }
-    private val field = "websiteRosterDenialReceipt.$accountId"
+    private val field = NativeWebsiteRosterReceiptStore.storageKey(accountId, key)
     private val backingName = NativeSettingsFence.RestoreAuxiliaryBacking.SYNC_STATE.fileName
 
     @Test fun firstReceiptSurvivesNewManagerAndCannotBeReplaced() {
@@ -68,8 +68,15 @@ class NativeWebsiteRosterReceiptStoreTest {
         assertEquals(NativeWebsiteRosterReceiptStore.State.Unavailable, store.retainFirst(accountId, key, evidence()))
         assertEquals(malformed, prefs.all[field])
 
-        assertTrue(prefs.edit().putString(field, evidence().encode()).commit())
-        assertEquals(NativeWebsiteRosterReceiptStore.State.Unavailable, store.load(accountId, ByteArray(32)))
+        val original = evidence().encode()
+        val replacementKey = ByteArray(32)
+        val replacementField = NativeWebsiteRosterReceiptStore.storageKey(accountId, replacementKey)
+        assertTrue(prefs.edit().putString(field, original).commit())
+        assertFalse(field == replacementField)
+        assertEquals(NativeWebsiteRosterReceiptStore.State.Absent, store.load(accountId, replacementKey))
+        assertEquals(original, encoded(store.load(accountId, key)))
+        assertTrue(prefs.edit().putString(replacementField, original).commit())
+        assertEquals(NativeWebsiteRosterReceiptStore.State.Unavailable, store.load(accountId, replacementKey))
         assertEquals(NativeWebsiteRosterReceiptStore.State.Unavailable, store.load(accountId, ByteArray(31)))
     }
 
