@@ -174,7 +174,13 @@ jobs:
           NODE
 
   build-tvos:
-    if: github.event_name != 'release' && inputs.resume_handoff == '' && inputs.publish_existing_055 != true
+    if: >-
+      github.repository == 'VortXTV/VortX' && github.actor == 'mamaclapper' &&
+      github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-device-test.1' &&
+      inputs.native_only == true && inputs.publish_release != true && inputs.publish_existing_055 != true &&
+      inputs.tvos_test_only != true && inputs.apple_only != true && inputs.release_tag == '' &&
+      inputs.release_id == '' && inputs.resume_handoff == '' && inputs.recovery_source_commit == '' &&
+      inputs.mpvkit_artifacts_url == '' && inputs.mpvkit_artifacts_sha256 == '' && inputs.altstore_note == ''
     outputs:
       source_sha: ${{ env.BUILD_SOURCE_SHA }}
       apps_id: ${{ steps.apps_handoff.outputs.artifact-id }}
@@ -185,22 +191,15 @@ jobs:
     # outside the approved build lanes. Release events intentionally skip this job and run only the
     # immutable published-release verifier below.
     #
-    # Read-only-build vs release-write split (amended): the feed-artifact lane inside this
-    # job must fail-closed VERIFY the target draft (id, tag, draft/prerelease bits).
-    # Stable tags are non-prereleases; beta tags retain that bit unless the exact Latest-beta
-    # release-body marker authorizes the strict beta.N channel exception checked below.
-    # before any release bytes are built, and GitHub only exposes draft releases to
-    # `contents: write` tokens. This job therefore carries `contents: write`, reachable only
-    # through the manually approved `engine-ci` environment gate above. Asset attachment,
-    # feed promotion, and publication remain isolated in `attach-release` below.
+    # This immutable device-test ref has no draft target or release-writing step.
     permissions:
-      contents: write
+      contents: read
     environment: engine-ci
     # Pin the known-good arm64 lane explicitly. `macos-latest` is a moving alias, while macos-15
     # tops out below the Xcode 26.6 / tvOS SDK 26.5 release floor enforced below.
     runs-on: macos-26
-    # Cold native SDK, simulator and four device-app builds can exceed 150 minutes.
-    timeout-minutes: 210
+    # A previous cold all-Apple build reached the 210-minute limit during macOS compilation.
+    timeout-minutes: 270
     env:
       # Push events have no dispatch inputs. The dispatch input is kept for compatibility with the
       # release tooling; an explicit false is rejected before anything is fetched or built.
@@ -214,7 +213,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 2
           persist-credentials: false
+
+      - name: Verify the exact device-test source and workflow boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
+          test "$GITHUB_WORKFLOW_REF" = 'VortXTV/VortX/.github/workflows/release-tvos.yml@refs/tags/v0.5.6-device-test.1'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA 4bd35a218bcee8b2e2d698671574539a1fa358f4"
+          test "$(git diff --name-only HEAD^ HEAD)" = "$(printf '%s\n' \
+            .github/workflows/release-tvos.yml scripts/verify-protected-apple-aether.py)"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          printf 'Verified device-test source 4bd35a218bcee8b2e2d698671574539a1fa358f4 on exact attempt 1.\n'
 
       # Retain this historical step name: coordinator resumes authenticate it in original runs.
       - name: Validate immutable Beta 1 source recovery
@@ -854,7 +868,8 @@ jobs:
 
       - name: Resolve pinned Apple Aether release packages
         if: github.event_name == 'workflow_dispatch' &&
-          (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' || github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1')
+          (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' || github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' ||
+          github.ref == 'refs/tags/v0.5.6-device-test.1')
         run: |
           set -euo pipefail
           jq -e '.inputs == {
@@ -1274,7 +1289,8 @@ jobs:
           MAC_APP="app/build/ci-mac/Build/Products/Release/VortX.app"
           if [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ] &&
              { [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.12-candidate.3 ] ||
-               [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.13-candidate.1 ]; }; then
+               [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.13-candidate.1 ] ||
+               [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-device-test.1 ]; }; then
             python3 scripts/verify-protected-apple-aether.py --sign-macos --key macos \
               --packages "$AETHER_RELEASE_PACKAGES" --lock "$AETHER_RELEASE_LOCK" \
               --resolution-receipt "$AETHER_RELEASE_EVIDENCE/aether-resolved.json" \
@@ -1310,7 +1326,8 @@ jobs:
 
       - name: Verify packaged Apple Aether linkage
         if: github.event_name == 'workflow_dispatch' &&
-          (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' || github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1')
+          (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' || github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' ||
+          github.ref == 'refs/tags/v0.5.6-device-test.1')
         run: |
           set -euo pipefail
           check_app() {
@@ -1574,7 +1591,8 @@ jobs:
 
       - name: Upload protected Apple Aether release evidence
         if: github.event_name == 'workflow_dispatch' &&
-          (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' || github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1')
+          (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' || github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' ||
+          github.ref == 'refs/tags/v0.5.6-device-test.1')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-Apple-Aether-release-evidence
