@@ -34,6 +34,7 @@ fun HomeCatalogSnapshotBrowseScreen(
     onBack: () -> Unit,
     onItem: (MetaItem) -> Unit,
     modifier: Modifier = Modifier,
+    onLocalResume: (MetaItem) -> Unit = onItem,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     Column(modifier.fillMaxSize().navigationBarsPadding()) {
@@ -51,7 +52,12 @@ fun HomeCatalogSnapshotBrowseScreen(
                 } else {
                     catalog.statusMessage?.let { Text(it, style = VortXTheme.type.label, modifier = Modifier.padding(VortXTheme.spacing.edge)) }
                     PosterGrid(catalog.items, { item ->
-                        if (catalog.id != "continue" || viewModel.isContinueWatchingTapCurrent(item)) onItem(item)
+                        when {
+                            catalog.id != "continue" -> onItem(item)
+                            !viewModel.isContinueWatchingTapCurrent(item) -> Unit
+                            catalog.readOnly -> onItem(item)
+                            else -> viewModel.localContinueWatchingResume(item)?.let(onLocalResume)
+                        }
                     }, emptyHint = catalog.statusMessage ?: "This catalog has no titles right now.", showMenu = !catalog.readOnly)
                 }
             }

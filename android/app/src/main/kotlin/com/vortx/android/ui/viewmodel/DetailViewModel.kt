@@ -279,6 +279,19 @@ internal fun currentAssembledBest(
         state.streamId == request.targetId
 }
 
+/** The remembered row has transport evidence but no historical configured-instance identity. */
+internal fun matchingRememberedEpisodeSource(groups: List<StreamGroup>, saved: StreamSource): StreamSource? {
+    if (saved.url.isNullOrBlank() && saved.infoHash.isNullOrBlank() && saved.nzbUrl.isNullOrBlank()) return null
+    val group = groups.singleOrNull { it.addon == saved.addon || it.streams.any { row -> row.addon == saved.addon } }
+        ?: return null
+    if (group.base.isBlank() || groups.count { it.sourceInstanceId == group.sourceInstanceId } != 1) return null
+    return group.streams.singleOrNull {
+        it.id == saved.id && it.addon == saved.addon && it.url == saved.url && it.infoHash == saved.infoHash &&
+            it.fileIdx == saved.fileIdx && it.nzbUrl == saved.nzbUrl && it.usenetKnownHash == saved.usenetKnownHash &&
+            it.fileMustInclude == saved.fileMustInclude && it.isTorrent == saved.isTorrent
+    }
+}
+
 internal fun bestSourceForCurrentRequest(
     state: com.vortx.android.engine.SourceListState,
     request: SourceRequestFence.Token?,
@@ -2426,14 +2439,29 @@ class DetailViewModel(
     fun resumeAvailable(): Boolean = resumeOffsetMs() > 0L
 
     /** WHY audit R01: Home's first CW hero restores the persisted exact source through CWResume. */
-    fun playLastStream(): Boolean {
+    fun playLastStream(expectedEpisode: PreferredEpisode? = null): Boolean {
         if (!isRouteAdmissionCurrent()) return false
-        val saved = lastStreamStore.load()?.takeIf { it.mediaId == id && it.mediaType == type } ?: return false
+        val saved = lastStreamStore.load()?.takeIf {
+            it.mediaId == id && it.mediaType == type && !it.url.startsWith("file:", ignoreCase = true)
+        } ?: return false
+        if (expectedEpisode != null && (expectedEpisode.upNext || expectedEpisode.videoIdentity.isNullOrBlank() ||
+                saved.mediaRef?.let { it.isSeries && it.season == expectedEpisode.season && it.episode == expectedEpisode.episode } != true))
+            return false
         viewModelScope.launch {
             val streamState = com.vortx.android.home.continueWatchingAdmittedResult(continueWatchingAdmission) {
                 Result.success(streams.first { it !is UiState.Loading })
             }.getOrNull() ?: return@launch
             if (streamState !is UiState.Success) return@launch
+            if (expectedEpisode != null) {
+                if (_selectedEpisodeId.value != expectedEpisode.videoIdentity ||
+                    currentModelEpisode()?.let { it.season == expectedEpisode.season && it.episode == expectedEpisode.episode } != true)
+                    return@launch
+                val source = matchingRememberedEpisodeSource(streamState.data, saved.source) ?: return@launch
+                if (!isRouteAdmissionCurrent() || _selectedEpisodeId.value != expectedEpisode.videoIdentity ||
+                    streams.value !== streamState) return@launch
+                play(source, manualPick = false, startPositionOverrideMs = saved.positionMs)
+                return@launch
+            }
             val owner = debridKeys.ownerToken()
             val service = saved.debridService
             if (owner != null && service != null) {

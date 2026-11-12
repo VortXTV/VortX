@@ -5,8 +5,13 @@ import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
+import com.vortx.android.model.MetaItem
+import com.vortx.android.model.PreferredEpisode
 import com.vortx.android.model.Playable
 import com.vortx.android.model.PlaybackContext
+import com.vortx.android.model.StreamGroup
+import com.vortx.android.model.StreamSource
+import com.vortx.android.ui.viewmodel.matchingRememberedEpisodeSource
 import com.vortx.android.player.autoSkipMediaIdentity
 import com.vortx.android.player.DownloadedNaturalEndAdmission
 import com.vortx.android.player.PlayerState
@@ -80,6 +85,51 @@ class OfflinePlaybackIdentityTest {
         assertEquals(0L, playableDownloadResumeMs(2_160_000L, 2_400_000L))
         assertEquals(0L, playableDownloadResumeMs(120_000L, 0L))
         assertEquals(0L, playableDownloadResumeMs(-1L, 2_400_000L))
+    }
+
+    @Test
+    fun continueWatchingMovieMatchesOnlyExactCompletedCopy() {
+        val movie = movieRecord()
+        val item = MetaItem(movie.contentId, MediaType.MOVIE, movie.name)
+        val target = requireNotNull(continueWatchingDownloadTarget(item))
+        assertTrue(target.matches(movie))
+        assertFalse(target.matches(movie.copy(contentId = "other")))
+        assertFalse(target.matches(movie.copy(videoId = "other")))
+        assertFalse(target.matches(movie.copy(episode = 1)))
+        assertFalse(target.matches(movie.copy(state = DownloadState.PAUSED)))
+        assertNull(continueWatchingDownloadTarget(item.copy(watched = true)))
+        assertNull(continueWatchingDownloadTarget(item.copy(continueWatchingUnavailableMessage = "unavailable")))
+    }
+
+    @Test
+    fun continueWatchingSeriesRequiresExactUnfinishedEpisodeAndCoordinates() {
+        val episode = episodeRecord()
+        val hint = PreferredEpisode(3, 1, episode.videoId)
+        val item = MetaItem(episode.contentId, MediaType.SERIES, episode.name, preferredEpisode = hint, watched = true)
+        val target = requireNotNull(continueWatchingDownloadTarget(item))
+        assertTrue(target.matches(episode))
+        assertFalse(target.matches(episode.copy(contentId = "other")))
+        assertFalse(target.matches(episode.copy(videoId = "other:3:1")))
+        assertFalse(target.matches(episode.copy(season = 4)))
+        assertFalse(target.matches(episode.copy(episode = 2)))
+        assertNull(continueWatchingDownloadTarget(item.copy(preferredEpisode = null)))
+        assertNull(continueWatchingDownloadTarget(item.copy(preferredEpisode = hint.copy(videoIdentity = null))))
+        assertNull(continueWatchingDownloadTarget(item.copy(preferredEpisode = hint.copy(upNext = true))))
+        assertNull(continueWatchingDownloadTarget(item.copy(preferredEpisode = hint.copy(episode = 0))))
+    }
+
+    @Test
+    fun continueWatchingRememberedEpisodeSourceRejectsInstanceAndPhysicalFileAmbiguity() {
+        val saved = StreamSource("source", "Configured", "Episode", isTorrent = true, infoHash = "hash", fileIdx = 3)
+        val current = saved.copy(nativePlaybackToken = "fresh-lease")
+        val group = StreamGroup(saved.addon, listOf(current), base = "https://example.test/config-a")
+        assertTrue(matchingRememberedEpisodeSource(listOf(group), saved) === current)
+        assertNull(matchingRememberedEpisodeSource(listOf(group.copy(base = "")), saved))
+        assertNull(matchingRememberedEpisodeSource(listOf(group, group.copy(addon = "Alias", streams = emptyList())), saved))
+        assertNull(matchingRememberedEpisodeSource(listOf(group, group.copy(base = "https://example.test/config-b",
+            streams = listOf(current.copy(id = "another-source")))), saved))
+        assertNull(matchingRememberedEpisodeSource(listOf(group.copy(streams = listOf(current, current))), saved))
+        assertNull(matchingRememberedEpisodeSource(listOf(group.copy(streams = listOf(current.copy(fileIdx = 4)))), saved))
     }
 
     private fun movieRecord() = DownloadRecord(

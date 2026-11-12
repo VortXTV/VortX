@@ -91,6 +91,7 @@ fun TvHomeScreen(
     reselectSignal: Int = 0,
     onImportedCollections: (() -> Unit)? = null,
     importedReturnSignal: Int = 0,
+    onLocalResume: (MetaItem) -> Unit = onItem,
 ) {
     androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_RESUME) { viewModel.refreshContinueWatchingOnFocus() }
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -149,6 +150,7 @@ fun TvHomeScreen(
                     onItem = { item ->
                         if (item.continueWatchingPermit == null || viewModel.isContinueWatchingTapCurrent(item)) onItem(item)
                     },
+                    onLocalResume = { item -> viewModel.localContinueWatchingResume(item)?.let(onLocalResume) },
                     onRemoveFromContinueWatching = viewModel::removeFromContinueWatching,
                     captureContinueWatchingAdmission = viewModel::captureContinueWatchingAdmission,
                     onLoadRowPage = viewModel::loadNextPage,
@@ -176,6 +178,7 @@ private fun TvHomeContent(
     onImportedCollections: (() -> Unit)?,
     importedReturnSignal: Int,
     onItem: (MetaItem) -> Unit,
+    onLocalResume: (MetaItem) -> Unit,
     onRemoveFromContinueWatching: (MetaItem) -> Unit,
     captureContinueWatchingAdmission: (MetaItem) -> com.vortx.android.home.ContinueWatchingAdmission?,
     onLoadRowPage: (Catalog) -> Unit,
@@ -278,6 +281,7 @@ private fun TvHomeContent(
             TvCatalogWall(
                 catalogs = visibleCatalogs,
                 onItem = onItem,
+                onLocalResume = onLocalResume,
                 onFocused = ::acceptFocus,
                 onRemoveFromContinueWatching = onRemoveFromContinueWatching,
                 captureContinueWatchingAdmission = captureContinueWatchingAdmission,
@@ -327,6 +331,7 @@ private fun TvHomeContent(
                             TvCatalogRow(
                                 catalog = catalog,
                                 onItem = onItem,
+                                onClickItem = if (tvUsesLocalContinueWatchingResume(catalog)) onLocalResume else onItem,
                                 onFocused = { acceptFocus(catalog.id, it) },
                                 onRemoveFromContinueWatching = onRemoveFromContinueWatching,
                                 captureContinueWatchingAdmission = captureContinueWatchingAdmission,
@@ -351,10 +356,11 @@ private fun TvHomeContent(
         }
     }
     browseCatalogId?.let { id ->
+        val catalog = visibleCatalogs.firstOrNull { it.id == id }
         TvHomeCatalogBrowse(
-            catalog = visibleCatalogs.firstOrNull { it.id == id },
+            catalog = catalog,
             onBack = ::closeCatalog,
-            onItem = onItem,
+            onItem = if (catalog != null && tvUsesLocalContinueWatchingResume(catalog)) onLocalResume else onItem,
             onLoadNextPage = onLoadRowPage,
             onRemoveFromContinueWatching = onRemoveFromContinueWatching,
         )
@@ -403,6 +409,7 @@ private fun TvHomeContent(
 private fun TvCatalogRow(
     catalog: Catalog,
     onItem: (MetaItem) -> Unit,
+    onClickItem: (MetaItem) -> Unit,
     onFocused: (MetaItem) -> Unit,
     onRemoveFromContinueWatching: (MetaItem) -> Unit,
     captureContinueWatchingAdmission: (MetaItem) -> com.vortx.android.home.ContinueWatchingAdmission?,
@@ -471,7 +478,7 @@ private fun TvCatalogRow(
                     if (usesContinueWatchingCard) {
                         TvCinemaCard(
                             item = item,
-                            onClick = { onItem(item) },
+                            onClick = { onClickItem(item) },
                             onFocused = { onFocused(item); if (isContinueWatchingRow) focusedCwItem = item },
                             focusRequester = cardFocus,
                             width = TvPosterLayoutPolicy.continueWatchingWidth(viewportWidth),
@@ -481,7 +488,7 @@ private fun TvCatalogRow(
                         )
                     } else TvPosterCard(
                         item = item,
-                        onClick = { onItem(item) },
+                        onClick = { onClickItem(item) },
                         onFocused = {
                             onFocused(item)
                             if (menu == PosterCardMenu.CONTINUE_WATCHING) focusedCwItem = item
@@ -505,6 +512,7 @@ private fun TvCatalogRow(
 private fun TvCatalogWall(
     catalogs: List<Catalog>,
     onItem: (MetaItem) -> Unit,
+    onLocalResume: (MetaItem) -> Unit,
     onFocused: (String, MetaItem) -> Unit,
     onRemoveFromContinueWatching: (MetaItem) -> Unit,
     captureContinueWatchingAdmission: (MetaItem) -> com.vortx.android.home.ContinueWatchingAdmission?,
@@ -545,6 +553,7 @@ private fun TvCatalogWall(
                     TvCatalogRow(
                         catalog = catalog,
                         onItem = onItem,
+                        onClickItem = if (tvUsesLocalContinueWatchingResume(catalog)) onLocalResume else onItem,
                         onFocused = { onFocused(catalog.id, it) },
                         onRemoveFromContinueWatching = onRemoveFromContinueWatching,
                         captureContinueWatchingAdmission = captureContinueWatchingAdmission,
@@ -588,7 +597,9 @@ private fun TvCatalogWall(
                         val menu = posterMenuFor(catalog)
                         TvPosterCard(
                             item = item,
-                            onClick = { onItem(item) },
+                            onClick = {
+                                if (tvUsesLocalContinueWatchingResume(catalog)) onLocalResume(item) else onItem(item)
+                            },
                             onFocused = { onFocused(catalog.id, item) },
                             focusRequester = if (ownsFirstFocus) firstCardFocus else null,
                             menu = menu,
@@ -660,6 +671,9 @@ private fun TvCatalogHeader(
  */
 internal fun tvHomeCatalogs(catalogs: List<Catalog>): List<Catalog> =
     normalizeHomeCatalogs(catalogs)
+
+private fun tvUsesLocalContinueWatchingResume(catalog: Catalog): Boolean =
+    catalog.id == HomeRail.CONTINUE_CATALOG_ID && !catalog.readOnly
 
 internal fun tvIsContinueWatchingCatalog(catalog: Catalog): Boolean =
     catalog.id == HomeRail.CONTINUE_CATALOG_ID || HomeRail.forCatalog(catalog) == HomeRail.TRAKT_CONTINUE_WATCHING

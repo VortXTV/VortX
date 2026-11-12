@@ -5,6 +5,8 @@ import android.content.SharedPreferences
 import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
+import com.vortx.android.player.PlaybackOwnerEpoch
+import com.vortx.android.player.PlaybackOwnerToken
 import com.vortx.android.profile.ProfileStore
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -69,9 +71,18 @@ internal data class ContinueWatchingPermit(
 )
 
 /** Process-only capability. Never serialized; its immutable capture cannot adopt a newer route owner. */
-class ContinueWatchingAdmission internal constructor(private val acceptsCapture: () -> Boolean) {
-    fun isCurrent(): Boolean = runCatching(acceptsCapture).getOrDefault(false)
+class ContinueWatchingAdmission internal constructor(
+    internal val downloadedResumeOwner: PlaybackOwnerToken? = null,
+    internal val renderedDownloadId: String? = null,
+    private val acceptsCapture: () -> Boolean,
+) {
+    fun isCurrent(): Boolean = downloadedResumeOwner?.let(PlaybackOwnerEpoch::isCurrent) != false &&
+        runCatching(acceptsCapture).getOrDefault(false)
 }
+
+internal fun MetaItem.matchesContinueWatchingResume(other: MetaItem): Boolean =
+    id == other.id && type == other.type && preferredEpisode == other.preferredEpisode &&
+        watched == other.watched && continueWatchingUnavailableMessage == other.continueWatchingUnavailableMessage
 
 /** Both local and remote published cards carry their immutable, process-only route authority. */
 internal fun continueWatchingItemWithAdmission(item: MetaItem, token: String?, admission: ContinueWatchingAdmission?): MetaItem =

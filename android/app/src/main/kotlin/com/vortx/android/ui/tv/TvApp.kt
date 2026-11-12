@@ -35,6 +35,8 @@ import com.vortx.android.model.Playable
 import com.vortx.android.downloads.isDownloadedPlaybackOwnerCurrent
 import com.vortx.android.downloads.isDownloadedPlaybackAdmissionCurrent
 import com.vortx.android.downloads.nextDownloadedPlayback
+import com.vortx.android.downloads.DownloadedContinueWatchingRequest
+import com.vortx.android.downloads.DownloadedContinueWatchingResult
 import com.vortx.android.model.PreferredEpisode
 import com.vortx.android.VortXApplication
 import com.vortx.android.player.queue.PlaybackQueueState
@@ -219,6 +221,7 @@ fun TvApp(
             importedCollectionsEntry = java.util.UUID.randomUUID().toString()
         }
         var pendingLibraryPlay by remember { mutableStateOf<RandomTitlePlayRequest?>(null) }
+        var pendingLocalResume by remember { mutableStateOf<DownloadedContinueWatchingRequest?>(null) }
         var pendingQueuePlay by remember { mutableStateOf<PlaybackQueueToken?>(null) }
         var pendingQueueAccepted by remember { mutableStateOf(false) }
         var pendingQueueAutomatic by remember { mutableStateOf(false) }
@@ -267,13 +270,27 @@ fun TvApp(
             pendingQueuePlay = null
             pendingQueueAccepted = false
             pendingQueueAutomatic = false
-            if (pendingLibraryPlay == null) return
+            if (pendingLibraryPlay == null && pendingLocalResume == null) return
             // Revoke callbacks synchronously, before the bounded ViewModel owner is forgotten.
             pendingLibraryPlay = null
+            pendingLocalResume = null
             detailGeneration += 1
             detail = null
             playing = null
             playingMeta = null
+        }
+        fun openDetail(item: MetaItem, tryLocalResume: Boolean = false) {
+            if (fileRecoveryPausedNow() || item.continueWatchingAdmission?.isCurrent() == false) return
+            retireLibraryPlayRoute()
+            item.continueWatchingUnavailableMessage?.let { message ->
+                unavailableContinueWatching = "${item.name}\n\n$message"
+                return
+            }
+            detailGeneration += 1
+            detail = item
+            if (tryLocalResume) {
+                pendingLocalResume = DownloadedContinueWatchingRequest.capture(item, detailGeneration)
+            }
         }
         fun openLibraryPlay(item: MetaItem) {
             if (fileRecoveryPausedNow()) return
@@ -790,6 +807,29 @@ fun TvApp(
             val current = detail
             if (current != null) {
                 val routeGeneration = detailGeneration
+                val local = pendingLocalResume
+                if (local != null && local.detailGeneration == routeGeneration && detail === local.item) {
+                    LaunchedEffect(local) {
+                        fun ownsRoute() = pendingLocalResume === local &&
+                            detailGeneration == local.detailGeneration && detail === local.item
+                        fun canPlay() = ownsRoute() && playing == null && !fileRecoveryPausedNow() &&
+                            profileStore?.needsPicker == false && local.isCurrent()
+                        val result = if (canPlay()) local.open(appContext) else DownloadedContinueWatchingResult.Unavailable
+                        if (!ownsRoute()) return@LaunchedEffect
+                        val accepted = canPlay() && result is DownloadedContinueWatchingResult.Ready &&
+                            isDownloadedPlaybackAdmissionCurrent(result.playable)
+                        pendingLocalResume = null
+                        if (accepted && result is DownloadedContinueWatchingResult.Ready) {
+                            autoAdvanceStreak[0] = 0
+                            playingEngineOverride = automaticEngineFor(result.playable)
+                            playingMeta = null
+                            playing = result.playable
+                        }
+                    }
+                    BackHandler { retireLibraryPlayRoute() }
+                    TvLoading()
+                    return@TvMaterialTheme
+                }
                 val libraryPlayRequest = pendingLibraryPlay
                 val queuePlayRequest = pendingQueuePlay
                 val queuePlayAutomatic = pendingQueueAutomatic
@@ -1005,16 +1045,8 @@ fun TvApp(
                     importedCollectionsOpen = importedCollectionsEntry != null,
                     importedFromHome = importedFromHome,
                     importedReturnSignal = importedReturnSignal,
-                    onItem = {
-                        retireLibraryPlayRoute()
-                        if (it.continueWatchingAdmission?.isCurrent() != false) {
-                            if (it.continueWatchingUnavailableMessage != null) unavailableContinueWatching = "${it.name}\n\n${it.continueWatchingUnavailableMessage}"
-                            else {
-                                detailGeneration += 1
-                                detail = it
-                            }
-                        }
-                    },
+                    onItem = { openDetail(it) },
+                    onLocalResume = { openDetail(it, tryLocalResume = true) },
                     onDirectResume = ::openLibraryPlay,
                     // A finished download plays straight into the shared player slot (no detail page), the same
                     // slot a streamed source resolves into. Clears any stale detail meta so the player reads the

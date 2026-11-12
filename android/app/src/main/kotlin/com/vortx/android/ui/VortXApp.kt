@@ -100,6 +100,8 @@ import com.vortx.android.model.Playable
 import com.vortx.android.downloads.isDownloadedPlaybackOwnerCurrent
 import com.vortx.android.downloads.isDownloadedPlaybackAdmissionCurrent
 import com.vortx.android.downloads.nextDownloadedPlayback
+import com.vortx.android.downloads.DownloadedContinueWatchingRequest
+import com.vortx.android.downloads.DownloadedContinueWatchingResult
 import com.vortx.android.downloads.refreshDownloadedPlaybackAdmission
 import com.vortx.android.model.PreferredEpisode
 import com.vortx.android.model.StreamSource
@@ -231,7 +233,13 @@ import kotlinx.coroutines.launch
 private const val AUTO_ADD_AFTER_MS = 60_000L
 
 /** One-shot resume intent; type + id prevent an old card tap from arming a colliding later Detail route. */
-private data class DirectResumeTarget(val type: MediaType, val id: String)
+private data class DirectResumeTarget(
+    val type: MediaType,
+    val id: String,
+    val generation: Long,
+    val local: DownloadedContinueWatchingRequest?,
+    val localChecked: Boolean = false,
+)
 
 internal fun detailViewModelKey(
     prefix: String,
@@ -413,6 +421,14 @@ fun VortXApp(
         }
         var detailGeneration by remember { mutableStateOf(0L) }
         var playing by remember { mutableStateOf<Playable?>(null) }
+        val openDirectResume: (MetaItem) -> Unit = resume@{ item ->
+            if (!openDetail(item)) return@resume
+            detailGeneration += 1
+            val local = DownloadedContinueWatchingRequest.capture(item, detailGeneration)
+            // Up Next and sparse episode cards stay in Detail; their prior source is not a resume target.
+            if (local == null && item.continueWatchingAdmission?.downloadedResumeOwner != null) return@resume
+            pendingDirectResumeTarget = DirectResumeTarget(item.type, item.id, detailGeneration, local)
+        }
         // Session-only route chosen on Detail. It rides source retries and episode advances inside the same
         // player, but every non-detail launch below explicitly resets it to Automatic. No preference store is
         // mutated, so one title's choice cannot become the next title's global default.
@@ -623,6 +639,7 @@ fun VortXApp(
             showPlaybackQueue = false
             savedPlaylistOwner = null
             savedPlaylistStore = null
+            pendingDirectResumeTarget = null
             pendingRandomTitlePlayRequest = null
             pendingQueueToken = null
             pendingQueueAccepted = false
@@ -1828,6 +1845,10 @@ fun VortXApp(
                     target = target,
                     onBack = { catalogBrowseTarget = null },
                     onItem = onBrowseItem,
+                    onLocalResume = { item ->
+                        catalogBrowseTarget = null
+                        openDirectResume(item)
+                    },
                 )
                 return@VortXTheme
             }
@@ -1846,6 +1867,37 @@ fun VortXApp(
 
         val current = detail
         if (current != null) {
+            val resume = pendingDirectResumeTarget
+            val local = resume?.local
+            if (resume != null && local != null && !resume.localChecked && resume.generation == detailGeneration &&
+                current.type == resume.type && current.id == resume.id) {
+                LaunchedEffect(local) {
+                    fun ownsRoute() = pendingDirectResumeTarget === resume && detailGeneration == local.detailGeneration &&
+                        savedDetailId == local.item.id && savedDetailType == local.item.type.id
+                    fun canPlay() = ownsRoute() && playing == null && !fileRecoveryPausedNow() &&
+                        !showWhosWatching && profileStore?.needsPicker == false && local.isCurrent()
+                    val result = if (canPlay()) local.open(appContext) else DownloadedContinueWatchingResult.Unavailable
+                    if (!ownsRoute()) return@LaunchedEffect
+                    if (!canPlay()) {
+                        pendingDirectResumeTarget = null
+                        return@LaunchedEffect
+                    }
+                    pendingDirectResumeTarget = if (result == DownloadedContinueWatchingResult.Missing)
+                        resume.copy(localChecked = true) else null
+                    if (result is DownloadedContinueWatchingResult.Ready &&
+                        isDownloadedPlaybackAdmissionCurrent(result.playable)) {
+                        autoAdvanceStreak[0] = 0
+                        playingEngineOverride = automaticEngineFor(result.playable)
+                        playingMeta = null
+                        playing = result.playable
+                    }
+                }
+                BackHandler { openDetail(null) }
+                Box(Modifier.fillMaxSize(), contentAlignment = androidx.compose.ui.Alignment.Center) {
+                    androidx.compose.material3.CircularProgressIndicator()
+                }
+                return@VortXTheme
+            }
             // The generation boundary deliberately tears down DetailScreen's local person/nested-title
             // navigation when a new deep-link event targets the same media id again.
             key(current.type, current.id, detailGeneration) {
@@ -1875,10 +1927,14 @@ fun VortXApp(
                 )
                 LaunchedEffect(detailVm, pendingDirectResumeTarget) {
                     val target = pendingDirectResumeTarget
-                    if (target?.type == current.type && target.id == current.id) {
-                        // One attempt only. Cross-device history frequently has no local exact source;
-                        // that case remains a normal Detail screen and must never arm a later visit.
-                        detailVm.playLastStream()
+                    if (target?.type == current.type && target.id == current.id &&
+                        target.generation == detailGeneration) {
+                        val localStillCurrent = target.local?.let { target.localChecked && it.isCurrent() } ?: true
+                        if (localStillCurrent && !fileRecoveryPausedNow() && profileStore?.needsPicker == false &&
+                            current.continueWatchingAdmission?.isCurrent() != false) {
+                            // One attempt only. Cross-device history can lack a remembered source.
+                            detailVm.playLastStream(current.preferredEpisode.takeIf { target.local != null })
+                        }
                         pendingDirectResumeTarget = null
                     }
                 }
@@ -2174,11 +2230,7 @@ fun VortXApp(
                             viewModel = viewModel<HomeViewModel>(factory = factory),
                             onItem = onItem,
                             modifier = Modifier.weight(1f),
-                            onDirectResume = { item ->
-                                openDetail(item)
-                                pendingDirectResumeTarget = DirectResumeTarget(item.type, item.id)
-                                detailGeneration += 1
-                            },
+                            onDirectResume = openDirectResume,
                             onDiscover = if (hiddenTabs.hideDiscover) null else {
                                 {
                                     if (mergeHomeDiscover) savedHomeModeName = CinemaHomeMode.BROWSE.name
@@ -2202,11 +2254,7 @@ fun VortXApp(
                     landingViewModel = viewModel<LibraryLandingViewModel>(key = "library-history", factory = factory),
                     onItem = onCinemaItem,
                     modifier = content,
-                    onDirectResume = { item ->
-                        openDetail(item)
-                        pendingDirectResumeTarget = DirectResumeTarget(item.type, item.id)
-                        detailGeneration += 1
-                    },
+                    onDirectResume = openDirectResume,
                     onRandomPlay = onRandomLibraryPlay,
                     onDownloads = { showDownloads = true },
                     onWatchlist = { showWatchlist = true },

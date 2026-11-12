@@ -6,6 +6,8 @@ import com.vortx.android.engine.NativeCatalogRepository
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
 import com.vortx.android.model.Episode
+import com.vortx.android.model.MediaType
+import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.model.PlaybackContext
 import com.vortx.android.model.cwItemIsFinished
@@ -90,6 +92,92 @@ internal fun downloadedEpisode(records: List<DownloadRecord>, episode: Episode):
         it.type == "series" && it.videoId == episode.id && it.season == episode.season && it.episode == episode.episode
     }
 
+/** The card supplies a title and, for series, its exact current video and coordinates. */
+internal data class ContinueWatchingDownloadTarget(
+    val contentId: String,
+    val type: MediaType,
+    val videoId: String,
+    val season: Int? = null,
+    val episode: Int? = null,
+) {
+    fun matches(record: DownloadRecord): Boolean =
+        record.state == DownloadState.COMPLETED && record.contentId == contentId && record.type == type.id &&
+            record.videoId == videoId && record.season == season && record.episode == episode
+}
+
+internal fun continueWatchingDownloadTarget(item: MetaItem): ContinueWatchingDownloadTarget? {
+    if (item.id.isBlank() || item.continueWatchingUnavailableMessage != null) return null
+    return when (item.type) {
+        MediaType.MOVIE -> if (item.watched) null else ContinueWatchingDownloadTarget(item.id, item.type, item.id)
+        MediaType.SERIES -> {
+            val episode = item.preferredEpisode?.takeUnless { it.upNext } ?: return null
+            val video = episode.videoIdentity?.takeIf { it.isNotBlank() } ?: return null
+            if (episode.season < 0 || episode.episode <= 0) return null
+            ContinueWatchingDownloadTarget(item.id, item.type, video, episode.season, episode.episode)
+        }
+        else -> null
+    }
+}
+
+internal class DownloadedContinueWatchingRequest private constructor(
+    val item: MetaItem,
+    val detailGeneration: Long,
+    private val target: ContinueWatchingDownloadTarget,
+    private val owner: PlaybackContext.Owner,
+    private val ownerToken: PlaybackOwnerToken,
+    private val copy: Copy,
+) {
+    private sealed interface Copy {
+        data object Absent : Copy
+        data object Ambiguous : Copy
+        data class Exact(val id: String) : Copy
+    }
+
+    fun isCurrent(): Boolean = PlaybackOwnerEpoch.isCurrent(ownerToken) &&
+        activeDownloadedPlaybackOwner() == owner && item.continueWatchingAdmission?.isCurrent() == true
+
+    suspend fun open(context: Context): DownloadedContinueWatchingResult {
+        if (!isCurrent()) return DownloadedContinueWatchingResult.Unavailable
+        val record = when (copy) {
+            Copy.Absent -> return if (DownloadStore.records.value.none(target::matches))
+                DownloadedContinueWatchingResult.Missing else DownloadedContinueWatchingResult.Unavailable
+            Copy.Ambiguous -> return DownloadedContinueWatchingResult.Unavailable
+            is Copy.Exact -> DownloadStore.record(copy.id)?.takeIf(target::matches)
+                ?: return DownloadedContinueWatchingResult.Unavailable
+        }
+        val local = openDownloadedPlaybackWithResume(context, record, owner, ownerToken, episodeTitle = null)
+        return if (local != null && isCurrent()) DownloadedContinueWatchingResult.Ready(local)
+            else DownloadedContinueWatchingResult.Unavailable
+    }
+
+    companion object {
+        fun capture(item: MetaItem, detailGeneration: Long): DownloadedContinueWatchingRequest? {
+            val admission = item.continueWatchingAdmission ?: return null
+            val token = admission.downloadedResumeOwner ?: return null
+            if (!admission.isCurrent()) return null
+            val target = continueWatchingDownloadTarget(item) ?: return null
+            val owner = activeDownloadedPlaybackOwner()
+            // Preserve the hero's rendered copy or the exact tap-time index state, before any suspend.
+            val copy = admission.renderedDownloadId?.let { Copy.Exact(it) } ?: run {
+                val records = DownloadStore.records.value.filter(target::matches)
+                when (records.size) {
+                    0 -> Copy.Absent
+                    1 -> Copy.Exact(records.single().id)
+                    else -> Copy.Ambiguous
+                }
+            }
+            return DownloadedContinueWatchingRequest(item, detailGeneration, target, owner, token, copy)
+                .takeIf { it.isCurrent() }
+        }
+    }
+}
+
+internal sealed interface DownloadedContinueWatchingResult {
+    data object Missing : DownloadedContinueWatchingResult
+    data object Unavailable : DownloadedContinueWatchingResult
+    data class Ready(val playable: Playable) : DownloadedContinueWatchingResult
+}
+
 /** The local index can prove episode+1 within the same season. A source list cannot prove season finality. */
 internal fun immediateDownloadedSuccessor(
     current: PlaybackContext,
@@ -132,6 +220,16 @@ internal suspend fun openDownloadedPlayback(
 ): Playable? {
     val ownerToken = PlaybackOwnerEpoch.capture() ?: return null
     val owner = activeDownloadedPlaybackOwner()
+    return openDownloadedPlaybackWithResume(context, record, owner, ownerToken, episodeTitle)
+}
+
+private suspend fun openDownloadedPlaybackWithResume(
+    context: Context,
+    record: DownloadRecord,
+    owner: PlaybackContext.Owner,
+    ownerToken: PlaybackOwnerToken,
+    episodeTitle: String?,
+): Playable? {
     val local = openDownloadedPlayback(context, record, owner, ownerToken, episodeTitle) ?: return null
     val bound = local.playbackContext ?: return null
     val native = nativeDownloads(context)
@@ -161,7 +259,7 @@ internal suspend fun nextDownloadedPlayback(context: Context, ended: Playable): 
             DownloadStore.completedPlaybackFile(it) != null
         }
     } ?: return null
-    return openDownloadedPlayback(context, next, current.owner, admission.ownerToken, episodeTitle = null)
+    return openDownloadedPlaybackWithResume(context, next, current.owner, admission.ownerToken, episodeTitle = null)
 }
 
 /** Re-admit the same file for a new mount without replacing its original playback-owner token. */

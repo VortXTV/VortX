@@ -75,6 +75,7 @@ fun TvLibraryScreen(
     onNetworkShares: (() -> Unit)? = null,
     onDirectResume: (MetaItem) -> Unit = onItem,
     pickerActive: Boolean = true,
+    onLocalResume: (MetaItem) -> Unit = onItem,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val landingState by landingViewModel.state.collectAsStateWithLifecycle()
@@ -126,6 +127,9 @@ fun TvLibraryScreen(
                 onMarkWatched = viewModel::markWatched,
                 landingState = landingState,
                 onRetryLanding = landingViewModel::retry,
+                onLocalResume = { owner, item ->
+                    landingViewModel.localContinueWatchingResume(owner, item)?.let(onLocalResume)
+                },
                 onRemoveContinueWatching = landingViewModel::removeFromContinueWatching,
                 onDownloads = onDownloads,
                 onWatchlist = onWatchlist,
@@ -155,6 +159,7 @@ private fun TvLibraryContent(
     onMarkWatched: (MetaItem, Boolean) -> Unit,
     landingState: UiState<LibraryLandingResult>,
     onRetryLanding: () -> Unit,
+    onLocalResume: (com.vortx.android.data.ContinueWatchingOwner, MetaItem) -> Unit,
     onRemoveContinueWatching: (MetaItem) -> Unit,
     onDownloads: () -> Unit,
     onWatchlist: () -> Unit,
@@ -202,7 +207,11 @@ private fun TvLibraryContent(
                 }
                 is UiState.Success -> if (landing.data.continueWatching.isNotEmpty()) {
                     item(key = "library-continue-watching", span = { GridItemSpan(maxLineSpan) }) {
-                        TvContinueWatchingRail(landing.data.continueWatching, onItem, onRemoveContinueWatching)
+                        TvContinueWatchingRail(
+                            landing.data.continueWatching,
+                            { item -> onLocalResume(landing.data.owner, item) },
+                            onRemoveContinueWatching,
+                        )
                     }
                 }
             }

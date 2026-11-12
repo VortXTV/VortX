@@ -329,7 +329,9 @@ fun LibraryScreen(
                 is UiState.Success -> if (landing.data.continueWatching.isNotEmpty()) {
                     PosterRail(
                         catalog = Catalog("continue", "Continue Watching", landing.data.continueWatching),
-                        onItem = onDirectResume,
+                        onItem = { item ->
+                            landingViewModel.localContinueWatchingResume(landing.data.owner, item)?.let(onDirectResume)
+                        },
                         onRemoveFromContinueWatching = landingViewModel::removeFromContinueWatching,
                         eyebrow = "Pick up where you left off",
                     )

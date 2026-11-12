@@ -171,12 +171,16 @@ private fun HomeContent(
     val heroCandidates = remember(heroCatalogs) { PhoneHeroPolicy.candidates(heroCatalogs) }
     val initialHero = heroCandidates.firstOrNull()
     val savedStream = initialHero?.let { lastStreamStore.load() }
+    val downloadRecords by com.vortx.android.downloads.DownloadStore.records.collectAsStateWithLifecycle()
+    val renderedHeroDownload = initialHero?.let { com.vortx.android.downloads.continueWatchingDownloadTarget(it) }
+        ?.let { target -> downloadRecords.singleOrNull(target::matches)?.id }
     // WHY audit R01: direct resume belongs only to the first Continue Watching hero, never ordinary cards.
     // An up-next hero names a finished episode: it opens Detail on the next one, never replays the old link.
     val heroCanDirectResume = heroCatalog?.id == "continue" && !heroCatalog.readOnly && initialHero != null &&
-        initialHero.preferredEpisode?.upNext != true && savedStream?.let {
-        it.mediaId == initialHero.id && it.mediaType == initialHero.type && it.positionMs > 0L
-    } == true
+        initialHero.preferredEpisode?.upNext != true && (renderedHeroDownload != null || savedStream?.let {
+        it.mediaId == initialHero.id && it.mediaType == initialHero.type && it.positionMs > 0L &&
+            !it.url.startsWith("file:", ignoreCase = true)
+    } == true)
     val hubShown = collections.isVisible && !hubHidden
     val forYouUi by viewModel.forYouUi.collectAsStateWithLifecycle()
     // Capture the rendered load at opening; recomposition must not replace its authority.
@@ -239,7 +243,7 @@ private fun HomeContent(
                     },
                     // Direct resume remains an affordance only for the leading Continue Watching title.
                     onDirectResume = ({ item: MetaItem ->
-                        if (viewModel.isContinueWatchingTapCurrent(item)) onDirectResume(item)
+                        viewModel.localContinueWatchingResume(item, renderedHeroDownload)?.let(onDirectResume)
                     }).takeIf { heroCanDirectResume },
                     directResumeIdentity = initialHero.let(PhoneHeroPolicy::identity).takeIf { heroCanDirectResume },
                 )
@@ -274,7 +278,7 @@ private fun HomeContent(
                             when {
                                 catalog.id == "continue" && !viewModel.isContinueWatchingTapCurrent(item) -> Unit
                                 catalog.id == "continue" && catalog.readOnly -> onItem(item)
-                                catalog.id == "continue" -> onDirectResume(item)
+                                catalog.id == "continue" -> viewModel.localContinueWatchingResume(item)?.let(onDirectResume)
                                 onCatalogItem != null -> onCatalogItem(item)
                                 else -> onItem(item)
                             }

@@ -115,6 +115,7 @@ fun TvShell(
     importedFromHome: Boolean = true,
     importedReturnSignal: Int = 0,
     onOpenProfilePickerTools: (() -> Unit)? = null,
+    onLocalResume: (MetaItem) -> Unit = onItem,
 ) {
     val appContext = LocalContext.current.applicationContext
     // Bumped when the active tab is re-selected on the rail. A depth-aware destination (Add-ons) pops its own
@@ -260,7 +261,8 @@ fun TvShell(
                     } else {
                         TvHomeScreen(viewModel<HomeViewModel>(factory = factory), onItem, modifier = Modifier.weight(1f), reselectSignal = reselectSignal,
                             onImportedCollections = onImportedCollections?.let { open -> { open(true) } },
-                            importedReturnSignal = if (importedFromHome) importedReturnSignal else 0)
+                            importedReturnSignal = if (importedFromHome) importedReturnSignal else 0,
+                            onLocalResume = onLocalResume)
                     }
                 }
                 TvDestination.DISCOVER ->
@@ -281,6 +283,7 @@ fun TvShell(
                             landingViewModel = landingViewModel,
                             onItem = onItem,
                             onDirectResume = onDirectResume,
+                            onLocalResume = onLocalResume,
                             pickerActive = libraryRoute == TvLibraryRoute.LANDING,
                             onDownloads = { openLibraryRoute(TvLibraryRoute.DOWNLOADS) },
                             onWatchlist = { openLibraryRoute(TvLibraryRoute.WATCHLIST) },

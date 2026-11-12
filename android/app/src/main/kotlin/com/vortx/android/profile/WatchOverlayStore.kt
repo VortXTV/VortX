@@ -99,7 +99,10 @@ class WatchOverlayStore(
                     (entry.durationMs > 0 && entry.timeOffsetMs.toDouble() >= entry.durationMs.toDouble() * 0.95))
             ) continue
             if (!(entry.timeOffsetMs > 0 || entry.watchedVideoIds.isNotEmpty())) continue
-            dated += Candidate(metaId, entry, metaItem(metaId, entry))
+            val item = metaItem(metaId, entry)
+            val preferredEpisode = com.vortx.android.model.continueWatchingEpisodeFromVideoIdentity(item.type, entry.videoId)
+                ?.let { if (entry.timeOffsetMs <= 0 && entry.videoId != null && entry.videoId in entry.watchedVideoIds) it.copy(upNext = true) else it }
+            dated += Candidate(metaId, entry, item.copy(preferredEpisode = preferredEpisode))
         }
         val ordered = dated.sortedWith(
             compareByDescending<Candidate> { it.entry.lastWatched }
