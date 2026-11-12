@@ -1533,14 +1533,14 @@ final class VortXSyncManager: ObservableObject {
             let selection = ProfileStore.shared.activeID
             return try await VortxNativeSession.withWebsiteRosterWriter(scope: scope) { writer in
                 let operation = authority.including(writer)
-                func ownerIsCurrent() -> Bool {
+                @MainActor func ownerIsCurrent() -> Bool {
                     self.isCurrent(capture) && authority.isCurrent &&
                         self.account?.id == accountID && self.dataKey == key &&
                         self.credentialAuthority.isMigrationEligible(capture) &&
                         self.nativeCheckpointGeneration == generation && ProfileStore.shared.activeID == selection &&
                         !self.accountFileRestoreBusy
                 }
-                func current() -> Bool {
+                @MainActor func current() -> Bool {
                     guard ownerIsCurrent(), !self.hasPendingAccountDocApply(for: capture) else { return false }
                     return (try? operation.withActive {}) != nil
                 }
