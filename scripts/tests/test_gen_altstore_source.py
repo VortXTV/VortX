@@ -2,6 +2,7 @@ import base64
 import copy
 import importlib.util
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,8 +23,8 @@ def project_target_fixture(name, build=221):
     return f'  {name}:\n    settings:\n      base:\n        CURRENT_PROJECT_VERSION: "{build}"\n'
 
 
-def project_fixture(build=221, historical=False, targets=NATIVE_PROJECT_TARGETS):
-    names = (*targets, *(("VortX",) if historical else ()))
+def project_fixture(build=221, historical=False, targets=NATIVE_PROJECT_TARGETS, aether=False):
+    names = (*targets, *(("VortX",) if historical else ()), *(("VortXAetherKit",) if aether else ()))
     return ("name: VortX\ntargets:\n" + "".join(project_target_fixture(name, build) for name in names)
             + "  CinemaUISmokeRenderer:\n    type: application\nschemes:\n  VortXTV:\n    build:\n")
 
@@ -75,22 +76,32 @@ class ProjectBuildTests(unittest.TestCase):
         with patch.object(MODULE, "gh_json", return_value={"content": encoded}):
             return MODULE.tag_build("v0.5.6")
 
-    def test_native_five_and_historical_six_named_targets(self):
+    def test_native_legacy_and_aether_versioned_targets(self):
         self.assertEqual(self.parse(project_fixture()), "221")
         self.assertEqual(self.parse(project_fixture(historical=True)), "221")
+        self.assertEqual(self.parse(project_fixture(aether=True)), "221")
         self.assertEqual(self.parse(project_fixture().replace(
             "  CinemaUISmokeRenderer:\n    type: application\n", "")), "221")
 
-    def test_missing_native_targets_in_both_layouts(self):
-        for historical in (False, True):
+    def test_full_checked_in_project_has_a_coherent_build(self):
+        project = (SCRIPT.parent.parent / "app" / "project.yml").read_text(encoding="utf-8")
+        self.assertRegex(project, r"(?m)^  VortXAetherKit:$")
+        builds = re.findall(r'(?m)^        CURRENT_PROJECT_VERSION: "([1-9][0-9]*)"$', project)
+        self.assertTrue(builds)
+        self.assertEqual(self.parse(project), builds[0])
+
+    def test_missing_native_targets_in_supported_layouts(self):
+        for historical, aether in ((False, False), (True, False), (False, True)):
             for missing in NATIVE_PROJECT_TARGETS:
-                with self.subTest(historical=historical, missing=missing):
+                with self.subTest(historical=historical, aether=aether, missing=missing):
                     targets = tuple(name for name in NATIVE_PROJECT_TARGETS if name != missing)
                     with self.assertRaises(MODULE.MetadataError):
-                        self.parse(project_fixture(historical=historical, targets=targets))
+                        self.parse(project_fixture(historical=historical, targets=targets, aether=aether))
 
     def test_duplicate_misplaced_incomplete_and_counterfeit_metadata(self):
         native, historical = project_fixture(), project_fixture(historical=True)
+        aether = project_fixture(aether=True)
+        aether_target = project_target_fixture("VortXAetherKit")
         field = '        CURRENT_PROJECT_VERSION: "221"\n'
         incomplete = project_fixture(targets=tuple(name for name in NATIVE_PROJECT_TARGETS if name != "VortXTopShelf"))
         cases = (
@@ -102,7 +113,12 @@ class ProjectBuildTests(unittest.TestCase):
             ("duplicate field", native.replace(field, field * 2, 1)),
             ("counterfeit six fields with a missing target", incomplete.replace(field, field * 3, 1)),
             ("duplicate named target", native.replace("schemes:\n", project_target_fixture("VortXTV") + "schemes:\n")),
+            ("Aether target missing its build", aether.replace(aether_target, "  VortXAetherKit:\n    type: framework\n")),
+            ("Aether target build mismatch", aether.replace(aether_target, project_target_fixture("VortXAetherKit", 220))),
+            ("Aether target duplicate build", aether.replace(aether_target, aether_target + field)),
+            ("duplicate Aether target", aether.replace(aether_target, aether_target * 2)),
             ("unexpected versioned target", native.replace("schemes:\n", project_target_fixture("OtherApp") + "schemes:\n")),
+            ("unexpected unversioned target", native.replace("schemes:\n", "  OtherFramework:\n    type: framework\nschemes:\n")),
             ("versioned smoke renderer", native.replace("  CinemaUISmokeRenderer:\n    type: application\n", project_target_fixture("CinemaUISmokeRenderer"))),
             ("build outside targets", "settings:\n      base:\n" + field + native),
             ("build in schemes", native + field),
