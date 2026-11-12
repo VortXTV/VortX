@@ -10,10 +10,11 @@ import java.util.concurrent.atomic.AtomicLong
 /** A coherent owner-scoped read, bound to a process revision for stale-resolution rejection. */
 internal sealed interface UsenetProviderRead {
     val owner: DebridOwnerToken?
-    data class Available(override val owner: DebridOwnerToken, val servers: UsenetProviderServerList, val revision: Long) : UsenetProviderRead
-    data class Missing(override val owner: DebridOwnerToken, val revision: Long) : UsenetProviderRead
+    val revision: Long
+    data class Available(override val owner: DebridOwnerToken, val servers: UsenetProviderServerList, override val revision: Long) : UsenetProviderRead
+    data class Missing(override val owner: DebridOwnerToken, override val revision: Long) : UsenetProviderRead
     /** Non-empty ciphertext that cannot be decoded, or an unavailable owner/backend. Never auto-overwrite it. */
-    data class UnavailableOrCorrupt(override val owner: DebridOwnerToken?, val revision: Long) : UsenetProviderRead
+    data class UnavailableOrCorrupt(override val owner: DebridOwnerToken?, override val revision: Long) : UsenetProviderRead
 }
 
 /**

@@ -230,8 +230,8 @@ class TvDebridSettingsContractTest {
         assertTrue(productionAdapterContract(source))
 
         val mutations = listOf(
-            "keys.setKey(service, value)" to "true",
-            "val status = keys.status(service)" to
+            "keys.setKey(service, value, it)" to "true",
+            "val status = owner?.let { keys.status(service, it) }" to
                 "val status = TvDebridStorageSnapshot(false, false, false)",
             "hasValue = status.hasValue" to "hasValue = false",
             "durablyConfigured = status.durablyConfigured" to "durablyConfigured = false",
@@ -243,6 +243,17 @@ class TvDebridSettingsContractTest {
                 productionAdapterContract(source.replace(before, after)),
             )
         }
+    }
+
+    @Test
+    fun `TV Usenet controls keep the rendered owner for status and edits`() {
+        val source = readProjectFile("src/main/kotlin/com/vortx/android/ui/tv/TvDebridKeysScreen.kt")
+        assertTrue(source.contains("owner = renderedOwner"))
+        assertTrue(source.contains("var password by remember(owner)"))
+        assertTrue(source.contains("store.snapshot(owner).editorStatus()"))
+        assertTrue(source.contains("store.save(credentials, owner)"))
+        assertTrue(source.contains("store.clear(owner)"))
+        assertTrue(source.contains("keys::mutateCurrentUsenetOwner"))
     }
 
     @Test
@@ -405,8 +416,9 @@ class TvDebridSettingsContractTest {
             source.contains("keyboardType = KeyboardType.Password")
 
     private fun productionAdapterContract(source: String): Boolean =
-        source.contains("keys.setKey(service, value)") &&
-            source.contains("val status = keys.status(service)") &&
+        source.contains("remember(keys, renderedOwner) { DebridKeysTvAccess(keys, renderedOwner) }") &&
+            source.contains("keys.setKey(service, value, it)") &&
+            source.contains("val status = owner?.let { keys.status(service, it) }") &&
             source.contains("hasValue = status.hasValue") &&
             source.contains("durablyConfigured = status.durablyConfigured") &&
             source.contains("storageUnavailable = status.storageUnavailable")

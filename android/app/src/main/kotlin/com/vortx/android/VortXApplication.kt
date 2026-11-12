@@ -308,6 +308,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         // Fail closed until the encrypted session store has produced a definitive account or sign-out.
         // This process-wide binding precedes every lazy repository, resolver, and settings consumer.
         DebridKeys.bindAccountOwnerSource { DebridAccountOwnerState.UnknownOrUnavailable }
+        DebridKeys.bindUsenetOwnerAdmission(null)
         // Stand up the multi-profile core once, before anything touches the engine (the engine session is
         // built lazily on first catalog/auth access, after this). ProfileStore.init makes
         // ProfileStore.shared/activeProfileId available to the source-pin per-profile key.
@@ -621,6 +622,9 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                         is SessionOwnerSnapshot.UnknownOrUnavailable ->
                             DebridAccountOwnerState.UnknownOrUnavailable
                     }
+                }
+                DebridKeys.bindUsenetOwnerAdmission { owner, mutation ->
+                    syncManager === manager && manager.mutateCurrentUsenetOwner(owner, mutation)
                 }
                 com.vortx.android.sync.AccountLibrarySync.bind(this@VortXApplication, manager)
                 val startNativeWork = checkNotNull(manager.prepareNativeGateway(nativeAccounts, accountForeground, confirmedOwner))

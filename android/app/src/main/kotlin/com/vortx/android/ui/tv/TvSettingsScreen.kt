@@ -67,6 +67,7 @@ import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.skip.SkipConfig
 import com.vortx.android.sync.VortXSyncManager
+import com.vortx.android.sync.presentationKey
 import com.vortx.android.ui.prefs.TabBarPrefs
 import com.vortx.android.ui.prefs.VisualEffects
 import com.vortx.android.ui.screens.AccountContent
@@ -195,16 +196,11 @@ fun TvSettingsScreen(
     var settingsQuery by remember { mutableStateOf("") }
 
     val store = ProfileStore.sharedOrNull()
-    // Re-read the debrid account after returning from profile management.
-    var refresh by remember { mutableStateOf(0) }
-    val debridAccountIdentity = remember(refresh) {
-        store?.activeKeychainAccount ?: ProfileStore.PRIMARY_TOKEN_ACCOUNT
-    }
     val activeProfile by (store?.activeProfile?.collectAsStateWithLifecycle()
         ?: remember { mutableStateOf(null) })
 
     if (route == TvSettingsRoute.PROFILES) {
-        TvProfilesScreen(onBack = { route = TvSettingsRoute.ROOT; refresh++; restoreProfilesFocus = true }, onSelected = onProfileSelected, modifier = modifier)
+        TvProfilesScreen(onBack = { route = TvSettingsRoute.ROOT; restoreProfilesFocus = true }, onSelected = onProfileSelected, modifier = modifier)
         return
     }
 
@@ -262,6 +258,8 @@ fun TvSettingsScreen(
 
     if (route == TvSettingsRoute.DEBRID) {
         BackHandler { returnToSettingsRoot() }
+        val debridAccountIdentity = syncManager?.sessionOwnerPresentation?.collectAsStateWithLifecycle()
+            ?.value?.presentationKey ?: "unavailable"
         TvDebridKeysScreen(
             keys = debridKeys,
             accountIdentity = debridAccountIdentity,

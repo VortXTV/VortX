@@ -14,12 +14,34 @@ import org.junit.Test
 class DebridKeysScreenContractTest {
 
     @Test
-    fun `Usenet transient credentials are keyed to the active account`() {
+    fun `Usenet transient credentials and actions use the rendered owner`() {
         val source = readSource()
-        assertTrue(source.contains("accountIdentity = accountIdentity"))
-        assertTrue(source.contains("fun UsenetProviderSection("))
-        assertTrue(source.contains("remember(accountIdentity) { mutableStateOf(\"\") }"))
-        assertTrue(source.contains("remember(ownerKnown, accountIdentity)"))
+        assertTrue(source.contains("owner = renderedOwner"))
+        assertTrue(source.contains("var password by remember(owner)"))
+        assertTrue(source.contains("store.snapshot(owner).editorStatus()"))
+        assertTrue(source.contains("store.save(credentials, owner)"))
+        assertTrue(source.contains("store.clear(owner)"))
+        assertTrue(source.contains("keys::mutateCurrentUsenetOwner"))
+    }
+
+    @Test
+    fun `debrid actions and status retain the rendered owner generation`() {
+        val source = readSource()
+        assertTrue(source.contains("debridEditorStateKey(service, renderedIdentity)"))
+        assertTrue(source.contains("\${it.identity}:\${it.generation}"))
+        assertTrue(source.contains("keys.setKey(service, value, renderedOwner)"))
+        assertTrue(source.contains("keys.setKey(service, \"\", renderedOwner)"))
+        assertTrue(source.contains("keys.status(service, renderedOwner)"))
+    }
+
+    @Test
+    fun `server list callbacks keep the owner revision and rows they rendered`() {
+        val source = readSource("UsenetServersSettingsScreen.kt")
+        assertTrue(source.contains("read === renderedRead"))
+        assertTrue(source.contains("store.saveServers(next, renderedRead.revision, owner)"))
+        assertTrue(source.contains("renderedServers.forEachIndexed"))
+        assertTrue(source.contains("persist(renderedServers.toMutableList()"))
+        assertTrue(source.contains("if (isRenderedCurrent()) password = it"))
     }
 
     @Test
@@ -225,13 +247,13 @@ class DebridKeysScreenContractTest {
     private fun phoneDangerStatusContrastContract(source: String): Boolean =
         source.contains("editor.storageUnavailable -> colors.textPrimary")
 
-    private fun readSource(): String {
+    private fun readSource(name: String = "DebridKeysScreen.kt"): String {
         val candidates = listOf(
-            File("src/main/kotlin/com/vortx/android/ui/screens/DebridKeysScreen.kt"),
-            File("app/src/main/kotlin/com/vortx/android/ui/screens/DebridKeysScreen.kt"),
-            File("android/app/src/main/kotlin/com/vortx/android/ui/screens/DebridKeysScreen.kt"),
+            File("src/main/kotlin/com/vortx/android/ui/screens/$name"),
+            File("app/src/main/kotlin/com/vortx/android/ui/screens/$name"),
+            File("android/app/src/main/kotlin/com/vortx/android/ui/screens/$name"),
         )
         return candidates.firstOrNull(File::isFile)?.readText()
-            ?: error("Could not locate DebridKeysScreen.kt from ${File(".").absolutePath}")
+            ?: error("Could not locate $name from ${File(".").absolutePath}")
     }
 }

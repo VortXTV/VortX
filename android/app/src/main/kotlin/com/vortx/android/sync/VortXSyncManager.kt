@@ -8,6 +8,8 @@ import com.vortx.android.backup.SettingsBackup
 import com.vortx.android.data.AddonPrefsStore
 import com.vortx.android.data.AddonTombstones
 import com.vortx.android.debrid.DebridKeys
+import com.vortx.android.debrid.DebridOwnerScope
+import com.vortx.android.debrid.DebridOwnerToken
 import com.vortx.android.debrid.DebridService
 import com.vortx.android.engine.VortxJniBindings
 import com.vortx.android.engine.AccountFileLocalPresence
@@ -1669,6 +1671,23 @@ class VortXSyncManager internal constructor(
             publishSessionUiState(SessionUiState.SignedIn(current.account))
         }
     } }
+
+    /** Serialize the Usenet document operation against sign-in, sign-out and session recovery. */
+    internal fun mutateCurrentUsenetOwner(expected: DebridOwnerToken, mutation: () -> Boolean): Boolean =
+        operations.snapshot {
+            sessionState.serialized {
+                if (!isStartupActive(this@VortXSyncManager)) return@serialized false
+                val persisted = (sessionRestoreTestSeam ?: store.load()) as? SessionLoad.Available
+                    ?: return@serialized false
+                val live = sessionState.value
+                val epoch = sessionState.ownerEpoch
+                if (epoch != expected.generation || epoch != persisted.ownerEpoch ||
+                    !sessionTruthMatches(live, persisted.session)
+                ) return@serialized false
+                val scope = live?.let { DebridOwnerScope.Account(it.account.id) } ?: DebridOwnerScope.SignedOutLocal
+                scope == expected.scope && mutation()
+            }
+        }
 
     /** Retry an unavailable/corrupt secure-session read without misclassifying it as sign-out. */
     fun retrySessionRestore() {

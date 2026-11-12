@@ -58,6 +58,9 @@ class DebridKeysContractTest {
 
             assertFalse(resolver.isCurrent(firstToken))
             assertNotEquals(firstToken, resolver.ownerToken())
+            assertTrue(ui.status(DebridService.REAL_DEBRID, firstToken).storageUnavailable)
+            assertFalse(ui.setKey(DebridService.REAL_DEBRID, "stale-replacement", firstToken))
+            assertFalse(ui.setKey(DebridService.REAL_DEBRID, "", firstToken))
             assertEquals("key-a", resolver.key(DebridService.REAL_DEBRID))
 
             state = DebridAccountOwnerState.SignedOutLocal(generation = 3)

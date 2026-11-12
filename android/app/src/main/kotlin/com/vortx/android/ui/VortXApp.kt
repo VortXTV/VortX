@@ -1724,7 +1724,7 @@ fun VortXApp(
             val keys = remember(appContext) { DebridKeys(appContext) }
             DebridKeysScreen(
                 keys = keys,
-                accountIdentity = keys.ownerIdentity(),
+                accountIdentity = debridOwnerEpoch,
                 onBack = closeDebridKeys,
             )
             return@VortXTheme

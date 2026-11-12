@@ -54,7 +54,9 @@ import androidx.tv.material3.LocalContentColor
 import androidx.tv.material3.Surface
 import com.vortx.android.R
 import com.vortx.android.debrid.DebridKeys
+import com.vortx.android.debrid.DebridOwnerToken
 import com.vortx.android.debrid.DebridService
+import com.vortx.android.ui.screens.editorStatus
 import com.vortx.android.usenet.UsenetProviderCredentials
 import com.vortx.android.usenet.UsenetProviderStore
 import com.vortx.android.ui.theme.VortXIcons
@@ -68,10 +70,12 @@ internal fun TvDebridKeysScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val access = remember(keys) { DebridKeysTvAccess(keys) }
+    val renderedOwner = keys.readDownloadOwner()
+    val renderedIdentity = renderedOwner?.let { "${it.identity}:${it.generation}" } ?: "unavailable:$accountIdentity"
+    val access = remember(keys, renderedOwner) { DebridKeysTvAccess(keys, renderedOwner) }
     val context = LocalContext.current.applicationContext
     val usenetStore = remember(keys) {
-        UsenetProviderStore(context, keys::ownerToken, keys::mutateCurrentOwner)
+        UsenetProviderStore(context, keys::readDownloadOwner, keys::mutateCurrentUsenetOwner)
     }
     val backFocus = remember { FocusRequester() }
 
@@ -103,7 +107,7 @@ internal fun TvDebridKeysScreen(
         }
         DebridService.entries.forEach { service ->
             item(key = service.id) {
-                val initialState = remember(access, accountIdentity, service) {
+                val initialState = remember(access, renderedIdentity, service) {
                     val snapshot = access.snapshot(service)
                     tvDebridEditorState(
                         hasValue = snapshot.hasValue,
@@ -114,7 +118,7 @@ internal fun TvDebridKeysScreen(
                 TvDebridKeySection(
                     access = access,
                     service = service,
-                    accountIdentity = accountIdentity,
+                    accountIdentity = renderedIdentity,
                     initialState = initialState,
                 )
             }
@@ -122,8 +126,7 @@ internal fun TvDebridKeysScreen(
         item(key = "usenet-provider") {
             TvUsenetProviderSection(
                 store = usenetStore,
-                ownerKnown = keys.ownerToken() != null,
-                accountIdentity = accountIdentity,
+                owner = renderedOwner,
             )
         }
     }
@@ -144,22 +147,21 @@ internal fun TvDebridKeysScreen(
 @Composable
 private fun TvUsenetProviderSection(
     store: UsenetProviderStore,
-    ownerKnown: Boolean,
-    accountIdentity: String,
+    owner: DebridOwnerToken?,
 ) {
     val colors = VortXTheme.colors
     val keyboardController = LocalSoftwareKeyboardController.current
     val hostFocus = remember { FocusRequester() }
     val saveFocus = remember { FocusRequester() }
     val clearFocus = remember { FocusRequester() }
-    var host by remember(accountIdentity) { mutableStateOf("") }
-    var port by remember(accountIdentity) { mutableStateOf("563") }
-    var username by remember(accountIdentity) { mutableStateOf("") }
-    var password by remember(accountIdentity) { mutableStateOf("") }
-    var connections by remember(accountIdentity) { mutableStateOf("4") }
-    var status by remember(store, ownerKnown, accountIdentity) {
-        mutableStateOf(if (ownerKnown && store.isConfigured()) "Configured (credentials redacted)" else "Not configured")
-    }
+    var host by remember(owner) { mutableStateOf("") }
+    var port by remember(owner) { mutableStateOf("563") }
+    var username by remember(owner) { mutableStateOf("") }
+    var password by remember(owner) { mutableStateOf("") }
+    var connections by remember(owner) { mutableStateOf("4") }
+    val initialStatus = remember(store, owner) { store.snapshot(owner).editorStatus() }
+    var status by remember(store, owner) { mutableStateOf(initialStatus) }
+    var configured by remember(store, owner) { mutableStateOf(initialStatus.startsWith("Configured")) }
 
     fun request(requester: FocusRequester) = runCatching { requester.requestFocus() }
     fun save() {
@@ -171,8 +173,10 @@ private fun TvUsenetProviderSection(
             maxConnections = connections.toIntOrNull() ?: 0,
             useSSL = true,
         )
-        val saved = ownerKnown && credentials.isValid && store.save(credentials)
-        status = if (saved && store.isConfigured()) "Configured (credentials redacted)" else "Unable to save secure Usenet provider"
+        val saved = owner != null && credentials.isValid && store.save(credentials, owner)
+        val current = store.snapshot(owner).editorStatus()
+        configured = current.startsWith("Configured")
+        status = if (saved) current else "Unable to save secure Usenet provider"
         if (saved) {
             username = ""
             password = ""
@@ -211,7 +215,7 @@ private fun TvUsenetProviderSection(
                 label = "Save provider",
                 accessibilityLabel = "Usenet provider: Save TLS credentials",
                 onClick = ::save,
-                enabled = ownerKnown && host.isNotBlank() && username.isNotBlank() && password.isNotBlank(),
+                enabled = owner != null && host.isNotBlank() && username.isNotBlank() && password.isNotBlank(),
                 modifier = Modifier.weight(1f),
                 focusRequester = saveFocus,
             )
@@ -219,16 +223,17 @@ private fun TvUsenetProviderSection(
                 label = "Clear",
                 accessibilityLabel = "Usenet provider: Clear credentials",
                 onClick = {
-                    if (ownerKnown && store.clear()) {
+                    if (owner != null && store.clear(owner)) {
                         host = ""; username = ""; password = ""
-                        status = "Not configured"
+                        status = store.snapshot(owner).editorStatus()
+                        configured = status.startsWith("Configured")
                         request(hostFocus)
                     } else {
                         status = "Unable to clear secure Usenet provider"
                         request(clearFocus)
                     }
                 },
-                enabled = ownerKnown && store.isConfigured(),
+                enabled = owner != null && configured,
                 modifier = Modifier.weight(1f),
                 focusRequester = clearFocus,
                 danger = true,
@@ -325,12 +330,14 @@ internal interface TvDebridKeyAccess {
 
 private class DebridKeysTvAccess(
     private val keys: DebridKeys,
+    private val owner: DebridOwnerToken?,
 ) : TvDebridKeyAccess {
     override fun setKey(service: DebridService, value: String): Boolean =
-        keys.setKey(service, value)
+        owner?.let { keys.setKey(service, value, it) } == true
 
     override fun snapshot(service: DebridService): TvDebridStorageSnapshot {
-        val status = keys.status(service)
+        val status = owner?.let { keys.status(service, it) }
+            ?: return TvDebridStorageSnapshot(false, false, true)
         return TvDebridStorageSnapshot(
             hasValue = status.hasValue,
             durablyConfigured = status.durablyConfigured,

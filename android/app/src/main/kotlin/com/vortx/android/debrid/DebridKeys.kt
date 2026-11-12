@@ -8,6 +8,7 @@ import com.vortx.android.integrations.NativeProviderAccess
 import com.vortx.android.security.AccountFileProviderWriters
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
+import com.vortx.android.sync.SessionOwnerSnapshot
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
@@ -69,6 +70,9 @@ internal data class DebridOwnerToken(
 ) {
     val identity: String get() = scope.uiIdentity
 }
+
+private fun DebridOwnerToken.nativeAccount(): SessionOwnerSnapshot.Account? =
+    (scope as? DebridOwnerScope.Account)?.let { SessionOwnerSnapshot.Account(it.id, generation) }
 
 /** A key and its process-monotonic mutation revision, captured as one credential-state read. */
 internal data class DebridCredentialSnapshot(
@@ -414,22 +418,21 @@ class DebridKeys private constructor(
     /// Current account-scoped state for Settings. A rejected mutation is not published through the confirmed
     /// read view and reports storage unavailable until a later secure read or commit succeeds.
     @Synchronized
-    internal fun status(service: DebridService): DebridKeyStatus {
+    internal fun status(service: DebridService, expected: DebridOwnerToken? = null): DebridKeyStatus {
         if (nativeMode) {
-            val read = NativeProviderAccess.read(setOf(service.id))
+            val account = expected?.nativeAccount()
+            if (expected != null && account == null) return DebridKeyStatus(false, false, true)
+            val read = NativeProviderAccess.read(setOf(service.id), expected = account)
             val hasValue = !read?.values?.get(service.id).isNullOrEmpty()
             return DebridKeyStatus(hasValue, hasValue, read == null)
         }
         val owner = currentOwner()
-            ?: return DebridKeyStatus(
-                hasValue = false,
-                durablyConfigured = false,
-                storageUnavailable = true,
-            )
+        if (owner == null || (expected != null && expected != owner)) return DebridKeyStatus(false, false, true)
         adoptLegacyForFirstOwner(owner)
         val storageKey = service.storageKey(owner.scope)
         val hasValue = key(service, owner).isNotEmpty()
         val storageUnavailable = isStorageUnavailable(storageKey)
+        if (!isCurrent(owner)) return DebridKeyStatus(false, false, true)
         return DebridKeyStatus(
             hasValue = hasValue,
             durablyConfigured = hasValue && !storageUnavailable,
@@ -442,10 +445,21 @@ class DebridKeys private constructor(
     /// must use this result rather than claiming that a mutation was saved. The instance monitor stays outside
     /// the process migration lock, matching every other two-lock path, and neither lock spans suspension.
     @Synchronized
-    fun setKey(service: DebridService, value: String): Boolean {
-        if (nativeMode) return NativeProviderAccess.edit(mapOf(service.id to value.trim().takeIf(String::isNotEmpty)))
+    fun setKey(service: DebridService, value: String): Boolean = setKeyLocked(service, value, null)
+
+    @Synchronized
+    internal fun setKey(service: DebridService, value: String, expected: DebridOwnerToken): Boolean =
+        setKeyLocked(service, value, expected)
+
+    private fun setKeyLocked(service: DebridService, value: String, expected: DebridOwnerToken?): Boolean {
+        if (nativeMode) {
+            val account = expected?.nativeAccount()
+            if (expected != null && account == null) return false
+            return NativeProviderAccess.edit(mapOf(service.id to value.trim().takeIf(String::isNotEmpty)), expected = account)
+        }
         return synchronized(CREDENTIAL_STATE_LOCK) credentialState@{
             val owner = currentOwner() ?: return@credentialState false
+            if (expected != null && expected != owner) return@credentialState false
             observeOwnerLocked(owner)
             adoptLegacyForFirstOwner(owner)
             if (!isCurrent(owner)) return@credentialState false
@@ -541,6 +555,10 @@ class DebridKeys private constructor(
             if (currentOwner() != owner) return@synchronized false
             mutation()
         }
+
+    /** Usenet callbacks touch only their encrypted document under this exact session admission. */
+    internal fun mutateCurrentUsenetOwner(owner: DebridOwnerToken, mutation: () -> Boolean): Boolean =
+        usenetOwnerAdmission?.invoke(owner, mutation) ?: false
 
     /** One persistence-backed observation, without credential adoption or cached owner state. */
     internal fun readDownloadOwner(): DebridOwnerToken? = currentOwner()
@@ -967,6 +985,7 @@ class DebridKeys private constructor(
         private val LEGACY_ADOPTION_LOCK = Any()
         private val CREDENTIAL_STATE_LOCK = Any()
         private val PROCESS_OWNER_BINDING = DebridAccountOwnerBinding()
+        @Volatile private var usenetOwnerAdmission: ((DebridOwnerToken, () -> Boolean) -> Boolean)? = null
         private val FAILED_LEGACY_ADOPTIONS = mutableMapOf<Any, FailedLegacyAdoption>()
         private val FAILED_STORAGE_KEYS = mutableMapOf<Any, MutableSet<String>>()
         private val credentialRevisionCounter = AtomicLong(0L)
@@ -997,6 +1016,10 @@ class DebridKeys private constructor(
                 PROCESS_OWNER_BINDING.bind(source)
                 observeOwnerLocked(PROCESS_OWNER_BINDING.currentOwner())
             }
+        }
+
+        internal fun bindUsenetOwnerAdmission(admit: ((DebridOwnerToken, () -> Boolean) -> Boolean)?) {
+            usenetOwnerAdmission = admit
         }
     }
 }

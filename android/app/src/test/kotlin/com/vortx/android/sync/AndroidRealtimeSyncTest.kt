@@ -8,6 +8,8 @@ import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 import com.vortx.android.integrations.NativeProviderAccess
 import com.vortx.android.integrations.NativeProviderTestStore
 import com.vortx.android.profile.UserProfile
+import com.vortx.android.debrid.DebridOwnerScope
+import com.vortx.android.debrid.DebridOwnerToken
 import com.vortx.android.sync.VortXSyncManager.SessionUiState
 import java.lang.reflect.Proxy
 import kotlinx.coroutines.CompletableDeferred
@@ -1456,6 +1458,100 @@ class AndroidRealtimeSyncTest {
             assertEquals(SessionUiState.SignedIn(account), manager.sessionUiState.value)
             assertEquals(replacement, manager.sessionOwnerPresentation.value)
         } finally { f.close() }
+    }
+
+    @Test fun `usenet credential mutation requires the rendered owner and preserves the callback result`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val rendered = DebridOwnerToken(DebridOwnerScope.Account(account.id), INITIAL_SESSION_OWNER_EPOCH)
+            assertEquals(SessionOwnerSnapshot.Account(account.id, rendered.generation), f.manager.sessionOwnerSnapshot())
+            val callbacks = mutableListOf<String>()
+            val other = rendered.copy(scope = DebridOwnerScope.Account("00000000-0000-0000-0000-000000000999"))
+            assertFalse(f.manager.mutateCurrentUsenetOwner(other) { callbacks += "different account"; true })
+            assertFalse(f.manager.mutateCurrentUsenetOwner(rendered.copy(scope = DebridOwnerScope.SignedOutLocal)) {
+                callbacks += "signed-out scope"; true
+            })
+            assertTrue(f.manager.mutateCurrentUsenetOwner(rendered) { callbacks += "accepted"; true })
+            assertFalse(f.manager.mutateCurrentUsenetOwner(rendered) { callbacks += "declined"; false })
+            assertEquals(listOf("accepted", "declined"), callbacks)
+            f.assertNoStartupDispatch()
+        } finally { f.close() }
+    }
+
+    @Test fun `usenet rendered owner cannot adopt the same account with a new persisted epoch`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val manager = f.manager
+            val original = requireNotNull(manager.currentSession())
+            val rendered = DebridOwnerToken(DebridOwnerScope.Account(account.id), INITIAL_SESSION_OWNER_EPOCH)
+            assertEquals(SessionOwnerSnapshot.Account(account.id, rendered.generation), manager.sessionOwnerSnapshot())
+
+            // Recover the exact same Session and account under a new durable owner epoch.
+            manager.installUnavailableSessionRestoreTestSeam()
+            assertTrue(manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.UnknownOrUnavailable)
+            val replacement = rendered.copy(generation = rendered.generation + 1)
+            manager.installSessionRestoreTestSeam(original, ownerEpoch = replacement.generation)
+            assertEquals(SessionOwnerSnapshot.Account(account.id, replacement.generation), manager.sessionOwnerSnapshot())
+            assertSame(original, manager.currentSession())
+            assertEquals(SessionUiState.SignedIn(account), manager.sessionUiState.value)
+
+            val callbacks = mutableListOf<String>()
+            assertFalse(manager.mutateCurrentUsenetOwner(rendered) { callbacks += "stale rendered editor"; true })
+            assertTrue(callbacks.isEmpty())
+            assertTrue(manager.mutateCurrentUsenetOwner(replacement) { callbacks += "fresh rendered editor"; true })
+            assertEquals(listOf("fresh rendered editor"), callbacks)
+            f.assertNoStartupDispatch()
+        } finally { f.close() }
+    }
+
+    @Test fun `usenet mutation rereads unavailable persistence before invoking the rendered editor callback`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val manager = f.manager
+            val original = requireNotNull(manager.currentSession())
+            val rendered = DebridOwnerToken(DebridOwnerScope.Account(account.id), INITIAL_SESSION_OWNER_EPOCH)
+            assertEquals(SessionOwnerSnapshot.Account(account.id, rendered.generation), manager.sessionOwnerSnapshot())
+            manager.installUnavailableSessionRestoreTestSeam()
+            // Do not call sessionOwnerSnapshot here: the mutation boundary must detect unavailable
+            // persistence itself while the cached signed-in presentation still looks unchanged.
+            assertEquals(SessionUiState.SignedIn(account), manager.sessionUiState.value)
+            var callbacks = 0
+            assertFalse(manager.mutateCurrentUsenetOwner(rendered) { callbacks++; true })
+            assertEquals(0, callbacks)
+            assertSame(original, manager.currentSession())
+
+            manager.installSessionRestoreTestSeam(original, ownerEpoch = rendered.generation)
+            assertEquals(SessionOwnerSnapshot.Account(account.id, rendered.generation), manager.sessionOwnerSnapshot())
+            assertTrue(manager.mutateCurrentUsenetOwner(rendered) { callbacks++; true })
+            assertEquals(1, callbacks)
+            f.assertNoStartupDispatch()
+        } finally { f.close() }
+    }
+
+    @Test fun `usenet mutation rejects a different persisted bearer key or epoch without adopting it`() = test {
+        for (changedField in listOf("bearer", "data key", "owner epoch")) {
+            val f = Fixture(testScheduler)
+            try {
+                val manager = f.manager
+                val original = requireNotNull(manager.currentSession())
+                val rendered = DebridOwnerToken(DebridOwnerScope.Account(account.id), INITIAL_SESSION_OWNER_EPOCH)
+                assertEquals(SessionOwnerSnapshot.Account(account.id, rendered.generation), manager.sessionOwnerSnapshot())
+                val persisted = when (changedField) {
+                    "bearer" -> VortXSyncManager.Session("fixture-replacement", account, key)
+                    "data key" -> VortXSyncManager.Session("fixture-a", account, ByteArray(32) { 38 })
+                    else -> original
+                }
+                manager.installSessionRestoreTestSeam(persisted,
+                    ownerEpoch = rendered.generation + if (changedField == "owner epoch") 1 else 0)
+                // No prior owner refresh may reject this candidate on the tested method's behalf.
+                assertEquals(SessionUiState.SignedIn(account), manager.sessionUiState.value)
+                var callbacks = 0
+                assertFalse(changedField, manager.mutateCurrentUsenetOwner(rendered) { callbacks++; true })
+                assertEquals(changedField, 0, callbacks)
+                assertSame(changedField, original, manager.currentSession())
+                f.assertNoStartupDispatch()
+            } finally { f.close() }
+        }
     }
 
     @Test fun `cold signed-out and unavailable owners cannot open a checkpoint request or socket`() = test {
