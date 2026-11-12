@@ -1486,6 +1486,160 @@ final class VortXSyncManager: ObservableObject {
         return adoption
     }
 
+    /// A fresh installation publishes the website roster before creating a local checkpoint.
+    /// Only the ordinary receive path may consume the authenticated readback and mount it.
+    private func promoteUnpublishedWebsiteRoster(_ pulled: VersionedPull, capture: CredentialScopeRegistry.Capture,
+        authority: ReceivedProviderCloudAuthority) async -> VersionedPull {
+        // A nested restore consumes the already-bound receive. It cannot swap in a new source.
+        guard authority.document == nil else { return pulled }
+        switch pulled {
+        case .doc, .ownerHistory: break
+        default: return pulled
+        }
+        let failure = VersionedPull.failed(retryable: false)
+        guard isCurrent(capture), authority.isCurrent, let accountID = account?.id,
+              CredentialScope(canonicalRemoteAccountID: accountID) == capture.scope,
+              let key = dataKey, key.count == 32 else { return failure }
+        do {
+            let slot = try NativeWebsiteRosterPublicationReceipt.storageSlot(accountNamespace: capture.namespace, dataKey: key)
+            guard case .doc(let document, let revision, let raw, _) = pulled,
+                  let adoption = try NativeWebsiteAccountAdoption(document, plaintext: raw, revision: revision) else {
+                // A restart may first see the PUT's target. A valid local receipt still binds
+                // that revision to its exact candidate; ordinary unrelated reads keep their gates.
+                switch Keychain.confirmedString(slot) {
+                case .missing: return pulled
+                case .failure: return failure
+                case .value(let saved):
+                    let receipt = try NativeWebsiteRosterPublicationReceipt.decode(saved,
+                        accountNamespace: capture.namespace, dataKey: key)
+                    return acceptsWebsiteRosterReadback(pulled, receipt: receipt) ? pulled : failure
+                }
+            }
+            guard revision >= lastSyncedVersion, credentialAuthority.isMigrationEligible(capture) else { return failure }
+            let scope = VortxAccountScope(account: capture.namespace, ownerProfileID: UserProfile.ownerID.uuidString)
+            let directory = try VortxNativeStorage.root(create: false)
+                .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
+            let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: key),
+                installationKey: VortxNativeInstallationKey.readExisting())
+            // Existing checkpoints keep their original exact-witness path. A later rosterless
+            // revision cannot authorize rebuilding a checkpoint or publishing a different owner.
+            if try store.authenticatedCheckpoint(scope: scope) != nil { return pulled }
+            let generation = nativeCheckpointGeneration
+            let selection = ProfileStore.shared.activeID
+            return try await VortxNativeSession.withWebsiteRosterWriter(scope: scope) { writer in
+                let operation = authority.including(writer)
+                func ownerIsCurrent() -> Bool {
+                    self.isCurrent(capture) && authority.isCurrent &&
+                        self.account?.id == accountID && self.dataKey == key &&
+                        self.credentialAuthority.isMigrationEligible(capture) &&
+                        self.nativeCheckpointGeneration == generation && ProfileStore.shared.activeID == selection &&
+                        !self.accountFileRestoreBusy
+                }
+                func current() -> Bool {
+                    guard ownerIsCurrent(), !self.hasPendingAccountDocApply(for: capture) else { return false }
+                    return (try? operation.withActive {}) != nil
+                }
+                var input = (adoption: adoption, revision: revision, raw: raw)
+                for _ in 0..<2 {
+                    guard current(), input.revision >= self.lastSyncedVersion,
+                          let target = SyncDocumentRevisionPolicy.next(after: input.revision) else { return failure }
+                    let candidate = try input.adoption.exportBase()
+                    let receipt = try NativeWebsiteRosterPublicationReceipt.pending(accountNamespace: capture.namespace,
+                        dataKey: key, baseRevision: input.revision, source: input.raw, candidate: candidate)
+                    guard let saved = Keychain.confirmedRead(slot, isCurrentOwner: ownerIsCurrent) else { return failure }
+                    let previous: NativeWebsiteRosterPublicationReceipt?
+                    switch saved.result {
+                    case .missing: previous = nil
+                    case .value(let value):
+                        previous = try NativeWebsiteRosterPublicationReceipt.decode(value,
+                            accountNamespace: capture.namespace, dataKey: key)
+                    case .failure: return failure
+                    }
+                    if let previous, try !previous.permitsAttempt(receipt, accountNamespace: capture.namespace, dataKey: key) {
+                        return failure
+                    }
+                    let isNewAttempt = previous != receipt
+                    try await self.validateDetachedWebsiteRoster(input.adoption, raw: input.raw,
+                        candidate: candidate, scope: scope, key: key)
+                    guard current() else { return failure }
+                    let bound = operation.binding(plaintext: input.raw, revision: input.revision)
+                    let encodedReceipt = receipt.encode()
+                    let result = await self.pushSyncDocAt(input.adoption.document, version: target, baseRevision: input.revision,
+                        credentialCapture: capture, plaintextData: candidate,
+                        prepareWebsiteSubmission: { sealed, body in
+                            guard sealed.utf8.count <= OwnerHistoryAccountExport.maximumSealedBytes,
+                                  let encoded = try? JSONSerialization.data(withJSONObject: body),
+                                  encoded.count <= OwnerHistoryAccountExport.maximumResponseBytes,
+                                  Keychain.confirmedString(slot) == saved.result else { return false }
+                            return (try? bound.withActive {
+                                if isNewAttempt {
+                                    guard Keychain.compareAndSetConfirmed(saved, with: encodedReceipt, for: slot,
+                                              isCurrentOwner: ownerIsCurrent) == .success,
+                                          Keychain.confirmedString(slot) == .value(encodedReceipt) else {
+                                        throw VortxNativeError.unavailable
+                                    }
+                                }
+                            }) != nil
+                        }, sourceIsCurrent: current)
+                    guard current(), let pending = Keychain.confirmedRead(slot, isCurrentOwner: ownerIsCurrent),
+                          pending.result == .value(encodedReceipt) else { return failure }
+                    var readbackReceipt = receipt
+                    if case .upgradeRequired = result { return failure }
+                    if case .rejected = result, isNewAttempt {
+                        // A replay can be rejected because an earlier ambiguous request won.
+                        // Only rejection of a newly reserved attempt can retire that uncertainty.
+                        readbackReceipt = try receipt.markingDefinitivelyRejected(accountNamespace: capture.namespace, dataKey: key)
+                        let rejected = readbackReceipt.encode()
+                        try bound.withActive {
+                            guard Keychain.compareAndSetConfirmed(pending, with: rejected, for: slot,
+                                      isCurrentOwner: ownerIsCurrent) == .success,
+                                  Keychain.confirmedString(slot) == .value(rejected) else { throw VortxNativeError.unavailable }
+                        }
+                    }
+                    let readback = await self.pullDocVersionedResult(credentialCapture: capture)
+                    guard current(), Keychain.confirmedString(slot) == .value(readbackReceipt.encode()) else { return failure }
+                    if self.acceptsWebsiteRosterReadback(readback, receipt: readbackReceipt) { return readback }
+                    guard case .rejected = result, isNewAttempt,
+                          case .doc(let latest, let version, let bytes, _) = readback, version >= target,
+                          let replacement = try NativeWebsiteAccountAdoption(latest, plaintext: bytes, revision: version) else {
+                        return failure
+                    }
+                    input = (replacement, version, bytes)
+                }
+                return failure
+            }
+        } catch {
+            DiagnosticsLog.log("native-profiles", "restore admission=website_roster_unavailable")
+            return failure
+        }
+    }
+
+    private func validateDetachedWebsiteRoster(_ adoption: NativeWebsiteAccountAdoption, raw: Data,
+        candidate: Data, scope: VortxAccountScope, key: Data) async throws {
+        guard let roster = Self.resolveRoster(from: adoption.document, fullOnly: true),
+              roster.profiles.count == 1, let owner = roster.profiles.first,
+              owner.isOwner, owner.id == UserProfile.ownerID else { throw VortxNativeError.invalidSnapshot }
+        // Check the ordinary provider carrier shape without reading or staging credentials.
+        let emptyProviders = try VortxNativeProviderCredentials(scope: scope.account, actor: owner.id.uuidString.lowercased())
+        _ = try mirrorNativeProviderKeys(emptyProviders, original: adoption.original["apiKeys"])
+        try await VortxAccountFileRestoreWorker.shared.validateWebsiteRoster(scope: scope, owner: owner,
+            rosterModified: roster.modified, source: raw, candidate: candidate, key: key)
+    }
+
+    private func acceptsWebsiteRosterReadback(_ pulled: VersionedPull, receipt: NativeWebsiteRosterPublicationReceipt) -> Bool {
+        switch pulled {
+        case .doc(let document, let revision, let raw, _):
+            guard revision >= lastSyncedVersion,
+                  Self.resolveRoster(from: document, fullOnly: true)?.profiles.filter(\.isOwner).count == 1 else { return false }
+            return receipt.classifyFullRosterReadback(revision: revision, raw: raw) != .denied
+        case .ownerHistory(let raw, let revision, _):
+            // This is independent authenticated source authority. Only the existing typed
+            // restore/mutation path may validate its owner, full carrier and capabilities.
+            return revision >= lastSyncedVersion && receipt.classifyFullRosterReadback(revision: revision, raw: raw) == .requiresIndependentAdmission
+        default: return false
+        }
+    }
+
     /// Never install a provisional owner before the server accepts its create-only seed. A
     /// rejected/ambiguous PUT is followed by authenticated readback, not a higher-version retry.
     private func publishDetachedNativeSeed(_ baseline: [String: Any], capture: CredentialScopeRegistry.Capture,
@@ -1680,7 +1834,7 @@ final class VortXSyncManager: ObservableObject {
         case .doc(let value, let version, let original, let observed):
             guard version >= lastSyncedVersion else { throw NativeRestoreAdmissionFailure.staleDocument }
             if let adoption = try authorizedWebsiteAccountAdoption(value, plaintext: original, revision: version,
-                capture: capture, requiringCheckpoint: false) {
+                capture: capture, requiringCheckpoint: true) {
                 document = adoption.document
                 websiteAdoption = adoption
                 DiagnosticsLog.log("native-profiles", "restore admission=web_only_owner_seeded")
@@ -1882,7 +2036,7 @@ final class VortXSyncManager: ObservableObject {
                 let checkpoint = try probe.authenticatedCheckpoint(scope: scope)
                 if let adoption = admitted.websiteAdoption {
                     guard try probe.permitsWebsiteRosterAdoption(scope: scope, witness: adoption.witness,
-                        requiringCheckpoint: checkpoint != nil) else {
+                        requiringCheckpoint: true) else {
                         throw VortxNativeError.invalidSnapshot
                     }
                 }
@@ -1965,8 +2119,7 @@ final class VortXSyncManager: ObservableObject {
                 stage = "checkpoint_creation"
                 let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes),
                                                                installationKey: VortxNativeInstallationKey.loadOrCreate(),
-                                                               bootstrap: archive, bootstrapScope: scope,
-                                                               initialWebsiteRosterAdoption: hadCheckpoint ? nil : admitted.websiteAdoption?.witness)
+                                                               bootstrap: archive, bootstrapScope: scope)
                 stage = "session_creation"
                 let session = try VortxNativeSession(scope: scope, ownerName: owners[0].name, abi: VortxCABI(), store: store,
                                                     transport: VortxCResourceTransport(), allowNewAccount: !hadCheckpoint, initialActions: initialActions,
@@ -3921,7 +4074,8 @@ final class VortXSyncManager: ObservableObject {
         guard let authority, authority.capture == capture, authority.isCurrent else {
             return (.failed(retryable: false), nil)
         }
-        let pulled = await pullDocVersionedResult(credentialCapture: capture)
+        let original = await pullDocVersionedResult(credentialCapture: capture)
+        let pulled = await promoteUnpublishedWebsiteRoster(original, capture: capture, authority: authority)
         guard isCurrent(capture), account?.id == originalAccount, dataKey == originalKey,
               let admitted = try? requireReceivedProviderCloudSource(pulled, authority: authority) else { return (pulled, nil) }
         return (pulled, admitted)
@@ -4679,6 +4833,7 @@ final class VortXSyncManager: ObservableObject {
     private func pushSyncDocAt(_ obj: [String: Any], version: Int, baseRevision: Int?,
                                credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil,
                                plaintextData: Data? = nil,
+                               prepareWebsiteSubmission: ((String, [String: Any]) -> Bool)? = nil,
                                sourceIsCurrent: () -> Bool = { true }) async -> PushOutcome {
         let capture = suppliedCapture ?? credentialAuthority.capture()
         let capturedAccountID = account?.id ?? ""
@@ -4694,8 +4849,11 @@ final class VortXSyncManager: ObservableObject {
             DiagnosticsLog.log("sync", "upload result=blocked stage=local_preflight")
             return .error
         }
-        let (code, json) = await request("PUT", "/v1/backup", body: ["document": ct, "version": version,
-            "baseRevision": baseRevision.map { $0 as Any } ?? NSNull()], auth: true, credentialCapture: capture)
+        let body: [String: Any] = ["document": ct, "version": version, "baseRevision": baseRevision.map { $0 as Any } ?? NSNull()]
+        if let prepareWebsiteSubmission {
+            guard prepareWebsiteSubmission(ct, body), sourceIsCurrent() else { return .error }
+        }
+        let (code, json) = await request("PUT", "/v1/backup", body: body, auth: true, credentialCapture: capture)
         guard isCurrent(capture), sourceIsCurrent(), !Task.isCancelled, dataKey == capturedDataKey,
               !hasPendingAccountDocApply(for: capture) else { return .error }
         guard code == 200 else {
@@ -4712,6 +4870,9 @@ final class VortXSyncManager: ObservableObject {
         }
         let accepted = verdict.boolValue
         if accepted {
+            // Detached roster publication leaves the normal ACK and all local apply state to
+            // the authenticated readback. A transport verdict alone must not advance either.
+            if prepareWebsiteSubmission != nil { return .accepted(version: version) }
             guard rememberNativeBackup(capture: capture) else {
                 DiagnosticsLog.log("sync", "upload result=accepted_remote_unacknowledged stage=local_backup")
                 return .error
@@ -5672,7 +5833,8 @@ final class VortXSyncManager: ObservableObject {
         let pulled: (doc: [String: Any], version: Int, plaintext: Data)
         var ownerHistoryPeer: (plaintext: Data, observation: UUID)?
         guard let originalCloudRead = try? captureReceivedProviderCloudAuthority(capture) else { return false }
-        let received = await pullDocVersionedRetrying(credentialCapture: capture, ifNoneMatch: conditionalVersion)
+        let original = await pullDocVersionedRetrying(credentialCapture: capture, ifNoneMatch: conditionalVersion)
+        let received = await promoteUnpublishedWebsiteRoster(original, capture: capture, authority: originalCloudRead)
         guard originalCloudRead.isCurrent, isCurrent(capture), dataKey == capturedDataKey,
               backupUploadFailure != .upgradeRequired else { return false }
         let receivedProviders: ReceivedProviderSource?

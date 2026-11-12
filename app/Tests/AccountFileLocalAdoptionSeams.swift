@@ -251,6 +251,10 @@ enum SyncBackupUploadFailure { case upgradeRequired, other
         defer { AdoptionWorld.current.suppressionDepth -= 1 }
         body()
     }
+    // These fixtures exercise ordinary receives for accounts with a roster.
+    private func promoteUnpublishedWebsiteRoster(_ pulled: VersionedPull, capture: CredentialScopeRegistry.Capture,
+        authority: ReceivedProviderCloudAuthority) async -> VersionedPull { pulled }
+
     private func pullDocVersionedRetrying(credentialCapture: CredentialScopeRegistry.Capture, ifNoneMatch: Int?) async -> VersionedPull {
         let w = AdoptionWorld.current; w.gets += 1
         let plain = w.plaintext, revision = w.revision, observation = w.observation

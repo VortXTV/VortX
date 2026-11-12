@@ -205,12 +205,18 @@ function extractRestoreAdmission() {
         'restore result=not_started reason=backoff', 'restore result=not_started reason=superseded',
         'stage=offline_restore reason=checkpoint_unavailable', 'self.nativeRestoreDocument(pulled,',
         'self.nativeCheckpointGeneration == generation', 'failure.stage', 'failure.rawValue',
-        'initialWebsiteRosterAdoption: hadCheckpoint ? nil : admitted.websiteAdoption?.witness',
+        'requiringCheckpoint: true',
         'self.nativeMutationDidCommit(credentialCapture: capture)']) {
         if (!restore.includes(required)) throw new Error('Missing restore outcome wiring: ' + required);
     }
     if (restore.includes('try? self.nativeEmptyAccountDocument') || restore.includes('try? await self.publishDetachedNativeSeed')) {
         throw new Error('Silent empty-seed error folding returned');
+    }
+    const restoreDocument = methods.find(method => method.signature === '    private func nativeRestoreDocument(').bytes;
+    const checkpointRead = extractDeclaration(manager, '    private func pullNativeCheckpointCloudSource(');
+    if (!restoreDocument.includes('requiringCheckpoint: true') || restore.includes('initialWebsiteRosterAdoption:') ||
+        !checkpointRead.includes('await promoteUnpublishedWebsiteRoster(original, capture: capture, authority: authority)')) {
+        throw new Error('Fresh website roster must be confirmed before creating a native checkpoint');
     }
     return template.replace('/* PRODUCTION_SECURE_BOUNDARY */', secure)
         .replace('/* PRODUCTION_DECLARATIONS */', observation + '\n' + properties + '\n' + methods.map(item => item.bytes).join('\n\n'));
@@ -323,6 +329,8 @@ async function main() {
         capture('test/xperience-harness-inputs.cjs');
         sources = xperienceInputs.observationInputs(capture(xperienceInputs.observationInputList).toString('utf8'));
         sources.push('app/SourcesShared/OwnerHistoryExactJSON.swift', 'app/SourcesShared/VortxNativeOwnerHistoryIngress.swift');
+        sources.push('app/SourcesShared/SyncDocumentRevisionPolicy.swift',
+            'app/SourcesShared/NativeWebsiteRosterPublicationReceipt.swift', 'app/Tests/NativeWebsiteRosterPublicationReceiptTests.swift');
         ['app/SourcesShared/VortXSyncManager.swift', 'app/SourcesShared/Keychain.swift',
             'app/SourcesShared/CredentialScope.swift', 'app/Tests/NativeRestoreAdmissionTests.swift'].forEach(capture);
     } else if (stage === 'bootstrap') {

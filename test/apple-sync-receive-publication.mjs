@@ -112,6 +112,11 @@ if (process.argv[2] === '--extract') {
         return try await prepareNativeLegacyMaterial(document, capture: capture)
     }`);
   }
+  if (manager.text.includes('private func promoteUnpublishedWebsiteRoster(')) {
+    conversionMembers.push(`    // Established-account receive fixtures do not publish a first roster.
+    private func promoteUnpublishedWebsiteRoster(_ pulled: VersionedPull, capture: CredentialScopeRegistry.Capture,
+        authority: ReceivedProviderCloudAuthority) async -> VersionedPull { pulled }`);
+  }
   const observation = xperienceInputs.observationProperty(manager.text);
   if (observation) receipts.push({ path: manager.path, marker: 'exact Xperience observation property',
     sourceSHA256: sha256(manager.text), sliceSHA256: sha256(observation) });

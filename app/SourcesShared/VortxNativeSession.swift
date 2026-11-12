@@ -2154,6 +2154,17 @@ actor VortxNativeSession {
         let lease: VortxSessionLease
         func withActive(_ operation: () throws -> Void) throws { try lease.withActive(operation) }
     }
+
+    /// Hold the normal account writer while proving absence and publishing the first roster.
+    /// The detached operation must finish before ordinary restore acquires the writer to mount.
+    @MainActor static func withWebsiteRosterWriter<T>(scope: VortxAccountScope,
+        operation: @MainActor (any VortxMutationAuthority) async throws -> T) async throws -> T {
+        try scope.validate()
+        let lease = VortxSessionLease()
+        let writer = try VortxScopeWriter(scope: scope, lease: lease)
+        defer { lease.revoke(); writer.release() }
+        return try await operation(OwnerHistoryLeaseAuthority(lease: lease))
+    }
     private struct OwnerHistoryAdditionalCheckpointAuthority: OwnerHistoryCompleteCheckpointAuthority {
         let raw: OwnerHistoryPreparedExport
         let additional: any VortxProspectiveCheckpointValidator

@@ -274,11 +274,13 @@ private struct VortxAccountScope {
         let web = fresh(); resolvedRoster = nil
         let webCapture = web.credentialAuthority.capture()
         let pulled = VersionedPull.doc(doc: webDocument, version: 7, plaintext: webBytes, observation: UUID())
+        await web.expectAdmission(.rosterUnavailable, pulled: pulled)
+        VortxEncryptedCheckpointStore.checkpointAdoption = true
         let adoption = try await web.nativeRestoreDocument(pulled, capture: webCapture,
             selectedProfile: ProfileStore.shared.activeID, generation: web.nativeCheckpointGeneration, cloudAuthority: .init())
         check(adoption.adoptsWebsiteRoster && adoption.owners.first?.id == UserProfile.ownerID &&
-              adoption.owners.first?.name == "Main", "cold authenticated website backup admits the deterministic owner")
-        check(adoption.plaintext == webBytes && web.seedCalls == 0, "cold admission keeps raw bytes and never sends create-only seed")
+              adoption.owners.first?.name == "Main", "authenticated existing website witness can reopen the deterministic owner")
+        check(adoption.plaintext == webBytes && web.seedCalls == 0, "existing website witness keeps raw bytes and never sends create-only seed")
         check((adoption.websiteAdoption?.original["vortx"] as? [String: Any])?["roster"] == nil,
               "the interpretation-only owner is absent from the archived source input")
         let progressBytes = Data(#"{"webProgress":{"owner":[]}}"#.utf8)
@@ -472,6 +474,7 @@ private struct VortxAccountScope {
     }
     static func run() async throws {
         markerCases(); try await admissionCases(); await pullCases(); await accountDataProbeCases()
+        try NativeWebsiteRosterPublicationReceiptTests.run()
         print("Native restore admission: \(checks) focused checks passed; no device/login or full mount proof")
     }
 }
