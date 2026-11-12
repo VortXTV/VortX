@@ -299,7 +299,7 @@ targets:
         # slice is kernel-only (the script's --no-server fallback): it would fail at link.
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER VORTX_AETHER_ENGINE"
         MARKETING_VERSION: "0.5.6"
-        CURRENT_PROJECT_VERSION: "286"
+        CURRENT_PROJECT_VERSION: "289"
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
@@ -461,7 +461,7 @@ targets:
         SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_AETHER_ENGINE"
         MARKETING_VERSION: "0.5.6"
-        CURRENT_PROJECT_VERSION: "286"
+        CURRENT_PROJECT_VERSION: "289"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
         # Base plist (merged under the generated keys) carrying the ATS arbitrary-loads exception +
@@ -603,7 +603,7 @@ targets:
         # VortxNativeServer body (see the VortXiOSNative note).
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER VORTX_AETHER_ENGINE"
         MARKETING_VERSION: "0.5.6"
-        CURRENT_PROJECT_VERSION: "286"
+        CURRENT_PROJECT_VERSION: "289"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
@@ -645,7 +645,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.topshelf
         MARKETING_VERSION: "0.5.6"
-        CURRENT_PROJECT_VERSION: "286"
+        CURRENT_PROJECT_VERSION: "289"
         # BASE plist carrying the NSExtension dict (the extension point + principal class), which has no
         # INFOPLIST_KEY_* equivalent and so cannot be expressed as build settings. Xcode merges its
         # GENERATED keys on top, exactly as ResourcesTV/Info-tvOS.plist does for the app: that merge is
@@ -689,7 +689,7 @@ targets:
         # so nothing outside it ever loads AetherEngine's AetherLib* FFmpeg modules next to MPVKit's.
         BUILD_LIBRARY_FOR_DISTRIBUTION: "YES"
         MARKETING_VERSION: "0.5.6"
-        CURRENT_PROJECT_VERSION: "286"
+        CURRENT_PROJECT_VERSION: "289"
         GENERATE_INFOPLIST_FILE: "YES"
         SWIFT_VERSION: "6.0"
         DEFINES_MODULE: "YES"
@@ -798,7 +798,7 @@ targets:
         SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_NO_EMBEDDED_SERVER VORTX_AETHER_ENGINE"
         MARKETING_VERSION: "0.5.6"
-        CURRENT_PROJECT_VERSION: "286"
+        CURRENT_PROJECT_VERSION: "289"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
