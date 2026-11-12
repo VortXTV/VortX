@@ -28,6 +28,7 @@ class NewEpisodeNotifyWorker(context: Context, params: WorkerParameters) :
         val seriesName = inputData.getString(NewEpisodeNotifications.KEY_SERIES_NAME).orEmpty()
         val episodeLabel = inputData.getString(NewEpisodeNotifications.KEY_EPISODE_LABEL).orEmpty()
         val app = context as? VortXApplication ?: return@withContext Result.success()
+        app.awaitAccountSyncStartup()
         val captured = when (val owner = captureEpisodeNotificationOwner(app)) {
             is EpisodeNotificationOwnerObservation.Mounted -> owner
             EpisodeNotificationOwnerObservation.Unavailable -> return@withContext Result.retry()

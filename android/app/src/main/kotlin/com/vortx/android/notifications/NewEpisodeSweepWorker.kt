@@ -47,6 +47,7 @@ class NewEpisodeSweepWorker(context: Context, params: WorkerParameters) :
         }
 
         val app = context as? VortXApplication ?: return@withContext Result.success()
+        app.awaitAccountSyncStartup()
         val captured = when (val owner = captureEpisodeNotificationOwner(app)) {
             is EpisodeNotificationOwnerObservation.Mounted -> owner
             EpisodeNotificationOwnerObservation.Unavailable -> return@withContext Result.retry()

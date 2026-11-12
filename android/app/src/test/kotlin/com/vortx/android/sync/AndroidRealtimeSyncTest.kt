@@ -162,9 +162,13 @@ class AndroidRealtimeSyncTest {
         override suspend fun prepareEmptyAccount(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean) = document()
     }
 
-    private inner class Fixture(scheduler: TestCoroutineScheduler, val context: MemoryContext = MemoryContext()) {
+    private inner class Fixture(
+        scheduler: TestCoroutineScheduler,
+        val context: MemoryContext = MemoryContext(),
+        startupActive: (VortXSyncManager) -> Boolean = { true },
+    ) {
         val work = CoroutineScope(SupervisorJob() + StandardTestDispatcher(scheduler))
-        val manager = VortXSyncManager(context, work)
+        val manager = VortXSyncManager(context, work, startupActive)
         val gateway = Gateway()
         val providers = NativeProviderTestStore()
         var cloud = document()
@@ -253,6 +257,20 @@ class AndroidRealtimeSyncTest {
             check(manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.UnknownOrUnavailable)
             check(manager.currentSession() == null)
         }
+        fun prepareStartup(
+            foreground: MutableStateFlow<AccountSyncForeground>,
+            confirmedOwner: SessionOwnerSnapshot = manager.sessionOwnerSnapshot(),
+        ): () -> Unit = requireNotNull(manager.prepareNativeGateway(gateway, foreground, confirmedOwner))
+
+        fun assertNoStartupDispatch() {
+            assertEquals(0, gateway.reopens)
+            assertEquals(0, gateway.applied)
+            assertEquals(0, gets)
+            assertEquals(0, puts)
+            assertTrue(tokens.isEmpty())
+            assertTrue(sockets.isEmpty())
+        }
+
         suspend fun close() { realtime.stop(); manager.cancelSyncTestWork(); gateway.retire(); NativeProviderAccess.unbindForTest() }
     }
 
@@ -1390,6 +1408,210 @@ class AndroidRealtimeSyncTest {
             f.manager.installSessionRestoreTestSeam(VortXSyncManager.Session("fixture-a", account, key), 2)
             f.manager.sessionOwnerSnapshot(); f.manager.onLocalNativeMutation(origin)
             assertFalse(f.dirty())
+        } finally { f.close() }
+    }
+
+    @Test fun `cold confirmed account waits for manager publication and forces one authenticated receive`() = test {
+        var published: VortXSyncManager? = null
+        val f = Fixture(testScheduler, startupActive = { it === published })
+        try {
+            val owner = f.manager.sessionOwnerSnapshot()
+            assertEquals(SessionOwnerSnapshot.Account(account.id, INITIAL_SESSION_OWNER_EPOCH), owner)
+            val start = f.prepareStartup(MutableStateFlow(AccountSyncForeground(active = false)), owner)
+            runCurrent()
+            f.assertNoStartupDispatch()
+            assertTrue(runCatching { start() }.exceptionOrNull() is IllegalStateException)
+            runCurrent()
+            f.assertNoStartupDispatch()
+
+            published = f.manager
+            start()
+            runCurrent()
+
+            assertEquals(1, f.gateway.reopens)
+            assertEquals(1, f.gateway.applied)
+            assertEquals(1, f.gets)
+            assertEquals(listOf("fixture-a"), f.tokens)
+            assertEquals(0, f.puts)
+            assertTrue(f.sockets.isEmpty())
+        } finally { f.close() }
+    }
+
+    @Test fun `cold signed-out and unavailable owners cannot open a checkpoint request or socket`() = test {
+        for (signedOut in listOf(true, false)) {
+            val f = Fixture(testScheduler)
+            try {
+                f.manager.installUnavailableSessionRestoreTestSeam()
+                assertTrue(f.manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.UnknownOrUnavailable)
+                if (signedOut) f.manager.installSessionRestoreTestSeam(null, ownerEpoch = 2)
+                val owner = f.manager.sessionOwnerSnapshot()
+                if (signedOut) {
+                    assertEquals(SessionOwnerSnapshot.SignedOutLocal(2), owner)
+                } else {
+                    assertTrue(owner is SessionOwnerSnapshot.UnknownOrUnavailable)
+                }
+
+                f.prepareStartup(MutableStateFlow(AccountSyncForeground(active = true)), owner)()
+                runCurrent()
+
+                f.assertNoStartupDispatch()
+                assertEquals(if (signedOut) SessionUiState.SignedOut else SessionUiState.UnknownOrUnavailable,
+                    f.manager.sessionUiState.value)
+            } finally { f.close() }
+        }
+    }
+
+    @Test fun `a live account and mismatched persisted tuple do not authorize cold receive`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val live = requireNotNull(f.manager.currentSession())
+            f.manager.installSessionRestoreTestSeam(
+                VortXSyncManager.Session("changed-fixture-token", live.account, ByteArray(32) { 38 }),
+                ownerEpoch = INITIAL_SESSION_OWNER_EPOCH,
+            )
+            val owner = f.manager.sessionOwnerSnapshot()
+            assertTrue(owner is SessionOwnerSnapshot.UnknownOrUnavailable)
+            assertSame(live, f.manager.currentSession())
+
+            // No foreground transition is present to independently recover the newer tuple.
+            f.prepareStartup(MutableStateFlow(AccountSyncForeground(active = false)), owner)()
+            runCurrent()
+
+            f.assertNoStartupDispatch()
+        } finally { f.close() }
+    }
+
+    @Test fun `cold startup rechecks unavailable or changed persistence after it waits for the native mutex`() = test {
+        for (unavailable in listOf(true, false)) {
+            val f = Fixture(testScheduler)
+            val release = CompletableDeferred<Unit>()
+            try {
+                val foreground = MutableStateFlow(AccountSyncForeground(active = false))
+                val start = f.prepareStartup(foreground)
+                f.getGate = release
+                val holder = async { f.manager.syncDown() }
+                runCurrent()
+                assertFalse(holder.isCompleted)
+                assertEquals(1, f.gets)
+                assertEquals(1, f.gateway.reopens)
+
+                start()
+                runCurrent()
+                assertEquals(1, f.gets)
+                if (unavailable) {
+                    f.manager.installUnavailableSessionRestoreTestSeam()
+                } else {
+                    f.manager.installSessionRestoreTestSeam(requireNotNull(f.manager.currentSession()), ownerEpoch = 2)
+                }
+                // Stop the holder at its existing transport response. It must not observe the changed
+                // persisted tuple on the way out and indirectly reject the queued cold lease for us.
+                f.getFails = true
+                f.getGate = null
+                release.complete(Unit)
+                runCurrent()
+                assertFalse(holder.await())
+
+                assertEquals("the rejected cold lease must not reopen the checkpoint", 1, f.gateway.reopens)
+                assertEquals(listOf("fixture-a"), f.tokens)
+                assertEquals(0, f.puts)
+                assertTrue(f.sockets.isEmpty())
+            } finally {
+                release.complete(Unit)
+                f.close()
+            }
+        }
+    }
+
+    @Test fun `background rejects an admitted realtime receive still waiting for native mutex`() = test {
+        val f = Fixture(testScheduler)
+        val release = CompletableDeferred<Unit>()
+        try {
+            val foreground = MutableStateFlow(AccountSyncForeground(active = true))
+            f.prepareStartup(foreground)()
+            runCurrent()
+            val socket = f.sockets.single()
+            val previousGets = f.gets
+            val previousReopens = f.gateway.reopens
+
+            f.getGate = release
+            val holder = async { f.manager.syncDown() }
+            runCurrent()
+            assertFalse(holder.isCompleted)
+            assertEquals(previousGets + 1, f.gets)
+            assertEquals(previousReopens + 1, f.gateway.reopens)
+
+            val oldLease = requireNotNull(f.manager.captureRealtimeLease())
+            // This call is not the socket worker, so stopping that worker cannot make the test pass by cancellation.
+            val queued = async { f.manager.syncDownForRealtime(oldLease) }
+            runCurrent()
+            assertFalse(queued.isCompleted)
+            foreground.value = AccountSyncForeground(active = false)
+            f.getGate = null
+            release.complete(Unit)
+            runCurrent()
+
+            assertTrue(holder.await())
+            assertFalse(queued.await())
+            assertTrue(socket.cancelled)
+            assertEquals(previousReopens + 1, f.gateway.reopens)
+            assertEquals(previousGets + 1, f.gets)
+            assertEquals(0, f.puts)
+        } finally {
+            release.complete(Unit)
+            f.close()
+        }
+    }
+
+    @Test fun `background after checkpoint preparation blocks the realtime transport request`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val foreground = MutableStateFlow(AccountSyncForeground(active = true))
+            f.prepareStartup(foreground)()
+            runCurrent()
+            val socket = f.sockets.single()
+            val previousGets = f.gets
+            val previousReopens = f.gateway.reopens
+            val oldLease = requireNotNull(f.manager.captureRealtimeLease())
+
+            // Invalidate the conditional receipt so this receive must use the real checkpoint/export path.
+            f.gateway.mountRevision++
+            var backgroundedBeforeRequest = false
+            f.gateway.afterExport = {
+                f.gateway.afterExport = null
+                backgroundedBeforeRequest = true
+                foreground.value = AccountSyncForeground(active = false)
+            }
+            val result = async { f.manager.syncDownForRealtime(oldLease) }
+            runCurrent()
+
+            assertTrue(backgroundedBeforeRequest)
+            assertFalse(result.await())
+            assertTrue(socket.cancelled)
+            assertEquals(previousReopens + 1, f.gateway.reopens)
+            assertEquals(previousGets, f.gets)
+            assertEquals(0, f.puts)
+        } finally { f.close() }
+    }
+
+    @Test fun `a conflated background and foreground retires the previous realtime socket`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val foreground = MutableStateFlow(AccountSyncForeground(active = true))
+            f.prepareStartup(foreground)()
+            runCurrent()
+            val old = f.sockets.single()
+            val previousGets = f.gets
+
+            foreground.value = AccountSyncForeground(active = false)
+            foreground.value = AccountSyncForeground(active = true)
+            runCurrent()
+
+            assertTrue(old.cancelled)
+            assertEquals(2, f.sockets.size)
+            assertEquals(previousGets + 1, f.gets)
+            old.updated(11)
+            runCurrent()
+            assertEquals(previousGets + 1, f.gets)
         } finally { f.close() }
     }
 

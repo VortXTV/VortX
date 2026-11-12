@@ -83,18 +83,59 @@ class ProfileSelectionWiringTest {
 
     @Test fun `restore exclusion is one application binding for the exact attached manager`() {
         val app = source("VortXApplication.kt")
-        val binding = "pickerFileRestoreBinding = manager to ApplicationAccountFileRestoreExclusion(this, manager)"
-        val attachment = app.indexOf("manager.attachNativeGateway(nativeAccounts)")
-        val publication = app.indexOf(binding)
-        assertTrue(attachment >= 0 && publication > attachment)
-        assertEquals(publication, app.lastIndexOf(binding))
-        assertTrue(app.contains("it.first === expected && syncManager === expected"))
+        val attachment = app.indexOf("manager.prepareNativeGateway(nativeAccounts, accountForeground, confirmedOwner)")
+        val binding = "val pickerRestore = ApplicationAccountFileRestoreExclusion(this@VortXApplication, manager)"
+        val construction = app.indexOf(binding)
+        val publication = app.indexOf("publishAccountSync(manager, pickerRestore, confirmedOwner)")
+        assertTrue(attachment >= 0 && construction > attachment && publication > construction)
+        assertEquals(construction, app.lastIndexOf(binding))
+        assertTrue(app.contains("_accountSyncStartup.value = ready"))
+        assertTrue(app.contains("?.takeIf { it.manager === expected }"))
+        assertTrue(app.contains("if (syncManager !== manager) return@bindAccountOwnerSource"))
         val model = source("ui/viewmodel/ProfilePickerToolsViewModel.kt")
         assertTrue(model.contains("if (manager != null && externalRestore != null)"))
         for (path in listOf("MainActivity.kt", "ui/tv/TvActivity.kt")) {
             val activity = source(path)
-            assertTrue(activity.contains("syncManager = app.syncManager"))
+            assertTrue(activity.contains("app.accountSyncStartup.collectAsStateWithLifecycle()"))
+            assertTrue(activity.contains("AccountStartupLoading()"))
+            assertTrue(activity.contains("syncManager = (startup as? VortXApplication.AccountSyncStartup.Ready)?.manager"))
             assertFalse(activity.contains("ApplicationAccountFileRestoreExclusion("))
+        }
+    }
+
+    @Test fun `cold account initialization waits to release foreground and owner-sensitive work`() {
+        val app = source("VortXApplication.kt")
+        val startup = app.substringAfter("private fun wireAccountSync()").substringBefore("/// The one [CatalogRepository]")
+        val lifecycle = startup.indexOf("registerActivityLifecycleCallbacks")
+        val worker = startup.indexOf("applicationScope.launch {")
+        val constructor = startup.indexOf("VortXSyncManager(this@VortXApplication)")
+        val published = startup.indexOf("publishAccountSync(manager, pickerRestore, confirmedOwner)")
+        assertTrue(lifecycle >= 0 && worker > lifecycle && constructor > worker)
+        assertTrue(published > constructor && startup.indexOf("startNativeWork()") > published)
+        assertTrue(startup.contains("accountForeground.value = AccountSyncForeground(active = false)"))
+        assertTrue(startup.contains("val confirmedOwner = manager.sessionOwnerSnapshot()"))
+
+        // Download ownership is tri-state. Direct work and unlock replay do not wait for account I/O.
+        for (path in listOf("downloads/DownloadWorker.kt", "downloads/DownloadUnlockReceiver.kt")) {
+            assertFalse(source(path).contains("awaitAccountSyncStartup()"))
+        }
+        assertTrue(app.contains("manager.sessionUiState.combine(manager.pickerAccountRevision)"))
+        assertTrue(app.contains("if (confirmedOwner != null) applicationScope.launch { retryDownloadRecovery(manager) }"))
+        assertTrue(app.contains("if (current is SessionOwnerSnapshot.SignedOutLocal) retireWatchNextAfterSignOut(manager, current)"))
+
+        for (path in listOf("notifications/NewEpisodeSweepWorker.kt", "notifications/NewEpisodeNotifyWorker.kt")) {
+            val workerSource = source(path)
+            assertTrue(workerSource.indexOf("app.awaitAccountSyncStartup()") in
+                0 until workerSource.indexOf("captureEpisodeNotificationOwner(app)"))
+        }
+        val tv = source("ui/tv/TvActivity.kt").substringAfter("repeatOnLifecycle(Lifecycle.State.STARTED)")
+        val wait = tv.indexOf("app.awaitAccountSyncStartup()")
+        assertTrue(tv.indexOf("app.clearWatchNextIfDisabled()") in 0 until wait)
+        assertTrue(wait in 0 until tv.indexOf("val repo = app.catalogRepository"))
+        for (path in listOf("MainActivity.kt", "ui/tv/TvActivity.kt")) {
+            val activity = source(path)
+            assertTrue(activity.contains("deepLinkEvent = deepLinks.pendingEvent"))
+            assertTrue(activity.contains("onDeepLinkHandled = deepLinks::acknowledge"))
         }
     }
 

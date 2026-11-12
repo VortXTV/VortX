@@ -4,8 +4,11 @@ import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.runtime.getValue
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.player.PlayerPipBridge
+import com.vortx.android.ui.components.AccountStartupLoading
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
@@ -60,19 +63,23 @@ class TvActivity : ComponentActivity() {
 
         val app = application as VortXApplication
         setContent {
-            TvApp(
-                repo = app.catalogRepository,
-                auth = app.authRepository,
-                syncManager = app.syncManager,
-                deepLinkEvent = deepLinks.pendingEvent,
-                onDeepLinkHandled = deepLinks::acknowledge,
-            )
+            val startup by app.accountSyncStartup.collectAsStateWithLifecycle()
+            if (startup === VortXApplication.AccountSyncStartup.Preparing) {
+                AccountStartupLoading()
+            } else {
+                TvApp(
+                    repo = app.catalogRepository,
+                    auth = app.authRepository,
+                    syncManager = (startup as? VortXApplication.AccountSyncStartup.Ready)?.manager,
+                    deepLinkEvent = deepLinks.pendingEvent,
+                    onDeepLinkHandled = deepLinks::acknowledge,
+                )
+            }
         }
 
         // Observe the local playback projection without competing for the visible Home catalog load.
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
-                val repo = app.catalogRepository
                 TopShelfSettings.observeShowContinueWatching(applicationContext)
                     .flowOn(Dispatchers.IO)
                     .collectLatest { enabled ->
@@ -80,6 +87,8 @@ class TvActivity : ComponentActivity() {
                             app.clearWatchNextIfDisabled()
                             return@collectLatest
                         }
+                        app.awaitAccountSyncStartup()
+                        val repo = app.catalogRepository
                         var published: Pair<PlaybackOwnerToken, WatchNextPublication>? = null
                         repo.ctxUpdates().onStart { emit(Unit) }.flowOn(Dispatchers.IO).conflate().collect {
                             val previous = published

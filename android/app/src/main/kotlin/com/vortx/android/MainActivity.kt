@@ -13,10 +13,13 @@ import android.view.animation.AnticipateInterpolator
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
+import androidx.compose.runtime.getValue
 import androidx.activity.enableEdgeToEdge
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.deeplink.ActivityDeepLinkDelivery
 import com.vortx.android.player.PlayerPipBridge
+import com.vortx.android.ui.components.AccountStartupLoading
 import com.vortx.android.ui.VortXApp
 import com.vortx.android.ui.prefs.AppLanguage
 import com.vortx.android.ui.theme.isAnimatorScaleZero
@@ -89,15 +92,18 @@ class MainActivity : ComponentActivity() {
         // here -- see VortXApplication's doc comment for why an Activity-scoped instance is unsafe.
         val app = application as VortXApplication
         setContent {
-            VortXApp(
-                repo = app.catalogRepository,
-                auth = app.authRepository,
-                // The VortX account + cross-device sync engine (nullable: sync is off the critical
-                // path; a keystore failure hides the account row instead of blocking launch).
-                syncManager = app.syncManager,
-                deepLinkEvent = deepLinks.pendingEvent,
-                onDeepLinkHandled = deepLinks::acknowledge,
-            )
+            val startup by app.accountSyncStartup.collectAsStateWithLifecycle()
+            if (startup === VortXApplication.AccountSyncStartup.Preparing) {
+                AccountStartupLoading()
+            } else {
+                VortXApp(
+                    repo = app.catalogRepository,
+                    auth = app.authRepository,
+                    syncManager = (startup as? VortXApplication.AccountSyncStartup.Ready)?.manager,
+                    deepLinkEvent = deepLinks.pendingEvent,
+                    onDeepLinkHandled = deepLinks::acknowledge,
+                )
+            }
         }
     }
 
