@@ -196,6 +196,15 @@ async function mountAndLoad(
   // the source now playing. See sourceGen.
   const myGen = ++sourceGen;
   const isCurrentSource = () => myToken === playToken && myGen === sourceGen;
+  let subtitleSelectionMade = false;
+  const selectSubtitle = (selected: TextTrack | null) => {
+    if (!isCurrentSource()) return;
+    subtitleSelectionMade = true;
+    for (const track of selectableSubtitleTracks(vid)) {
+      track.mode = track === selected ? "showing" : "disabled";
+    }
+    controller?.refreshSubtitles();
+  };
   const hasNext = sessionIndex < sessionFallbacks.length - 1;
   controller = mountControls(host, vid, {
     title,
@@ -204,10 +213,11 @@ async function mountAndLoad(
     hasNextEpisode: !!opts.onNextEpisode,
     onNextEpisode: opts.onNextEpisode,
     onTryNextSource: hasNext ? () => advanceSource(host, "manual") : undefined,
+    onSelectSubtitle: selectSubtitle,
   });
 
   if (opts.item) wireProgress(vid, opts.item);
-  wireKeyboard(vid);
+  wireKeyboard(vid, selectSubtitle);
   wireMobileAudio(vid);
   wireAudioFailure(host, vid, myGen);
   // Surface a clear message when the element fails to load or decode (an expired debrid link, a 404, an
@@ -218,16 +228,13 @@ async function mountAndLoad(
     if (!advanceSource(host, "decode"))
       showError(host, "This source could not be played. It may be offline or an unsupported format. Try another source.");
   });
-  // Subtitles: non-blocking, gated on the session token so a list that resolves after close / a new source
-  // does not attach tracks to a dead session.
+  // Add-on tracks must attach to this source and respect an explicit CC or keyboard selection.
   if (opts.subtitles) {
     void opts.subtitles
-      .then((subs) => {
-        if (myToken !== playToken) return;
-        return addSubtitleTracks(vid, subs);
-      })
-      .then(() => {
-        if (myToken === playToken) controller?.refreshSubtitles();
+      .then(async (subs) => {
+        if (!isCurrentSource()) return;
+        await addSubtitleTracks(vid, subs, isCurrentSource, () => !subtitleSelectionMade);
+        if (isCurrentSource()) controller?.refreshSubtitles();
       })
       .catch(() => undefined);
   }
@@ -445,9 +452,9 @@ function wireProgress(video: HTMLVideoElement, item: CWItem, admitted = sessionP
 
 /** Global keyboard shortcuts while the player overlay is open (the native <video> controls only respond
  *  when the element is focused): Space play/pause, Left/Right seek by the Skip-step setting, Up/Down volume,
- *  [ / ] playback speed, M mute, F fullscreen.
+ *  [ / ] playback speed, M mute, F fullscreen, C toggle preferred subtitles.
  *  Removed on close so keys don't leak to the surfaces underneath. */
-function wireKeyboard(video: HTMLVideoElement): void {
+function wireKeyboard(video: HTMLVideoElement, selectSubtitle: (track: TextTrack | null) => void): void {
   if (keyHandler) document.removeEventListener("keydown", keyHandler);
   keyHandler = (e: KeyboardEvent) => {
     let handled = true;
@@ -473,6 +480,12 @@ function wireKeyboard(video: HTMLVideoElement): void {
         break;
       case "BracketLeft":
         stepSpeed(video, -1);
+        break;
+      case "KeyC":
+        if (e.defaultPrevented || e.repeat || e.isComposing || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey ||
+            (e.target instanceof HTMLElement && (e.target.isContentEditable ||
+              e.target.matches("textarea, select, input:not([type=range]), [role=textbox]")))) return;
+        handled = togglePreferredSubtitle(video, selectSubtitle);
         break;
       case "KeyM":
         video.muted = !video.muted;
@@ -500,8 +513,48 @@ function wireKeyboard(video: HTMLVideoElement): void {
 
 type SelectableSubtitleTrack = Pick<TextTrack, "language" | "mode">;
 
-function primaryLanguage(value: string): string {
-  return value.trim().toLowerCase().split(/[-_]/, 1)[0] ?? "";
+// ISO 639-2 spellings of the subtitle languages offered in web Settings. Older TV
+// browser locale data can leave three-letter spellings as-is.
+const subtitleLanguageAliases = new Map([
+  ["eng", "en"], ["spa", "es"], ["fra", "fr"], ["fre", "fr"], ["deu", "de"], ["ger", "de"],
+  ["ita", "it"], ["por", "pt"], ["rus", "ru"], ["jpn", "ja"], ["kor", "ko"],
+  ["zho", "zh"], ["chi", "zh"], ["hin", "hi"], ["ara", "ar"],
+]);
+
+function subtitleLanguage(value: string): string {
+  const [base, ...region] = value.trim().toLowerCase().replace(/_/g, "-").split("-");
+  if (!base) return "";
+  const tag = [subtitleLanguageAliases.get(base) ?? base, ...region].join("-");
+  try { return Intl.getCanonicalLocales(tag)[0]?.toLowerCase() ?? ""; }
+  catch { return tag; }
+}
+
+function primaryLanguage(tag: string): string {
+  return tag.split("-", 1)[0] ?? "";
+}
+
+function preferredSubtitleTrack<T extends SelectableSubtitleTrack>(tracks: T[], language: string): T | undefined {
+  const preferred = subtitleLanguage(language);
+  const primary = primaryLanguage(preferred);
+  if (!primary) return undefined;
+  const candidates = tracks.map((track) => ({ track, tag: subtitleLanguage(track.language) }));
+  return (candidates.find(({ tag }) => tag === preferred) ??
+    candidates.find(({ tag }) => primaryLanguage(tag) === primary))?.track;
+}
+
+function selectableSubtitleTracks(video: HTMLVideoElement): TextTrack[] {
+  return Array.from(video.textTracks).filter((track) => track.kind === "subtitles" || track.kind === "captions");
+}
+
+function togglePreferredSubtitle(video: HTMLVideoElement, selectSubtitle: (track: TextTrack | null) => void): boolean {
+  const tracks = selectableSubtitleTracks(video);
+  const preferred = preferredSubtitleTrack(tracks, getSettings().subtitleLang);
+  if (!preferred) return false;
+  const language = primaryLanguage(subtitleLanguage(preferred.language));
+  const alreadyShowing = tracks.some((track) =>
+    track.mode === "showing" && primaryLanguage(subtitleLanguage(track.language)) === language);
+  selectSubtitle(alreadyShowing ? null : preferred);
+  return true;
 }
 
 /** Apply the persisted subtitle policy after tracks have been attached to the video. */
@@ -514,19 +567,21 @@ function applySubtitlePreference(
   for (const track of available) track.mode = "disabled";
   if (mode !== "always") return;
 
-  const preferred = primaryLanguage(preferredLanguage);
-  const selected =
-    (preferred
-      ? available.find((track) => primaryLanguage(track.language) === preferred)
-      : undefined) ?? available[0];
+  const selected = preferredSubtitleTrack(available, preferredLanguage) ?? available[0];
   if (selected) selected.mode = "showing";
 }
 
 /** Add subtitle <track>s to the video; the player's CC menu then exposes them to pick one. */
-async function addSubtitleTracks(video: HTMLVideoElement, subs: SubtitleTrack[]): Promise<void> {
+async function addSubtitleTracks(
+  video: HTMLVideoElement,
+  subs: SubtitleTrack[],
+  isCurrentSource: () => boolean = () => true,
+  shouldApplyPreference: () => boolean = () => true,
+): Promise<void> {
   // Convert all in parallel so one slow source does not hold up the rest (sequential awaits could take
   // up to ~12s x N before the user's language appears). Promise.all preserves the original order.
   const resolved = await Promise.all(subs.map(async (sub) => ({ sub, url: await toVttUrl(sub) })));
+  if (!isCurrentSource()) return;
   const appended: TextTrack[] = [];
   for (const { sub, url } of resolved) {
     if (!url) continue;
@@ -538,8 +593,12 @@ async function addSubtitleTracks(video: HTMLVideoElement, subs: SubtitleTrack[])
     video.appendChild(track);
     appended.push(track.track);
   }
-  const settings = getSettings();
-  applySubtitlePreference(appended, settings.subtitlesMode, settings.subtitleLang);
+  if (shouldApplyPreference()) {
+    const settings = getSettings();
+    applySubtitlePreference(appended, settings.subtitlesMode, settings.subtitleLang);
+  } else {
+    for (const track of appended) track.mode = "disabled";
+  }
 }
 
 export const __playerTestHooks = { addSubtitleTracks, applySubtitlePreference, wireProgress };
@@ -549,11 +608,14 @@ async function toVttUrl(sub: SubtitleTrack): Promise<string | null> {
   const abortCtrl = new AbortController();
   const timer = setTimeout(() => abortCtrl.abort(), 12_000);
   // Also abort if the player session ends while this fetch is in flight, so it can't push a stale blob URL.
-  subAbort?.signal.addEventListener("abort", () => abortCtrl.abort(), { once: true });
+  const sourceSignal = subAbort?.signal;
+  const abort = () => abortCtrl.abort();
+  sourceSignal?.addEventListener("abort", abort, { once: true });
   try {
     const res = await fetch(sub.url, { signal: abortCtrl.signal });
     if (!res.ok) return null;
     const text = await res.text();
+    if (abortCtrl.signal.aborted) return null;
     const isVtt = /\.vtt(\?|$)/i.test(sub.url) || /^﻿?\s*WEBVTT/.test(text);
     const blobUrl = URL.createObjectURL(new Blob([isVtt ? text : srtToVtt(text)], { type: "text/vtt" }));
     subtitleBlobs.push(blobUrl);
@@ -562,6 +624,7 @@ async function toVttUrl(sub: SubtitleTrack): Promise<string | null> {
     return null;
   } finally {
     clearTimeout(timer);
+    sourceSignal?.removeEventListener("abort", abort);
   }
 }
 
