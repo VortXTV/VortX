@@ -647,7 +647,7 @@ enum TopShelfSnapshot {
     /// its progress satisfies TVServices' 0...1 contract, and its poster is https or a file inside
     /// the managed artwork folder. Reject malformed rows without repairing the shared cache.
     static func displayable(_ item: Item, artworkDirectory: URL?) -> Item? {
-        guard let link = openURL(type: item.type, id: item.id), parse(link) == .open(type: item.type, id: item.id),
+        guard hasValidAction(type: item.type, id: item.id),
               item.progress.isFinite, (0...1).contains(item.progress) else { return nil }
         guard let poster = item.poster else { return item }
         let accepted: Bool
@@ -822,6 +822,12 @@ enum TopShelfSnapshot {
         c.host = "open"
         c.queryItems = [URLQueryItem(name: "type", value: type), URLQueryItem(name: "id", value: id)]
         return c.url
+    }
+
+    /// The app writer and extension reader require the same exact, routable title identity.
+    static func hasValidAction(type: String, id: String) -> Bool {
+        guard let link = openURL(type: type, id: id) else { return false }
+        return parse(link) == .open(type: type, id: id)
     }
 
     /// Content types a link may address. A URL scheme is an OPEN door: any app on the device can send

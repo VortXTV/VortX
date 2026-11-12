@@ -34,7 +34,9 @@ writeFileSync(`${dir}/BaselineServiceSelection.swift`, renamedBaseline
   .replace('    static func permitsPrivateArtworkCommit(', '    @MainActor static func permitsPrivateArtworkCommit('));
 const shelf = read('app/SourcesTV/TopShelfSnapshotWriter.swift');
 writeFileSync(`${dir}/FixtureTopShelfMapper.swift`, 'import Foundation\nenum FixtureTopShelfMapper {\n' +
-  ['struct PublicationKey:', 'static func publicationKey(', 'static func items(\n', 'private static func shelfProgress(', 'private static func shelfPoster('].map(marker => block(shelf, marker)).join('\n') + '\n}\n');
+  ['struct PublicationKey:', 'static func publicationKey(', 'static func items(\n',
+   'private static func shelfCandidates(', 'private static func snapshotItems(',
+   'private static func shelfProgress(', 'private static func shelfPoster('].map(marker => block(shelf, marker)).join('\n') + '\n}\n');
 // Source wiring only; the Swift cases below execute the actual key/mapper, not a second policy.
 const home = read('app/SourcesTV/HomeView.swift');
 const shelfPublisher = block(home, '.onChange(of: TopShelfSnapshotWriter.publicationKey(for: shelfContinueWatching))');
@@ -154,6 +156,7 @@ cw_inputs=(
     app/SourcesShared/SIMKLContinueWatching.swift
     app/SourcesShared/SIMKLContinueWatchingShadow.swift
     app/SourcesShared/HomeContinueWatchingSelection.swift
+    app/SourcesShared/TopShelfSnapshot.swift
     "$cw_build_dir/FixtureTopShelfMapper.swift"
     "$cw_build_dir/FixtureContinueWatchingFocus.swift"
     "$cw_build_dir/MigrationFixtureProfileStore.swift"

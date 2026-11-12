@@ -469,6 +469,10 @@ struct ContinueWatchingServiceTests {
         require(capped.items.count == 8, "shelf observation retains only eight mapped rows")
         require(key(Array(nine.prefix(8)) + [row("8", progress: 0.6)]) == capped,
                 "unpublished ninth-row progress does not cause a shelf write")
+        let invalidPrefix = (0..<TopShelfSnapshot.maxItems).map { row(String(repeating: "x", count: 257) + String($0)) }
+        let actionable = FixtureTopShelfMapper.items(from: invalidPrefix + nine, source: .local)
+        require(actionable == capped.items,
+                "unroutable history ahead of valid rows does not consume the Top Shelf cap")
         let original = CoreBridge.shared.nativeBinding!
         CoreBridge.shared.nativeBinding = nil
         let unavailable = key([row("a"), row("b")])

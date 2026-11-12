@@ -112,7 +112,6 @@ enum TopShelfSnapshotWriter {
         let snapshot = publicationSnapshot(core: .shared, profiles: profiles)
         let selection = snapshot.selection
         let context = snapshot.context
-        let pending = items(from: selection.items, source: selection.source, displayProgress: selection.displayProgress)
         guard snapshot.intent.isCurrent() else {
             cancelWarm(clearArtwork: true); publish([]); return
         }
@@ -121,19 +120,10 @@ enum TopShelfSnapshotWriter {
         guard selection.source == .local || TopShelfSnapshot.appGroupSource != .signer else {
             cancelWarm(clearArtwork: true); publish([]); return
         }
-        // Keep the warm identity exactly aligned with the queue above. Raw Trakt state can still carry
-        // finished, removed, or temporary seeds; those rows never render and must not consume one of the
-        // bounded eight private-image requests.
-        let sourceItems = Array(selection.items.lazy
-            .filter {
-                EpisodePlaybackIdentity.usesSeriesLifecycle(type: $0.type) || !$0.isFinished
-            }
-            .filter { $0.removed != true && $0.temp != true }
-            // Every system shelf item is actionable. Unsupported SIMKL cards remain visible in
-            // Home with an explicit unavailable action, never as a broken generic deep link.
-            .filter { selection.source != .simkl || SIMKLContinueWatchingFold.unavailableReason(id: $0.id, type: $0.type, videoID: $0.state.videoId) == nil }
-            .prefix(TopShelfSnapshot.maxItems)
-            .map { WarmCandidate(id: $0.id, type: $0.type, poster: $0.poster) })
+        let selectedRows = shelfCandidates(from: selection.items, source: selection.source)
+        let pending = snapshotItems(from: selectedRows, source: selection.source, displayProgress: selection.displayProgress)
+        // Warm artwork for exactly the rows that qualified for publication.
+        let sourceItems = selectedRows.map { WarmCandidate(id: $0.id, type: $0.type, poster: $0.poster) }
 
         // A private Trakt row is published immediately with nil artwork. The only later replacement is
         // a local file URL produced by the bounded first-party warm pass; joined third-party artwork is
@@ -237,7 +227,14 @@ enum TopShelfSnapshotWriter {
         source: TraktPlaybackShadow.ContinueWatchingSource,
         displayProgress: [String: Double] = [:]
     ) -> [TopShelfSnapshot.Item] {
-        cw.lazy
+        snapshotItems(from: shelfCandidates(from: cw, source: source), source: source, displayProgress: displayProgress)
+    }
+
+    private static func shelfCandidates(
+        from cw: [CoreCWItem],
+        source: TraktPlaybackShadow.ContinueWatchingSource
+    ) -> [CoreCWItem] {
+        Array(cw.lazy
             // The rail's own prune rule. `CoreBridge` already applies `isFinished` before publishing
             // the rail, but the shelf re-applies it rather than trusting that, because a shelf is
             // rendered from a FILE that can outlive the process that wrote it: a title finished on
@@ -249,16 +246,25 @@ enum TopShelfSnapshotWriter {
             // business on the Home screen even while the engine still carries them in the bucket.
             .filter { $0.removed != true && $0.temp != true }
             .filter { source != .simkl || SIMKLContinueWatchingFold.unavailableReason(id: $0.id, type: $0.type, videoID: $0.state.videoId) == nil }
-            .prefix(TopShelfSnapshot.maxItems)
-            .map {
-                TopShelfSnapshot.Item(
-                    id: $0.id,
-                    type: $0.type,
-                    title: $0.name,
-                    poster: shelfPoster($0.poster, source: source),
-                    progress: shelfProgress(displayProgress[$0.id] ?? $0.progress)
-                )
-            }
+            // Apply the extension's link rule before the cap so a bad row cannot displace a good one.
+            .filter { TopShelfSnapshot.hasValidAction(type: $0.type, id: $0.id) }
+            .prefix(TopShelfSnapshot.maxItems))
+    }
+
+    private static func snapshotItems(
+        from rows: [CoreCWItem],
+        source: TraktPlaybackShadow.ContinueWatchingSource,
+        displayProgress: [String: Double]
+    ) -> [TopShelfSnapshot.Item] {
+        rows.map {
+            TopShelfSnapshot.Item(
+                id: $0.id,
+                type: $0.type,
+                title: $0.name,
+                poster: shelfPoster($0.poster, source: source),
+                progress: shelfProgress(displayProgress[$0.id] ?? $0.progress)
+            )
+        }
     }
 
     /// Watch progress, guaranteed finite and inside 0…1.
