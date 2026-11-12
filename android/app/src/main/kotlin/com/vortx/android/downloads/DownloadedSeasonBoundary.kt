@@ -102,7 +102,7 @@ internal data class DownloadedRollover(
             records.any { successor.matches(it) && boundary.matchesNext(it) }
 }
 
-/** Captures the original detail refresh independently from the account/profile playback epoch. */
+/** Captures the original route refresh independently from the account/profile playback epoch. */
 internal class DownloadedSeasonBoundaryRefreshFence {
     class Request internal constructor()
     private val active = AtomicReference<Request?>()
@@ -181,6 +181,8 @@ internal suspend fun refreshDownloadedSeasonBoundaries(
     owner: PlaybackOwnerToken,
     routeGenerationCurrent: () -> Boolean,
     routeCurrentOnMain: () -> Boolean,
+    startingSeason: Int? = null,
+    metadataRequestAllowed: () -> Boolean = { true },
 ) = withContext(Dispatchers.IO) {
     val job = currentCoroutineContext()
     // Inside the index lock the route check is scalar only. A full CW admission can enter native.
@@ -192,11 +194,11 @@ internal suspend fun refreshDownloadedSeasonBoundaries(
         }
     }
     suspend fun get(path: String): JSONObject? {
-        if (!current()) return null
+        if (!current() || !metadataRequestAllowed()) return null
         val response = CatalogTmdbEdge.getJson(path, maxBodyBytes = SEASON_RESPONSE_BYTES)
         return response.takeIf { current() }
     }
-    // Two open details can target the same record. Serialize observations and snapshot after
+    // Two routes can target the same record. Serialize observations and snapshot after
     // admission so a later contradiction can see and retire a receipt written by the first.
     refreshMutex.withLock {
         for (contentId in contentIds) {
@@ -207,13 +209,16 @@ internal suspend fun refreshDownloadedSeasonBoundaries(
             val bySeason = rows.groupBy { it.season }
             val origins = rows.filter {
                 val season = it.season ?: return@filter false
-                season in 1 until Int.MAX_VALUE && it.isCanonicalEpisodeCandidate() &&
+                season in 1 until Int.MAX_VALUE && (startingSeason == null || season >= startingSeason) &&
+                    it.isCanonicalEpisodeCandidate() &&
                     bySeason[season + 1].orEmpty().any { candidate ->
                         candidate.episode == 1 && candidate.isCanonicalEpisodeCandidate()
                     }
             }
             if (origins.isEmpty()) continue
-            resolveDownloadedSeasonBoundaries(contentId, origins, bySeason, ::get) { origin, boundary ->
+            // A direct binge can reach the current season finale before later season requests finish.
+            val orderedOrigins = if (startingSeason == null) origins else origins.sortedBy { it.season }
+            resolveDownloadedSeasonBoundaries(contentId, orderedOrigins, bySeason, ::get) { origin, boundary ->
                 if (current()) DownloadManager.rememberSeasonBoundary(origin, boundary, ::currentGeneration)
             }
         }

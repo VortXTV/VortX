@@ -82,7 +82,9 @@ import com.vortx.android.cast.CastOverlay
 import com.vortx.android.cast.CastRouteChooserSheet
 import com.vortx.android.cast.rememberCastManager
 import com.vortx.android.data.PlayerResourceReleaseGate
+import com.vortx.android.downloads.DownloadedSeasonBoundaryRefreshFence
 import com.vortx.android.downloads.isDownloadedPlaybackAdmissionCurrent
+import com.vortx.android.downloads.refreshMountedDownloadSeasonBoundaries
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.model.Episode
 import com.vortx.android.model.Playable
@@ -247,6 +249,7 @@ fun PlayerScreen(
     // this one idempotent route. The outer shell still owns navigation state, but it must not receive a
     // second Back while the first callback is waiting for composition to remove this player.
     var playerExitRequested by remember(outerPlaybackSessionId) { mutableStateOf(false) }
+    val downloadBoundaryFence = remember(outerPlaybackSessionId) { DownloadedSeasonBoundaryRefreshFence() }
     // Orientation belongs to this PLAYER MOUNT, not a source retry or an Up Next replacement. Those
     // operations change [outerPlaybackSessionId] while the same fullscreen composition remains active.
     // Re-keying this value would erase the pre-player orientation and make a later exit restore the
@@ -273,6 +276,7 @@ fun PlayerScreen(
     val preparePlayerExit = remember { AtomicReference<(() -> Unit)?>(null) }
     fun exitPlayer() {
         if (playerExitRequested) return
+        downloadBoundaryFence.invalidate()
         cancelAddonSubtitlePreparation()
         // Preserve/flush an owned receiver synchronously, before invalidating its original history gate.
         preparePlayerExit.get()?.invoke()
@@ -284,7 +288,10 @@ fun PlayerScreen(
     }
     BackHandler(enabled = !playerExitRequested) { exitPlayer() }
     DisposableEffect(sourceSwitchCoordinator, outerPlaybackSessionId) {
-        onDispose { sourceSwitchCoordinator.invalidateIfCurrent(outerPlaybackSessionId) }
+        onDispose {
+            downloadBoundaryFence.invalidate()
+            sourceSwitchCoordinator.invalidateIfCurrent(outerPlaybackSessionId)
+        }
     }
 
     // The shell's [playable] is the initial mount (and still changes for the established retry / Up Next
@@ -592,6 +599,21 @@ fun PlayerScreen(
     // A new file must still satisfy its policy proof when it reaches the decoder. An engine
     // switch on an already mounted file retains that file's original playback-owner gate.
     var downloadedFileMounted by remember(playbackSessionKey) { mutableStateOf(false) }
+    // The Downloads list can unmount as soon as playback opens. Own this work in the actual player.
+    LaunchedEffect(playbackSessionKey, downloadedFileMounted) {
+        val admission = currentPlayable.downloadedPlaybackAdmission ?: return@LaunchedEffect
+        if (!downloadedFileMounted || playerExitRequested || admission.seasonBoundaryLaunchFile == null ||
+            originalPlaybackOwner !== admission.ownerToken || !admission.ownerToken.isActive
+        ) return@LaunchedEffect
+        val request = downloadBoundaryFence.begin()
+        refreshMountedDownloadSeasonBoundaries(context, currentPlayable,
+            routeGenerationCurrent = {
+                downloadBoundaryFence.isCurrent(request) && sourceSwitchCoordinator.ownsOuterSession(outerPlaybackSessionId)
+            },
+            routeCurrentOnMain = {
+                !playerExitRequested && sourceSwitchState.sessionKey == playbackSessionKey && admission.ownerToken.isActive
+            })
+    }
     LaunchedEffect(playbackSessionKey, forceExoPlayer, enginePreference) {
         val original = originalPlaybackOwner
         val needsDownloadAdmission = currentPlayable.downloadedPlaybackAdmission != null && !downloadedFileMounted
@@ -1083,7 +1105,10 @@ fun PlayerScreen(
             publishState = { replacement, acknowledgePublished ->
                 // Keep the old frame alive while resolving, then cut its audio at the linearized
                 // accepted replacement boundary. An already-paused viewer remains paused.
-                if (replacement.revision > sourceSwitchState.revision) engine.pause()
+                if (replacement.revision > sourceSwitchState.revision) {
+                    downloadBoundaryFence.invalidate()
+                    engine.pause()
+                }
                 sourceSwitchState = replacement
                 acknowledgePublished()
             },
@@ -1112,7 +1137,10 @@ fun PlayerScreen(
             currentState = { sourceSwitchState },
             publishState = { accepted, acknowledgePublished ->
                 val previous = sourceSwitchState
-                if (accepted.revision > previous.revision) engine.pause()
+                if (accepted.revision > previous.revision) {
+                    downloadBoundaryFence.invalidate()
+                    engine.pause()
+                }
                 sourceSwitchState = accepted
                 acknowledgePublished()
                 acceptedEpisodeReplacement(previous, accepted)?.let { replacement ->

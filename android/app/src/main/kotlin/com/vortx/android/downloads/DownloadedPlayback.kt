@@ -1,6 +1,8 @@
 package com.vortx.android.downloads
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import com.vortx.android.VortXApplication
 import com.vortx.android.engine.NativeCatalogRepository
 import com.vortx.android.model.DownloadRecord
@@ -26,6 +28,7 @@ class DownloadedPlaybackAdmission internal constructor(
     internal val target: PlaybackContext,
     internal val policyWitness: DownloadedPolicyWitness?,
     internal val rollover: DownloadedRollover? = null,
+    internal val seasonBoundaryLaunchFile: DownloadedSeasonFile? = null,
 )
 
 internal fun interface DownloadedPolicyWitness {
@@ -76,6 +79,7 @@ private suspend fun readDownloadedAdmission(
     target: PlaybackContext,
     recordId: String,
     token: PlaybackOwnerToken,
+    seasonBoundaryLaunchFile: DownloadedSeasonFile? = null,
 ): DownloadedPlaybackAdmission? {
     if (!PlaybackOwnerEpoch.isCurrent(token)) return null
     val native = nativeDownloads(context)
@@ -85,7 +89,8 @@ private suspend fun readDownloadedAdmission(
         policy.witness
     } else null
     if (!PlaybackOwnerEpoch.isCurrent(token)) return null
-    return DownloadedPlaybackAdmission(recordId, token, target, witness)
+    return DownloadedPlaybackAdmission(recordId, token, target, witness,
+        seasonBoundaryLaunchFile = seasonBoundaryLaunchFile)
 }
 
 internal fun downloadedEpisode(records: List<DownloadRecord>, episode: Episode): DownloadRecord? =
@@ -146,7 +151,8 @@ internal class DownloadedContinueWatchingRequest private constructor(
             is Copy.Exact -> DownloadStore.record(copy.id)?.takeIf(target::matches)
                 ?: return DownloadedContinueWatchingResult.Unavailable
         }
-        val local = openDownloadedPlaybackWithResume(context, record, owner, ownerToken, episodeTitle = null)
+        val local = openDownloadedPlaybackWithResume(context, record, owner, ownerToken, episodeTitle = null,
+            refreshSeasonBoundaryOnMount = true)
         return if (local != null && isCurrent()) DownloadedContinueWatchingResult.Ready(local)
             else DownloadedContinueWatchingResult.Unavailable
     }
@@ -222,7 +228,8 @@ internal suspend fun openDownloadedPlayback(
 ): Playable? {
     val ownerToken = PlaybackOwnerEpoch.capture() ?: return null
     val owner = activeDownloadedPlaybackOwner()
-    return openDownloadedPlaybackWithResume(context, record, owner, ownerToken, episodeTitle)
+    return openDownloadedPlaybackWithResume(context, record, owner, ownerToken, episodeTitle,
+        refreshSeasonBoundaryOnMount = true)
 }
 
 private suspend fun openDownloadedPlaybackWithResume(
@@ -231,8 +238,10 @@ private suspend fun openDownloadedPlaybackWithResume(
     owner: PlaybackContext.Owner,
     ownerToken: PlaybackOwnerToken,
     episodeTitle: String?,
+    refreshSeasonBoundaryOnMount: Boolean = false,
 ): Playable? {
-    val local = openDownloadedPlayback(context, record, owner, ownerToken, episodeTitle) ?: return null
+    val local = openDownloadedPlayback(context, record, owner, ownerToken, episodeTitle,
+        refreshSeasonBoundaryOnMount) ?: return null
     val bound = local.playbackContext ?: return null
     val native = nativeDownloads(context)
     val resume = if (native != null) {
@@ -245,6 +254,47 @@ private suspend fun openDownloadedPlaybackWithResume(
     } else 0L
     val admitted = refreshDownloadedPlaybackAdmission(context, local) ?: return null
     return admitted.copy(startPositionMs = resume)
+}
+
+/** Discover season boundaries while a manually opened download plays. The handoff uses saved proof. */
+internal suspend fun refreshMountedDownloadSeasonBoundaries(
+    context: Context,
+    playable: Playable,
+    routeGenerationCurrent: () -> Boolean,
+    routeCurrentOnMain: () -> Boolean,
+) {
+    val admission = playable.downloadedPlaybackAdmission ?: return
+    val launchFile = admission.seasonBoundaryLaunchFile ?: return
+    val target = admission.target
+    val startingSeason = target.season?.takeIf { it in 1 until Int.MAX_VALUE } ?: return
+    if (target.type != "series" || (target.episode ?: 0) <= 0) return
+    fun matchesLaunch(record: DownloadRecord): Boolean =
+        launchFile.matches(record) && record.state == DownloadState.COMPLETED &&
+            record.playbackContext(target.owner) == target
+    val hasManagedFile = withContext(Dispatchers.IO) {
+        val record = DownloadStore.record(admission.recordId) ?: return@withContext false
+        routeGenerationCurrent() && matchesLaunch(record) && DownloadStore.completedPlaybackFile(record) != null &&
+            DownloadStore.matchesManagedFileUri(record, playable.url)
+    }
+    if (!hasManagedFile) return
+    refreshDownloadedSeasonBoundaries(
+        contentIds = setOf(target.contentId),
+        owner = admission.ownerToken,
+        // Called inside the index write lock. Recheck identity through the live index, with no file/native work.
+        routeGenerationCurrent = {
+            routeGenerationCurrent() && DownloadStore.record(admission.recordId)?.let(::matchesLaunch) == true
+        },
+        routeCurrentOnMain = { routeCurrentOnMain() && isDownloadedPlaybackAdmissionCurrent(playable) },
+        startingSeason = startingSeason,
+        metadataRequestAllowed = {
+            runCatching {
+                val manager = context.getSystemService(ConnectivityManager::class.java) ?: return@runCatching false
+                val capabilities = manager.activeNetwork?.let(manager::getNetworkCapabilities) ?: return@runCatching false
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            }.getOrDefault(false)
+        },
+    )
 }
 
 internal suspend fun nextDownloadedPlayback(context: Context, ended: Playable): Playable? {
@@ -291,6 +341,7 @@ internal suspend fun refreshDownloadedPlaybackAdmission(context: Context, playab
     val current = readDownloadedAdmission(context, target, admission.recordId, admission.ownerToken) ?: return null
     return playable.copy(downloadedPlaybackAdmission = DownloadedPlaybackAdmission(
         current.recordId, current.ownerToken, current.target, current.policyWitness, admission.rollover,
+        admission.seasonBoundaryLaunchFile,
     )).takeIf(::isDownloadedPlaybackAdmissionCurrent)
 }
 
@@ -300,6 +351,7 @@ private suspend fun openDownloadedPlayback(
     owner: PlaybackContext.Owner,
     ownerToken: PlaybackOwnerToken,
     episodeTitle: String?,
+    refreshSeasonBoundaryOnMount: Boolean,
 ): Playable? {
     val target = record.playbackContext(owner)
     if (readDownloadedAdmission(context, target, record.id, ownerToken) == null) return null
@@ -317,7 +369,8 @@ private suspend fun openDownloadedPlayback(
         if (DownloadStore.completedPlaybackFile(accepted) != file) return@withContext null
         accepted.localPlayable(file.toURI().toString(), owner).copy(episodeTitle = episodeTitle)
     } ?: return null
-    val admission = readDownloadedAdmission(context, target, record.id, ownerToken) ?: return null
+    val launchFile = if (refreshSeasonBoundaryOnMount && target.type == "series") DownloadedSeasonFile(record) else null
+    val admission = readDownloadedAdmission(context, target, record.id, ownerToken, launchFile) ?: return null
     return prepared.copy(downloadedPlaybackAdmission = admission).takeIf(::isDownloadedPlaybackAdmissionCurrent)
 }
 

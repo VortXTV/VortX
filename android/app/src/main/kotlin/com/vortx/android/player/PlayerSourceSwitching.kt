@@ -33,6 +33,8 @@ internal class PlayerSourceSwitchCoordinator {
         }
     }
 
+    fun ownsOuterSession(outerSessionId: Long): Boolean = liveAuthority.get()?.outerSessionId == outerSessionId
+
     fun beginRequest(outerSessionId: Long): PlayerSourceSwitchAuthority? = synchronized(lock) {
         val live = liveAuthority.get()?.takeIf { it.outerSessionId == outerSessionId } ?: return@synchronized null
         PlayerSourceSwitchAuthority(
