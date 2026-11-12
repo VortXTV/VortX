@@ -171,10 +171,17 @@ struct DetailView: View {
     }
 
     var body: some View {
-        let offlineCopies = fencedMeta == nil && !LiveTypes.contains(type)
-            ? detailDownloads.playableDownloads(libraryID: id, type: type) : []
+        let meta = fencedMeta
+        let needsEpisodeFallback = effectiveType == "series" && meta?.videos?.isEmpty != false
+        let offlineCopies = !LiveTypes.contains(type) && (meta == nil || needsEpisodeFallback)
+            ? detailDownloads.playableDownloads(libraryID: meta?.id ?? id, type: effectiveType) : []
         Group {
-            if let meta = fencedMeta {
+            if !offlineCopies.isEmpty {
+                // Reuse the offline surface for a partial series shell too. Its remote focus stays
+                // on playable buttons instead of the empty movie source list.
+                DownloadedTitleChoices(copies: offlineCopies, onPlay: playDownloadedCopy)
+                    .padding(Theme.Space.screenEdge)
+            } else if let meta {
                 // Live (tv / channel / events) gets its own stripped-down page BEFORE the movie
                 // fallback (today live falls through to moviePage): backdrop + name + a red LIVE
                 // badge + the channel source list, with NO VOD chrome: no trailer chip, no movie
@@ -191,9 +198,6 @@ struct DetailView: View {
                 } else {
                     moviePage(meta)
                 }
-            } else if !offlineCopies.isEmpty {
-                DownloadedTitleChoices(copies: offlineCopies, onPlay: playDownloadedCopy)
-                .padding(Theme.Space.screenEdge)
             } else if !LiveTypes.contains(type), type != "series", metaRequestID.hasPrefix("tt"),
                       let placeholder = CoreMetaItem.placeholder(id: metaRequestID, type: type, name: "") {
                 // Cinemeta meta is nil for this tt (a new/unreleased title: tt at TMDB, not yet in Cinemeta).

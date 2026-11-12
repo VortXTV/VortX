@@ -489,6 +489,11 @@ fun DetailScreen(
     val downloadTitleIds = setOfNotNull(viewModel.routeId, downloadDetail?.id)
     val downloadAvailability = rememberCompletedTitleDownloads(downloadTitleIds, viewModel.routeType, downloadDetail != null)
     val downloads = downloadAvailability.records
+    val unlistedDownloads = remember(downloadAvailability, downloadDetail, onPlayDownloaded != null) {
+        if (onPlayDownloaded != null && downloadDetail?.type == MediaType.SERIES) {
+            downloadAvailability.unlistedEpisodes(downloadDetail.videos)
+        } else emptyList()
+    }
     val beginDetailInteraction: () -> Boolean = {
         downloadLaunch?.cancel()
         onQueueInteraction()
@@ -789,8 +794,8 @@ fun DetailScreen(
                         )
                     }
                 }
-                if (m.data.type == MediaType.SERIES && m.data.videos.isEmpty() && onPlayDownloaded != null) {
-                    items(downloads, key = { "downloaded-${it.id}" }) { record ->
+                if (unlistedDownloads.isNotEmpty()) {
+                    items(unlistedDownloads, key = { "downloaded-${it.id}" }) { record ->
                         Chip(
                             label = "Play Downloaded · ${record.displayTitle}",
                             selected = false,

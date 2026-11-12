@@ -38,6 +38,21 @@ class OfflinePlaybackIdentityTest {
     private val ownerOverlay = PlaybackContext.Owner(profileId = "kids-profile", usesEngineHistory = false)
 
     @Test
+    fun `partial metadata leaves omitted downloads available without duplicating listed episodes`() {
+        val listed = episodeRecord()
+        val otherId = listed.copy(id = "different-video", videoId = "another-video")
+        val nextEpisode = listed.copy(id = "next-episode", videoId = "exact-next", episode = 2)
+        val video = Episode(listed.videoId, "Listed episode", 3, 1)
+        val admitted = DownloadedTitleAvailability(listOf(listed, otherId, nextEpisode), allowsMetadataFallback = true)
+
+        assertEquals(listOf(otherId, nextEpisode), admitted.unlistedEpisodes(listOf(video)))
+        assertEquals(listOf(listed, otherId, nextEpisode), admitted.unlistedEpisodes(emptyList()))
+        assertEquals(emptyList<DownloadRecord>(), admitted.copy(allowsMetadataFallback = false).unlistedEpisodes(listOf(video)))
+        assertEquals(listOf(listed, otherId, nextEpisode), admitted.copy(allowsMetadataFallback = false).unlistedEpisodes(emptyList()))
+        assertEquals(emptyList<DownloadRecord>(), DownloadedTitleAvailability().unlistedEpisodes(listOf(video)))
+    }
+
+    @Test
     fun `offline next requires exact immediate successor in same series and season`() {
         val current = episodeRecord().copy(season = 1, episode = 2)
         val currentContext = current.playbackContext(PlaybackContext.Owner("local", true))

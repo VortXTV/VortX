@@ -163,6 +163,11 @@ fun TvDetailScreen(
     val downloadTitleIds = setOfNotNull(viewModel.routeId, downloadDetail?.id)
     val downloadAvailability = rememberCompletedTitleDownloads(downloadTitleIds, viewModel.routeType, downloadDetail != null)
     val downloads = downloadAvailability.records
+    val unlistedDownloads = remember(downloadAvailability, downloadDetail, onPlayDownloaded != null) {
+        if (onPlayDownloaded != null && downloadDetail?.type == MediaType.SERIES) {
+            downloadAvailability.unlistedEpisodes(downloadDetail.videos)
+        } else emptyList()
+    }
     val beginDetailInteraction: () -> Boolean = {
         downloadLaunch?.cancel()
         onQueueInteraction()
@@ -267,6 +272,7 @@ fun TvDetailScreen(
                 onManualAction = onAutoWatchCancelled,
                 onQueueInteraction = beginDetailInteraction,
                 downloads = if (onPlayDownloaded != null) downloads else emptyList(),
+                unlistedDownloads = unlistedDownloads,
                 playDownloaded = playDownloaded,
                 queueCount = queueCount,
                 queueAvailable = queueAvailable,
@@ -294,6 +300,7 @@ private fun TvDetailContent(
     onManualAction: () -> Boolean,
     onQueueInteraction: () -> Boolean,
     downloads: List<DownloadRecord>,
+    unlistedDownloads: List<DownloadRecord>,
     playDownloaded: (DownloadRecord) -> Unit,
     queueCount: Int,
     queueAvailable: Boolean,
@@ -730,12 +737,12 @@ private fun TvDetailContent(
                     modifier = Modifier.padding(horizontal = TvDimens.edge, vertical = VortXTheme.spacing.sm),
                 )
             }
-            if (detail.type == MediaType.SERIES && detail.videos.isEmpty() && downloads.isNotEmpty()) {
+            if (unlistedDownloads.isNotEmpty()) {
                 LazyRow(
                     contentPadding = PaddingValues(horizontal = TvDimens.edge),
                     horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
                 ) {
-                    items(downloads, key = { it.id }) { record ->
+                    items(unlistedDownloads, key = { it.id }) { record ->
                         TvPlayButton(
                             label = "Play Downloaded · ${record.displayTitle}",
                             enabled = true,

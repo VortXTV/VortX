@@ -44,7 +44,16 @@ internal data class DownloadedPlaybackPolicy(
 internal data class DownloadedTitleAvailability(
     val records: List<DownloadRecord> = emptyList(),
     val allowsMetadataFallback: Boolean = false,
-)
+) {
+    /** Admitted local episodes that the provider's episode controls cannot show. */
+    fun unlistedEpisodes(videos: List<Episode>): List<DownloadRecord> {
+        if (records.isEmpty() || (videos.isNotEmpty() && !allowsMetadataFallback)) return emptyList()
+        val listed = videos.mapTo(HashSet()) { Triple<String, Int?, Int?>(it.id, it.season, it.episode) }
+        return records.filter {
+            it.type == MediaType.SERIES.id && Triple(it.videoId, it.season, it.episode) !in listed
+        }
+    }
+}
 
 private fun nativeDownloads(context: Context): NativeCatalogRepository? =
     (context.applicationContext as? VortXApplication)?.catalogRepository as? NativeCatalogRepository
