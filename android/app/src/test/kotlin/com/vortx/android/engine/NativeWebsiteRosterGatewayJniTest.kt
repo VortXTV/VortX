@@ -11,6 +11,7 @@ import com.vortx.android.sync.NativeAccountReadCapture
 import com.vortx.android.sync.NativeSettingsFence
 import com.vortx.android.sync.NativeWebsiteRosterCandidate
 import com.vortx.android.sync.NativeWebsiteRosterDenialReceipt
+import com.vortx.android.sync.NativeWebsiteRosterReceiptStore
 import com.vortx.android.sync.RevisionContext
 import com.vortx.android.sync.SessionOwnerSnapshot
 import com.vortx.android.sync.SyncRequestTestSeam
@@ -153,8 +154,14 @@ class NativeWebsiteRosterGatewayJniTest {
         override fun close() { gateway.retire(); assertTrue(bindings.live.isEmpty()) }
     }
 
+    @Test fun `two real managers admit one encrypted website roster promotion`() =
+        runWebsiteRosterRoundTrip(rejectFirst = false)
+
+    @Test fun definitivelyRejectedWebsiteRosterCasRebasesAndSecondDeviceRestoresConfirmedHead() =
+        runWebsiteRosterRoundTrip(rejectFirst = true)
+
     @OptIn(ExperimentalCoroutinesApi::class)
-    @Test fun `two real managers admit one encrypted website roster promotion`() = runBlocking {
+    private fun runWebsiteRosterRoundTrip(rejectFirst: Boolean): Unit = runBlocking {
         assumeTrue("Explicit reviewed website roster JNI gate required", System.getenv("VORTX_JNI_WEBSITE_ROSTER_ADMISSION") == "1")
         Dispatchers.setMain(UnconfinedTestDispatcher())
         val previousNotifications = NativeSettingsFence.queuedNotificationsForTest
@@ -163,76 +170,136 @@ class NativeWebsiteRosterGatewayJniTest {
         try {
             withTimeout(30_000) {
                 val identity = VortXSyncManager.Account(account.id, "fixture@example.invalid", "Fixture", false)
-                val addon = "https://fixture.invalid/manifest.json"
-                val original = OHJson.literal(
+                val originalAddon = "https://fixture.invalid/manifest.json"
+                val revisedAddon = "https://fixture.invalid/revised/manifest.json"
+                fun websiteSource(addon: String, progress: String, opaque: String) = OHJson.literal(
                     """{
                       "addons":[{"transportUrl":"$addon","manifest":{"id":"com.example.fixture","name":"Fixture catalog","version":"1.0.0","types":["movie"],"resources":["catalog"],"catalogs":[]}}],
                       "addonOrder":["$addon"],
-                      "webProgress":{"editedAt":1720000000000,"owner":[{"id":"tt0000101","type":"series","v":"tt0000101:1:2","t":37.125,"d":2500,"lastWatched":1720000000000}]},
-                      "vortx":{"webFuture":{"n":1.2300e+2,"z":-0}},
+                      "webProgress":{"editedAt":1720000000000,"owner":[{"id":"tt0000101","type":"series","v":"tt0000101:1:2","t":$progress,"d":2500,"lastWatched":1720000000000}]},
+                      "vortx":{"webFuture":{"n":$opaque,"z":-0}},
                       "future":{"exact":9007199254740993,"text":"\u0061"}
                     }""",
                 )
-                val originalFields = OHJson.Obj(original)
-                val originalVortx = originalFields.obj("vortx")
-                val originalProgress = JSONObject(original.toString(Charsets.UTF_8)).getJSONObject("webProgress")
+                val original = websiteSource(originalAddon, "37.125", "1.2300e+2")
+                val revised = websiteSource(revisedAddon, "79.25", "1.2500e+2")
+                val expectedRevision = if (rejectFirst) 42L else 41L
+                val expectedAddon = if (rejectFirst) revisedAddon else originalAddon
+                val expectedSource = if (rejectFirst) revised else original
+                val expectedProgress = JSONObject(expectedSource.toString(Charsets.UTF_8)).getJSONObject("webProgress")
                 var cloudRevision = 40L
-                var cloudCiphertext = VortXCrypto.sealDocument(key, original, identity.id, cloudRevision, writeV2 = true)
+                var cloudCiphertext = requireNotNull(VortXCrypto.sealDocument(key, original, identity.id, cloudRevision, writeV2 = true))
                 val requests = mutableListOf<String>()
                 val websiteOwner = UserProfile(id = UserProfile.OWNER_ID, name = "Main", avatar = "🍿", isOwner = true)
+                val firstRequests = if (rejectFirst) {
+                    listOf("first:GET:40", "first:PUT:40/41", "first:GET:41", "first:PUT:41/42", "first:GET:42")
+                } else {
+                    listOf("first:GET:40", "first:PUT:40/41", "first:GET:41")
+                }
 
                 fun cloudReply() = JSONObject().put("version", cloudRevision).put("document", cloudCiphertext)
+
+                fun assertProjection(source: ByteArray, candidate: ByteArray) {
+                    val sourceFields = OHJson.Obj(source)
+                    val proposed = OHJson.Obj(candidate)
+                    assertEquals(sourceFields.keys, proposed.keys)
+                    for (field in sourceFields.keys - "vortx")
+                        assertArrayEquals(field, sourceFields.raw(field), proposed.raw(field))
+                    val sourceVortx = sourceFields.obj("vortx")
+                    val vortx = proposed.obj("vortx")
+                    assertEquals(sourceVortx.keys + setOf("roster", "rosterModified"), vortx.keys)
+                    for (field in sourceVortx.keys)
+                        assertArrayEquals(field, sourceVortx.raw(field), vortx.raw(field))
+                    assertArrayEquals(OHJson.literal("0"), vortx.raw("rosterModified"))
+                    val parsed = VortXSyncDoc.parse(JSONObject(candidate.toString(Charsets.UTF_8)))
+                    assertTrue(parsed.rosterIsLossless)
+                    assertEquals(listOf(websiteOwner), parsed.roster)
+                }
 
                 withRoundTripDevice { device ->
                     device.install(VortXSyncManager.Session("first-fixture", identity, key)) { method, path, body, bearer ->
                         assertEquals("/v1/backup", path)
                         assertEquals("first-fixture", bearer)
                         device.assertCold()
-                        requests += "first:$method"
                         when (method) {
                             "GET" -> {
                                 assertNull(body)
-                                if (cloudRevision == 41L) device.allowInstallation()
+                                requests += "first:GET:$cloudRevision"
+                                when {
+                                    cloudRevision == expectedRevision -> {
+                                        val receipt = NativeWebsiteRosterDenialReceipt.decode(
+                                            requireNotNull(device.firstReceipt()), identity.id, key,
+                                        )
+                                        val head = requireNotNull(VortXCrypto.openDocument(key, cloudCiphertext, identity.id, cloudRevision))
+                                        try {
+                                            assertFalse(receipt.isDefinitivelyRejected)
+                                            assertTrue(receipt.matchesProjectedBytes(identity.id, key, cloudRevision, head))
+                                        } finally { head.fill(0) }
+                                        device.allowInstallation()
+                                    }
+                                    cloudRevision == 41L && rejectFirst -> {
+                                        assertTrue(device.closedDetachedRuntime())
+                                        val rejected = NativeWebsiteRosterDenialReceipt.decode(
+                                            requireNotNull(device.firstReceipt()), identity.id, key,
+                                        )
+                                        assertTrue(rejected.isDefinitivelyRejected)
+                                        assertEquals(40L, rejected.originalRevision)
+                                        assertEquals(41L, rejected.targetRevision)
+                                        val head = requireNotNull(VortXCrypto.openDocument(key, cloudCiphertext, identity.id, 41L))
+                                        try {
+                                            assertArrayEquals(revised, head)
+                                            assertFalse(OHJson.Obj(head).obj("vortx").keys.contains("roster"))
+                                        } finally { head.fill(0) }
+                                    }
+                                    else -> {
+                                        assertEquals(40L, cloudRevision)
+                                        assertNull(device.firstReceipt())
+                                    }
+                                }
                                 200 to cloudReply()
                             }
                             "PUT" -> {
                                 assertTrue(device.closedDetachedRuntime())
-                                assertEquals(40L, cloudRevision)
+                                val base = cloudRevision
+                                assertTrue(base == 40L || rejectFirst && base == 41L)
+                                val target = base + 1
+                                requests += "first:PUT:$base/$target"
                                 val request = requireNotNull(body)
-                                assertEquals(40L, request.getLong("baseRevision"))
-                                assertEquals(41L, request.getLong("version"))
+                                assertEquals(base, request.getLong("baseRevision"))
+                                assertEquals(target, request.getLong("version"))
                                 val encrypted = request.getString("document")
                                 assertTrue(encrypted.startsWith(VortXCrypto.DOC_V2_PREFIX))
-                                assertNull(VortXCrypto.openDocument(key, encrypted, identity.id, 42L))
-                                val candidate = requireNotNull(VortXCrypto.openDocument(key, encrypted, identity.id, 41L))
+                                assertNull(VortXCrypto.openDocument(key, encrypted, identity.id, target + 1))
+                                val candidate = requireNotNull(VortXCrypto.openDocument(key, encrypted, identity.id, target))
                                 try {
-                                    val proposed = OHJson.Obj(candidate)
-                                    assertEquals(originalFields.keys, proposed.keys)
-                                    for (field in originalFields.keys - "vortx")
-                                        assertArrayEquals(field, originalFields.raw(field), proposed.raw(field))
-                                    val vortx = proposed.obj("vortx")
-                                    assertEquals(originalVortx.keys + setOf("roster", "rosterModified"), vortx.keys)
-                                    for (field in originalVortx.keys)
-                                        assertArrayEquals(field, originalVortx.raw(field), vortx.raw(field))
-                                    assertArrayEquals(OHJson.literal("0"), vortx.raw("rosterModified"))
-                                    val parsed = VortXSyncDoc.parse(JSONObject(candidate.toString(Charsets.UTF_8)))
-                                    assertTrue(parsed.rosterIsLossless)
-                                    assertEquals(listOf(websiteOwner), parsed.roster)
-                                    val denial = NativeWebsiteRosterDenialReceipt.decode(requireNotNull(device.firstReceipt()), identity.id, key)
-                                    assertTrue(denial.matchesAttempt(identity.id, key, 40L, original, 41L, candidate))
+                                    val source = if (base == 40L) original else revised
+                                    assertProjection(source, candidate)
+                                    val receipt = NativeWebsiteRosterDenialReceipt.decode(
+                                        requireNotNull(device.firstReceipt()), identity.id, key,
+                                    )
+                                    assertFalse(receipt.isDefinitivelyRejected)
+                                    assertTrue(receipt.matchesAttempt(identity.id, key, base, source, target, candidate))
                                 } finally { candidate.fill(0) }
-                                cloudCiphertext = encrypted
-                                cloudRevision = 41L
-                                200 to JSONObject().put("accepted", true).put("version", cloudRevision)
+                                cloudRevision = target
+                                if (rejectFirst && base == 40L) {
+                                    // Simulate a concurrent website writer winning this exact CAS.
+                                    cloudCiphertext = requireNotNull(VortXCrypto.sealDocument(key, revised, identity.id, target, writeV2 = true))
+                                    200 to JSONObject().put("accepted", false).put("version", cloudRevision)
+                                } else {
+                                    cloudCiphertext = encrypted
+                                    200 to JSONObject().put("accepted", true).put("version", cloudRevision)
+                                }
                             }
                             else -> error("Unexpected backup method")
                         }
                     }
                     assertTrue(device.manager.syncDown(force = true))
-                    assertEquals(listOf("first:GET", "first:PUT", "first:GET"), requests)
-                    device.assertMounted(websiteOwner, addon, originalProgress, cloudRevision)
+                    assertEquals(firstRequests, requests)
+                    assertEquals(expectedRevision, cloudRevision)
+                    device.assertMounted(websiteOwner, expectedAddon, expectedProgress, expectedRevision)
                 }
 
+                val confirmedCiphertext = cloudCiphertext
                 withRoundTripDevice { device ->
                     device.install(VortXSyncManager.Session("second-fixture", identity, key)) { method, path, body, bearer ->
                         assertEquals("/v1/backup", path)
@@ -240,15 +307,16 @@ class NativeWebsiteRosterGatewayJniTest {
                         assertEquals("GET", method)
                         assertNull(body)
                         device.assertCold()
-                        requests += "second:GET"
+                        requests += "second:GET:$cloudRevision"
+                        assertEquals(confirmedCiphertext, cloudCiphertext)
                         device.allowInstallation()
                         200 to cloudReply()
                     }
                     assertTrue(device.manager.syncDown(force = true))
-                    assertEquals(listOf("first:GET", "first:PUT", "first:GET", "second:GET"), requests)
-                    assertEquals(41L, cloudRevision)
+                    assertEquals(firstRequests + "second:GET:$expectedRevision", requests)
+                    assertEquals(expectedRevision, cloudRevision)
                     assertNull(device.firstReceipt())
-                    device.assertMounted(websiteOwner, addon, originalProgress, cloudRevision)
+                    device.assertMounted(websiteOwner, expectedAddon, expectedProgress, expectedRevision)
                 }
             }
         } finally {
@@ -265,9 +333,123 @@ class NativeWebsiteRosterGatewayJniTest {
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
-    private inner class RoundTripDevice {
+    @Test fun websiteRosterReplayReadbackFloorSurvivesRestart() = runBlocking {
+        assumeTrue("Explicit reviewed website roster JNI gate required", System.getenv("VORTX_JNI_WEBSITE_ROSTER_ADMISSION") == "1")
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        val previousNotifications = NativeSettingsFence.queuedNotificationsForTest
+        NativeSettingsFence.queuedNotificationsForTest = mutableListOf()
+        val key = ByteArray(32) { 38 }
+        try {
+            withTimeout(30_000) {
+                val context = RevisionContext()
+                val identity = VortXSyncManager.Account(account.id, "fixture@example.invalid", "Fixture", false)
+                val original = source()
+                val candidate = requireNotNull(NativeWebsiteRosterProjection.project(original))
+                val newer = b("""{"addons":[],"apiKeys":{"tmdb":"synthetic-new-head"},"webProgress":{"owner":[]}}""")
+                val originalCiphertext = requireNotNull(VortXCrypto.sealDocument(key, original, identity.id, 40L, writeV2 = true))
+                val targetCiphertext = requireNotNull(VortXCrypto.sealDocument(key, candidate, identity.id, 41L, writeV2 = true))
+                val newerCiphertext = requireNotNull(VortXCrypto.sealDocument(key, newer, identity.id, 50L, writeV2 = true))
+                val originalReceipt = NativeWebsiteRosterDenialReceipt.create(identity.id, key, 40L, original, 41L, candidate).encode()
+                assertTrue("Seed the original pending wire format", originalReceipt.startsWith("v1:"))
+
+                fun encryptedReply(version: Long, ciphertext: String) =
+                    200 to JSONObject().put("version", version).put("document", ciphertext)
+
+                fun readRaisedPending(device: RoundTripDevice): String {
+                    val saved = requireNotNull(device.firstReceipt())
+                    val receipt = NativeWebsiteRosterDenialReceipt.decode(saved, identity.id, key)
+                    assertFalse("A replay rejection cannot settle the first attempt", receipt.isDefinitivelyRejected)
+                    assertEquals(40L, receipt.originalRevision)
+                    assertEquals(41L, receipt.targetRevision)
+                    assertEquals(50L, receipt.minimumReadbackRevision)
+                    return saved
+                }
+
+                var requests = 0
+                val persisted = withRoundTripDevice(context) { device ->
+                    device.install(VortXSyncManager.Session("replay-fixture", identity, key)) { method, path, body, bearer ->
+                        assertEquals("/v1/backup", path)
+                        assertEquals("replay-fixture", bearer)
+                        device.assertCold()
+                        when (++requests) {
+                            1 -> {
+                                assertEquals("GET", method)
+                                assertNull(body)
+                                assertEquals(originalReceipt, device.firstReceipt())
+                                encryptedReply(40L, originalCiphertext)
+                            }
+                            2 -> {
+                                assertEquals("PUT", method)
+                                assertTrue(device.closedDetachedRuntime())
+                                assertEquals(originalReceipt, device.firstReceipt())
+                                val request = requireNotNull(body)
+                                assertEquals(40L, request.getLong("baseRevision"))
+                                assertEquals(41L, request.getLong("version"))
+                                val encrypted = request.getString("document")
+                                assertTrue(encrypted.startsWith(VortXCrypto.DOC_V2_PREFIX))
+                                val submitted = requireNotNull(VortXCrypto.openDocument(key, encrypted, identity.id, 41L))
+                                try { assertArrayEquals(candidate, submitted) }
+                                finally { submitted.fill(0) }
+                                200 to JSONObject().put("accepted", false).put("version", 50L)
+                            }
+                            3 -> {
+                                assertEquals("GET", method)
+                                assertNull(body)
+                                readRaisedPending(device)
+                                encryptedReply(41L, targetCiphertext)
+                            }
+                            else -> error("Unexpected replay request")
+                        }
+                    }
+                    device.seedFirstReceipt(originalReceipt)
+                    assertFalse(device.manager.syncDown(force = true))
+                    assertEquals(3, requests)
+                    device.assertCold()
+                    readRaisedPending(device)
+                }
+
+                // A new Manager and coordinator use the same synthetic persistent prefs.
+                // Ordinary applied revision stays zero, so it cannot explain either refusal.
+                var restartRequests = 0
+                withRoundTripDevice(context) { device ->
+                    device.install(VortXSyncManager.Session("restart-fixture", identity, key)) { method, path, body, bearer ->
+                        assertEquals("/v1/backup", path)
+                        assertEquals("restart-fixture", bearer)
+                        assertEquals("GET", method)
+                        assertNull(body)
+                        device.assertCold()
+                        assertEquals(persisted, readRaisedPending(device))
+                        when (++restartRequests) {
+                            1 -> encryptedReply(41L, targetCiphertext)
+                            2 -> encryptedReply(50L, newerCiphertext)
+                            else -> error("Unexpected request after restart")
+                        }
+                    }
+                    assertFalse(device.manager.syncDown(force = true))
+                    assertEquals(1, restartRequests)
+                    device.assertCold()
+                    assertFalse(device.manager.syncDown(force = true))
+                    assertEquals(2, restartRequests)
+                    device.assertCold()
+                    assertEquals(persisted, readRaisedPending(device))
+                }
+            }
+        } finally {
+            key.fill(0)
+            try {
+                LibraryTombstones.activateAccount(null)
+                AddonTombstones.activateAccount(null)
+                AddonPrefsStore.activateAccount(null)
+            } finally {
+                NativeSettingsFence.queuedNotificationsForTest = previousNotifications
+                Dispatchers.resetMain()
+            }
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private inner class RoundTripDevice(private val context: RevisionContext) {
         private val bindings = Bindings()
-        private val context = RevisionContext()
         val manager = VortXSyncManager(context, CoroutineScope(SupervisorJob() + UnconfinedTestDispatcher()))
         private val scope = VortxAccountScope("account.${account.id}", UserProfile.OWNER_ID)
         private var mayInstall = false
@@ -336,7 +518,15 @@ class NativeWebsiteRosterGatewayJniTest {
 
         private fun principal() = manager.sessionOwnerSnapshot() as SessionOwnerSnapshot.Account
         private fun state() = context.getSharedPreferences("vortx_sync_state", Context.MODE_PRIVATE)
-        fun firstReceipt() = state().getString("websiteRosterDenialReceipt.${account.id}", null)
+        private fun receiptPreferenceKey() = NativeWebsiteRosterReceiptStore.storageKey(
+            account.id, requireNotNull(manager.currentSession()).dataKey,
+        )
+        fun firstReceipt() = state().getString(receiptPreferenceKey(), null)
+        fun seedFirstReceipt(encoded: String) {
+            assertNull(firstReceipt())
+            assertTrue(state().edit().putString(receiptPreferenceKey(), encoded).commit())
+            assertEquals(encoded, firstReceipt())
+        }
         private fun appliedVersion() = state().getLong("lastSyncedVersion.${account.id}", 0)
 
         fun install(session: VortXSyncManager.Session, transport: SyncRequestTestSeam) {
@@ -390,9 +580,12 @@ class NativeWebsiteRosterGatewayJniTest {
         }
     }
 
-    private suspend fun withRoundTripDevice(block: suspend (RoundTripDevice) -> Unit) {
-        val device = RoundTripDevice()
-        try { block(device) } finally { withContext(NonCancellable) { device.close() } }
+    private suspend fun <T> withRoundTripDevice(
+        context: RevisionContext = RevisionContext(),
+        block: suspend (RoundTripDevice) -> T,
+    ): T {
+        val device = RoundTripDevice(context)
+        return try { block(device) } finally { withContext(NonCancellable) { device.close() } }
     }
 
 
