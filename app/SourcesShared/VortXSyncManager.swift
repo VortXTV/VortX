@@ -1493,7 +1493,7 @@ final class VortXSyncManager: ObservableObject {
         // A nested restore consumes the already-bound receive. It cannot swap in a new source.
         guard authority.document == nil else { return pulled }
         switch pulled {
-        case .doc, .ownerHistory: break
+        case .doc, .ownerHistory, .empty: break
         default: return pulled
         }
         let failure = VersionedPull.failed(retryable: false)
@@ -1502,6 +1502,11 @@ final class VortXSyncManager: ObservableObject {
               let key = dataKey, key.count == 32 else { return failure }
         do {
             let slot = try NativeWebsiteRosterPublicationReceipt.storageSlot(accountNamespace: capture.namespace, dataKey: key)
+            if case .empty = pulled {
+                // A receipt proves this account already had a backup. A later 404 cannot
+                // complete a pending publication or make that account look freshly created.
+                return Keychain.confirmedString(slot) == .missing ? pulled : failure
+            }
             guard case .doc(let document, let revision, let raw, _) = pulled,
                   let adoption = try NativeWebsiteAccountAdoption(document, plaintext: raw, revision: revision) else {
                 // A restart may first see the PUT's target. A valid local receipt still binds
@@ -1558,12 +1563,14 @@ final class VortXSyncManager: ObservableObject {
                     if let previous, try !previous.permitsAttempt(receipt, accountNamespace: capture.namespace, dataKey: key) {
                         return failure
                     }
-                    let isNewAttempt = previous != receipt
+                    let priorPending = previous.flatMap { $0.state == .pending ? $0 : nil }
+                    let isNewAttempt = priorPending == nil
+                    let pendingReceipt = priorPending ?? receipt
                     try await self.validateDetachedWebsiteRoster(input.adoption, raw: input.raw,
                         candidate: candidate, scope: scope, key: key)
                     guard current() else { return failure }
                     let bound = operation.binding(plaintext: input.raw, revision: input.revision)
-                    let encodedReceipt = receipt.encode()
+                    let encodedReceipt = pendingReceipt.encode()
                     let result = await self.pushSyncDocAt(input.adoption.document, version: target, baseRevision: input.revision,
                         credentialCapture: capture, plaintextData: candidate,
                         prepareWebsiteSubmission: { sealed, body in
@@ -1583,19 +1590,26 @@ final class VortXSyncManager: ObservableObject {
                         }, sourceIsCurrent: current)
                     guard current(), let pending = Keychain.confirmedRead(slot, isCurrentOwner: ownerIsCurrent),
                           pending.result == .value(encodedReceipt) else { return failure }
-                    var readbackReceipt = receipt
+                    var readbackReceipt = pendingReceipt
                     if case .upgradeRequired = result { return failure }
-                    if case .rejected(let storedRevision) = result, isNewAttempt {
+                    if case .rejected(let storedRevision) = result {
                         // A replay can be rejected because an earlier ambiguous request won.
                         // Only rejection of a newly reserved attempt can retire that uncertainty.
                         // The response's revision only bounds a later authenticated read.
-                        readbackReceipt = try receipt.markingDefinitivelyRejected(accountNamespace: capture.namespace,
-                            dataKey: key, storedRevision: storedRevision)
-                        let rejected = readbackReceipt.encode()
-                        try bound.withActive {
-                            guard Keychain.compareAndSetConfirmed(pending, with: rejected, for: slot,
-                                      isCurrentOwner: ownerIsCurrent) == .success,
-                                  Keychain.confirmedString(slot) == .value(rejected) else { throw VortxNativeError.unavailable }
+                        if isNewAttempt {
+                            readbackReceipt = try pendingReceipt.markingDefinitivelyRejected(accountNamespace: capture.namespace,
+                                dataKey: key, storedRevision: storedRevision)
+                        } else {
+                            readbackReceipt = try pendingReceipt.recordingReplayConflict(accountNamespace: capture.namespace,
+                                dataKey: key, storedRevision: storedRevision)
+                        }
+                        if readbackReceipt != pendingReceipt {
+                            let updated = readbackReceipt.encode()
+                            try bound.withActive {
+                                guard Keychain.compareAndSetConfirmed(pending, with: updated, for: slot,
+                                          isCurrentOwner: ownerIsCurrent) == .success,
+                                      Keychain.confirmedString(slot) == .value(updated) else { throw VortxNativeError.unavailable }
+                            }
                         }
                     }
                     let readback = await self.pullDocVersionedResult(credentialCapture: capture)

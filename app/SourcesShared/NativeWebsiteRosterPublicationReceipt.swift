@@ -33,7 +33,7 @@ struct NativeWebsiteRosterPublicationReceipt: Equatable, Sendable {
     private static let version = "v1"
     private static let maximumRevision = SyncDocumentRevisionPolicy.maximumSafeRevision
     private static let maximumRawBytes = 32 * 1024 * 1024
-    private static let maximumEncodedBytes = 250
+    static let maximumEncodedBytes = 250
     private static let recordDomain = "vortx/apple/website-roster-publication/record/v1\u{0}"
     private static let keyDomain = Data("vortx/apple/website-roster-publication/key/v1".utf8)
     private static let slotDomain = "vortx/apple/website-roster-publication/slot/v1\u{0}"
@@ -70,7 +70,6 @@ struct NativeWebsiteRosterPublicationReceipt: Equatable, Sendable {
               let base = parseRevision(fields[2]), let target = parseRevision(fields[3]),
               SyncDocumentRevisionPolicy.next(after: base) == target,
               let minimumReadback = parseRevision(fields[4]), minimumReadback >= target,
-              state == .definitivelyRejected || minimumReadback == target,
               let sourceDigest = parseDigest(fields[5]), let candidateDigest = parseDigest(fields[6]),
               let seal = parseDigest(fields[7]) else { throw Failure.invalidRecord }
         let body = fields.dropLast().joined(separator: ":")
@@ -85,11 +84,25 @@ struct NativeWebsiteRosterPublicationReceipt: Equatable, Sendable {
     /// The caller may use this only for an explicit rejection of a fresh send with no
     /// preceding ambiguous submission. A rejection on replay does not settle an earlier send.
     func markingDefinitivelyRejected(accountNamespace: String, dataKey: Data, storedRevision: Int? = nil) throws -> Self {
+        try recordingConflict(accountNamespace: accountNamespace, dataKey: dataKey,
+                              storedRevision: storedRevision, resolvesSubmission: true)
+    }
+
+    /// A conflict on replay can rule out a stale GET without resolving the earlier submission.
+    func recordingReplayConflict(accountNamespace: String, dataKey: Data, storedRevision: Int?) throws -> Self {
+        try recordingConflict(accountNamespace: accountNamespace, dataKey: dataKey,
+                              storedRevision: storedRevision, resolvesSubmission: false)
+    }
+
+    private func recordingConflict(accountNamespace: String, dataKey: Data,
+                                    storedRevision: Int?, resolvesSubmission: Bool) throws -> Self {
         try requireAuthenticated(accountNamespace: accountNamespace, dataKey: dataKey)
         if state == .definitivelyRejected { return self }
-        let minimumReadback = max(targetRevision, storedRevision ?? targetRevision)
+        let minimumReadback = max(minimumReadbackRevision, storedRevision ?? targetRevision)
         guard minimumReadback <= Self.maximumRevision else { throw Failure.invalidAttempt }
-        return Self.signed(state: .definitivelyRejected, baseRevision: baseRevision, targetRevision: targetRevision,
+        if !resolvesSubmission && minimumReadback == minimumReadbackRevision { return self }
+        return Self.signed(state: resolvesSubmission ? .definitivelyRejected : .pending,
+                           baseRevision: baseRevision, targetRevision: targetRevision,
                            minimumReadbackRevision: minimumReadback,
                            sourceDigest: sourceDigest, candidateDigest: candidateDigest,
                            accountNamespace: accountNamespace,
@@ -104,7 +117,8 @@ struct NativeWebsiteRosterPublicationReceipt: Equatable, Sendable {
         try next.requireAuthenticated(accountNamespace: accountNamespace, dataKey: dataKey)
         guard next.state == .pending else { return false }
         if state == .definitivelyRejected { return next.baseRevision >= minimumReadbackRevision }
-        return next.baseRevision == baseRevision && next.sourceDigest == sourceDigest && next.candidateDigest == candidateDigest
+        return minimumReadbackRevision == targetRevision && next.baseRevision == baseRevision &&
+            next.sourceDigest == sourceDigest && next.candidateDigest == candidateDigest
     }
 
     /// Call only after authenticating and independently classifying the GET as a full roster.

@@ -80,6 +80,14 @@ enum NativeWebsiteRosterPublicationReceiptTests {
         try check(try !ahead.permitsAttempt(pending(49), accountNamespace: account, dataKey: key), "Stale rosterless read cannot send")
         try check(try ahead.permitsAttempt(pending(50), accountNamespace: account, dataKey: key), "Authenticated head can be readmitted")
 
+        let replay = try decode(reopened.recordingReplayConflict(accountNamespace: account, dataKey: key, storedRevision: 50).encode())
+        try check(replay.state == .pending && replay.minimumReadbackRevision == 50, "Replay does not settle earlier delivery")
+        try check(replay.classifyFullRosterReadback(revision: 41, raw: candidate) == .denied, "Replay cannot settle from known stale bytes")
+        try check(try !replay.permitsAttempt(pending(50), accountNamespace: account, dataKey: key), "Replay cannot authorize changed base")
+        try check(try !replay.permitsAttempt(pending(), accountNamespace: account, dataKey: key), "Replay refuses known stale original base")
+        try check(try replay.recordingReplayConflict(accountNamespace: account, dataKey: key, storedRevision: 49) == replay,
+                  "Replay readback floor cannot roll back")
+
         rejects("Account binding") { _ = try decode(wire, owner: foreign) }
         rejects("Data-key binding") { _ = try decode(wire, key: wrongKey) }
         rejects("Transition cannot re-key") { _ = try reopened.markingDefinitivelyRejected(accountNamespace: account, dataKey: wrongKey) }
