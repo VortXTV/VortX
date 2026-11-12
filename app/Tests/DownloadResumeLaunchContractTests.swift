@@ -36,7 +36,20 @@ import Foundation
         precondition(store.contains("core.engineResumeSecondsByLibraryId(for: meta)"))
         precondition(store.contains("await core.nativeResumeSeconds(for: meta, target: current.owner)"))
         precondition(store.contains("ProfileStore.shared.resumeOffset(for: meta)"))
-        precondition(store.contains("let final = current.revalidated()"))
+        let preparation = store.components(separatedBy: "@MainActor func prepareForPlayback(")[1]
+            .components(separatedBy: "/// Offline entry choices")[0]
+        let finalAdmission = preparation.range(of: "let final = current.revalidated()")!.lowerBound
+        let bingeRefresh = preparation.range(of: "DownloadStore.shared.refreshSeasonBoundaries(")!.lowerBound
+        let launchReturn = preparation.range(of: "return (final, resume.isFinite")!.lowerBound
+        precondition(finalAdmission < bingeRefresh && bingeRefresh < launchReturn)
+        precondition(preparation.contains("owner: final.owner, startingFrom: final.record"),
+                     "a manual download may start a binge before its finale")
+        precondition(!preparation.contains("await DownloadStore.shared.refreshSeasonBoundaries"))
+        precondition(store.contains("possibleFinales.keys.filter { $0 >= start }.sorted()"),
+                     "prioritize the launched season before later boundaries under the existing cap")
+        precondition(store.contains("refreshSeasonBoundary(for: candidate, owner: owner, startingFrom: launch)"))
+        precondition(store.contains("guard let origin = self.record(id: launch.id), origin.state == .completed"))
+        precondition(store.contains("origin.playbackMeta == launch.playbackMeta"))
         precondition(store.contains("stillAdmitsSeasonRollover(seasonRollover, candidate: current.record)"))
         precondition(store.contains("current.seasonRollover = seasonRollover"))
         precondition(store.contains("current.seasonBoundary == saved"))

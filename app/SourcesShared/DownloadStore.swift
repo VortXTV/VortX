@@ -194,7 +194,8 @@ final class DownloadStore: ObservableObject {
     }
 
     func refreshSeasonBoundaries(libraryID: String, type: String, owner: PlaybackMutationTarget,
-                                 afterEnqueuing added: DownloadRecord? = nil) {
+                                 afterEnqueuing added: DownloadRecord? = nil,
+                                 startingFrom launch: DownloadRecord? = nil) {
         guard EpisodePlaybackIdentity.usesSeriesLifecycle(type: type) else { return }
         var possibleFinales: [Int: DownloadRecord] = [:]
         var firstEpisodeSeasons: Set<Int> = []
@@ -204,14 +205,21 @@ final class DownloadStore: ObservableObject {
             if episode == 1, candidate.state != .failed { firstEpisodeSeasons.insert(season) }
             if episode > (possibleFinales[season]?.episode ?? 0) { possibleFinales[season] = candidate }
         }
-        for season in possibleFinales.keys.sorted(by: >) {
+        let seasons = if let start = launch?.season {
+            possibleFinales.keys.filter { $0 >= start }.sorted()
+        } else {
+            possibleFinales.keys.sorted(by: >)
+        }
+        for season in seasons {
             guard seasonBoundaryRequests.count < 2 else { return }
             guard firstEpisodeSeasons.contains(season + 1), let candidate = possibleFinales[season] else { continue }
             if let added, added.id != candidate.id,
                !(added.season == season + 1 && added.episode == 1) { continue }
-            refreshSeasonBoundary(for: candidate, owner: owner)
+            refreshSeasonBoundary(for: candidate, owner: owner, startingFrom: launch)
         }
-        if added == nil {
+        if let launch {
+            refreshSeasonBoundary(for: launch, owner: owner, startingFrom: launch)
+        } else if added == nil {
             for candidate in records where candidate.contentId == libraryID && candidate.type == type
                 && candidate.seasonBoundary != nil {
                 guard seasonBoundaryRequests.count < 2 else { return }
@@ -220,7 +228,8 @@ final class DownloadStore: ObservableObject {
         }
     }
 
-    func refreshSeasonBoundary(for candidate: DownloadRecord, owner: PlaybackMutationTarget) {
+    private func refreshSeasonBoundary(for candidate: DownloadRecord, owner: PlaybackMutationTarget,
+                                       startingFrom launch: DownloadRecord? = nil) {
         guard seasonBoundaryRequests.count < 2, !seasonBoundaryRequests.contains(candidate.id),
               let original = record(id: candidate.id), original.playbackMeta == candidate.playbackMeta,
               let season = original.season, season > 0, season < Int.max,
@@ -232,8 +241,13 @@ final class DownloadStore: ObservableObject {
             guard let self, !Task.isCancelled, ConnectivityMonitor.shared.launchOffline != nil,
                   !ConnectivityMonitor.shared.isOffline, ProfileStore.shared.active?.isKids != true,
                   owner.stillOwnsCurrentContext(core: CoreBridge.shared),
-                  let current = self.record(id: id) else { return false }
-            return current.state != .failed && current.playbackMeta == meta && current.seasonBoundary == saved
+                  let current = self.record(id: id), current.state != .failed,
+                  current.playbackMeta == meta, current.seasonBoundary == saved else { return false }
+            if let launch {
+                guard let origin = self.record(id: launch.id), origin.state == .completed,
+                      origin.playbackMeta == launch.playbackMeta else { return false }
+            }
+            return true
         }
         let savedMatches = saved?.matches(meta, successorVideoID: "\(meta.libraryId):\(season + 1):1") == true
         guard stillCurrent(), savedMatches || DownloadRecord.seasonRolloverSuccessorID(after: meta, in: records) != nil
@@ -478,8 +492,11 @@ struct AppleDownloadedPlayback {
             resume = ProfileStore.shared.resumeOffset(for: meta)
         }
         guard !Task.isCancelled, let final = current.revalidated() else { return nil }
-        if refreshSeasonBoundary {
-            DownloadStore.shared.refreshSeasonBoundary(for: final.record, owner: final.owner)
+        if refreshSeasonBoundary, let season = final.record.season, season > 0,
+           let episode = final.record.episode, episode > 0 {
+            // Warm the reachable season finale even when the viewer starts on an earlier episode.
+            DownloadStore.shared.refreshSeasonBoundaries(libraryID: meta.libraryId, type: meta.type,
+                                                         owner: final.owner, startingFrom: final.record)
         }
         return (final, resume.isFinite ? max(0, resume) : 0)
     }
