@@ -11,6 +11,8 @@ import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.SystemClock
+import android.view.InputDevice
+import android.view.KeyEvent as AndroidKeyEvent
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -51,6 +53,7 @@ import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -394,6 +397,7 @@ fun PlayerScreen(
         mutableStateOf(com.vortx.android.player.extras.AspectRatioSetting.current(context))
     }
     var speed by remember(playbackSessionKey) { mutableStateOf(1.0f) }
+    val controlSheet = remember(playbackSessionKey) { mutableStateOf(ControlSheet.NONE) }
     // Whether the "contribute a skip time" editor overlay is open. Reset per playback session.
     var showSkipEditor by remember(playbackSessionKey) { mutableStateOf(false) }
     val savedSubtitleDelay = remember(playbackSessionKey) {
@@ -1002,6 +1006,18 @@ fun PlayerScreen(
     }
     fun userTogglePlayback() {
         userSetPlaying(engine.state.value.isPaused || !playbackIntent.snapshot().shouldPlay)
+    }
+
+    fun setPlayerSpeed(value: Float) {
+        showControls()
+        speed = value
+        engine.setPlaybackSpeed(value)
+    }
+
+    fun setPlayerScaleMode(mode: VideoScaleMode) {
+        showControls()
+        scaleMode = mode
+        com.vortx.android.player.extras.AspectRatioSetting.setCurrent(context, mode)
     }
 
     // Settings can change while the player remains mounted (including profile sync/restore). Keep one
@@ -2417,14 +2433,131 @@ fun PlayerScreen(
     // would dead-end. Parking focus on the root box lets the next key press land in [onKeyEvent] below,
     // which consumes it and re-shows the controls (Back/Escape excepted, so Back still exits the player).
     val rootFocus = remember { FocusRequester() }
-    LaunchedEffect(controlsVisible) {
-        if (!controlsVisible) runCatching { rootFocus.requestFocus() }
+    fun keyboardOverlayOpen() = controlSheet.value != ControlSheet.NONE || showSkipEditor || partyPanelOpen ||
+        castChooserOpen || castOwned || stillWatchingPrompt
+    val overlayOpen = keyboardOverlayOpen()
+    LaunchedEffect(controlsVisible, overlayOpen) {
+        // Phone/tablet has no TV chrome focus parking, so the video receives keys immediately on entry
+        // and again after a sheet closes. While an overlay is open, leave its focus where it belongs.
+        if (!overlayOpen && (!isTvPlayer || !controlsVisible)) runCatching { rootFocus.requestFocus() }
+    }
+    val consumedKeyboardKeys = remember { mutableSetOf<Pair<Int, Int>>() }
+
+    fun requestEpisodeSwitch(episode: Episode) {
+        val resolver = currentOnSwitchEpisode
+        val currentRef = sourceSwitchState.playable.mediaRef
+        if (
+            resolver != null &&
+            !(currentRef?.isSeries == true && currentRef.season == episode.season && currentRef.episode == episode.episode)
+        ) {
+            cancelAddonSubtitlePreparation()
+            sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
+            sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
+                sourceSwitchState = beginPlayerEpisodeSwitch(sourceSwitchState, episode, authority)
+            }
+        }
+    }
+
+    fun performKeyboardShortcut(shortcut: PlayerKeyboardShortcut, keyCode: Int): Boolean {
+        when (shortcut) {
+            PlayerKeyboardShortcut.TOGGLE_PLAYBACK -> {
+                showControls()
+                userTogglePlayback()
+            }
+            PlayerKeyboardShortcut.SEEK_BACK, PlayerKeyboardShortcut.SEEK_FORWARD -> {
+                showControls()
+                userSeekLocalBy(if (shortcut == PlayerKeyboardShortcut.SEEK_FORWARD) seekStepMs else -seekStepMs)
+            }
+            PlayerKeyboardShortcut.SEEK_PERCENT -> {
+                val duration = engine.state.value.durationMs
+                if (duration <= 0L || currentPlayable.isLive) return false
+                showControls()
+                val percentage = (keyCode - AndroidKeyEvent.KEYCODE_0) / 10.0
+                userSeekLocalTo((duration * percentage).roundToLong())
+            }
+            PlayerKeyboardShortcut.VOLUME_UP, PlayerKeyboardShortcut.VOLUME_DOWN -> {
+                showControls()
+                setPlayerVolume(playerVolume + if (shortcut == PlayerKeyboardShortcut.VOLUME_UP) 5.0 else -5.0)
+            }
+            PlayerKeyboardShortcut.TOGGLE_MUTE -> {
+                showControls()
+                togglePlayerMute()
+            }
+            PlayerKeyboardShortcut.PREFERRED_SUBTITLE -> return togglePreferredPrimarySubtitle()
+            PlayerKeyboardShortcut.AUDIO_MENU, PlayerKeyboardShortcut.SUBTITLE_MENU,
+            PlayerKeyboardShortcut.PLAYBACK_INFO -> {
+                if (shortcut == PlayerKeyboardShortcut.AUDIO_MENU && engine.state.value.audioTracks.isEmpty()) {
+                    return false
+                }
+                showControls()
+                controlSheet.value = when (shortcut) {
+                    PlayerKeyboardShortcut.AUDIO_MENU -> ControlSheet.AUDIO
+                    PlayerKeyboardShortcut.SUBTITLE_MENU -> ControlSheet.SUBTITLE
+                    else -> ControlSheet.INFO
+                }
+            }
+            PlayerKeyboardShortcut.SLOWER, PlayerKeyboardShortcut.FASTER -> {
+                val next = if (shortcut == PlayerKeyboardShortcut.FASTER) SPEED_PRESETS.firstOrNull { it > speed }
+                else SPEED_PRESETS.lastOrNull { it < speed }
+                next?.let(::setPlayerSpeed)
+            }
+            PlayerKeyboardShortcut.NEXT_ASPECT -> {
+                val modes = VideoScaleMode.entries
+                setPlayerScaleMode(modes[(scaleMode.ordinal + 1) % modes.size])
+            }
+            PlayerKeyboardShortcut.PICTURE_IN_PICTURE -> {
+                if (!pip.supported) return false
+                pip.enter()
+            }
+            PlayerKeyboardShortcut.SKIP_SEGMENT -> {
+                val segment = activeSkipSegment(skipSegments, engine.state.value.positionMs)
+                    ?.takeUnless { it.start == dismissedSkipStart || autoSkipCountdown.isSuppressed(it) }
+                    ?: return false
+                val owner = AutoSkipActionOwner(autoSkipIdentity, playbackSessionKey, engine, autoSkipCountdown.epoch)
+                if (!isCurrentAutoSkipAction(owner, segment)) return false
+                manualSkip(segment, owner)
+            }
+            PlayerKeyboardShortcut.PREVIOUS_EPISODE, PlayerKeyboardShortcut.NEXT_EPISODE -> {
+                if (isLocalSession || currentOnSwitchEpisode == null) return false
+                val episode = adjacentKeyboardEpisode(
+                    episodeOptions, sourceSwitchState.playable.mediaRef,
+                    next = shortcut == PlayerKeyboardShortcut.NEXT_EPISODE,
+                ) ?: return false
+                requestEpisodeSwitch(episode)
+            }
+        }
+        return true
     }
 
     Box(
         modifier = modifier
             .fillMaxSize()
             .focusRequester(rootFocus)
+            .onPreviewKeyEvent { event ->
+                val native = event.nativeKeyEvent
+                val key = native.deviceId to native.keyCode
+                // Pair a handled down with its up, even if that down opened a sheet or changed focus.
+                if (event.type == KeyEventType.KeyUp) return@onPreviewKeyEvent consumedKeyboardKeys.remove(key)
+                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                // The release may have gone to a separate dialog window. A fresh press owns itself.
+                if (native.repeatCount == 0) consumedKeyboardKeys.remove(key)
+                val consumedDown = key in consumedKeyboardKeys
+                val shortcut = playerKeyboardShortcut(
+                    keyCode = native.keyCode,
+                    fromKeyboard = native.isFromSource(InputDevice.SOURCE_KEYBOARD),
+                    unmodified = native.hasNoModifiers(),
+                    alphabeticKeyboard = native.device?.keyboardType == InputDevice.KEYBOARD_TYPE_ALPHABETIC,
+                    isTvPlayer = isTvPlayer,
+                ) ?: return@onPreviewKeyEvent consumedDown
+                if (native.repeatCount > 0 && (!consumedDown || !shortcut.repeats)) return@onPreviewKeyEvent consumedDown
+                if (keyboardOverlayOpen() || controlsLocked || effectiveError || pip.isInPip ||
+                    playerExitRequested || sourceSwitchState.isSwitching || engine.state.value.hasEnded ||
+                    originalPlaybackOwner?.isActive != true || engineHolder.get() !== engine
+                ) return@onPreviewKeyEvent consumedDown
+                val handled = performKeyboardShortcut(shortcut, native.keyCode)
+                if (handled) consumedKeyboardKeys.add(key)
+                handled || consumedDown
+            }
             .onKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
                 // MEDIA transport keys (TV remote play/pause/ffwd/rew, BT keyboards) drive the
@@ -2477,10 +2610,19 @@ fun PlayerScreen(
                     revealUnlockHint()
                     return@onKeyEvent true
                 }
-                if (event.key == Key.C && event.nativeKeyEvent.hasNoModifiers()) {
-                    return@onKeyEvent event.nativeKeyEvent.repeatCount == 0 &&
-                        !showSkipEditor && !partyPanelOpen && !effectiveError && !pip.isInPip &&
-                        togglePreferredPrimarySubtitle()
+                val native = event.nativeKeyEvent
+                if (native.isFromSource(InputDevice.SOURCE_KEYBOARD) &&
+                    native.device?.keyboardType == InputDevice.KEYBOARD_TYPE_ALPHABETIC
+                ) {
+                    // Keep unhandled typing and modifier chords available to the focused UI. Real TV
+                    // direction/select and the existing Back/Escape path still use the remote rules below.
+                    val navigation = when (event.key) {
+                        Key.DirectionLeft, Key.DirectionRight, Key.DirectionUp, Key.DirectionDown,
+                        Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> isTvPlayer
+                        Key.Back, Key.Escape -> true
+                        else -> false
+                    }
+                    if (!native.hasNoModifiers() || !navigation) return@onKeyEvent false
                 }
                 if (!controlsVisible) {
                     // TV hidden-chrome SKIP PILL reachability: while a resolved skip segment sits under the
@@ -2622,7 +2764,7 @@ fun PlayerScreen(
             playable = currentPlayable,
             queueCount = queueCount,
             onShowQueue = onShowQueue,
-            playbackSessionRevision = sourceSwitchState.revision,
+            controlSheet = controlSheet,
             // The watchdog's stall verdict and the runtime-mismatch verdict both ride the same
             // hasError the engines publish, so the chrome has exactly one error surface (the overlay
             // + "Choose another source" retry path). A mismatch additionally clears hasEnded: the
@@ -2729,17 +2871,8 @@ fun PlayerScreen(
                 }
             },
             onSelectSubtitle = ::selectPrimarySubtitle,
-            onSetSpeed = { newSpeed ->
-                showControls()
-                speed = newSpeed
-                engine.setPlaybackSpeed(newSpeed)
-            },
-            onSelectScaleMode = { mode ->
-                showControls()
-                scaleMode = mode
-                // Persist under Apple's key so the pick survives this title and rides the cross-device blob.
-                com.vortx.android.player.extras.AspectRatioSetting.setCurrent(context, mode)
-            },
+            onSetSpeed = ::setPlayerSpeed,
+            onSelectScaleMode = ::setPlayerScaleMode,
             onErrorRetry = {
                 cancelAddonSubtitlePreparation()
                 currentOnError()
@@ -2777,26 +2910,7 @@ fun PlayerScreen(
                     }
                 }
             },
-            onSwitchEpisode = { episode ->
-                val resolver = currentOnSwitchEpisode
-                val currentRef = sourceSwitchState.playable.mediaRef
-                if (
-                    resolver != null &&
-                    !(currentRef?.isSeries == true &&
-                        currentRef.season == episode.season &&
-                        currentRef.episode == episode.episode)
-                ) {
-                    cancelAddonSubtitlePreparation()
-                    sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
-                    sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
-                        sourceSwitchState = beginPlayerEpisodeSwitch(
-                            state = sourceSwitchState,
-                            episode = episode,
-                            authority = authority,
-                        )
-                    }
-                }
-            },
+            onSwitchEpisode = ::requestEpisodeSwitch,
             // The explicit PiP entry (user action); null on devices/hosts that cannot PiP, which
             // hides the control entirely. Home-press entry rides auto-enter / onUserLeaveHint.
             onEnterPip = if (pip.supported) {
@@ -2905,6 +3019,7 @@ fun PlayerScreen(
             // TV-only chrome opt-ins (both default off on the phone host, leaving its chrome unchanged).
             shareLink = shareLink,
             isTvPlayer = isTvPlayer,
+            keyboardEpisodeShortcutsAvailable = !isLocalSession && currentOnSwitchEpisode != null,
             modifier = Modifier.fillMaxSize(),
         )
 
