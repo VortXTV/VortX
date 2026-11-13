@@ -757,9 +757,7 @@ final class UpdateChecker: ObservableObject {
 
     private func release(from github: GitHubRelease) -> Release? {
         guard let identity = releaseIdentity(from: github.tagName),
-              // The public release title is canonical. Release-note bodies carry older beta history, so their
-              // first "Build" marker is not necessarily the build of this release.
-              let build = buildNumber(in: github.name ?? "") ?? highestBuildNumber(in: github.body ?? ""),
+              let build = releaseBuildNumber(title: github.name ?? "", notes: github.body ?? ""),
               build > 0,
               let asset = github.assets.first(where: { $0.name == expectedArtifactFilename(identity.tag) }) else {
             return nil
@@ -809,20 +807,43 @@ final class UpdateChecker: ObservableObject {
         return identity.tag
     }
 
-    private func buildNumber(in text: String) -> Int? {
-        guard let value = firstMatch(in: text, pattern: #"(?i)\bbuild\s*[:#-]?\s*(\d+)\b"#) else { return nil }
-        return Int(value)
-    }
-
-    private func highestBuildNumber(in text: String) -> Int? {
-        guard let expression = try? NSRegularExpression(pattern: #"(?i)\bbuild\s*[:#-]?\s*(\d+)\b"#) else {
+    private func releaseBuildNumber(title: String, notes: String) -> Int? {
+        let marker = #"<!-- vortx-build: ([0-9]+) -->"#
+        let lines = notes.components(separatedBy: .newlines)
+        let buildMarkers = lines.filter { $0.hasPrefix("<!-- vortx-build:") }
+        if !buildMarkers.isEmpty {
+            guard buildMarkers.count == 1,
+                  let value = firstMatch(in: buildMarkers[0], pattern: "^" + marker + "$") else { return nil }
+            return Int(value)
+        }
+        // The title is authoritative for older releases. Only a trailing parenthesized number
+        // has the legacy build meaning, so beta numbers and the marketing version cannot match.
+        let plain = #"(?i)\bbuild[ \t]*[:#-]?[ \t]*([0-9]+)\b"#
+        if let value = firstMatch(in: title, pattern: plain) ??
+                       firstMatch(in: title, pattern: #"\(([0-9]+)\)[ \t]*$"#) {
+            return Int(value)
+        }
+        // A release body can append older release notes. Prefer its opening build line,
+        // including the house-style Markdown form "Build **285**".
+        if let introduction = lines.first(where: {
+            let line = $0.trimmingCharacters(in: .whitespaces)
+            return !line.isEmpty && !line.hasPrefix("#") && !line.hasPrefix("<!--")
+        }) {
+            let line = introduction.trimmingCharacters(in: .whitespaces)
+            if let value = firstMatch(in: line, pattern: #"(?i)^build[ \t]*[:#-]?[ \t]*\*\*([0-9]+)\*\*"#) ??
+                           firstMatch(in: line, pattern: "^" + plain) {
+                return Int(value)
+            }
+        }
+        // Older unstructured bodies had only prose build references.
+        guard let expression = try? NSRegularExpression(pattern: plain) else {
             return nil
         }
-        let range = NSRange(text.startIndex..., in: text)
-        return expression.matches(in: text, range: range)
+        let range = NSRange(notes.startIndex..., in: notes)
+        return expression.matches(in: notes, range: range)
             .compactMap { match in
-                guard let valueRange = Range(match.range(at: 1), in: text) else { return nil }
-                return Int(text[valueRange])
+                guard let valueRange = Range(match.range(at: 1), in: notes) else { return nil }
+                return Int(notes[valueRange])
             }
             .max()
     }

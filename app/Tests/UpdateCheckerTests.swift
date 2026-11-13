@@ -128,13 +128,16 @@ func response(_ status: Int, url: URL = URL(string: "https://api.github.com/repo
                     httpVersion: nil, headerFields: nil)!
 }
 
-func release(build: Int, body: String = "", tag: String = "v0.3.15", assetName: String? = nil) -> Data {
+func release(build: Int, body: String = "", tag: String = "v0.3.15",
+             assetName: String? = nil, title: String? = nil) -> Data {
     let resolvedAssetName = assetName ?? "VortX-macOS-\(tag)-ci.dmg"
     let version = String(tag.dropFirst().split(separator: "-", maxSplits: 1)[0])
-    let fixture = """
-    [{"tag_name":"\(tag)","name":"VortX \(version) (Build \(build))","body":"\(body)","draft":false,"prerelease":false,"published_at":"2026-08-30T00:00:00Z","assets":[{"name":"\(resolvedAssetName)","browser_download_url":"https://github.com/VortXTV/VortX/releases/download/\(tag)/\(resolvedAssetName)"}]}]
-    """
-    return Data(fixture.utf8)
+    return try! JSONSerialization.data(withJSONObject: [[
+        "tag_name": tag, "name": title ?? "VortX \(version) (Build \(build))", "body": body,
+        "draft": false, "prerelease": false, "published_at": "2026-08-30T00:00:00Z",
+        "assets": [["name": resolvedAssetName,
+                    "browser_download_url": "https://github.com/VortXTV/VortX/releases/download/\(tag)/\(resolvedAssetName)"]],
+    ]])
 }
 
 func appcast(version: String, build: Int) -> Data {
@@ -667,6 +670,38 @@ struct UpdateCheckerTests {
         let appcastCurrentGitHubCalls = await appcastCurrentLoader.githubCalls
         check(appcastCurrentAppcastCalls == 1 && appcastCurrentGitHubCalls == 1,
               "valid current appcast performs one GitHub comparison")
+
+        let releaseTitle = "VortX 0.5.6 beta 13: Profile Recovery and Subtitle Shortcuts"
+        let releaseFormats: [(title: String, body: String, expected: Int?, label: String)] = [
+            ("\(releaseTitle) (285)", "Build **285**", 285, "numeric build suffix"),
+            (releaseTitle, "# Release notes\r\n\r\nBuild **285** for Apple TV.\r\n\r\nPreviously tested Build 999.", 285, "formatted introduction before history"),
+            ("\(releaseTitle) (286)", "Build 999.\n\n<!-- vortx-build: 285 -->", 285, "explicit machine build marker"),
+            ("\(releaseTitle) (285)", "<!-- vortx-build: 285 -->\n<!-- vortx-build: 286 -->", nil, "ambiguous build markers rejected"),
+            (releaseTitle, "Notes about Beta 13.", nil, "beta number is not a build"),
+        ]
+        for (index, format) in releaseFormats.enumerated() {
+            let domain = "\(suiteName).release-format.\(index)"
+            let formatDefaults = UserDefaults(suiteName: domain)!
+            defer { formatDefaults.removePersistentDomain(forName: domain) }
+            let formatLoader = RoutedLoader(
+                appcast: .success((appcast(version: "0.5.5", build: 274), response(200))),
+                github: .success((release(build: 285, body: format.body, tag: "v0.5.6-beta.13",
+                                          title: format.title), response(200)))
+            )
+            let checker = await MainActor.run {
+                UpdateChecker(defaults: formatDefaults,
+                              requestLoader: { request in try await formatLoader.load(request) },
+                              currentBuild: 283, currentVersion: "0.5.6")
+            }
+            await MainActor.run { checker.checkNow() }
+            await waitForManualCheckToFinish(checker)
+            let outcome = await manualOutcome(checker)
+            if let expected = format.expected, case .updateAvailable(let update) = outcome {
+                check(update.build == expected && update.tag == "v0.5.6-beta.13", format.label)
+            } else {
+                check(format.expected == nil && outcome == .upToDate, format.label)
+            }
+        }
 
         // Primary status or schema failure falls back to the existing GitHub parser. Both transport chains
         // failing still surface the manual retry state instead of quietly recording the request.

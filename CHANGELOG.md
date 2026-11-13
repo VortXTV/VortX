@@ -4,20 +4,36 @@ Notable VortX changes, newest first. VortX is Apple TV first, with iPhone/iPad, 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
-## 0.5.6 beta 13 candidate - Profile recovery, cloud sync and subtitle shortcuts
+## 0.5.6 beta 13 - Profile Recovery, Mac Sign-In and Subtitle Shortcuts - 2026-11-11
 
-Build **285** for Apple TV, iPhone, iPad, Mac and Android.
+Build 285 for Apple TV, iPhone, iPad, Mac and Android. This beta makes it easier to recover an account from the profile picker, fixes a Mac sign-in failure and keeps the Library visible during refresh.
 
-### Profiles and cloud sync
+### Fixed
 
-- **Apple TV backup tools** ([#263](https://github.com/VortXTV/VortX/issues/263)). Download, Repair and Restore can become available when Tools opens during a screen transition. The remote can move from Back or Diagnostics to the backup actions once they're ready.
-- **Older accounts open with unreadable settings held aside** ([#263](https://github.com/VortXTV/VortX/issues/263)). An unreadable preference no longer fails the second stage of profile recovery. The original encrypted backup remains available.
-- **Mac sign-in** ([#296](https://github.com/VortXTV/VortX/issues/296)). Password and QR sign-in can save credentials when the streaming server created the app support folder first.
-- **Library and backup reads.** The first Library result stays visible during refresh. Cloud sync handles larger encrypted backup responses and keeps the encryption format already used by the account.
+- **Apple TV backup tools and remote navigation ([#263](https://github.com/VortXTV/VortX/issues/263)).** Open **Tools** on the profile picker to download, repair or restore an account backup, or export diagnostics. Backup actions become available once the signed-in Tools screen finishes opening. **Back** and **Diagnostics** are aligned with the backup controls so you can reach them with the Siri Remote.
+- **Older profiles that failed to open ([#263](https://github.com/VortXTV/VortX/issues/263)).** If an older backup contains an unreadable preference, recovery sets it aside and opens the account from the inspected copy. Your original encrypted backup is kept.
+- **Mac password and QR sign-in ([#296](https://github.com/VortXTV/VortX/issues/296)).** VortX can save your sign-in when the streaming server has already created the app’s support folder.
+- **Library and cloud backups.** The Library keeps the first result visible while refreshing. Cloud sync accepts larger encrypted backups and keeps your account’s existing encryption format.
 
-### Playback
+### New
 
-- **Press `C` for preferred subtitles.** With a keyboard in the player, `C` selects an available track in your preferred language, or turns it off if that language is already active. On iPhone and iPad, this shortcut requires iOS or iPadOS 17 or later.
+- **Preferred subtitles with `C`.** With keyboard focus in the Apple player, press `C` to select an available track in your preferred language. Press it again to turn that primary track off. On iPhone and iPad, this requires iOS or iPadOS 17 or later.
+
+### Please test
+
+- On Apple TV, open **Tools** from the profile picker and check that you can reach **Back**, **Diagnostics** and the available backup actions with the remote.
+- On Mac, try signing in with your password or QR code. In the Library, check that titles stay visible during refresh.
+- In the Apple player, press `C` twice on a title that has subtitles in your preferred language.
+
+### Install
+
+**Mac (.dmg).** Download `VortX-macOS-v0.5.6-beta.13-ci.dmg` and drag VortX into Applications. This is an Apple-silicon build for macOS 14 or later with an ad hoc signature. It is unnotarized. [Install on Mac](https://github.com/VortXTV/VortX/wiki/Install-on-Mac)
+
+**iPhone, iPad and Apple TV.** The IPAs require compatible sideload signing. Use `VortX-iOS-v0.5.6-beta.13-ci.ipa` on iPhone or iPad. On Apple TV, use `VortX-tvOS-v0.5.6-beta.13-ci.ipa` for Full with Top Shelf, or `VortX-tvOS-lite-v0.5.6-beta.13-ci.ipa` for Lite. [Installing on iPhone, iPad and Apple TV](https://github.com/VortXTV/VortX/wiki/Installing)
+
+**Android phone, tablet and TV.** Choose `VortX-0.5.6-full-mpv-universal.apk` for Full with mpv or `VortX-0.5.6-play-media3-universal.apk` for Play with Media3. The Media3 AAB is included for store distribution. Update using the same app variant.
+
+`SHA256SUMS.txt` lists package checksums. `VortX-Hosted-Direct-Beta-Provenance.json` records the original GitHub Actions builds.
 
 ## 0.5.6 beta 11 - AetherEngine on every Apple device and Trakt that stays signed in
 
