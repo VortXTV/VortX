@@ -128,42 +128,42 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
       <div class="pl-bottomtint" aria-hidden="true"></div>
 
       <div class="pl-top">
-        <button class="pl-icon pl-back" data-action="close-player" aria-label="Back">${icon("chevron-left") || "‹"}<span>Back</span></button>
+        <button class="pl-icon pl-back" data-action="close-player" aria-label="Back" aria-keyshortcuts="Escape" title="Back (Escape)">${icon("chevron-left") || "‹"}<span>Back</span></button>
         <div class="pl-title" id="pl-title"></div>
       </div>
 
       <button class="pl-unmute" id="pl-unmute" hidden aria-label="Tap for sound">${icon("volume-x") || "🔇"}<span>Tap for sound</span></button>
 
       <div class="pl-corner">
-        <button class="pl-skipseg" id="pl-skipseg" hidden></button>
-        ${ctx.hasNextEpisode ? `<button class="pl-next" id="pl-next" aria-label="Next episode">${icon("fast-forward") || "⟳"}<span>Next Episode</span></button>` : ""}
+        <button class="pl-skipseg" id="pl-skipseg" hidden aria-keyshortcuts="S" title="Skip segment (S)"></button>
+        ${ctx.hasNextEpisode ? `<button class="pl-next" id="pl-next" aria-label="Next episode" aria-keyshortcuts="N" title="Next episode (N)">${icon("fast-forward") || "⟳"}<span>Next Episode</span></button>` : ""}
       </div>
 
       <div class="pl-center">
-        <button class="pl-icon pl-skip" id="pl-rew" aria-label="Skip back ${escapeHtml(String(ctx.skipStep))} seconds">${icon("rewind") || "⟲"}<small>${escapeHtml(String(ctx.skipStep))}</small></button>
-        <button class="pl-icon pl-bigplay" id="pl-bigplay" aria-label="Play/pause"></button>
-        <button class="pl-icon pl-skip" id="pl-ff" aria-label="Skip forward ${escapeHtml(String(ctx.skipStep))} seconds">${icon("fast-forward") || "⟳"}<small>${escapeHtml(String(ctx.skipStep))}</small></button>
+        <button class="pl-icon pl-skip" id="pl-rew" aria-label="Skip back ${escapeHtml(String(ctx.skipStep))} seconds" aria-keyshortcuts="ArrowLeft J" title="Skip back (Left Arrow/J)">${icon("rewind") || "⟲"}<small>${escapeHtml(String(ctx.skipStep))}</small></button>
+        <button class="pl-icon pl-bigplay" id="pl-bigplay" aria-label="Play/pause" aria-keyshortcuts="Space K" title="Play/pause (Space/K)"></button>
+        <button class="pl-icon pl-skip" id="pl-ff" aria-label="Skip forward ${escapeHtml(String(ctx.skipStep))} seconds" aria-keyshortcuts="ArrowRight L" title="Skip forward (Right Arrow/L)">${icon("fast-forward") || "⟳"}<small>${escapeHtml(String(ctx.skipStep))}</small></button>
       </div>
 
       <div class="pl-bottom">
-        <div class="pl-seek" id="pl-seek" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">
+        <div class="pl-seek" id="pl-seek" role="slider" tabindex="0" aria-label="Seek" aria-keyshortcuts="ArrowLeft ArrowRight" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" title="Seek (Left/Right Arrow)">
           <div class="pl-seek-track"><div class="pl-seek-buffered" id="pl-buffered"></div><div class="pl-seek-played" id="pl-played"></div><div class="pl-seek-handle" id="pl-handle"></div></div>
           <div class="pl-seek-tip" id="pl-tip" aria-hidden="true">0:00</div>
         </div>
         <div class="pl-bar">
-          <button class="pl-icon" id="pl-play" aria-label="Play/pause"></button>
+          <button class="pl-icon" id="pl-play" aria-label="Play/pause" aria-keyshortcuts="Space K" title="Play/pause (Space/K)"></button>
           <div class="pl-vol">
-            <button class="pl-icon" id="pl-mute" aria-label="Mute"></button>
-            <input class="pl-vol-slider" id="pl-vol" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume" />
+            <button class="pl-icon" id="pl-mute" aria-label="Mute" aria-keyshortcuts="M" title="Mute/unmute (M)"></button>
+            <input class="pl-vol-slider" id="pl-vol" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume" aria-keyshortcuts="ArrowUp ArrowDown" title="Volume (Up/Down Arrow)" />
           </div>
           <div class="pl-time"><span id="pl-cur">0:00</span> <span class="pl-time-sep">/</span> <span id="pl-dur">0:00</span></div>
           <div class="pl-spacer"></div>
-          <button class="pl-icon" id="pl-subs-btn" aria-label="Subtitles" aria-haspopup="true" aria-keyshortcuts="C">${icon("subtitles") || "CC"}</button>
+          <button class="pl-icon" id="pl-subs-btn" aria-label="Subtitles" aria-haspopup="true" aria-keyshortcuts="C T" title="Subtitles (C toggles preferred track; T opens menu)">${icon("subtitles") || "CC"}</button>
           <button class="pl-icon" id="pl-snap" aria-label="Save frame">${icon("camera") || "▣"}</button>
-          <button class="pl-icon" id="pl-settings-btn" aria-label="Settings" aria-haspopup="true">${icon("settings") || "⚙"}</button>
+          <button class="pl-icon" id="pl-settings-btn" aria-label="Playback settings" aria-haspopup="true" aria-keyshortcuts="I" title="Playback settings (I; Escape closes menus)">${icon("settings") || "⚙"}</button>
           ${canCast ? `<button class="pl-icon" id="pl-cast" aria-label="Cast">${icon("cast") || "▶"}</button>` : ""}
-          <button class="pl-icon" id="pl-pip" aria-label="Picture in picture">${icon("pip") || "⧉"}</button>
-          <button class="pl-icon" id="pl-fs" aria-label="Fullscreen">${icon("fullscreen") || "⤢"}</button>
+          <button class="pl-icon" id="pl-pip" aria-label="Picture in picture" aria-keyshortcuts="P" title="Picture in picture (P)">${icon("pip") || "⧉"}</button>
+          <button class="pl-icon" id="pl-fs" aria-label="Fullscreen" aria-keyshortcuts="F" title="Fullscreen (F)">${icon("fullscreen") || "⤢"}</button>
         </div>
       </div>
 
@@ -211,8 +211,13 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
   };
   const renderPlay = () => {
     const m = video.paused ? PLAY : PAUSE;
-    $("pl-play")!.innerHTML = m;
-    $("pl-bigplay")!.innerHTML = video.paused ? PLAY : PAUSE;
+    const label = video.paused ? "Play" : "Pause";
+    const playButton = $("pl-play")!;
+    const bigPlayButton = $("pl-bigplay")!;
+    playButton.innerHTML = m;
+    bigPlayButton.innerHTML = video.paused ? PLAY : PAUSE;
+    playButton.setAttribute("aria-label", `${label} (Space/K)`);
+    bigPlayButton.setAttribute("aria-label", `${label} (Space/K)`);
     stage.classList.toggle("is-paused", video.paused);
   };
   $("pl-play")!.addEventListener("click", togglePlay);
@@ -265,7 +270,9 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
   const renderVolume = () => {
     volSlider.value = String(video.muted ? 0 : video.volume);
     const off = video.muted || video.volume === 0;
-    $("pl-mute")!.innerHTML = off ? icon("volume-x") || "🔇" : video.volume < 0.5 ? icon("volume-1") || "🔉" : icon("volume-2") || "🔊";
+    const muteButton = $("pl-mute")!;
+    muteButton.innerHTML = off ? icon("volume-x") || "🔇" : video.volume < 0.5 ? icon("volume-1") || "🔉" : icon("volume-2") || "🔊";
+    muteButton.setAttribute("aria-label", `${off ? "Unmute" : "Mute"} (M)`);
     try {
       // Persist the user's real intent, NOT an autoplay auto-mute: while auto-muted, save muted:false so the
       // next session starts sound-on (the tap-to-unmute path still restores audio this session). A genuine
@@ -315,6 +322,8 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
     activeSeg = seg;
     if (seg) {
       skipBtn.textContent = skipLabel(seg.kind);
+      skipBtn.setAttribute("aria-label", `${skipLabel(seg.kind)} (S)`);
+      skipBtn.title = `${skipLabel(seg.kind)} (S)`;
       skipBtn.hidden = false;
     } else {
       skipBtn.hidden = true;
@@ -417,12 +426,21 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
     }
   });
 
-  // Escape: first close an open menu instead of closing the whole player. Capture phase + stopPropagation
+  // Escape: first close an open menu instead of closing the whole player. Capture phase + immediate stop
   // so this runs before (and suppresses) the global Escape handler in main.ts whenever a menu is open.
   const onDocKeydown = (e: KeyboardEvent) => {
-    if (e.key === "Escape" && openMenu) {
-      e.stopPropagation();
+    if (e.defaultPrevented || e.isComposing || e.key !== "Escape") return;
+    const typingTarget = e.target instanceof HTMLElement &&
+      (e.target.isContentEditable || (typeof e.target.matches === "function" && e.target.matches("textarea, select, input:not([type=range]), [role=textbox]")));
+    if (openMenu) {
+      e.preventDefault();
+      // This listener is on document, as is main.ts's global player-close listener. stopPropagation()
+      // alone does not prevent another listener on the same target from closing the whole player too.
+      e.stopImmediatePropagation();
       closeMenus();
+    } else if (typingTarget) {
+      // A text field may consume Escape locally; do not let main.ts close the whole player behind it.
+      e.stopImmediatePropagation();
     }
   };
   document.addEventListener("keydown", onDocKeydown, true);

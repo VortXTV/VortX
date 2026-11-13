@@ -217,7 +217,7 @@ async function mountAndLoad(
   });
 
   if (opts.item) wireProgress(vid, opts.item);
-  wireKeyboard(vid, selectSubtitle);
+  wireKeyboard(host, vid, selectSubtitle, isCurrentSource);
   wireMobileAudio(vid);
   wireAudioFailure(host, vid, myGen);
   // Surface a clear message when the element fails to load or decode (an expired debrid link, a 404, an
@@ -450,18 +450,88 @@ function wireProgress(video: HTMLVideoElement, item: CWItem, admitted = sessionP
   });
 }
 
+function isTypingTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement &&
+    (target.isContentEditable || (typeof target.matches === "function" && target.matches("textarea, select, input:not([type=range]), [role=textbox]")));
+}
+
+function isPlayerControlTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement && typeof target.matches === "function" &&
+    target.matches("button, a, [role=button], [role^=menuitem], input[type=range]");
+}
+
+function changeVolume(video: HTMLVideoElement, delta: number): void {
+  const current = Number.isFinite(video.volume) ? video.volume : 1;
+  const next = Math.min(1, Math.max(0, current + delta));
+  video.volume = next;
+  if (delta > 0 && video.muted) video.muted = false;
+  if (next === 0) video.muted = true;
+}
+
+const KEYBOARD_SEEK_SECONDS = 10;
+
+function keyboardShortcutKey(e: KeyboardEvent): string {
+  if (e.key === " ") return "Space";
+  if (typeof e.key === "string" && e.key.length === 1) return e.key.toLowerCase();
+  return e.code;
+}
+
+function playerPopupOpen(host: HTMLElement): boolean {
+  return !!host.querySelector<HTMLElement>(".pl-menu:not([hidden])");
+}
+
 /** Global keyboard shortcuts while the player overlay is open (the native <video> controls only respond
- *  when the element is focused): Space play/pause, Left/Right seek by the Skip-step setting, Up/Down volume,
- *  [ / ] playback speed, M mute, F fullscreen, C toggle preferred subtitles.
- *  Removed on close so keys don't leak to the surfaces underneath. */
-function wireKeyboard(video: HTMLVideoElement, selectSubtitle: (track: TextTrack | null) => void): void {
+ *  when the element is focused): Space/K play-pause, J/L fixed ten-second seek, Left/Right seek by the
+ *  Skip-step setting, Up/Down volume, [ / ] playback speed, M mute, F fullscreen, P picture-in-picture,
+ *  C toggle preferred subtitles, T subtitles menu, S skip the active segment, I playback settings, and N
+ *  next episode when the current session supplies one. Escape is reserved for the control chrome's menu
+ *  dismissal and the app-level player close handler. Playback shortcuts are suspended while a player menu
+ *  is open. Removed on close so keys don't leak to surfaces below. */
+function wireKeyboard(
+  host: HTMLElement,
+  video: HTMLVideoElement,
+  selectSubtitle: (track: TextTrack | null) => void,
+  isCurrentSource: () => boolean,
+): void {
   if (keyHandler) document.removeEventListener("keydown", keyHandler);
+  const clickControl = (id: string): boolean => {
+    const button = host.querySelector<HTMLElement>(`#${id}`);
+    if (!button) return false;
+    button.click();
+    return true;
+  };
+  const clickVisibleControl = (id: string): boolean => {
+    const button = host.querySelector<HTMLElement>(`#${id}`);
+    if (!button || button.hidden) return false;
+    button.click();
+    return true;
+  };
+  const discreteKeys = new Set(["Space", "k", "KeyK", "c", "KeyC", "m", "KeyM", "f", "KeyF", "p", "KeyP", "n", "KeyN", "s", "KeyS", "t", "KeyT", "i", "KeyI"]);
   keyHandler = (e: KeyboardEvent) => {
+    const isEscape = e.code === "Escape" || e.key === "Escape";
+    const shortcut = keyboardShortcutKey(e);
+    // Do not steal browser/app shortcuts, text editing, or native control activation. A focused seek
+    // slider is a div role=slider, so its arrows intentionally continue to use the player shortcut.
+    if (!isCurrentSource() || e.defaultPrevented || e.isComposing || e.altKey || e.ctrlKey || e.metaKey ||
+        e.shiftKey || isTypingTarget(e.target) || (!isEscape && playerPopupOpen(host)) ||
+        (!isEscape && isPlayerControlTarget(e.target)) || (e.repeat && discreteKeys.has(shortcut))) return;
     let handled = true;
-    switch (e.code) {
+    switch (shortcut) {
       case "Space":
-        if (video.paused) void video.play().catch(() => undefined);
-        else video.pause();
+      case "k":
+      case "KeyK":
+        if (!clickControl("pl-play")) {
+          if (video.paused) void video.play().catch(() => undefined);
+          else video.pause();
+        }
+        break;
+      case "j":
+      case "KeyJ":
+        video.currentTime = Math.max(0, video.currentTime - KEYBOARD_SEEK_SECONDS);
+        break;
+      case "l":
+      case "KeyL":
+        video.currentTime = Math.min(video.duration || Infinity, video.currentTime + KEYBOARD_SEEK_SECONDS);
         break;
       case "ArrowLeft":
         video.currentTime = Math.max(0, video.currentTime - getSettings().skipStep);
@@ -470,38 +540,63 @@ function wireKeyboard(video: HTMLVideoElement, selectSubtitle: (track: TextTrack
         video.currentTime = Math.min(video.duration || Infinity, video.currentTime + getSettings().skipStep);
         break;
       case "ArrowUp":
-        video.volume = Math.min(1, video.volume + 0.1);
+        changeVolume(video, 0.1);
         break;
       case "ArrowDown":
-        video.volume = Math.max(0, video.volume - 0.1);
+        changeVolume(video, -0.1);
         break;
       case "BracketRight":
+      case "]":
         stepSpeed(video, 1);
         break;
       case "BracketLeft":
+      case "[":
         stepSpeed(video, -1);
         break;
       case "KeyC":
-        if (e.defaultPrevented || e.repeat || e.isComposing || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey ||
-            (e.target instanceof HTMLElement && (e.target.isContentEditable ||
-              e.target.matches("textarea, select, input:not([type=range]), [role=textbox]")))) return;
+      case "c":
         handled = togglePreferredSubtitle(video, selectSubtitle);
         break;
       case "KeyM":
-        video.muted = !video.muted;
+      case "m":
+        if (!clickControl("pl-mute")) video.muted = !video.muted;
         break;
       case "KeyF":
-        if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
-        else void video.requestFullscreen().catch(() => undefined);
+      case "f":
+        if (!clickControl("pl-fs")) {
+          if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+          else if (typeof video.requestFullscreen === "function") void video.requestFullscreen().catch(() => undefined);
+          else handled = false;
+        }
         break;
       case "KeyP":
-        if (document.pictureInPictureElement) void document.exitPictureInPicture().catch(() => undefined);
-        else if (document.pictureInPictureEnabled) void video.requestPictureInPicture().catch(() => undefined);
+      case "p":
+        if (!clickControl("pl-pip")) {
+          if (document.pictureInPictureElement) void document.exitPictureInPicture().catch(() => undefined);
+          else if (document.pictureInPictureEnabled && typeof video.requestPictureInPicture === "function") {
+            void video.requestPictureInPicture().catch(() => undefined);
+          } else handled = false;
+        }
         break;
       case "KeyN":
+      case "n":
         // Next episode (series only; a no-op for movies / the last episode).
-        if (sessionOptions.onNextEpisode) sessionOptions.onNextEpisode();
+        if (sessionOptions.onNextEpisode) {
+          if (!clickControl("pl-next")) sessionOptions.onNextEpisode();
+        }
         else handled = false;
+        break;
+      case "KeyS":
+      case "s":
+        handled = clickVisibleControl("pl-skipseg");
+        break;
+      case "KeyT":
+      case "t":
+        handled = clickControl("pl-subs-btn");
+        break;
+      case "KeyI":
+      case "i":
+        handled = clickControl("pl-settings-btn");
         break;
       default:
         handled = false;

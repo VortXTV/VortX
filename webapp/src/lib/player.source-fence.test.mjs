@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
-const state = globalThis.__playerSourceFence = { gate: deferred(), importStarted: false, instances: [], controls: [] };
+const state = globalThis.__playerSourceFence = { gate: deferred(), importStarted: false, instances: [], controls: [], popupOpen: false };
 const hlsMock = `
   const state = globalThis.__playerSourceFence;
   state.importStarted = true; await state.gate.promise;
@@ -43,7 +43,11 @@ class Video extends EventTarget {
 }
 const classes = new Set(["hidden"]);
 state.host = { children: [], classList: { add: (value) => classes.add(value), remove: (value) => classes.delete(value), contains: (value) => classes.has(value) },
-  setAttribute() {}, appendChild(video) { this.children.push(video); }, querySelector(selector) { return selector === "video" ? this.children.find((video) => video.kind === "video") ?? null : null; },
+  setAttribute() {}, appendChild(video) { this.children.push(video); }, querySelector(selector) {
+    if (selector === "video") return this.children.find((video) => video.kind === "video") ?? null;
+    if (selector === ".pl-menu:not([hidden])") return state.popupOpen ? {} : null;
+    return null;
+  },
   addEventListener() {}, removeEventListener() {}, set innerHTML(_html) { this.children = []; },
 };
 globalThis.HTMLElement = class extends EventTarget {};
@@ -95,6 +99,15 @@ function pressC(options = {}) {
   }
   document.dispatchEvent(event);
   return event.defaultPrevented;
+}
+
+function pressKey(code, options = {}) {
+  const event = new Event("keydown", { cancelable: true });
+  for (const [key, value] of Object.entries({ code, ...options })) {
+    Object.defineProperty(event, key, { value });
+  }
+  document.dispatchEvent(event);
+  return event;
 }
 
 test("C uses the exact preferred language, toggles a matching track off, and leaves unmatched tracks alone", async () => {
@@ -151,6 +164,65 @@ test("C matches saved two-letter languages to ISO 639-2 even when browser locale
     Intl.getCanonicalLocales = canonicalize;
     player.close();
   }
+});
+
+test("common player shortcuts use current controls, guard focused controls, and stay source-scoped", async () => {
+  let next = 0;
+  await player.play("https://media.test/keyboard.mp4", "Keyboard", { onNextEpisode: () => next++ });
+  const video = state.controls.at(-1).video;
+  const autoplayPlays = video.plays;
+
+  video.paused = true;
+  assert.equal(pressKey("Space").defaultPrevented, true);
+  assert.equal(video.plays, autoplayPlays + 1);
+  video.paused = true;
+  assert.equal(pressKey("KeyK", { key: "k" }).defaultPrevented, true, "letter shortcuts use the localized key value");
+  assert.equal(video.plays, autoplayPlays + 2);
+
+  video.currentTime = 50;
+  assert.equal(pressKey("KeyJ", { key: "j" }).defaultPrevented, true);
+  assert.equal(video.currentTime, 40);
+  assert.equal(pressKey("KeyL", { key: "l" }).defaultPrevented, true);
+  assert.equal(video.currentTime, 50);
+  assert.equal(pressKey("ArrowLeft").defaultPrevented, true);
+  assert.equal(video.currentTime, 40);
+  assert.equal(pressKey("ArrowRight").defaultPrevented, true);
+  assert.equal(video.currentTime, 50);
+
+  video.volume = 0;
+  video.muted = true;
+  pressKey("ArrowUp");
+  assert.equal(video.volume, 0.1);
+  assert.equal(video.muted, false, "volume up restores sound from mute-at-zero");
+  pressKey("ArrowDown");
+  assert.equal(video.volume, 0);
+  assert.equal(video.muted, true, "volume down to zero mutes");
+  pressKey("KeyM");
+  assert.equal(video.muted, false);
+
+  assert.equal(pressKey("KeyF").defaultPrevented, false, "unsupported fullscreen is not claimed by the shortcut");
+  assert.equal(pressKey("KeyN").defaultPrevented, true);
+  assert.equal(next, 1);
+  assert.equal(pressKey("KeyN", { repeat: true }).defaultPrevented, false);
+  assert.equal(next, 1, "repeat cannot advance episodes twice");
+
+  const editable = Object.assign(new HTMLElement(), { isContentEditable: true });
+  video.currentTime = 50;
+  assert.equal(pressKey("ArrowLeft", { target: editable }).defaultPrevented, false);
+  assert.equal(video.currentTime, 50);
+
+  state.popupOpen = true;
+  assert.equal(pressKey("KeyJ", { key: "j" }).defaultPrevented, false, "playback shortcuts yield to an open player menu");
+  assert.equal(video.currentTime, 50);
+  state.popupOpen = false;
+
+  const control = Object.assign(new HTMLElement(), { matches: (selector) => selector.startsWith("button") });
+  assert.equal(pressKey("Space", { target: control }).defaultPrevented, false);
+  assert.equal(video.plays, autoplayPlays + 2, "focused player controls retain native activation");
+
+  player.close();
+  assert.equal(pressKey("Space").defaultPrevented, false);
+  assert.equal(video.plays, autoplayPlays + 2, "closed sources no longer own the keyboard");
 });
 
 test("late add-on subtitles preserve the active source's manual CC choice and never attach to a retired source", async () => {

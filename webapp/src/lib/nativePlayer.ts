@@ -38,15 +38,17 @@ let paused = false;
 let unlisten: (() => void) | null = null;
 let statusTimer: ReturnType<typeof setInterval> | null = null;
 let keyHandler: ((event: KeyboardEvent) => void) | null = null;
+let wiredHost: HTMLElement | null = null;
 
-function render(host: HTMLElement, title: string): void {
+function render(host: HTMLElement, title: string, hasNextEpisode: boolean): void {
   host.innerHTML = `
-    <button class="player-close" data-native-action="close">Back</button>
+    <button class="player-close" data-native-action="close" aria-label="Back" aria-keyshortcuts="Escape" title="Back (Escape)">Back</button>
     <div class="player-title">${escapeHtml(title)}</div>
     <div class="native-transport">
-      <button data-native-action="back10" aria-label="Back ${SEEK_STEP_SECONDS} seconds">-${SEEK_STEP_SECONDS}s</button>
-      <button data-native-action="pause" aria-label="Pause">Pause</button>
-      <button data-native-action="fwd10" aria-label="Forward ${SEEK_STEP_SECONDS} seconds">+${SEEK_STEP_SECONDS}s</button>
+      <button data-native-action="back10" aria-label="Back ${SEEK_STEP_SECONDS} seconds" aria-keyshortcuts="ArrowLeft J" title="Back ${SEEK_STEP_SECONDS} seconds (Left Arrow/J)">-${SEEK_STEP_SECONDS}s</button>
+      <button data-native-action="pause" aria-label="Pause" aria-keyshortcuts="Space K" title="Play/pause (Space/K)">Pause</button>
+      <button data-native-action="fwd10" aria-label="Forward ${SEEK_STEP_SECONDS} seconds" aria-keyshortcuts="ArrowRight L" title="Forward ${SEEK_STEP_SECONDS} seconds (Right Arrow/L)">+${SEEK_STEP_SECONDS}s</button>
+      ${hasNextEpisode ? `<button data-native-action="next" aria-label="Next episode" aria-keyshortcuts="N" title="Next episode (N)">Next episode</button>` : ""}
     </div>
     <p class="player-error" data-native-status></p>`;
 }
@@ -56,13 +58,19 @@ function setStatus(host: HTMLElement, text: string): void {
   if (node) node.textContent = text;
 }
 
+function removeKeyHandler(): void {
+  if (keyHandler) document.removeEventListener("keydown", keyHandler, true);
+  keyHandler = null;
+}
+
 function teardown(): void {
   unlisten?.();
   unlisten = null;
   if (statusTimer !== null) clearInterval(statusTimer);
   statusTimer = null;
-  if (keyHandler) document.removeEventListener("keydown", keyHandler);
-  keyHandler = null;
+  removeKeyHandler();
+  if (wiredHost) wiredHost.onclick = null;
+  wiredHost = null;
   paused = false;
 }
 
@@ -92,11 +100,28 @@ async function togglePause(host: HTMLElement): Promise<void> {
   const button = host.querySelector<HTMLButtonElement>('[data-native-action="pause"]');
   if (button) {
     button.textContent = paused ? "Play" : "Pause";
-    button.setAttribute("aria-label", paused ? "Play" : "Pause");
+    button.setAttribute("aria-label", `${paused ? "Play" : "Pause"} (Space/K)`);
   }
 }
 
-function wireControls(host: HTMLElement, mine: number): void {
+function isTypingTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement &&
+    (target.isContentEditable || (typeof target.matches === "function" && target.matches("textarea, select, input:not([type=range]), [role=textbox]")));
+}
+
+function isNativeControlTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement && typeof target.matches === "function" &&
+    target.matches("button, a, [role=button], input[type=range]");
+}
+
+function keyboardShortcutKey(event: KeyboardEvent): string {
+  if (event.key === " ") return "Space";
+  if (typeof event.key === "string" && event.key.length === 1) return event.key.toLowerCase();
+  return event.code;
+}
+
+function wireControls(host: HTMLElement, mine: number, onNextEpisode?: () => void): void {
+  wiredHost = host;
   host.onclick = (event) => {
     if (mine !== session) return;
     const action = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-native-action]")?.dataset
@@ -105,17 +130,55 @@ function wireControls(host: HTMLElement, mine: number): void {
     else if (action === "pause") void togglePause(host);
     else if (action === "back10") void seekNative(-SEEK_STEP_SECONDS);
     else if (action === "fwd10") void seekNative(SEEK_STEP_SECONDS);
+    else if (action === "next") onNextEpisode?.();
   };
   keyHandler = (event: KeyboardEvent) => {
-    if (mine !== session) return;
-    if (event.key === "Escape") void closeNative();
-    else if (event.key === " ") void togglePause(host);
-    else if (event.key === "ArrowLeft") void seekNative(-SEEK_STEP_SECONDS);
-    else if (event.key === "ArrowRight") void seekNative(SEEK_STEP_SECONDS);
-    else return;
-    event.preventDefault();
+    if (mine !== session || event.defaultPrevented || event.isComposing || event.altKey || event.ctrlKey ||
+        event.metaKey || event.shiftKey) return;
+    const shortcut = keyboardShortcutKey(event);
+    const isEscape = shortcut === "Escape";
+    if (isTypingTarget(event.target)) {
+      // Keep a text field's Escape local; the app-level document listener would otherwise close the player.
+      if (isEscape) event.stopImmediatePropagation();
+      return;
+    }
+    if (!isEscape && isNativeControlTarget(event.target)) return;
+    const discrete = new Set(["Space", "k", "KeyK", "n", "KeyN"]);
+    if (event.repeat && discrete.has(shortcut)) return;
+    let handled = true;
+    switch (shortcut) {
+      case "Escape":
+        event.stopImmediatePropagation();
+        void closeNative();
+        break;
+      case "Space":
+      case "k":
+      case "KeyK":
+        void togglePause(host);
+        break;
+      case "ArrowLeft":
+      case "j":
+      case "KeyJ":
+        void seekNative(-SEEK_STEP_SECONDS);
+        break;
+      case "ArrowRight":
+      case "l":
+      case "KeyL":
+        void seekNative(SEEK_STEP_SECONDS);
+        break;
+      case "n":
+      case "KeyN":
+        if (onNextEpisode) onNextEpisode();
+        else handled = false;
+        break;
+      default:
+        handled = false;
+    }
+    if (handled) event.preventDefault();
   };
-  document.addEventListener("keydown", keyHandler);
+  // Capture prevents the app-level Escape listener from closing the player a second time. Returning early
+  // for focused native controls still lets their own browser activation and keyboard behavior proceed.
+  document.addEventListener("keydown", keyHandler, true);
 }
 
 /** Play a torrent stream in native mpv inside the desktop shell. */
@@ -124,11 +187,11 @@ export async function playNative(stream: Stream, title: string, options: NativeP
   const mine = ++session;
   const host = el("player");
   if (!host) return;
-  render(host, title);
+  render(host, title, !!options.onNextEpisode);
   host.classList.remove("hidden");
   host.setAttribute("aria-hidden", "false");
   setStatus(host, "Starting…");
-  wireControls(host, mine);
+  wireControls(host, mine, options.onNextEpisode);
 
   const item = options.item;
   const admitted = captureProgressAdmission();
@@ -142,6 +205,9 @@ export async function playNative(stream: Stream, title: string, options: NativeP
   if (mine !== session) return;
   if (!started) {
     setStatus(host, "This source could not be played. It may have no peers right now.");
+    // The overlay remains so Back still works, but a failed Windows/native start must not leave a
+    // document-level shortcut handler claiming keys after the typed mpv command was rejected.
+    removeKeyHandler();
     return;
   }
   setStatus(host, "");
