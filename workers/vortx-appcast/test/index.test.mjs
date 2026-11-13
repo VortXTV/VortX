@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash, createHmac, webcrypto } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import worker, { FeedCoordinator } from "../src/index.js";
@@ -29,10 +30,10 @@ function asset(tag, slug, extension, checksumName, byte, assetId) {
   return { name, checksumName, url, size: byte.length, sha256: sha256(byte), state: "uploaded", assetId };
 }
 
-function makeReceipt({ releaseId = "19", build = BUILD, tag = TAG, latestBeta = false, note = "Verified release notes." } = {}) {
+function makeReceipt({ releaseId = "19", build = BUILD, tag = TAG, latestBeta = false, note = "Verified release notes.", name } = {}) {
   const version = tag.replace(/^v/, "").replace(/-.*/, "");
   const prerelease = tag.includes("-") && !latestBeta;
-  const releaseName = prerelease ? "Beta 19" : `VortX ${version}`;
+  const releaseName = name ?? (prerelease ? "Beta 19" : `VortX ${version}`);
   const assets = {
     ios: asset(tag, "iOS", "ipa", "VortX-iOS-ci.ipa", "ios-bytes", 11),
     tvos: asset(tag, "tvOS", "ipa", "VortX-tvOS-ci.ipa", "tvos-bytes", 12),
@@ -187,6 +188,278 @@ function androidAugmentation(receipt, operationId = "augment-android-test", vers
       provenanceText,
     },
   };
+}
+
+function bindPublishedFeedBytes(receipt, appcast) {
+  receipt.appcast = `${JSON.stringify(appcast, null, 2)}\n`;
+  const manifest = receipt.manifest;
+  manifest.appcastSha256 = sha256(receipt.appcast);
+  manifest.checksumSha256 = sha256(receipt.checksum);
+  manifest.feedSha256 = sha256(`${receipt.source}\n${receipt.appcast}\n${receipt.checksum}`);
+  manifest.generation = `${manifest.tag}:${manifest.build}:${manifest.feedSha256}`;
+  Object.assign(receipt, manifest);
+  return receipt;
+}
+
+function publishedAndroidReceipt({ releaseId = "442", tag = "v0.5.6-beta.13", build = 285, versionCode = 285, latestBeta = true, name, note } = {}) {
+  const receipt = makeReceipt({ releaseId, tag, build, latestBeta, name, note });
+  const manifest = receipt.manifest;
+  const assets = manifest.assets;
+  const appcast = JSON.parse(receipt.appcast);
+  const releaseAsset = (name, bytes, assetId) => ({
+    name,
+    checksumName: name,
+    url: `https://github.com/VortXTV/VortX/releases/download/${tag}/${name}`,
+    size: Buffer.byteLength(bytes),
+    sha256: sha256(bytes),
+    state: "uploaded",
+    assetId,
+  });
+  for (const entry of Object.values(assets)) entry.checksumName = entry.name;
+  assets.androidFull = releaseAsset(`VortX-${manifest.version}-full-mpv-universal.apk`, "full-production-apk", 21);
+  assets.androidPlay = releaseAsset(`VortX-${manifest.version}-play-media3-universal.apk`, "play-production-apk", 22);
+  assets.androidBundle = releaseAsset(`VortX-${manifest.version}-play-media3.aab`, "play-production-aab", 23);
+  receipt.checksum = Object.values(assets).map((entry) => `${entry.sha256}  ${entry.name}`).join("\n") + "\n";
+  manifest.checksumAsset = releaseAsset("SHA256SUMS.txt", receipt.checksum, 24);
+  const entry = (flavor, engine, apk) => ({
+    tag,
+    version: manifest.version,
+    build: versionCode,
+    versionCode,
+    name: manifest.name,
+    notes: manifest.notes,
+    prerelease: manifest.prerelease,
+    flavor,
+    applicationId: "com.vortx.android",
+    engine,
+    artifactType: "apk",
+    signed: true,
+    url: apk.url,
+    size: apk.size,
+    sha256: apk.sha256,
+    signer: ANDROID_SIGNER,
+  });
+  manifest.android = {
+    full: entry("full", "mpv", assets.androidFull),
+    play: entry("play", "media3", assets.androidPlay),
+  };
+  appcast.android = structuredClone(manifest.android);
+  return bindPublishedFeedBytes(receipt, appcast);
+}
+
+function promoteReceipt(receipt, expectedActiveGeneration) {
+  return {
+    action: "promote",
+    operationId: `promote-${receipt.manifest.releaseId}`,
+    releaseId: receipt.manifest.releaseId,
+    generation: receipt.manifest.generation,
+    expectedActiveGeneration,
+  };
+}
+
+test("published split Android stage serves exact bytes, can be inherited, and rolls back to the exact prior generation", async () => {
+  const env = environment(new MemoryKV());
+  const post = (payload) => worker.fetch(signedRequest("/__release/receipt", payload), env);
+  const publicFeed = () => worker.fetch(new Request("https://vortx.tv/appcast.json?cache-bust=test"), env);
+  const old = makeReceipt({ releaseId: "441", tag: "v0.5.5", build: 274 });
+  assert.equal((await post(old)).status, 200);
+  assert.equal((await post(promoteReceipt(old, null))).status, 200);
+  const legacyAugment = androidAugmentation(old, "augment-old", 274);
+  legacyAugment.expectedReceiptSha256 = (await env.__state.storage.get("active")).receiptSha256;
+  assert.equal((await post(legacyAugment)).status, 200);
+  const prior = await env.__state.storage.get("active");
+
+  const current = publishedAndroidReceipt({ build: 285, versionCode: 286 });
+  const stage = await post(current);
+  assert.equal(stage.status, 200, await stage.text());
+  assert.equal(await (await publicFeed()).text(), prior.appcastText);
+  const promotion = promoteReceipt(current, prior.manifest.generation);
+  const promoted = await post(promotion);
+  assert.equal(promoted.status, 200, await promoted.text());
+  assert.equal((await (await post(current)).json()).idempotent, true);
+  assert.equal((await (await post(promotion)).json()).idempotent, true);
+  const response = await publicFeed();
+  assert.equal(response.headers.get("x-vortx-feed-generation"), current.manifest.generation);
+  assert.equal(await response.text(), current.appcast);
+  for (const path of ["/altstore.json", "/vortx-altstore.json"]) {
+    assert.equal(await (await worker.fetch(new Request(`https://vortx.tv${path}`), env)).text(), current.source);
+  }
+  const active = await (await post({ action: "read-active-receipt" })).json();
+  assert.equal(active.inheritedAndroidState, "active");
+  assert.equal(active.active.appcastText, current.appcast);
+  assert.deepEqual(active.active.manifest.android, current.manifest.android);
+
+  const later = makeReceipt({ releaseId: "443", tag: "v0.5.6-beta.14", build: 287 });
+  assert.equal((await post(later)).status, 200);
+  assert.equal((await post(promoteReceipt(later, current.manifest.generation))).status, 200);
+  const inherited = await (await post({ action: "read-active-receipt" })).json();
+  assert.equal(inherited.inheritedAndroidState, "valid");
+  assert.deepEqual(inherited.inheritedAndroid, current.manifest.android);
+  assert.deepEqual((await (await publicFeed()).json()).android, current.manifest.android);
+
+  for (const [from, to] of [[later.manifest.generation, current.manifest.generation], [current.manifest.generation, prior.manifest.generation]]) {
+    assert.equal((await post({ action: "rollback", expectedCurrentGeneration: from, restoreGeneration: to })).status, 200);
+  }
+  const restored = await publicFeed();
+  assert.equal(restored.headers.get("x-vortx-feed-generation"), prior.manifest.generation);
+  assert.equal(await restored.text(), prior.appcastText);
+  assert.equal((await post(promotion)).status, 409);
+});
+
+test("published split Android rejects unauthorized, out-of-scope, or mismatched signed package receipts", async () => {
+  const endpoint = "/__release/receipt";
+  const stage = (receipt) => worker.fetch(signedRequest(endpoint, receipt), environment(new MemoryKV()));
+  const original = publishedAndroidReceipt();
+  const unsigned = await worker.fetch(new Request(`https://vortx.tv${endpoint}`, {
+    method: "POST",
+    body: JSON.stringify(original),
+  }), environment(new MemoryKV()));
+  assert.equal(unsigned.status, 401);
+  const prerelease = await stage(publishedAndroidReceipt({ latestBeta: false }));
+  assert.equal(prerelease.status, 503);
+  const repair = await stage({ ...original, action: "repair" });
+  assert.equal(repair.status, 503);
+
+  for (const [label, mutate] of Object.entries({
+    "missing flavor": (r) => { delete r.manifest.android.play; },
+    "extra flavor": (r) => { r.manifest.android.lite = r.manifest.android.play; },
+    "wrong engine": (r) => { r.manifest.android.full.engine = "media3"; },
+    "wrong signer": (r) => { r.manifest.android.play.signer = "0".repeat(64); },
+    "wrong tag": (r) => { r.manifest.android.play.tag = "v0.5.5"; },
+    "wrong application": (r) => { r.manifest.android.full.applicationId = "com.example.app"; },
+    "unsigned APK": (r) => { r.manifest.android.play.signed = false; },
+    "discordant builds": (r) => { r.manifest.android.play.build += 1; },
+    "discordant version codes": (r) => { r.manifest.android.play.versionCode += 1; },
+    "non-numeric version code": (r) => { r.manifest.android.full.versionCode = "285"; },
+    "wrong variant URL": (r) => { r.manifest.android.play.url = r.manifest.android.full.url; },
+    "wrong APK digest": (r) => { r.manifest.android.full.sha256 = "a".repeat(64); },
+    "missing canonical AAB": (r) => { delete r.manifest.assets.androidBundle; },
+    "missing checksum asset": (r) => { delete r.manifest.checksumAsset; },
+    "wrong checksum digest": (r) => { r.manifest.checksumAsset.sha256 = "a".repeat(64); },
+    "wrong checksum length": (r) => { r.manifest.checksumAsset.size += 1; },
+    "ambiguous asset IDs": (r) => { r.manifest.checksumAsset.assetId = r.manifest.assets.androidFull.assetId; },
+    "asset ID coerced": (r) => { r.manifest.assets.androidFull.assetId = "21"; },
+    "wrong Lite filename": (r) => { r.manifest.assets.tvosLite.name = r.manifest.assets.tvos.name; },
+  })) {
+    const receipt = structuredClone(original);
+    mutate(receipt);
+    const appcast = { ...JSON.parse(receipt.appcast), android: receipt.manifest.android };
+    const response = await stage(bindPublishedFeedBytes(receipt, appcast));
+    assert.equal(response.status, 503, label);
+  }
+
+  for (const mutate of [
+    (value) => `${value}${value.split("\n")[0]}\n`,
+    (value) => `${value}${"a".repeat(64)}  unrelated.zip\n`,
+    (value) => value.replace(/^[0-9a-f]{64}/, "a".repeat(64)),
+    (value) => value.replace("  VortX-", "  out/VortX-"),
+  ]) {
+    const receipt = structuredClone(original);
+    receipt.checksum = mutate(receipt.checksum);
+    receipt.manifest.checksumAsset.size = Buffer.byteLength(receipt.checksum);
+    receipt.manifest.checksumAsset.sha256 = sha256(receipt.checksum);
+    assert.equal((await stage(bindPublishedFeedBytes(receipt, JSON.parse(receipt.appcast)))).status, 503);
+  }
+  const conflict = structuredClone(original);
+  const conflictAppcast = JSON.parse(conflict.appcast);
+  conflictAppcast.android.full.versionCode += 1;
+  const response = await stage(bindPublishedFeedBytes(conflict, conflictAppcast));
+  assert.equal(response.status, 503);
+  assert.match((await response.json()).message, /Android appcast metadata/);
+});
+
+test("published split Android honors the installed client integer, APK, text and UTF-8 appcast limits", async () => {
+  const stage = (receipt) => worker.fetch(signedRequest("/__release/receipt", receipt), environment(new MemoryKV()));
+  const apkLimit = 1_073_741_824;
+  const versionCodeLimit = 2_147_483_647;
+  const appcastLimit = 512 * 1024;
+  const maxed = publishedAndroidReceipt({
+    tag: `v${"1".repeat(60)}.1.0`,
+    versionCode: versionCodeLimit,
+    name: "x".repeat(200),
+    note: "🎬".repeat(10_000),
+  });
+  maxed.manifest.assets.androidFull.size = apkLimit;
+  maxed.manifest.assets.androidPlay.size = apkLimit;
+  maxed.manifest.android.full.size = apkLimit;
+  maxed.manifest.android.play.size = apkLimit;
+  const appcast = { ...JSON.parse(maxed.appcast), android: maxed.manifest.android, fixturePadding: "" };
+  const remainingBytes = appcastLimit - Buffer.byteLength(`${JSON.stringify(appcast, null, 2)}\n`);
+  appcast.fixturePadding = "é".repeat(Math.floor(remainingBytes / 2)) + "a".repeat(remainingBytes % 2);
+  bindPublishedFeedBytes(maxed, appcast);
+  assert.equal(Buffer.byteLength(maxed.appcast), appcastLimit);
+  const accepted = await stage(maxed);
+  assert.equal(accepted.status, 200, await accepted.text());
+
+  const oversizedAppcast = structuredClone(maxed);
+  const padding = { ...appcast, fixturePadding: `${appcast.fixturePadding}a` };
+  const response = await stage(bindPublishedFeedBytes(oversizedAppcast, padding));
+  assert.equal(response.status, 503);
+  assert.match((await response.json()).message, /appcast exceeds/);
+  for (const [assetKey, flavor] of [["androidFull", "full"], ["androidPlay", "play"]]) {
+    const oversizedAPK = publishedAndroidReceipt();
+    oversizedAPK.manifest.assets[assetKey].size = apkLimit + 1;
+    oversizedAPK.manifest.android[flavor].size = apkLimit + 1;
+    const appcastWithAPK = { ...JSON.parse(oversizedAPK.appcast), android: oversizedAPK.manifest.android };
+    const refused = await stage(bindPublishedFeedBytes(oversizedAPK, appcastWithAPK));
+    assert.equal(refused.status, 503);
+    assert.match((await refused.json()).message, /APK size exceeds/);
+  }
+  for (const [parameters, reason] of [
+    [{ versionCode: versionCodeLimit + 1 }, /client integer range/],
+    [{ tag: `v${"1".repeat(61)}.1.0` }, /release text exceeds/],
+    [{ name: "x".repeat(201) }, /release text exceeds/],
+    [{ note: `${"🎬".repeat(10_000)}x` }, /release text exceeds/],
+  ]) {
+    const refused = await stage(publishedAndroidReceipt(parameters));
+    assert.equal(refused.status, 503);
+    assert.match((await refused.json()).message, reason);
+  }
+});
+
+test("published Android versionCode must advance the active and inherited build at both stage and promotion", async () => {
+  const env = environment(new MemoryKV());
+  const post = (payload) => worker.fetch(signedRequest("/__release/receipt", payload), env);
+  const early = publishedAndroidReceipt({ releaseId: "441", tag: "v0.5.5", build: 274, versionCode: 280 });
+  const laterLowerCode = publishedAndroidReceipt({ build: 286, versionCode: 285 });
+  assert.equal((await post(laterLowerCode)).status, 200);
+  assert.equal((await post(early)).status, 200);
+  assert.equal((await post(promoteReceipt(early, null))).status, 200);
+  const current = publishedAndroidReceipt({ releaseId: "443", tag: "v0.5.6-beta.14", build: 285, versionCode: 286 });
+  assert.equal((await post(current)).status, 200);
+  assert.equal((await post(promoteReceipt(current, early.manifest.generation))).status, 200);
+  const competing = await post(promoteReceipt(laterLowerCode, current.manifest.generation));
+  assert.equal(competing.status, 409);
+  assert.equal((await competing.json()).error, "android-build-order");
+
+  const appleOnly = makeReceipt({ releaseId: "444", tag: "v0.5.6-beta.15", build: 287 });
+  assert.equal((await post(appleOnly)).status, 200);
+  assert.equal((await post(promoteReceipt(appleOnly, current.manifest.generation))).status, 200);
+  const sameCode = publishedAndroidReceipt({ releaseId: "445", tag: "v0.5.6-beta.16", build: 288, versionCode: 286 });
+  const rejectedStage = await post(sameCode);
+  assert.equal(rejectedStage.status, 409);
+  assert.equal((await rejectedStage.json()).error, "android-build-order");
+  const higherCode = publishedAndroidReceipt({ releaseId: "445", tag: "v0.5.6-beta.16", build: 288, versionCode: 287 });
+  assert.equal((await post(higherCode)).status, 200);
+});
+
+// Optional actual-byte acceptance, using only the synthetic HMAC and in-memory Worker bindings.
+if (process.env.VORTX_PUBLISHED_STAGE_FIXTURE) {
+  test("actual published stage fixture round-trips through the Worker", async () => {
+    const receipt = JSON.parse(readFileSync(process.env.VORTX_PUBLISHED_STAGE_FIXTURE, "utf8"));
+    const env = environment(new MemoryKV());
+    const post = (payload) => worker.fetch(signedRequest("/__release/receipt", payload), env);
+    const staged = await post(receipt);
+    assert.equal(staged.status, 200, await staged.text());
+    const promoted = await post(promoteReceipt(receipt, null));
+    assert.equal(promoted.status, 200, await promoted.text());
+    for (const [path, bytes] of [["/altstore.json", receipt.source], ["/vortx-altstore.json", receipt.source], ["/appcast.json", receipt.appcast]]) {
+      const response = await worker.fetch(new Request(`https://vortx.tv${path}`), env);
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get("x-vortx-feed-generation"), receipt.manifest.generation);
+      assert.equal(await response.text(), bytes);
+    }
+  });
 }
 
 test("staging, promotion, exact bytes, query invariance, and rollback are fail-closed", async () => {
