@@ -1059,6 +1059,7 @@ struct TVPlayerView: View {
     @State private var torrentStatus: String?           // live warm-up line ("Connecting to peers · 12 connected")
     @State private var torrentWarmupsUsed = 0           // bounded warm-up rounds before the error overlay
     @State private var playSpeed = 1.0                  // mpv playback speed (sticky for the session)
+    private let playbackSpeeds: [Double] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
     @State private var showStats = false                // live playback info overlay
     @State private var statsRows: [(String, String)] = []
     @State private var showStreamQR = false             // QR overlay sharing the playing link to a phone
@@ -1193,11 +1194,7 @@ struct TVPlayerView: View {
             if !showWatchParty {
             RemoteCatcher(
                 onPress: { handlePress($0) },
-                onPreferredSubtitleKey: {
-                    guard togglePreferredSubtitle() else { return false }
-                    noteInteraction()
-                    return true
-                },
+                onKeyboardAction: handlePlayerKeyboardAction,
                 onSwipe: { if !showWatchParty { noteInteraction(); if !stillWatching && !showStreamQR { showControls() } } },
                 accessibilityItems: remoteAccessibilityItems,
                 accessibilityFocusedID: remoteAccessibilityFocusedID,
@@ -2942,6 +2939,65 @@ struct TVPlayerView: View {
 
     // MARK: - Remote handling (all input arrives here from the UIKit catcher)
 
+    private func handlePlayerKeyboardAction(_ action: PlayerKeyboardAction, isRepeat: Bool) -> Bool {
+        guard !leftPlayback, !showWatchParty else { return false }
+        if action == .back {
+            if !isRepeat { handlePress(.menu) }
+            return true
+        }
+        if action == .playPause {
+            // Keep the TV's Play/Pause behavior for the idle prompt and playback failure.
+            guard !showOptions, !showStreamQR, !refinding else { return false }
+            if !isRepeat { handlePress(.playPause) }
+            return true
+        }
+        guard hasStartedPlaying, !loadFailed, !refinding, !showOptions, !showStreamQR,
+              !stillWatching, !scrubbing, !switchingEpisode, pendingAdvance == nil,
+              supersededAdvance == nil, !hasUncommittedIssuedMedia,
+              coordinator.player?.activeLoadToken != nil else { return false }
+        if isRepeat && !action.repeats { return true }
+        switch action {
+        case .subtitles:
+            guard togglePreferredSubtitle() else { return false }
+        case .audioMenu:
+            guard !audioTracks.isEmpty else { return false }
+            openPanel(.audio)
+        case .subtitleMenu:
+            openPanel(.subtitles)
+        case .playbackInfo:
+            togglePlaybackInfo()
+        case .cycleAspect:
+            setVideoSize(PlayerKeyboardAspect.next(after: coordinator.player?.videoSizeMode ?? videoSize))
+            flashControls()
+        case .slower, .faster:
+            guard !isCurrentLiveStream,
+                  let value = PlayerKeyboardSpeed.next(from: playSpeed, action: action, presets: playbackSpeeds)
+            else { return false }
+            setPlaybackSpeed(value)
+            flashControls()
+        case .seekBackward, .seekForward:
+            guard isSeekable, !isCurrentLiveStream, duration.isFinite, duration > 0 else { return false }
+            seek(action == .seekBackward ? -seekStepSeconds : seekStepSeconds)
+        case .previousEpisode, .nextEpisode:
+            guard downloadedPlayback == nil else { return false }
+            let available = episodeControlAvailability
+            if action == .previousEpisode {
+                guard available.previous else { return false }
+                requestManualEpisodeNavigation(.previous)
+            } else {
+                guard available.next else { return false }
+                requestManualEpisodeNavigation(.next)
+            }
+        case .skipSegment:
+            guard let segment = skipPillSegment else { return false }
+            skipTo(segment)
+        case .playPause, .back, .volumeUp, .volumeDown, .mute, .fullScreen:
+            return false
+        }
+        noteInteraction()
+        return true
+    }
+
     private func handlePress(_ type: UIPress.PressType) {
         guard !showWatchParty else { return } // reject a queued catcher callback before dismantle
         noteInteraction()   // any remote press is presence: re-arm the "Still watching?" idle guard
@@ -3773,17 +3829,16 @@ struct TVPlayerView: View {
             // fallback for the brief mount gap and the value the next load re-applies (iOS parity).
             let mode = coordinator.player?.videoSizeMode ?? videoSize
             return [
-                OptionRow(label: "Fit  ·  default", isSelected: mode == "original") { videoSize = "original"; coordinator.player?.setVideoSize("original") },
-                OptionRow(label: "Fill  ·  crop to screen", isSelected: mode == "fill" || mode == "zoom") { videoSize = "fill"; coordinator.player?.setVideoSize("fill") },
-                OptionRow(label: "Stretch  ·  fill, distort", isSelected: mode == "stretch") { videoSize = "stretch"; coordinator.player?.setVideoSize("stretch") },
+                OptionRow(label: "Fit  ·  default", isSelected: mode == "original") { setVideoSize("original") },
+                OptionRow(label: "Fill  ·  crop to screen", isSelected: mode == "fill" || mode == "zoom") { setVideoSize("fill") },
+                OptionRow(label: "Stretch  ·  fill, distort", isSelected: mode == "stretch") { setVideoSize("stretch") },
             ]
         case .playback:
             var rows: [OptionRow] = [OptionRow(label: "Speed", isHeader: true)]
-            for s in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
+            for s in playbackSpeeds {
                 rows.append(OptionRow(label: s == 1.0 ? "Normal  ·  1×" : "\(s.formatted())×",
                                       isSelected: abs(playSpeed - s) < 0.01) {
-                    playSpeed = s
-                    coordinator.player?.setSpeed(s)
+                    setPlaybackSpeed(s)
                 })
             }
             return rows
@@ -4245,6 +4300,21 @@ struct TVPlayerView: View {
     /// The gear panel: player-wide settings that aren't tied to one media kind. Handoff to an
     /// installed external player (direct/debrid URLs only; a torrent's local-server URL dies when
     /// this app suspends), the decoder choice, and the info/QR rows that used to crowd Playback.
+    private func setVideoSize(_ mode: String) {
+        videoSize = mode
+        coordinator.player?.setVideoSize(mode)
+    }
+
+    private func setPlaybackSpeed(_ value: Double) {
+        playSpeed = value
+        coordinator.player?.setSpeed(value)
+    }
+
+    private func togglePlaybackInfo() {
+        showStats.toggle()
+        withAnimation { showOptions = false }
+    }
+
     private func playerSettingsRows() -> [OptionRow] {
         var rows: [OptionRow] = []
         if !isTrailer {
@@ -4305,11 +4375,15 @@ struct TVPlayerView: View {
         let sleepDetail = sleepAtEpisodeEnd ? "End of episode  ·  ›"
             : sleepMinutes.map { "\($0) min  ·  ›" } ?? "Off  ·  ›"
         rows.append(OptionRow(label: "Sleep timer", detail: sleepDetail) { openPanel(.sleep) })
+        rows.append(OptionRow(label: String(localized: "Keyboard shortcuts"), isHeader: true))
+        rows.append(OptionRow(label: String(localized: "Space or K: play/pause · J/L: seek · C: subtitles"), isHeader: true))
+        rows.append(OptionRow(label: String(localized: "P/N: previous/next episode · S: skip · Esc: back"), isHeader: true))
+        rows.append(OptionRow(label: String(localized: "A: audio menu · T: subtitle menu · I: playback info"), isHeader: true))
+        rows.append(OptionRow(label: String(localized: "V: cycle aspect ratio · [ / ]: playback speed"), isHeader: true))
         rows.append(OptionRow(label: "Info", isHeader: true))
         rows.append(OptionRow(label: showStats ? "Hide playback info" : "Show playback info",
                               isSelected: showStats) {
-            showStats.toggle()
-            withAnimation { showOptions = false }
+            togglePlaybackInfo()
         })
         if shareLink != nil {
             rows.append(OptionRow(label: isTorrentPlayback ? "Magnet link  ·  QR for your phone"
@@ -13451,7 +13525,7 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
     }
 
     var onPress: (UIPress.PressType) -> Void
-    var onPreferredSubtitleKey: () -> Bool
+    var onKeyboardAction: (PlayerKeyboardAction, Bool) -> Bool
     var onSwipe: () -> Void
     var accessibilityItems: [AccessibilityItem]
     var accessibilityFocusedID: String?
@@ -13477,7 +13551,7 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
 
     private func update(_ vc: CatchVC) {
         vc.onPress = onPress
-        vc.onPreferredSubtitleKey = onPreferredSubtitleKey
+        vc.onKeyboardAction = onKeyboardAction
         vc.onSwipe = onSwipe
         vc.onAccessibilityFocus = onAccessibilityFocus
         vc.onAccessibilityActivate = onAccessibilityActivate
@@ -13536,9 +13610,9 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
     /// a directional press would otherwise move focus to nothing (which left the player deaf to the remote).
     final class CatchVC: UIViewController {
         var onPress: ((UIPress.PressType) -> Void)?
-        var onPreferredSubtitleKey: (() -> Bool)?
+        var onKeyboardAction: ((PlayerKeyboardAction, Bool) -> Bool)?
         var onSwipe: (() -> Void)?
-        private var capturedSubtitlePresses: Set<UIPress> = []
+        private var capturedKeyboardPresses: [UIPress: UIKeyboardHIDUsage] = [:]
         var onAccessibilityFocus: ((String) -> Void)?
         var onAccessibilityActivate: ((String) -> Void)?
         var onAccessibilityAdjust: ((String, Int) -> Void)?
@@ -13661,8 +13735,8 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
             acceptsRepeat = false
             stopRepeat()
             onPress = nil
-            onPreferredSubtitleKey = nil
-            capturedSubtitlePresses.removeAll()
+            onKeyboardAction = nil
+            // Keep the ownership of pressed keys until their releases arrive.
             onSwipe = nil
             onAccessibilityFocus = nil
             onAccessibilityActivate = nil
@@ -13740,61 +13814,82 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
             }
         }
 
+        private static func keyboardAction(_ key: UIKey) -> PlayerKeyboardAction? {
+            if key.keyCode == .keyboardEscape { return .back }
+            if key.keyCode == .keyboardSpacebar { return .playPause }
+            switch PlayerKeyboardAction(character: key.charactersIgnoringModifiers) {
+            case .fullScreen, .mute: return nil
+            case let action: return action
+            }
+        }
+
         override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-            var handled = false
-            var remaining = presses
+            var unhandled: Set<UIPress> = []
             let modifiers: UIKeyModifierFlags = [.command, .alternate, .control, .shift]
             for press in presses {
-                if let key = press.key, key.charactersIgnoringModifiers.lowercased() == "c" {
-                    if key.modifierFlags.intersection(modifiers).isEmpty,
-                       !capturedSubtitlePresses.isEmpty || onPreferredSubtitleKey?() == true {
-                        capturedSubtitlePresses.insert(press)
-                        remaining.remove(press)
+                if let key = press.key {
+                    guard key.modifierFlags.intersection(modifiers).isEmpty else {
+                        unhandled.insert(press)
+                        continue
                     }
-                    continue
+                    if let action = Self.keyboardAction(key) {
+                        let isRepeat = capturedKeyboardPresses.values.contains(key.keyCode)
+                        if (isRepeat && !action.repeats) || onKeyboardAction?(action, isRepeat) == true {
+                            capturedKeyboardPresses[press] = key.keyCode
+                        } else {
+                            unhandled.insert(press)
+                        }
+                        continue
+                    }
                 }
                 switch press.type {
                 case .select, .menu, .playPause:
-                    onPress?(press.type); handled = true
+                    onPress?(press.type)
                 case .upArrow, .downArrow, .leftArrow, .rightArrow:
-                    onPress?(press.type); handled = true
+                    onPress?(press.type)
                     startRepeat(press.type)
-                default: break
+                default:
+                    unhandled.insert(press)
                 }
             }
-            if !handled, !remaining.isEmpty { super.pressesBegan(remaining, with: event) }
+            if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
         }
 
         override func pressesChanged(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-            let remaining = presses.subtracting(capturedSubtitlePresses)
-            if !remaining.isEmpty { super.pressesChanged(remaining, with: event) }
+            let remaining = presses.filter { capturedKeyboardPresses[$0] == nil }
+            if !remaining.isEmpty { super.pressesChanged(Set(remaining), with: event) }
         }
 
         override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-            let remaining = presses.subtracting(capturedSubtitlePresses)
-            capturedSubtitlePresses.subtract(presses)
-            guard !remaining.isEmpty else { return }
-            stopRepeat()
-            // Swallow the RELEASE of every press type pressesBegan handled, not just
-            // the press itself. Forwarding the menu release to UIKit let the system
-            // act on it anyway and suspend the app to the home screen, intermittently,
-            // raced against the player teardown the menu press had just started.
-            let unhandled = remaining.filter {
-                if $0.key?.charactersIgnoringModifiers.lowercased() == "c" { return true }
-                switch $0.type {
-                case .select, .menu, .playPause, .upArrow, .downArrow, .leftArrow, .rightArrow:
+            let remaining = unclaimedPresses(ending: presses)
+            if !remaining.isEmpty { super.pressesEnded(remaining, with: event) }
+        }
+
+        override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+            let remaining = unclaimedPresses(ending: presses)
+            if !remaining.isEmpty { super.pressesCancelled(remaining, with: event) }
+        }
+
+        private func unclaimedPresses(ending presses: Set<UIPress>) -> Set<UIPress> {
+            // Forward only releases the focus engine owns. Forwarding a consumed remote Menu release
+            // can otherwise send the app to the system Home Screen after the player handles Back.
+            let modifiers: UIKeyModifierFlags = [.command, .alternate, .control, .shift]
+            return Set(presses.filter { press in
+                if capturedKeyboardPresses.removeValue(forKey: press) != nil { return false }
+                if let key = press.key,
+                   Self.keyboardAction(key) != nil || !key.modifierFlags.intersection(modifiers).isEmpty {
+                    return true
+                }
+                switch press.type {
+                case .upArrow, .downArrow, .leftArrow, .rightArrow:
+                    stopRepeat()
+                    return false
+                case .select, .menu, .playPause:
                     return false
                 default:
                     return true
                 }
-            }
-            if !unhandled.isEmpty { super.pressesEnded(unhandled, with: event) }
-        }
-        override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-            let remaining = presses.subtracting(capturedSubtitlePresses)
-            capturedSubtitlePresses.subtract(presses)
-            guard !remaining.isEmpty else { return }
-            stopRepeat(); super.pressesCancelled(remaining, with: event)
+            })
         }
 
         private func startRepeat(_ type: UIPress.PressType) {

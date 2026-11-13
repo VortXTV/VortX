@@ -890,9 +890,8 @@ private struct PlayerVideoTouchPolicy<TouchID: Hashable> {
 }
 
 #if os(iOS)
-@MainActor private struct PlayerSubtitleKeyboardShortcut: ViewModifier {
-    let enabled: Bool
-    let toggle: @MainActor () -> Bool
+@MainActor private struct PlayerKeyboardShortcuts: ViewModifier {
+    let handle: @MainActor (PlayerKeyboardAction, Bool) -> Bool
     @FocusState private var videoFocused: Bool
 
     @ViewBuilder
@@ -903,11 +902,21 @@ private struct PlayerVideoTouchPolicy<TouchID: Hashable> {
                 .focused($videoFocused)
                 .defaultFocus($videoFocused, true)
                 .focusEffectDisabled()
-                .onKeyPress("c", phases: [.down, .repeat]) { press in
+                .onKeyPress(phases: [.down, .repeat]) { press in
                     let modifiers: EventModifiers = [.command, .option, .control, .shift]
-                    guard enabled, press.modifiers.intersection(modifiers).isEmpty else { return .ignored }
-                    guard press.phase == .down else { return .handled }
-                    return toggle() ? .handled : .ignored
+                    guard press.modifiers.intersection(modifiers).isEmpty else { return .ignored }
+                    let action: PlayerKeyboardAction?
+                    switch press.key {
+                    case .leftArrow: action = .seekBackward
+                    case .rightArrow: action = .seekForward
+                    case .upArrow: action = .volumeUp
+                    case .downArrow: action = .volumeDown
+                    case .escape: action = .back
+                    case .space: action = .playPause
+                    default: action = PlayerKeyboardAction(character: press.characters)
+                    }
+                    guard let action else { return .ignored }
+                    return handle(action, press.phase == .repeat) ? .handled : .ignored
                 }
         } else {
             content
@@ -1041,6 +1050,74 @@ private struct PlayerVideoTouchPolicy<TouchID: Hashable> {
     }
 }
 
+#endif
+
+#if os(macOS)
+/// AppKit can dispatch keys directly to the renderer. A local monitor sees them first, but
+/// only the key window containing this mounted player may drive it.
+@MainActor private struct MacPlayerKeyboardShortcuts: NSViewRepresentable {
+    let handle: @MainActor (PlayerKeyboardAction, Bool) -> Bool
+
+    func makeNSView(context: Context) -> ShortcutView {
+        let view = ShortcutView()
+        view.handle = handle
+        return view
+    }
+
+    func updateNSView(_ view: ShortcutView, context: Context) {
+        view.handle = handle
+    }
+
+    static func dismantleNSView(_ view: ShortcutView, coordinator: ()) {
+        view.retire()
+    }
+
+    final class ShortcutView: NSView {
+        var handle: ((PlayerKeyboardAction, Bool) -> Bool)?
+        private var monitor: Any?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            removeMonitor()
+            guard window != nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self, let window = self.window, window.isKeyWindow, event.window === window,
+                      !(window.firstResponder is NSText), !(window.firstResponder is NSTextField),
+                      let action = Self.action(for: event),
+                      self.handle?(action, event.isARepeat) == true else { return event }
+                return nil
+            }
+        }
+
+        func retire() {
+            handle = nil
+            removeMonitor()
+        }
+
+        private func removeMonitor() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        }
+
+        private static func action(for event: NSEvent) -> PlayerKeyboardAction? {
+            let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+            let characters = event.charactersIgnoringModifiers ?? ""
+            if modifiers == .command, characters == "." { return .back }
+            if modifiers == [.command, .control], characters.lowercased() == "f" { return .fullScreen }
+            guard modifiers.isEmpty else { return nil }
+            // AppKit virtual key codes for Space, Escape and the four arrow keys.
+            switch event.keyCode {
+            case 49: return .playPause
+            case 53: return .back
+            case 123: return .seekBackward
+            case 124: return .seekForward
+            case 125: return .volumeDown
+            case 126: return .volumeUp
+            default: return PlayerKeyboardAction(character: characters)
+            }
+        }
+    }
+}
 #endif
 
 private struct PlayerSizeModeFeedback: View {
@@ -1661,8 +1738,6 @@ struct PlayerScreen: View {
     /// Display-sleep assertion held while the player is open (macOS parity with the iOS idle-timer
     /// disable): keeps the Mac from dimming / sleeping mid-movie. Ended on disappear.
     @State private var macSleepActivity: NSObjectProtocol?
-    /// macOS player keyDown monitor for Space/Left/Right and C; see installMacKeyMonitor.
-    @State private var macKeyMonitor: Any?
     /// Tracks whether the player's window is in native macOS fullscreen, so the toolbar glyph flips
     /// between enter/exit. Kept in sync by NSWindow's will-enter / will-exit fullscreen notifications.
     @State private var macIsFullScreen = false
@@ -2583,8 +2658,7 @@ struct PlayerScreen: View {
             PlayerVideoInteractionSurface(locked: isLocked, pinchEnabled: touchPinchEnabled,
                 onTap: { if isLocked { revealUnlockChip() } else { toggleControls() } },
                 onPinch: handleVideoPinch)
-                .modifier(PlayerSubtitleKeyboardShortcut(
-                    enabled: acceptsSubtitleShortcut, toggle: togglePreferredSubtitle))
+                .modifier(PlayerKeyboardShortcuts(handle: handlePlayerKeyboardAction))
                 .ignoresSafeArea()
             #else
             Color.clear.contentShape(Rectangle())
@@ -2676,9 +2750,8 @@ struct PlayerScreen: View {
             if stillWatchingPrompt { stillWatchingOverlay }
 
             // Always-present escape hatch until the first frame arrives: a top-most close button so the
-            // player is NEVER a trap, even with controls auto-hidden and the spinner covering the
-            // tap-to-restore layer. macOS has no Esc/▶︎ remote fallback, so this is the only reliable
-            // way out of a stuck load. Disappears once playback starts (the normal controls take over).
+            // player remains closable even with the spinner covering the tap-to-restore layer.
+            // Disappears once playback starts and the normal controls take over.
             if !hasStartedPlaying {
                 VStack {
                     HStack {
@@ -2691,7 +2764,9 @@ struct PlayerScreen: View {
                                 .playerControlSurface(in: Circle())
                         }
                         .buttonStyle(.plain)
-                        .keyboardShortcut(.cancelAction)   // ⌘. / Esc on macOS
+                        #if os(iOS)
+                        .keyboardShortcut(.cancelAction)
+                        #endif
                         .accessibilityLabel("Close player")
                         Spacer()
                     }
@@ -2702,24 +2777,10 @@ struct PlayerScreen: View {
                 .zIndex(100)
             }
 
-            #if os(macOS)
-            // The visible pre-start close button vanishes once playback starts, taking its
-            // .cancelAction shortcut with it. macOS has no remote/Esc fallback otherwise, so keep an
-            // always-present hidden Esc handler so ⌘. / Esc closes the player at any point (#14).
-            Button { leavePlayback() } label: { EmptyView() }
-                .keyboardShortcut(.cancelAction)
-                .hidden()
-            // Fullscreen: Ctrl-Cmd-F, the standard macOS fullscreen shortcut. A MODIFIED key equivalent, so
-            // (unlike the unmodified Space/arrows) it reaches this hidden SwiftUI button rather than being
-            // swallowed by the Metal NSView's keyDown:, the same pattern the Esc/Cmd-[ handlers rely on, so
-            // this never has to touch the installMacKeyMonitor NSEvent monitor.
-            Button { toggleMacFullScreen() } label: { EmptyView() }
-                .keyboardShortcut("f", modifiers: [.command, .control])
-                .hidden()
-            // The NSEvent monitor handles unmodified player keys before AppKit sends them to the
-            // Metal NSView. The Esc/.cancelAction handler above stays.
-            #endif
         }
+        #if os(macOS)
+        .background { MacPlayerKeyboardShortcuts(handle: handlePlayerKeyboardAction).allowsHitTesting(false) }
+        #endif
         .animation(.easeOut(duration: 0.3), value: upNextRemaining != nil)
         #if os(iOS)
         .statusBarHidden(true)
@@ -2856,7 +2917,6 @@ struct PlayerScreen: View {
             // mid-movie (the iOS/tvOS keep-awake parity that was missing on Mac).
             macSleepActivity = ProcessInfo.processInfo.beginActivity(options: .idleDisplaySleepDisabled,
                                                                      reason: "StremioX video playback")
-            installMacKeyMonitor()
             observeMacFullScreen()
             #endif
         }
@@ -2914,7 +2974,6 @@ struct PlayerScreen: View {
             PlayerOrientation.release()                       // hand orientation back to the user's rotation lock
             #elseif os(macOS)
             if let token = macSleepActivity { ProcessInfo.processInfo.endActivity(token); macSleepActivity = nil }
-            removeMacKeyMonitor()
             unobserveMacFullScreen()
             #endif
         }
@@ -9325,6 +9384,11 @@ struct PlayerScreen: View {
     }
     #endif
 
+    private func setPlaybackSpeed(_ value: Double) {
+        speed = value
+        coordinator.player?.setSpeed(value)
+    }
+
     private func applyVideoSize(_ mode: String) {
         guard ["original", "fill", "stretch"].contains(mode) else { return }
         videoSize = mode
@@ -10463,11 +10527,102 @@ struct PlayerScreen: View {
         }
     }
 
+    private var keyboardPresentationAvailable: Bool {
+        !playbackExited && !showExternalChooser && !showShare && !showWatchParty &&
+        grabbedFrame == nil && !externalLinkDead && !subtitleLoadFailed
+    }
+
+    private var acceptsPlayerKeyboardTransport: Bool {
+        keyboardPresentationAvailable && hasStartedPlaying && !isLocked && !loadFailed &&
+        panel == nil && !touchOptionsVisible && !skipEditActive && !stillWatchingPrompt &&
+        !scrubbing && !editingVolume && !switchingEpisode && pendingAdvance == nil &&
+        supersededAdvance == nil && !hasUncommittedIssuedMedia &&
+        coordinator.player?.activeLoadToken != nil
+    }
+
     private var acceptsSubtitleShortcut: Bool {
-        hasStartedPlaying && !playbackExited && !isLocked && !loadFailed && panel == nil &&
-        !touchOptionsVisible && !skipEditActive && !showExternalChooser && !showShare &&
-        grabbedFrame == nil && !externalLinkDead && !subtitleLoadFailed && !stillWatchingPrompt &&
-        subtitleLoadingURL == nil && pendingSubtitleReapply == nil
+        acceptsPlayerKeyboardTransport && subtitleLoadingURL == nil && pendingSubtitleReapply == nil
+    }
+
+    private func handlePlayerKeyboardAction(_ action: PlayerKeyboardAction, _ isRepeat: Bool) -> Bool {
+        guard keyboardPresentationAvailable else { return false }
+        if action == .back {
+            // Let the system dismiss native sheets, and leave the still-watching decision to its buttons.
+            guard !stillWatchingPrompt else { return false }
+            if isRepeat { return true }
+            if panel != nil { close() }
+            else if touchOptionsVisible { touchOptionsVisible = false }
+            else if skipEditActive { toggleSkipDBEditor() }
+            else { leavePlayback() }
+            return true
+        }
+        if action == .fullScreen {
+            #if os(macOS)
+            guard panel == nil, !isLocked, !stillWatchingPrompt else { return false }
+            if !isRepeat { toggleMacFullScreen() }
+            return true
+            #else
+            return false
+            #endif
+        }
+        guard acceptsPlayerKeyboardTransport else { return false }
+        #if os(iOS) && !CINEMA_UI_SMOKE_RENDERER
+        if googleCast.state.owned, action != .playPause && action != .seekBackward && action != .seekForward {
+            return false
+        }
+        #endif
+        if isRepeat && !action.repeats { return true }
+        switch action {
+        case .playPause:
+            viewerToggleFromWatchPartyInput()
+            scheduleHide()
+        case .seekBackward, .seekForward:
+            guard !effectivelyLive, duration.isFinite, duration > 0 else { return false }
+            seekBy(action == .seekBackward ? -seekStepSeconds : seekStepSeconds)
+        case .volumeUp, .volumeDown:
+            let current = playerMuted ? 0 : playerVolume
+            setPlayerVolume(current + (action == .volumeUp ? 5 : -5))
+            scheduleHide()
+        case .mute:
+            togglePlayerMute()
+        case .subtitles:
+            guard togglePreferredSubtitle() else { return false }
+        case .audioMenu:
+            guard !audioTracks.isEmpty else { return false }
+            openPanel(.audio)
+        case .subtitleMenu:
+            openPanel(.subtitles)
+        case .playbackInfo:
+            openPanel(.info)
+        case .cycleAspect:
+            applyVideoSize(PlayerKeyboardAspect.next(after: coordinator.player?.videoSizeMode ?? videoSize))
+        case .slower, .faster:
+            guard !effectivelyLive, let value = PlayerKeyboardSpeed.next(from: speed, action: action, presets: speeds)
+            else { return false }
+            setPlaybackSpeed(value)
+            scheduleHide()
+        case .previousEpisode, .nextEpisode:
+            guard downloadedPlayback == nil else { return false }
+            if action == .previousEpisode {
+                guard showsPreviousEpisodeControl else { return false }
+                goToPrevEpisode()
+            } else if showsNextEpisodeControl {
+                goToNextEpisode()
+            } else {
+                guard hasNext else { return false }
+                if duration > 0 { reportProgress(currentTime) }
+                onNext()
+            }
+        case .skipSegment:
+            guard let segment = currentSkip, !autoSkipCountdown.isSuppressed(for: segment),
+                  PlayerSkipChromePolicy.showsPrompt(controlsVisible: controlsVisible, sharesChrome: skipSharesChrome),
+                  upNextRemaining == nil else { return false }
+            skipImmediately(segment)
+        case .fullScreen, .back:
+            return false
+        }
+        noteInteraction()
+        return true
     }
 
     private func selectPrimarySubtitleTrack(_ id: Int) {
@@ -11513,7 +11668,7 @@ struct PlayerScreen: View {
             } }
         case .speed:
             return speeds.map { s in Row(label: speedLabel(s), selected: abs(speed - s) < 0.01) {
-                speed = s; coordinator.player?.setSpeed(s)
+                setPlaybackSpeed(s)
             } }
         case .episodes:
             // The season's episodes, current one highlighted; tapping switches in place (goToEpisode).
@@ -11824,6 +11979,17 @@ struct PlayerScreen: View {
                 })
             }
             rows.append(Row(label: "Playback Info", detail: "›") { openPanel(.info) })
+            if #available(iOS 17.0, *) {
+                rows.append(Row(label: String(localized: "Keyboard shortcuts"), isHeader: true))
+                rows.append(Row(label: String(localized: "Space or K: play/pause · J/L or ←/→: seek · S: skip"), wraps: true, isEnabled: false))
+                rows.append(Row(label: String(localized: "↑/↓: volume · M: mute · C: preferred subtitles"), wraps: true, isEnabled: false))
+                rows.append(Row(label: String(localized: "P/N: previous/next episode · Esc: back"), wraps: true, isEnabled: false))
+                rows.append(Row(label: String(localized: "A: audio menu · T: subtitle menu · I: playback info"), wraps: true, isEnabled: false))
+                rows.append(Row(label: String(localized: "V: cycle aspect ratio · [ / ]: playback speed"), wraps: true, isEnabled: false))
+                #if os(macOS)
+                rows.append(Row(label: String(localized: "F or Control–Command–F: fullscreen"), wraps: true, isEnabled: false))
+                #endif
+            }
             #if os(iOS) || os(macOS)
             // Player engine picker (P3, #76): only when AVPlayer is a real option for this stream (DV / HLS /
             // debrid; never torrents or a yt-direct sidecar pair). Flips libmpv <-> AVPlayer mid-title.
@@ -12348,42 +12514,6 @@ struct PlayerScreen: View {
     }
 
     #if os(macOS)
-    private static let kVK_Space = 49
-    private static let kVK_LeftArrow = 123
-    private static let kVK_RightArrow = 124
-
-    /// App-level keyDown monitor for unmodified player keys. AppKit can send them directly to
-    /// the Metal NSView, so intercept before responder dispatch. Returning nil consumes the event.
-    private func installMacKeyMonitor() {
-        guard macKeyMonitor == nil else { return }
-        macKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard panel == nil, !showExternalChooser, !showShare,
-                  !externalLinkDead, !subtitleLoadFailed else { return event }
-            let mods: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
-            if !event.modifierFlags.intersection(mods).isEmpty { return event }
-            if event.window?.firstResponder is NSText { return event }
-            if event.window?.isMainWindow == true, event.charactersIgnoringModifiers?.lowercased() == "c",
-               acceptsSubtitleShortcut {
-                if event.isARepeat || togglePreferredSubtitle() { return nil }
-                return event
-            }
-            switch Int(event.keyCode) {
-            case Self.kVK_Space:
-                viewerToggle(); scheduleHide(); return nil
-            case Self.kVK_LeftArrow:
-                seekBy(-seekStepSeconds); return nil
-            case Self.kVK_RightArrow:
-                seekBy(seekStepSeconds); return nil
-            default:
-                return event
-            }
-        }
-    }
-
-    private func removeMacKeyMonitor() {
-        if let m = macKeyMonitor { NSEvent.removeMonitor(m); macKeyMonitor = nil }
-    }
-
     /// The window hosting the player. The Mac player is rendered at the app window's root via
     /// MacRootPlayerOverlay, so the key window (falling back to the main window) is that window.
     private var macPlayerWindow: NSWindow? { NSApp.keyWindow ?? NSApp.mainWindow }
@@ -12415,7 +12545,7 @@ struct PlayerScreen: View {
     /// Keep `macIsFullScreen` in sync with the window so the toolbar glyph reflects the real state, whether
     /// fullscreen was toggled from our button, the shortcut, or the system green button / menu item.
     private func observeMacFullScreen() {
-        // Re-entry guard mirroring installMacKeyMonitor: SwiftUI can fire onAppear twice with no intervening
+        // SwiftUI can fire onAppear twice with no intervening
         // onDisappear, and without this the second call would overwrite `macFullScreenObservers`, orphaning
         // the first observer pair for the process lifetime (they keep writing a defunct view's @State and
         // unobserveMacFullScreen can no longer remove them).
