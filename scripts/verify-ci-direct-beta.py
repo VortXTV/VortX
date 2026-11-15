@@ -48,7 +48,7 @@ NATIVE_BETA14_TAG = "v0.5.6-beta.14"
 PROTECTED_RELEASES = {
     NATIVE_BETA12_TAG: ("v0.5.6-beta.12-candidate.3", "283", "beta12-candidate-preflight"),
     NATIVE_BETA13_TAG: ("v0.5.6-beta.13-candidate.1", "285", "beta13-candidate-preflight"),
-    NATIVE_BETA14_TAG: ("v0.5.6-beta.14-candidate.1", "292", "beta14-candidate-preflight"),
+    NATIVE_BETA14_TAG: ("v0.5.6-beta.14-candidate.2", "293", "beta14-candidate-preflight"),
 }
 NATIVE_TAGS = (NATIVE_BETA7_TAG, NATIVE_BETA11_TAG, *PROTECTED_RELEASES)
 NATIVE_TARGETS = ("VortXiOSNative", "VortXMac", "VortXTV", "VortXTopShelf", "VortXTVLite")

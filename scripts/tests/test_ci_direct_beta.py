@@ -3,6 +3,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 import re
 from pathlib import Path
 import tempfile
@@ -555,10 +556,10 @@ class NativeBeta13Contract(NativeBeta12Contract):
 
 class NativeBeta14Contract(NativeBeta12Contract):
     tag = "v0.5.6-beta.14"
-    candidate = "v0.5.6-beta.14-candidate.1"
-    build = "292"
+    candidate = "v0.5.6-beta.14-candidate.2"
+    build = "293"
     preflight_mode = "beta14-candidate-preflight"
-    rejected_candidates = ("2", "9")
+    rejected_candidates = ("1", "9")
 
     def test_beta14_requires_both_the_artifact_only_guard_and_android_regression_gate(self):
         for lane, guard in (("apple", "Verify protected Beta 14 artifact-only dispatch"),
@@ -571,6 +572,29 @@ class NativeBeta14Contract(NativeBeta12Contract):
             with self.assertRaisesRegex(ValueError, guard):
                 MODULE.successful_job([original], lane, 5, 1, self.source, self.tag)
 
+
+    def test_aether_evidence_accepts_the_same_exact_candidate_as_packaging(self):
+        release_script = Path(__file__).resolve().parents[1] / "verify-protected-apple-aether.py"
+        spec = importlib.util.spec_from_file_location("protected_apple_aether", release_script)
+        verifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verifier)
+        env = {
+            "BUILD_SOURCE_SHA": self.source, "GITHUB_SHA": self.source,
+            "GITHUB_REF": "refs/tags/" + MODULE.build_tag(self.tag),
+            "GITHUB_RUN_ID": "5", "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REPOSITORY": "VortXTV/VortX",
+        }
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(verifier, "run", return_value=self.source):
+            identity = verifier.identity()
+            self.assertEqual(identity["ref"], "refs/tags/" + self.candidate)
+            self.assertEqual(identity["sourceCommit"], self.source)
+            for ref in (self.tag, self.tag + "-candidate.1", self.tag + "-candidate.3"):
+                with mock.patch.dict(os.environ, {"GITHUB_REF": "refs/tags/" + ref}):
+                    with self.assertRaisesRegex(ValueError, "exact candidate"):
+                        verifier.identity()
+            with mock.patch.dict(os.environ, {"GITHUB_SHA": "b" * 40}):
+                with self.assertRaisesRegex(ValueError, "exact candidate"):
+                    verifier.identity()
 
     def test_regression_receipt_requires_every_suite_and_matching_total(self):
         beginning = "2026-11-15T00:00:00Z"

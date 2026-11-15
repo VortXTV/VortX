@@ -57,7 +57,7 @@ jobs:
               case "$GITHUB_REF:$RELEASE_TAG" in
                 refs/tags/v0.5.6-beta.12-candidate.3:v0.5.6-beta.12-candidate.3|\
                 refs/tags/v0.5.6-beta.13-candidate.1:v0.5.6-beta.13-candidate.1|\
-                refs/tags/v0.5.6-beta.14-candidate.1:v0.5.6-beta.14-candidate.1) ;;
+                refs/tags/v0.5.6-beta.14-candidate.2:v0.5.6-beta.14-candidate.2) ;;
                 *) echo "::error::Protected candidate ref and input must match an exact reviewed pair"; exit 1 ;;
               esac
               [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REPOSITORY" == VortXTV/VortX &&
@@ -218,7 +218,7 @@ jobs:
           retention-days: 90
 
       - name: Verify protected Android backup format and CAS
-        if: github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' || github.ref == 'refs/tags/v0.5.6-beta.14-candidate.1'
+        if: github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' || github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2'
         working-directory: android
         timeout-minutes: 15
         env:
@@ -253,7 +253,7 @@ jobs:
           PYTEST
 
       - name: Verify protected Android account setup and release regressions
-        if: github.ref == 'refs/tags/v0.5.6-beta.14-candidate.1'
+        if: github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2'
         working-directory: android
         timeout-minutes: 20
         env:
