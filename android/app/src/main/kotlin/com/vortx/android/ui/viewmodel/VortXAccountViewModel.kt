@@ -157,6 +157,7 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     private var activeAuthSubmission: Any? = null
     private var authSubmissionJob: Job? = null
     private var completionOwner: PickerAccountSnapshot? = null
+    private var postAuthInvocation: Any? = null
     private var pickerFileRecoveryIntent: VortXSyncManager.PickerFileRecoverySignIn? = null
     private var activeRecoveryAttempt: AtomicBoolean? = null
     private val _pickerFileRecoverySignIn = MutableStateFlow(false)
@@ -170,6 +171,7 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
 
     private fun clearPendingCompletion() {
         completionOwner = null
+        postAuthInvocation = null
         _postAuthCompleting.value = false
         _recoveryCode.value = null
         _showReconcile.value = false
@@ -561,8 +563,9 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
             VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> publishCompletion(original) {
                 _syncNotice.value = null; sync.startRealtime()
             }
-            VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA ->
-                requireAccountReconcile(sync.interactiveReconcileChoiceFor(original) ?: original)
+            // Both account surfaces render the manager's shared pending decision.
+            VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA,
+            VortXSyncManager.SignInReconcile.ALREADY_COMPLETED -> Unit
             VortXSyncManager.SignInReconcile.UNREACHABLE -> publishCompletion(original) {
                 _syncNotice.value = sync.syncProblem.value ?: "Signed in. Your synced data wasn't reachable yet; it will catch up automatically."
                 sync.startRealtime()
@@ -577,10 +580,14 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         val original = checkNotNull(owner)
         when (sync.reconcileAfterSignIn(original)) {
             VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> publishCompletion(original) { _syncNotice.value = null }
+            VortXSyncManager.SignInReconcile.ALREADY_COMPLETED -> Unit
             VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA -> {
-                val restored = sync.useAccountData(sync.interactiveReconcileChoiceFor(original) ?: original)
-                publishCompletion(original) {
-                    if (!restored) _syncNotice.value = sync.syncProblem.value ?: RECONCILE_RETRY_NOTICE
+                sync.interactiveReconcileChoiceFor(original)?.let { choice ->
+                    val restored = sync.useAccountData(choice)
+                    publishCompletion(original) {
+                        if (!restored && sync.interactiveReconcileChoiceFor(original) != null)
+                            _syncNotice.value = sync.syncProblem.value ?: RECONCILE_RETRY_NOTICE
+                    }
                 }
             }
             VortXSyncManager.SignInReconcile.UNREACHABLE -> publishCompletion(original) {
@@ -596,6 +603,8 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         retireObsoleteCompletion()
         clearAuthInputs()
         if (owner == null || !sync.isPickerCompletionOwnerCurrent(owner)) return
+        val invocation = Any()
+        postAuthInvocation = invocation
         completionOwner = owner; _postAuthCompleting.value = true
         val admit = sync.captureLocalLibraryMutationAdmission()
         try {
@@ -604,7 +613,11 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         catch (_: Exception) {
             admit?.invoke { _syncNotice.value = POST_AUTH_RETRY_NOTICE; true }
         } finally {
-            if (completionOwner === owner) { _postAuthCompleting.value = false; settleCompletionIfFinished() }
+            if (postAuthInvocation === invocation) {
+                postAuthInvocation = null
+                _postAuthCompleting.value = false
+                settleCompletionIfFinished()
+            }
             retireObsoleteCompletion()
         }
     }
@@ -670,7 +683,11 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     fun syncNow() {
         if (_syncing.value || _postAuthCompleting.value) return
         sync.pendingInteractiveProbeOwner()?.let { owner ->
-            viewModelScope.launch { onAuthed(owner) }
+            _syncing.value = true
+            viewModelScope.launch {
+                try { onAuthed(owner) }
+                finally { _syncing.value = false }
+            }
             return
         }
         _syncing.value = true

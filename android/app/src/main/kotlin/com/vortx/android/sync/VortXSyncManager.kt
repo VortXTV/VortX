@@ -4704,7 +4704,7 @@ class VortXSyncManager internal constructor(
         }
     }
 
-    enum class SignInReconcile { SEEDED_FROM_DEVICE, HAS_ACCOUNT_DATA, UNREACHABLE }
+    enum class SignInReconcile { SEEDED_FROM_DEVICE, HAS_ACCOUNT_DATA, UNREACHABLE, ALREADY_COMPLETED }
 
     /**
      * Call right after a successful sign-in. A fresh (empty) account is seeded from this device; an account
@@ -4714,8 +4714,11 @@ class VortXSyncManager internal constructor(
     suspend fun reconcileAfterSignIn(): SignInReconcile = reconcileAfterSignIn(captureSyncLease())
     internal suspend fun reconcileAfterSignIn(owner: PickerAccountSnapshot): SignInReconcile = interactiveProbeMutex.withLock {
         val lease = captureCompletionLease(owner) ?: return@withLock SignInReconcile.UNREACHABLE
-        if (_interactiveReconcileOwner.value?.let(::isPickerCompletionOwnerCurrent) == true)
-            SignInReconcile.HAS_ACCOUNT_DATA else reconcileAfterSignIn(lease, owner)
+        when {
+            _interactiveReconcileOwner.value?.let(::isPickerCompletionOwnerCurrent) == true -> SignInReconcile.HAS_ACCOUNT_DATA
+            !interactiveSetupPending(lease) -> SignInReconcile.ALREADY_COMPLETED
+            else -> reconcileAfterSignIn(lease, owner)
+        }
     }
 
     internal fun pendingInteractiveProbeOwner(): PickerAccountSnapshot? = operations.snapshot {

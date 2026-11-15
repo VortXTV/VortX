@@ -327,14 +327,49 @@ class AndroidRealtimeSyncTest {
         } finally { model.viewModelScope.cancel(); f.close() }
     }
 
+    private suspend fun adoptInteractiveFixture(f: Fixture): PickerAccountSnapshot {
+        val password = "fixture-password"
+        val salt = ByteArray(16) { 23 }
+        val master = VortXCrypto.masterKey(password, salt, VortXCrypto.MIN_ITERS)
+        val wrapped = try { requireNotNull(VortXCrypto.seal(master, key)) } finally { master.fill(0) }
+        // Keep the real durable session transition. Substitute only its OS-backed persistence.
+        val durable = f.manager.javaClass.getDeclaredField("sessionState").apply { isAccessible = true }.get(f.manager)
+        val persist: (VortXSyncManager.Session, Long) -> Boolean = { session, epoch ->
+            f.manager.installSessionRestoreTestSeam(session, epoch)
+            true
+        }
+        durable.javaClass.getDeclaredField("persist").apply { isAccessible = true }.set(durable, persist)
+        f.manager.installSyncTestSeam(requireNotNull(f.manager.currentSession()), 10, transport = { method, path, _, _ ->
+            when (path) {
+                "/v1/auth/prelogin" -> 200 to JSONObject()
+                    .put("kdfSalt", VortXCrypto.b64(salt)).put("kdfIters", VortXCrypto.MIN_ITERS)
+                "/v1/auth/login" -> 200 to JSONObject().put("token", "fixture-b").put("wrappedKeyPassword", wrapped)
+                    .put("account", JSONObject().put("id", account.id).put("email", account.email).put("username", account.username))
+                "/v1/backup" -> {
+                    assertEquals("GET", method)
+                    f.gets++
+                    f.getGate?.await()
+                    200 to JSONObject().put("version", f.version).put("document",
+                        VortXCrypto.sealDocument(key, f.cloud.toString().toByteArray(), account.id, f.version, true))
+                }
+                else -> error("Unexpected account path")
+            }
+        })
+        val completion = PickerAuthCompletion()
+        assertEquals(VortXSyncManager.AuthResult.Ok,
+            f.manager.signIn("fixture", password, totp = null, completion = completion))
+        return requireNotNull(completion.owner)
+    }
+
     @Test fun registrationBackBeforeRecoveryAcknowledgementKeepsOriginalCodeAndReconcile() = test {
         val f = Fixture(testScheduler)
         val model = VortXAccountViewModel(f.manager)
         try {
             f.cloud.put("vortx", JSONObject()) // Actual post-auth probe returns the pending account-data choice.
             model.openPickerPresentation()
-            model.completeRegistration(VortXSyncManager.RegisterResult(VortXSyncManager.AuthResult.Ok, "fixture recovery code"),
-                f.manager.capturePickerCompletionOwner(), f.manager.capturePickerCompletionOwner())
+            val owner = adoptInteractiveFixture(f)
+            model.completeRegistration(VortXSyncManager.RegisterResult(VortXSyncManager.AuthResult.Ok, "fixture recovery code"), owner, owner)
+            runCurrent()
             assertEquals("fixture recovery code", model.recoveryCode.value)
             assertTrue(model.showReconcile.value)
             assertFalse(model.requestClosePickerPresentation())
@@ -372,8 +407,9 @@ class AndroidRealtimeSyncTest {
         try {
             f.cloud.put("vortx", JSONObject())
             model.openPickerPresentation()
-            model.completeRegistration(VortXSyncManager.RegisterResult(VortXSyncManager.AuthResult.Ok, "fixture recovery code"),
-                f.manager.capturePickerCompletionOwner(), f.manager.capturePickerCompletionOwner())
+            val owner = adoptInteractiveFixture(f)
+            model.completeRegistration(VortXSyncManager.RegisterResult(VortXSyncManager.AuthResult.Ok, "fixture recovery code"), owner, owner)
+            runCurrent()
             val saved = f.manager.currentSession()
             f.manager.installSessionClearTestSeam { false }
             val captured = checkNotNull(f.manager.capturePickerAccountSnapshot())
@@ -1117,8 +1153,7 @@ class AndroidRealtimeSyncTest {
             f.cloud = document(native(JSONObject().put("cloud-library", true)))
                 .put("future", JSONObject().put("unknown", "keep"))
             val original = f.cloud.toString()
-            val owner = f.manager.capturePickerCompletionOwner()
-            assertEquals(VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA, f.manager.reconcileAfterSignIn(owner))
+            assertEquals(VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA, f.manager.reconcileAfterSignIn())
             runCurrent()
             assertEquals(1, f.gets)
             assertEquals(0, f.puts)
@@ -1153,11 +1188,10 @@ class AndroidRealtimeSyncTest {
                     else -> error("Unexpected backup method")
                 }
             })
-            val owner = f.manager.capturePickerCompletionOwner()
-            assertEquals(VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE, f.manager.reconcileAfterSignIn(owner))
+            assertEquals(VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE, f.manager.reconcileAfterSignIn())
             assertEquals(listOf("GET", "GET", "PUT"), requests)
             assertEquals(1, f.gateway.applied)
-            assertEquals(VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA, f.manager.reconcileAfterSignIn(owner))
+            assertEquals(VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA, f.manager.reconcileAfterSignIn())
             assertEquals(listOf("GET", "GET", "PUT", "GET"), requests)
         } finally { f.close() }
     }
@@ -1188,44 +1222,14 @@ class AndroidRealtimeSyncTest {
         val f = Fixture(testScheduler)
         val originalModel = VortXAccountViewModel(f.manager)
         try {
-            val password = "fixture-password"
-            val salt = ByteArray(16) { 23 }
-            val master = VortXCrypto.masterKey(password, salt, VortXCrypto.MIN_ITERS)
-            val wrapped = try { requireNotNull(VortXCrypto.seal(master, key)) } finally { master.fill(0) }
-            // Keep the real durable session transition. Substitute only its OS-backed persistence.
-            val durable = f.manager.javaClass.getDeclaredField("sessionState").apply { isAccessible = true }.get(f.manager)
-            val persist: (VortXSyncManager.Session, Long) -> Boolean = { session, epoch ->
-                f.manager.installSessionRestoreTestSeam(session, epoch)
-                true
-            }
-            durable.javaClass.getDeclaredField("persist").apply { isAccessible = true }.set(durable, persist)
             f.cloud.getJSONObject("nativeSync").getJSONObject("facts").put("cloud-library", true)
-            f.manager.installSyncTestSeam(requireNotNull(f.manager.currentSession()), 10, transport = { method, path, _, _ ->
-                when (path) {
-                    "/v1/auth/prelogin" -> 200 to JSONObject()
-                        .put("kdfSalt", VortXCrypto.b64(salt)).put("kdfIters", VortXCrypto.MIN_ITERS)
-                    "/v1/auth/login" -> 200 to JSONObject().put("token", "fixture-b").put("wrappedKeyPassword", wrapped)
-                        .put("account", JSONObject().put("id", account.id).put("email", account.email).put("username", account.username))
-                    "/v1/backup" -> {
-                        assertEquals("GET", method)
-                        f.gets++
-                        f.getGate?.await()
-                        200 to JSONObject().put("version", f.version).put("document",
-                            VortXCrypto.sealDocument(key, f.cloud.toString().toByteArray(), account.id, f.version, true))
-                    }
-                    else -> error("Unexpected account path")
-                }
-            })
-            val completion = PickerAuthCompletion()
-            assertEquals(VortXSyncManager.AuthResult.Ok,
-                f.manager.signIn("fixture", password, totp = null, completion = completion))
+            val owner = adoptInteractiveFixture(f)
             f.manager.setRealtimeForeground(true)
             runCurrent()
             assertEquals(0, f.gets)
             assertEquals(0, f.gateway.applied)
             assertTrue(f.sockets.isEmpty())
 
-            val owner = requireNotNull(completion.owner)
             assertEquals(account, owner.account)
             f.getGate = CompletableDeferred()
             val interruptedProbe = async { f.manager.reconcileAfterSignIn(owner) }
@@ -1237,6 +1241,7 @@ class AndroidRealtimeSyncTest {
             originalModel.syncNow()
             runCurrent()
             assertTrue(originalModel.showReconcile.value)
+            assertFalse(originalModel.postAuthCompleting.value)
             assertNotNull(f.manager.interactiveReconcileOwner.value)
             assertEquals(2, f.gets)
             f.manager.setRealtimeForeground(false)
@@ -1268,6 +1273,8 @@ class AndroidRealtimeSyncTest {
                 assertNull(f.manager.interactiveReconcileOwner.value)
                 assertEquals(3, f.gets)
                 assertEquals(1, f.gateway.applied)
+                assertEquals(VortXSyncManager.SignInReconcile.ALREADY_COMPLETED, f.manager.reconcileAfterSignIn(owner))
+                assertEquals(3, f.gets)
                 assertTrue(f.gateway.carrier.getJSONObject("facts").getBoolean("cloud-library"))
             } finally { reopenedModel.viewModelScope.cancel() }
         } finally { originalModel.viewModelScope.cancel(); f.close() }
