@@ -625,8 +625,8 @@ class NativeBeta14Contract(NativeBeta12Contract):
 
 class NativeBeta15Contract(NativeBeta12Contract):
     tag = "v0.5.6-beta.15"
-    candidate = "v0.5.6-beta.15-candidate.3"
-    build = "298"
+    candidate = "v0.5.6-beta.15-candidate.4"
+    build = "299"
     preflight_mode = "beta15-candidate-preflight"
 
     def test_exact_frozen_project_build(self):
@@ -648,7 +648,8 @@ class NativeBeta15Contract(NativeBeta12Contract):
             ("Android versionCode", self.build), ("Android versionName", "0.5.6"),
         )]
         MODULE.validate_android_evidence(evidence, self.pointer, self.tag, self.source, "0.5.6", self.build)
-        for previous, previous_build, previous_source in (("1", "296", "b" * 40), ("2", "297", "c" * 40)):
+        previous_candidates = (("1", "296", "b" * 40), ("2", "297", "c" * 40), ("3", "298", "d" * 40))
+        for previous, previous_build, previous_source in previous_candidates:
             previous_tag = f"{self.tag}-candidate.{previous}"
             with self.subTest(previous_tag=previous_tag):
                 for changed in ({"ref": "refs/tags/" + previous_tag},
@@ -664,10 +665,11 @@ class NativeBeta15Contract(NativeBeta12Contract):
                     MODULE.source_versions(NativeBeta11Contract.project(build=previous_build),
                                            NativeBeta11Contract.gradle(build=previous_build), "0.5.6", self.tag)
 
-    def test_update_and_recovery_gates_cannot_be_skipped(self):
+    def test_update_playback_and_recovery_gates_cannot_be_skipped(self):
         for lane, gate in (("apple", "Verify protected Beta 15 artifact-only dispatch"),
                            ("apple", "Verify protected Apple legacy archive recovery"),
                            ("apple", MODULE.BETA15_APPLE_UPDATE), ("apple", MODULE.BETA15_APPLE_TRAILER),
+                           ("apple", MODULE.BETA15_APPLE_SHORT_HISTORY),
                            ("android", MODULE.BETA13_ANDROID_BACKUP_CAS),
                            ("android", MODULE.BETA14_ANDROID_REGRESSIONS)):
             with self.subTest(lane=lane, gate=gate):

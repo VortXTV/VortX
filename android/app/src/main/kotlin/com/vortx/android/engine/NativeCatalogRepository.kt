@@ -1709,9 +1709,12 @@ internal class NativeCatalogRepository(
         require(positionMs >= 0 && durationMs >= 0)
         nativeSession.owned(current.owner) { synchronized(this) {
             if (playing !== current) return@owned null
-            val query = JSONObject().put("kind", "profile_playback").put("profileId", current.owner.profileID)
-            val prior = watchedStamp(nativeSession.resolve(query, current.owner), current.context, false) ?: 0L
             try {
+                // A rejected or unstarted source has no admitted progress snapshot. Retire its
+                // session without replacing an existing resume position with the empty snapshot.
+                if (positionMs == 0L && durationMs == 0L) return@owned null
+                val query = JSONObject().put("kind", "profile_playback").put("profileId", current.owner.profileID)
+                val prior = watchedStamp(nativeSession.resolve(query, current.owner), current.context, false) ?: 0L
                 nativeSession.dispatch(listOf(action("report_progress").put("metaId", current.context.contentId).put("videoId", current.context.videoId)
                     .put("name", current.context.title).put("positionMs", positionMs).put("durationMs", durationMs)
                     .put("metadata", JSONObject().put("type", current.context.type).put("poster", current.context.poster))), current.owner)

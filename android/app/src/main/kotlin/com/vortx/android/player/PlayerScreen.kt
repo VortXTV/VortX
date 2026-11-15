@@ -1276,7 +1276,7 @@ fun PlayerScreen(
     //     expected runtime (a file that LIED about its duration, then ended early) is the same
     //     verdict, applied before the ended signal can reach the host.
     // With NO expected runtime (ad-hoc plays, downloads, live) the check falls back to a conservative
-    // absolute floor: nothing feature-length is under [JUNK_DURATION_FLOOR_MS]. Trailers are exempt
+    // two-minute floor for unverified runtimes. Trailers are exempt
     // (short by design), and a live stream never reports a positive duration, so neither can trip it.
     // The verdict is terminal for this file by construction (metadata and the demuxed length cannot
     // change), so unlike [stallError] it never self-clears. A [Playable.userForcedSource] play (the
@@ -2309,11 +2309,9 @@ fun PlayerScreen(
                 ) ||
                 playerExitRequested
         ) return@LaunchedEffect
-        // A userForcedSource play skips the conversion (the viewer chose this exact file off the
-        // manual fallback; its end is their end) -- but its progress writes were still junk-gated, so
-        // even a forced junk file reaches here UNWATCHED and the advance is the viewer's own doing.
-        if (!currentPlayable.userForcedSource && isJunkEof(s.positionMs, s.durationMs, currentPlayable)) {
-            runtimeMismatch = true
+        if (isJunkDuration(s.durationMs, currentPlayable) || isJunkEof(s.positionMs, s.durationMs, currentPlayable)) {
+            // Let an explicitly chosen file play out, then return to details without auto-advancing.
+            if (currentPlayable.userForcedSource) exitPlayer() else runtimeMismatch = true
             return@LaunchedEffect
         }
         // Sleep timer set to "End of episode": this one finished, so STOP here (leave the player) rather
@@ -3429,15 +3427,6 @@ private const val WATCHDOG_START_TIMEOUT_MS = 30_000L
 /// dead connection, and the verdict self-clears if the stream recovers.
 private const val WATCHDOG_STALL_TIMEOUT_MS = 20_000L
 
-/// Whether the FILE's demuxed duration is implausibly short for the title being played, i.e. the
-/// source resolved to the WRONG file (a removed episode's ~10s debrid junk/sample). With a known
-/// expected runtime ([Playable.expectedDurationMs], from catalog metadata) the file is junk when it
-/// runs under `min(expected/2, expected - 10min)`: half-length catches a sample/clip against any
-/// feature runtime, while the 10-minute slack keeps a legitimately shorter cut of a short episode
-/// out of the verdict (for anything under ~20 minutes expected, the slack term shrinks the
-/// threshold toward zero, so only truly tiny files are condemned). With NO expected runtime the
-/// only safe signal is the absolute floor: nothing feature-length is under [JUNK_DURATION_FLOOR_MS].
-/// Trailers are exempt (short by design); a non-positive duration is "not demuxed yet", never junk.
 /// The scrubber band colour for a skippable segment kind. Cool cyan for the intro, amber for a recap,
 /// violet for the credits, and orange for a next-episode preview, so a glance at the bar reads what each
 /// coloured stretch is. Kept next to the player because [PlayerChrome]'s scrubber is colour-agnostic.
@@ -3461,15 +3450,6 @@ private fun isJunkDuration(fileDurationMs: Long, playable: Playable): Boolean {
 private fun isJunkEof(positionMs: Long, fileDurationMs: Long, playable: Playable): Boolean {
     return isJunkPlayerEof(positionMs, fileDurationMs, playable)
 }
-
-/// Slack subtracted from the expected runtime for the mismatch threshold, so credit-less cuts,
-/// ad-padded metadata runtimes, and slightly-off catalog numbers never condemn a real file.
-private const val EXPECTED_RUNTIME_SLACK_MS = 10 * 60_000L
-
-/// Conservative absolute junk floor when NO expected runtime is known: no real episode or movie
-/// file is under 2 minutes, but plenty of legitimate short content sits just above it, so this only
-/// catches outright samples/stubs. (Trailers never reach the check at all.)
-private const val JUNK_DURATION_FLOOR_MS = 2 * 60_000L
 
 /// Tile width for a captured trickplay frame, in pixels. 480 == the `maxWidth` Apple passes on both of its
 /// capture paths. The sheet builder downscales again to its own 320x180 tile, so this is only the

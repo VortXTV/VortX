@@ -114,6 +114,12 @@ struct PlaybackCompletionEvidence<Token: Equatable> {
         duration = seconds
     }
 
+    func observedDuration(owner: Token?, mountGeneration: UInt64? = nil) -> Double? {
+        guard let owner, self.owner == owner,
+              mountGeneration.map({ self.mountGeneration == $0 }) ?? true else { return nil }
+        return duration
+    }
+
     mutating func consumeEOF(owner: Token, isLive: Bool, isTrailer: Bool,
                              knownDurationFallback: Double? = nil) -> Decision {
         guard self.owner == owner, !rejectedEOF else { return .ignore }
@@ -126,6 +132,23 @@ struct PlaybackCompletionEvidence<Token: Equatable> {
         guard position < duration - tailTolerance else { return .allowCompletion }
         rejectedEOF = true
         return .premature(position: position, duration: duration)
+    }
+}
+
+/// Some online sources serve a short, playable error video for a catalog title. The decoder's
+/// duration can prove that the file ended, but only matching title metadata can vouch for a short.
+enum ShortTitlePlaybackPolicy {
+    static func allowsAutomaticHistory(
+        durationSeconds: Double?,
+        expectedRuntimeSeconds: @autoclosure () -> Double?,
+        isOnlineTitle: Bool
+    ) -> Bool {
+        guard isOnlineTitle else { return true }
+        guard let durationSeconds, durationSeconds.isFinite, durationSeconds > 0 else { return false }
+        guard durationSeconds <= 60 else { return true }
+        guard let expected = expectedRuntimeSeconds(), expected.isFinite, expected > 0 else { return false }
+        // Allow imprecise minute-scale metadata for actual shorts.
+        return durationSeconds >= expected / 2 && expected >= durationSeconds / 2
     }
 }
 

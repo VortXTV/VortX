@@ -50,7 +50,7 @@ PROTECTED_RELEASES = {
     NATIVE_BETA12_TAG: ("v0.5.6-beta.12-candidate.3", "283", "beta12-candidate-preflight"),
     NATIVE_BETA13_TAG: ("v0.5.6-beta.13-candidate.1", "285", "beta13-candidate-preflight"),
     NATIVE_BETA14_TAG: ("v0.5.6-beta.14-candidate.2", "293", "beta14-candidate-preflight"),
-    NATIVE_BETA15_TAG: ("v0.5.6-beta.15-candidate.3", "298", "beta15-candidate-preflight"),
+    NATIVE_BETA15_TAG: ("v0.5.6-beta.15-candidate.4", "299", "beta15-candidate-preflight"),
 }
 NATIVE_BACKUP_CAS_TAGS = (NATIVE_BETA13_TAG, NATIVE_BETA14_TAG, NATIVE_BETA15_TAG)
 NATIVE_ACCOUNT_REGRESSION_TAGS = (NATIVE_BETA14_TAG, NATIVE_BETA15_TAG)
@@ -88,6 +88,10 @@ BETA15_APPLE_TOOLS = (
     "app/SourcesiOS/VortXiOSApp.swift", "app/SourcesiOS/iOSRootView.swift", "app/SourcesiOS/iOSSettingsView.swift",
     "app/Tests/UpdateCheckerTests.swift", "app/Tests/UpdateNotificationPresentationContractTests.swift",
     "app/Sources/Player/MPVPreviewSeekStormPolicy.swift", "app/Tests/MPVPreviewSeekStormPolicyTests.swift",
+    "app/SourcesShared/DiagnosticPlaybackIntegrityPolicy.swift", "app/Tests/PlaybackCompletionEvidenceTests.swift",
+    "app/Sources/PlayerScreen.swift", "app/SourcesTV/TVPlayerView.swift",
+    "scripts/test-watched-playback-dwell.py", "app/Tests/WatchedPlaybackDwellCallsiteTests.swift",
+    "app/SourcesShared/WatchedPlaybackDwell.swift", "app/SourcesShared/CoreModels.swift",
 )
 APPLE_STEPS = (
     "Select the authenticated native source revision",
@@ -161,6 +165,9 @@ BETA15_APPLE_UPDATE = "Verify protected Apple update checking and presentation"
 BETA15_APPLE_UPDATE_MARKER = "Apple update checker and presentation contracts: verified"
 BETA15_APPLE_TRAILER = "Verify protected Apple trailer seek containment"
 BETA15_APPLE_TRAILER_MARKER = "MPVPreviewSeekStormPolicyTests: all checks passed"
+BETA15_APPLE_SHORT_HISTORY = "Verify protected Apple short playback history"
+BETA15_APPLE_SHORT_HISTORY_MARKER = "PlaybackCompletionEvidenceTests: "
+BETA15_APPLE_WATCHED_CALLSITE_MARKER = "PASS: actual iOS/macOS and tvOS watched/EOF/film-exit methods"
 BETA14_ANDROID_SUITES = tuple("com.vortx.android." + name for name in (
     "sync.AndroidRealtimeSyncTest",
     "sync.VortXSessionOwnerTransitionContractTest",
@@ -186,6 +193,8 @@ BETA15_ANDROID_SUITES = BETA14_ANDROID_SUITES + tuple("com.vortx.android." + nam
     "backup.accountfiles.AccountBackupDocumentsTest",
     "sync.SessionRenewalManagerTest",
     "sync.VortXQrJoinFlowTest",
+    "player.PlayerRecoveryParityTest",
+    "engine.NativeDurableWatchReceiptJniTest",
 ))
 ANDROID_DRAFT_STEP = "Create or append to the draft release"
 BETA12_AETHER_PACKAGES = {
@@ -484,7 +493,7 @@ def job_contract(lane, tag):
         required += (("Verify protected Apple legacy archive recovery",) if lane == "apple"
                      else (BETA14_ANDROID_REGRESSIONS,))
     if tag == NATIVE_BETA15_TAG and lane == "apple":
-        required += (BETA15_APPLE_UPDATE, BETA15_APPLE_TRAILER)
+        required += (BETA15_APPLE_UPDATE, BETA15_APPLE_TRAILER, BETA15_APPLE_SHORT_HISTORY)
     return required, skipped
 
 
@@ -706,11 +715,15 @@ def protected_gate_proof(lane, pointer, tag, source, repo_id, job, log, work):
     if lane == "apple":
         if tag == NATIVE_BETA15_TAG:
             require_step_order(steps, ("Show toolchain", BETA15_APPLE_UPDATE, BETA15_APPLE_TRAILER,
-                                       "Verify complete native engine ABI"))
+                                       BETA15_APPLE_SHORT_HISTORY, "Verify complete native engine ABI"))
             unique_step_marker(log, steps[BETA15_APPLE_UPDATE], BETA15_APPLE_UPDATE_MARKER,
                                re.escape(BETA15_APPLE_UPDATE_MARKER))
             unique_step_marker(log, steps[BETA15_APPLE_TRAILER], BETA15_APPLE_TRAILER_MARKER,
                                re.escape(BETA15_APPLE_TRAILER_MARKER))
+            unique_step_marker(log, steps[BETA15_APPLE_SHORT_HISTORY], BETA15_APPLE_SHORT_HISTORY_MARKER,
+                               re.escape(BETA15_APPLE_SHORT_HISTORY_MARKER) + r"[1-9][0-9]{0,3} checks passed")
+            unique_step_marker(log, steps[BETA15_APPLE_SHORT_HISTORY], BETA15_APPLE_WATCHED_CALLSITE_MARKER,
+                               re.escape(BETA15_APPLE_WATCHED_CALLSITE_MARKER))
         require_step_order(steps, ("Verify complete native engine ABI", BETA12_LIVE_ABI, BETA12_APPLE_GATE,
             BETA12_APPLE_EVIDENCE, "Capture exact native SDK and player inputs before app compilation", "Build tvOS (Full)"))
         unique_step_marker(log, steps[BETA12_LIVE_ABI], "app/Tests/VortxNativeLiveABITests.swift:",

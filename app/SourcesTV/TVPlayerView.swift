@@ -1089,6 +1089,7 @@ struct TVPlayerView: View {
     @State private var assetSanityObservationTask: Task<Void, Never>?
     @State private var assetSanityObservationToken: PlayerLoadToken?
     @State private var exitAcceptedLoadToken: PlayerLoadToken?
+    @State private var exitAcceptedHistoryDuration: Double?
     /// Wall-clock trickplay capture driver (player-agnostic backstop to the timePos tick). See startTrickplayCaptureTimer.
     @State private var trickplayCaptureTimer: Task<Void, Never>?
     @State private var trickplayRuntimeGate = TrickplayRuntimeLookupGate()
@@ -1786,6 +1787,23 @@ struct TVPlayerView: View {
         return seconds
     }
 
+    /// Read the duration of the same player item whose history we would update.
+    private func automaticHistoryDuration(owner: PlayerLoadToken?) -> Double? {
+        if let owner, owner == exitAcceptedLoadToken { return exitAcceptedHistoryDuration }
+        let isOnlineTitle = curMeta != nil && !isCurrentLiveStream && !isTrailer
+            && downloadedPlayback == nil && !(curURL ?? url).isFileURL
+        guard isOnlineTitle else { return duration }
+        guard let owner, owner == coordinator.player?.activeLoadToken else { return nil }
+        let mountGeneration = (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0
+        let observedDuration = completionEvidence.observedDuration(owner: owner, mountGeneration: mountGeneration)
+        guard ShortTitlePlaybackPolicy.allowsAutomaticHistory(
+            durationSeconds: observedDuration,
+            expectedRuntimeSeconds: assetSanityExpectedRuntimeSeconds(),
+            isOnlineTitle: isOnlineTitle
+        ) else { return nil }
+        return observedDuration
+    }
+
     private func assetSanityEvidence(
         loadToken: PlayerLoadToken,
         metadata: PlaybackMeta? = nil
@@ -1830,7 +1848,9 @@ struct TVPlayerView: View {
                 contextCurrent: !leftPlayback && playbackMutationTarget.stillOwnsCurrentContext(core: core))
         }
         guard assetSanityAttempt.isAccepted(owner: loadToken),
-              assetSanityStartEffectsToken != loadToken else { return }
+              assetSanityStartEffectsToken != loadToken,
+              !leftPlayback, playbackMutationTarget.stillOwnsCurrentContext(core: core),
+              let historyDuration = automaticHistoryDuration(owner: loadToken) else { return }
         assetSanityStartEffectsToken = loadToken
         if pendingAdvance == nil, assetSanityDeferredStartToken == loadToken,
            coordinator.player?.activeLoadToken == loadToken, let meta = curMeta {
@@ -1862,12 +1882,12 @@ struct TVPlayerView: View {
         }
         if !isCurrentLiveStream, let m = curMeta {
             ScrobbleCoordinator.shared.playbackStarted(
-                m, position: position, duration: duration,
+                m, position: position, duration: historyDuration,
                 sessionToken: playbackSessionID
             )
         }
         publishAcceptedDurationSideEffectsIfNeeded(
-            loadToken: loadToken, durationSeconds: duration
+            loadToken: loadToken, durationSeconds: historyDuration
         )
     }
 
@@ -1880,7 +1900,7 @@ struct TVPlayerView: View {
             callbackOwner: loadToken,
             acceptedOwner: acceptedOwner,
             durationSeconds: durationSeconds
-        ) else { return }
+        ), automaticHistoryDuration(owner: loadToken) != nil else { return }
         if let m = curMeta {
             scrubThumbnails.configureCommunity(
                 imdbId: m.libraryId, season: m.season, episode: m.episode,
@@ -2058,7 +2078,7 @@ struct TVPlayerView: View {
         // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
         // (first-writer-wins, background, gated; no-op if the community already had a set). Both engines
         // capture frames now (AVPlayer via AVPlayerItemVideoOutput). Independent of the engine-teardown rules below.
-        if assetSanityAccepted {
+        if assetSanityAccepted, automaticHistoryDuration(owner: integrityOwner) != nil {
             scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)
         }
         NowPlayingCenter.clear()   // #157: drop the system Now Playing card + its transport targets on close
@@ -2066,6 +2086,7 @@ struct TVPlayerView: View {
             flushExitProgress(integrityOwner: integrityOwner, assetSanityAccepted: assetSanityAccepted)
         }
         exitAcceptedLoadToken = nil
+        exitAcceptedHistoryDuration = nil
         // The engine is NOT torn down here: RootView presents the player with `.id(req.id)`, so any
         // path that mints a fresh PlaybackRequest id rebuilds the player → onDisappear → would
         // destroy an engine that's about to be reused. (In-player source picks go through switchStream
@@ -2092,14 +2113,15 @@ struct TVPlayerView: View {
         // Attribution gate (binge-desync fix): only write to the engine Player when it is loaded for the
         // episode curMeta names. After a binge advance whose engine re-point could not be confirmed, this
         // skips the wrong-episode flush; the correct-identity account write (saveProgress above) still lands.
-        guard let position = admittedProgressPosition(currentTime, owner: integrityOwner) else { return }
+        guard let position = admittedProgressPosition(currentTime, owner: integrityOwner),
+              let historyDuration = automaticHistoryDuration(owner: integrityOwner) else { return }
         var clearsResumeFloor = true
         if let floor: Double = suppressedResumeFloor { clearsResumeFloor = position >= floor }
         let playingVideoID: String? = curMeta?.videoId
         let engineOwnsEpisode: Bool = enginePlayerVideoId == playingVideoID
         if terminalRewindGate.permitsExitProgressFlush,
            assetSanityAccepted, !isCurrentLiveStream, engineOwnsEpisode, clearsResumeFloor {
-            core.reportProgress(timeSeconds: position, durationSeconds: duration,
+            core.reportProgress(timeSeconds: position, durationSeconds: historyDuration,
                                 target: playbackMutationTarget)   // flush final position (never for live)
         }
     }
@@ -2205,7 +2227,9 @@ struct TVPlayerView: View {
             )
             if name == MPVProperty.duration, let seconds = data as? Double {
                 completionEvidence.recordDuration(seconds, owner: loadToken)
-                if let source = TrickplayCaptureSource(player: coordinator.player, loadToken: loadToken) {
+                if pendingAdvance?.issued != true, supersededAdvance == nil,
+                   automaticHistoryDuration(owner: loadToken) != nil,
+                   let source = TrickplayCaptureSource(player: coordinator.player, loadToken: loadToken) {
                     scrubThumbnails.observeNativeCaptureDuration(seconds, source: source)
                 }
             } else if name == MPVProperty.timePos, let event = data as? PlayerTimePositionEvent,
@@ -2285,10 +2309,11 @@ struct TVPlayerView: View {
                 // creds. SIMKL has no live scrobble, so it is skipped by capability.
                 if callbackBelongsToCommittedMedia(loadToken),
                    assetSanityAttempt.isAccepted(owner: loadToken),
+                   let historyDuration = automaticHistoryDuration(owner: loadToken),
                    !isCurrentLiveStream, let m = curMeta {
                     let pos = max(currentTime, suppressedResumeFloor ?? 0)
-                    if b { ScrobbleCoordinator.shared.playbackPaused(m, position: pos, duration: duration) }
-                    else { ScrobbleCoordinator.shared.playbackResumed(m, position: pos, duration: duration) }
+                    if b { ScrobbleCoordinator.shared.playbackPaused(m, position: pos, duration: historyDuration) }
+                    else { ScrobbleCoordinator.shared.playbackResumed(m, position: pos, duration: historyDuration) }
                 }
                 if b {
                     saveProgress(at: currentTime)   // persist on pause
@@ -2300,9 +2325,10 @@ struct TVPlayerView: View {
                     // back" report). Engine dispatches are ordered, so this can never race backward.
                     if assetSanityAttempt.isAccepted(owner: loadToken),
                        let position = admittedProgressPosition(currentTime, owner: loadToken),
+                       let historyDuration = automaticHistoryDuration(owner: loadToken),
                        !isCurrentLiveStream, enginePlayerVideoId == curMeta?.videoId,
                        suppressedResumeFloor == nil || position >= (suppressedResumeFloor ?? 0) {
-                        core.reportProgress(timeSeconds: position, durationSeconds: duration,
+                        core.reportProgress(timeSeconds: position, durationSeconds: historyDuration,
                                             target: playbackMutationTarget)
                     }
                     // The engine writes position ticks at most every 30 s; make this one durable now.
@@ -2518,10 +2544,6 @@ struct TVPlayerView: View {
                     }
                 }
                 currentTime = d
-                if hasStartedPlaying, observedAudioLanguage == nil, incomingEpisodeChoice == nil,
-                   assetSanityAttempt.isAccepted(owner: event.loadToken) {
-                    rememberAcceptedSeriesChoice()
-                }
                 if assetSanityDeferredStartToken == event.loadToken,
                    !assetSanityAttempt.isAccepted(owner: event.loadToken),
                    !assetSanityAttempt.isRejected(owner: event.loadToken),
@@ -2530,7 +2552,6 @@ struct TVPlayerView: View {
                    ) {
                     return
                 }
-                let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: event.loadToken)
                 maybeLogFrameDropReceipt()
                 // Durationless-stream fallback (the "watch position never saved / no resume on some
                 // debrid MKVs" report): many debrid direct-HTTP MKVs never DELIVER mpv's `duration`
@@ -2541,9 +2562,26 @@ struct TVPlayerView: View {
                 // until a real value lands and route it through the same handling as the event; one C
                 // property read at ~2-4 Hz, and it stops the moment duration is known. The AVPlayer
                 // engine returns 0 here (it delivers its duration event reliably), so this is mpv-only.
-                if duration <= 0, !isCurrentLiveStream,
+                if completionEvidence.observedDuration(owner: event.loadToken) == nil,
+                   !isCurrentLiveStream,
                    let engineDur = coordinator.player?.mediaDurationSeconds(), engineDur.isFinite, engineDur > 0 {
                     handleProperty(MPVProperty.duration, engineDur, loadToken: event.loadToken)
+                    guard event.loadToken == coordinator.player?.activeLoadToken else { return }
+                }
+                let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: event.loadToken)
+                let historyDuration = automaticHistoryDuration(owner: event.loadToken)
+                if hasStartedPlaying, assetSanityAccepted, historyDuration != nil,
+                   pendingAdvance == nil, supersededAdvance == nil {
+                    if assetSanityStartEffectsToken != event.loadToken,
+                       assetSanityDeferredStartToken == event.loadToken {
+                        // Duration or matching title metadata can arrive after the first frame.
+                        publishAssetSanityStartEffectsIfNeeded(
+                            loadToken: event.loadToken, position: assetSanityDeferredStartPosition
+                        )
+                    } else if observedAudioLanguage == nil, incomingEpisodeChoice == nil,
+                              !leftPlayback, playbackMutationTarget.stillOwnsCurrentContext(core: core) {
+                        rememberAcceptedSeriesChoice()
+                    }
                 }
                 updateCurrentSkip(at: d)
                 // #157: keep the system Now Playing card's clock honest. Self-throttling, so this is a couple
@@ -2559,7 +2597,7 @@ struct TVPlayerView: View {
                 maybeCaptureLocalTrickplay(at: d)
                 // Live: no progress is persisted (saveProgress no-ops) and nothing is reported
                 // to the engine - a live stream has no meaningful watch position.
-                if assetSanityAccepted, !isCurrentLiveStream,
+                if assetSanityAccepted, !isCurrentLiveStream, let historyDuration,
                    (lastSaved < 0 || abs(d - lastSaved) >= 20 || pendingAetherSeekProgressOwner == event.loadToken) {   // persist ~every 20s
                     pendingAetherSeekProgressOwner = nil
                     lastSaved = d
@@ -2574,14 +2612,14 @@ struct TVPlayerView: View {
                     // not regress the ENGINE library's resume point either, until playback passes it.
                     if enginePlayerVideoId == curMeta?.videoId,
                        suppressedResumeFloor == nil || d >= (suppressedResumeFloor ?? 0) {
-                        core.reportProgress(timeSeconds: d, durationSeconds: duration,
+                        core.reportProgress(timeSeconds: d, durationSeconds: historyDuration,
                                             target: playbackMutationTarget)   // engine progress
                     }
                 }
                 // ~60s in → the user is really watching this: auto-add to the Library (D8) + send the anon
                 // fleet watch ping (D9), once per playback. Idempotent + gated (D8 setting + per-profile dedup;
                 // D9 MoatConsent + per-title/day dedup); skipped for live and ad-hoc plays.
-                if assetSanityAccepted, !autoAddedThisPlayback,
+                if assetSanityAccepted, historyDuration != nil, !autoAddedThisPlayback,
                    !isCurrentLiveStream, d >= 60, let m = curMeta {
                     autoAddedThisPlayback = true
                     LibraryAutoAdd.addIfNeeded(meta: m, core: core, enabled: autoAddLibrary,
@@ -2900,6 +2938,11 @@ struct TVPlayerView: View {
                 }
             }
             if !completionOnly, handleLiveStreamEOF() { break }
+            guard let historyDuration = automaticHistoryDuration(owner: loadToken) else {
+                if armsTerminalDeadline { armTerminalAdvanceDeadline(reason: "EOF while next target resolving") }
+                if !completionOnly { leavePlayback() }
+                return
+            }
             if !markedWatched, let m = curMeta {
                 markedWatched = true
                 core.markPlaybackWatched(
@@ -2912,7 +2955,7 @@ struct TVPlayerView: View {
             // External sync (Trakt/SIMKL): scrobble STOP at end-of-file (a completion). Additive + fail-soft +
             // gated + once-latched inside the coordinator (dedupes against the watched record above), no-op with
             // empty creds. Fired for the finishing episode before any in-place advance opens a new session.
-            if !isCurrentLiveStream, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: max(currentTime, suppressedResumeFloor ?? 0), duration: duration) }
+            if !isCurrentLiveStream, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: max(currentTime, suppressedResumeFloor ?? 0), duration: historyDuration) }
             if completionOnly {
                 // Route was .outgoingCommittedWhileResolving: the outgoing completion is now persisted +
                 // scrobbled, but we cannot advance or exit while the requested next target resolves. Arm the
@@ -6549,6 +6592,7 @@ struct TVPlayerView: View {
         guard !markedWatched, let m = curMeta,
               event.loadToken == coordinator.player?.activeLoadToken,
               committedLoadToken == event.loadToken,
+              let historyDuration = automaticHistoryDuration(owner: event.loadToken),
               pendingAdvance == nil, supersededAdvance == nil else {
             watchedDwell.reset()
             return
@@ -6559,7 +6603,7 @@ struct TVPlayerView: View {
                            sourceGeneration: sourceSwitchGeneration,
                            seekGeneration: event.mpvSeekSettlement?.generation),
             time: ProcessInfo.processInfo.systemUptime, position: event.seconds,
-            duration: duration, rate: playSpeed,
+            duration: historyDuration, rate: playSpeed,
             eligible: assetSanityAttempt.isAccepted(owner: event.loadToken)
                 && hasStartedPlaying && event.positionSettled
                 && !isCurrentLiveStream && !scrubbing && !isPaused && !buffering
@@ -7587,8 +7631,9 @@ struct TVPlayerView: View {
     private func configureCommunityTrickplayProvisional() {
         guard let m = curMeta else { return }
         if duration.isFinite, duration > 0 {
+            guard let historyDuration = automaticHistoryDuration(owner: coordinator.player?.activeLoadToken) else { return }
             scrubThumbnails.configureCommunity(imdbId: m.libraryId, season: m.season, episode: m.episode,
-                                               duration: duration, isRealDuration: true)
+                                               duration: historyDuration, isRealDuration: true)
             return
         }
         // The loaded meta carries the human runtime; use it only when it is THIS title's meta.
@@ -10587,6 +10632,10 @@ struct TVPlayerView: View {
 
     /// Auto-advance when an episode ends: next episode if there is one, otherwise leave the player.
     private func autoAdvance() {
+        guard automaticHistoryDuration(owner: coordinator.player?.activeLoadToken) != nil else {
+            leavePlayback()
+            return
+        }
         if sleepAtEpisodeEnd {
             // Sleep timer set to "End of episode": this episode finished, so stop here instead of
             // auto-advancing. It is already marked watched (endFileEof), so Continue Watching rolls
@@ -12163,9 +12212,11 @@ struct TVPlayerView: View {
         let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: exitLoadToken)
         // Capture under the original load before invalidation retires its settled witness.
         let exitStopPosition = admittedStopPosition(currentTime, owner: exitLoadToken)
+        let exitHistoryDuration = automaticHistoryDuration(owner: exitLoadToken)
         cancelTerminalFinalityRefresh()
         cancelDirectResumeInventoryRefresh()
         exitAcceptedLoadToken = assetSanityAccepted ? exitLoadToken : nil
+        exitAcceptedHistoryDuration = assetSanityAccepted ? exitHistoryDuration : nil
         leftPlayback = true   // FIRST: a pending EOF last-chance backfill must never resurrect a player the user left
         firstFrameCover.retire()
         cancelEmptySourceRecovery()
@@ -12202,9 +12253,9 @@ struct TVPlayerView: View {
         // empty creds. Near the end this records the watch (deduped against the 90%/EOF record); mid-title it
         // saves a resume/pause point (live scrobble only).
         if !persistenceBlockedForExit, assetSanityAccepted,
-           !isCurrentLiveStream, let m = curMeta, let exitStopPosition {
+           !isCurrentLiveStream, let m = curMeta, let exitStopPosition, let exitHistoryDuration {
             ScrobbleCoordinator.shared.playbackStopped(
-                m, position: exitStopPosition, duration: duration
+                m, position: exitStopPosition, duration: exitHistoryDuration
             )
         }
         if let hash = currentTorrentHash { closeTorrent(hash: hash) }
@@ -12438,7 +12489,8 @@ struct TVPlayerView: View {
         guard let position = admittedProgressPosition(position, owner: integrityOwner) else { return }
         guard !isCurrentLiveStream else { return }
         guard !hasUncommittedIssuedMedia, !persistenceBlockedForExit else { return }
-        guard let m = curMeta, duration > 0, position >= 0 else { return }
+        guard let m = curMeta, let historyDuration = automaticHistoryDuration(owner: integrityOwner),
+              historyDuration > 0, position >= 0 else { return }
         // A DV-remux play whose resume seek was suppressed (maybeResume) starts from 0: do not let the
         // periodic saves REGRESS the stored resume point below where the viewer actually was. Saves resume
         // once playback passes the old position (or the floor is cleared on the next title).
@@ -12446,9 +12498,8 @@ struct TVPlayerView: View {
             if position < floor { return }
             suppressedResumeFloor = nil
         }
-        let dur = duration
         Task {
-            await account.saveProgress(for: m, positionSeconds: position, durationSeconds: dur,
+            await account.saveProgress(for: m, positionSeconds: position, durationSeconds: historyDuration,
                                        target: playbackMutationTarget)
             if thenSyncEngine { await MainActor.run { core.syncLibraryNow() } }
         }
@@ -12577,9 +12628,10 @@ struct TVPlayerView: View {
         if isAetherEngineActive {
             pendingAetherSeekProgressOwner = coordinator.player?.activeLoadToken
         } else if assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken),
-           !isCurrentLiveStream, duration > 0, enginePlayerVideoId == curMeta?.videoId,
+           let historyDuration = automaticHistoryDuration(owner: coordinator.player?.activeLoadToken),
+           !isCurrentLiveStream, historyDuration > 0, enginePlayerVideoId == curMeta?.videoId,
            suppressedResumeFloor == nil || scrubTarget >= (suppressedResumeFloor ?? 0) {
-            core.reportProgress(timeSeconds: scrubTarget, durationSeconds: duration,
+            core.reportProgress(timeSeconds: scrubTarget, durationSeconds: historyDuration,
                                 target: playbackMutationTarget)
         }
         scrubThumbnails.clear()
@@ -12805,12 +12857,11 @@ struct TVPlayerView: View {
     /// The one place a trickplay frame is grabbed (from the timePos tick OR the wall-clock timer). Engine-
     /// agnostic + logged so a silent pool can be traced from a terminal run (which stage refused / nil frame).
     private func captureTrickplayFrame(at time: Double) {
-        guard assetSanityAttempt.isAccepted(
-            owner: coordinator.player?.activeLoadToken
-        ) else { return }
+        guard let player = coordinator.player,
+              assetSanityAttempt.isAccepted(owner: player.activeLoadToken),
+              automaticHistoryDuration(owner: player.activeLoadToken) != nil else { return }
         guard !buffering, !isPaused else { return }
         guard !localTrickplayCaptureInFlight else { return }
-        guard let player = coordinator.player else { VXProbe.log("tp", "no player mounted at \(Int(time))s (tvOS)"); return }
         guard let captureSource = TrickplayCaptureSource(player: player, loadToken: player.activeLoadToken) else { return }
         lastLocalTrickplayCapture = time
         localTrickplayCaptureGeneration &+= 1
@@ -12846,7 +12897,8 @@ struct TVPlayerView: View {
                     guard let currentSource = TrickplayCaptureSource(
                         player: self.coordinator.player, loadToken: self.coordinator.player?.activeLoadToken
                     ), currentSource == captureSource,
-                       self.assetSanityAttempt.isAccepted(owner: captureSource.loadToken) else { return }
+                       self.assetSanityAttempt.isAccepted(owner: captureSource.loadToken),
+                       self.automaticHistoryDuration(owner: captureSource.loadToken) != nil else { return }
                     self.trickplayCaptureCompletionsSinceReceipt &+= 1
                     self.trickplayCaptureNilSinceReceipt &+= 1
                     if self.localTrickplayCaptureBreaker.recordCapture(hadData: false) {
@@ -12866,7 +12918,8 @@ struct TVPlayerView: View {
                     guard let currentSource = TrickplayCaptureSource(
                         player: self.coordinator.player, loadToken: self.coordinator.player?.activeLoadToken
                     ), currentSource == captureSource,
-                       self.assetSanityAttempt.isAccepted(owner: captureSource.loadToken) else { return }
+                       self.assetSanityAttempt.isAccepted(owner: captureSource.loadToken),
+                       self.automaticHistoryDuration(owner: captureSource.loadToken) != nil else { return }
                     self.trickplayCaptureCompletionsSinceReceipt &+= 1
                     _ = self.localTrickplayCaptureBreaker.recordCapture(hadData: true)
                     guard let decoded else { return }   // decode failed / near-black: already logged off-actor

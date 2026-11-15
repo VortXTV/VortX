@@ -95,6 +95,20 @@ class NativeDurableWatchReceiptJniTest {
         }
     }
 
+    @Test fun `ending without an admitted sample preserves history and retires playback token`() = runBlocking {
+        val store = Store()
+        open(store).use { session ->
+            val repository = repository { session }
+            assertNull(finish(repository, position = 20_000))
+            val previous = requireNotNull(store.value)
+            val token = repository.beginPlaybackSession(context(), repository.continueWatchingOwner()).getOrThrow()
+            assertNull(repository.endPlaybackSessionWithDurableWatchReceipt(token, 0, 0).getOrThrow())
+            assertEquals(previous, store.value)
+            repository.reportProgress(token, 95_000, 100_000).getOrThrow()
+            assertEquals(previous, store.value)
+        }
+    }
+
     @Test fun `failed checkpoint or fresh readback never authorizes cleanup`() = runBlocking {
         val store = Store()
         var durableBeforeFailure: String? = null
