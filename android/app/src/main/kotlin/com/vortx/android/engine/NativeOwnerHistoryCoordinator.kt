@@ -383,8 +383,13 @@ internal class NativeOwnerHistoryCoordinator private constructor(
             val n = OHJson.Obj(peer.native); val profiles = n.obj("profiles"); val roster = OHJson.Obj()
             profiles.keys.forEach { id -> val p = profiles.obj(id).raw("profile"); require(OHJson.Obj(p).text("id") == id); roster.set(id, p) }
             val owner = roster.obj(scope.ownerProfileID); require(isTrue(owner, "owner") && (owner["deleted"] == null || isFalse(owner, "deleted")))
+            // Like a fresh native store, the local owner has a library bucket even when
+            // the peer has no mutable library or watch entries. Native restore fills it.
+            val libraries = OHJson.Obj().set(scope.ownerProfileID, OHJson.literal("{}"))
             val input = OHJson.Obj().set("roster", OHJson.Obj().set("profiles", roster.encoded()).encoded())
-                .set("activeProfileId", OHJson.quote(target.profileID)).set("nativeSync", peer.native).encoded()
+                .set("activeProfileId", OHJson.quote(target.profileID))
+                .set("libraries", libraries.encoded())
+                .set("nativeSync", peer.native).encoded()
             peer.sources.validate(input, bindings, authority)
             val v = Verify(scope, target, uid, authority, bindings, peer.sources, Mode.OPEN, openingNative = peer.native)
             val native = NativeOwnerHistoryRuntime.open(bindings, input, v.callback); var attempted = false
