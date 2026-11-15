@@ -592,7 +592,7 @@ class NativeBeta14Contract(NativeBeta12Contract):
                 identity = verifier.identity()
                 self.assertEqual(identity["ref"], "refs/tags/" + candidate)
                 self.assertEqual(identity["sourceCommit"], self.source)
-                for ref in (tag, tag + "-candidate.9"):
+                for ref in (tag, tag + "-candidate.1", tag + "-candidate.9"):
                     with mock.patch.dict(os.environ, {"GITHUB_REF": "refs/tags/" + ref}):
                         with self.assertRaisesRegex(ValueError, "exact candidate"):
                             verifier.identity()
@@ -625,8 +625,8 @@ class NativeBeta14Contract(NativeBeta12Contract):
 
 class NativeBeta15Contract(NativeBeta12Contract):
     tag = "v0.5.6-beta.15"
-    candidate = "v0.5.6-beta.15-candidate.1"
-    build = "296"
+    candidate = "v0.5.6-beta.15-candidate.2"
+    build = "297"
     preflight_mode = "beta15-candidate-preflight"
 
     def test_exact_frozen_project_build(self):
@@ -634,6 +634,26 @@ class NativeBeta15Contract(NativeBeta12Contract):
         project = (root / "app/project.yml").read_text()
         gradle = (root / "android/app/build.gradle.kts").read_text()
         self.assertEqual(MODULE.source_versions(project, gradle, "0.5.6", self.tag), self.build)
+
+    def test_previous_beta15_candidate_cannot_supply_either_original_build(self):
+        previous = "v0.5.6-beta.15-candidate.1"
+        receipt = {"schemaVersion": 1, "event": "workflow_dispatch", "ref": "refs/tags/" + self.candidate,
+                   "sourceCommit": self.source, "workflowCommit": self.source, "runId": 5, "attempt": 1,
+                   "inputs": MODULE.APPLE_INPUTS}
+        MODULE.validate_dispatch(receipt, self.pointer, self.tag, self.source)
+        with self.assertRaisesRegex(ValueError, "original typed Apple dispatch inputs"):
+            MODULE.validate_dispatch({**receipt, "ref": "refs/tags/" + previous}, self.pointer, self.tag, self.source)
+        evidence = [f"{name}: {value}" for name, value in (
+            ("release tag", self.candidate), ("release tag commit", self.source), ("source commit", self.source),
+            ("native engine source commit", MODULE.expected_engine(self.tag)),
+            ("native engine Cargo features", "jni,server,resource-host"),
+            ("workflow run", "https://github.com/VortXTV/VortX/actions/runs/5"), ("workflow run attempt", "1"),
+            ("Android versionCode", self.build), ("Android versionName", "0.5.6"),
+        )]
+        MODULE.validate_android_evidence(evidence, self.pointer, self.tag, self.source, "0.5.6", self.build)
+        evidence[0] = f"release tag: {previous}"
+        with self.assertRaisesRegex(ValueError, "original Android evidence identity differs: release tag"):
+            MODULE.validate_android_evidence(evidence, self.pointer, self.tag, self.source, "0.5.6", self.build)
 
     def test_update_and_recovery_gates_cannot_be_skipped(self):
         for lane, gate in (("apple", "Verify protected Beta 15 artifact-only dispatch"),

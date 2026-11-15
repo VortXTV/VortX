@@ -51,7 +51,67 @@ struct VortxNativeProfileEditHostTests {
             scope: scope, baseline: baseline, committedReplay: true)
         check(delayed.conflict == nil && delayed.preferences.local.document == newer.local.document)
         try uuidInterop(scope: scope, actor: actor, eventID: eventID, base: base, baseline: baseline)
+        try numericHostEventInterop(scope: scope, actor: actor)
         print("Website host-CAS: shared JavaScript canonical hashes, absent authenticated baseline, sparse siblings, conflict atomicity and exact/newer replay passed")
+    }
+
+    static func numericHostEventInterop(scope: VortxAccountScope, actor: String) throws {
+        let watch = try VortxNativeWatchlist.field(id: "tt-fixture", type: "movie")
+        func carrier(_ field: String, _ suppliedValue: String, clock: String, metadata: String = "", global: Bool = false) throws -> Data {
+            var value = suppliedValue
+            if field == "playback" {
+                var playback = try OwnerHistoryExactJSON.Object(Data(value.utf8))
+                let defaults = ["audioLang": "eng", "subtitleLang": "eng", "forcedPolicy": "forced", "subFont": "system",
+                                "subSize": "medium", "subColor": "white", "subBackground": "none"]
+                for (key, setting) in defaults { playback.set(key, try OwnerHistoryExactJSON.string(setting)) }
+                value = String(decoding: try playback.encoded(), as: UTF8.self)
+            }
+            let fields = #"{"fields":{"\#(field)":{"clock":\#(clock),"actor":"\#(actor)","value":\#(value)\#(metadata)}}}"#
+            let profiles = global ? "{}" : #"{"\#(scope.ownerProfileID)":\#(fields)}"#
+            let globals = global ? fields : #"{"fields":{}}"#
+            return Data(#"{"schemaVersion":1,"scope":"\#(scope.account)","ownerProfileId":"\#(scope.ownerProfileID)","profiles":\#(profiles),"globals":\#(globals)}"#.utf8)
+        }
+        let aliases: [(field: String, local: String, peer: String, global: Bool)] = [
+            ("avatar", #""star""#, #""star""#, false),
+            ("playback", #"{"maxFileSizeGB":-0.0,"subSizeScale":1.0,"maxResolution":1e0}"#,
+             #"{"maxFileSizeGB":0e0,"subSizeScale":1e0,"maxResolution":1.0}"#, false),
+            (watch, #"{"id":"tt-fixture","type":"movie","name":"Fixture","addedAt":1.0}"#,
+             #"{"id":"tt-fixture","type":"movie","name":"Fixture","addedAt":1e0}"#, false),
+            ("discovery", #"{"providerOrder":[1.0,2e0]}"#, #"{"providerOrder":[1,2]}"#, false),
+            ("forYou.collection.00000000-0000-0000-0000-000000000002",
+             #"{"createdAt":1.0,"rules":{"minRating":6.50}}"#,
+             #"{"createdAt":1,"rules":{"minRating":65e-1}}"#, false),
+            ("stremiox.autoSkipDelaySeconds", "5.0", "5", true)
+        ]
+        for fixture in aliases {
+            var host = try VortxNativeHostPreferences(scope: scope, actor: actor)
+            try host.mergeRaw(carrier(fixture.field, fixture.local, clock: "7.0", global: fixture.global), scope: scope)
+            let original = try host.rawDocumentData()
+            try host.mergeRaw(carrier(fixture.field, fixture.peer, clock: "7e0", global: fixture.global), scope: scope)
+            check(try host.rawDocumentData() == original && host.local.counter == 7,
+                  "equivalent \(fixture.field) event keeps the complete original carrier and clock")
+        }
+        let conflicts = [
+            ("playback", #"{"maxFileSizeGB":9007199254740992.0}"#,
+             #"{"maxFileSizeGB":9007199254740992.1}"#, "", ""),
+            ("playback", #"{"maxFileSizeGB":1,"futureNumeric":1.0}"#,
+             #"{"maxFileSizeGB":1.0,"futureNumeric":1}"#, "", ""),
+            ("discovery", #"{"providerOrder":[1.0,2]}"#, #"{"providerOrder":[2,1]}"#, "", ""),
+            ("playback", #"{"maxFileSizeGB":1.0}"#, #"{"maxFileSizeGB":1}"#,
+             #", "futureRegister": 1.0"#, #", "futureRegister": 1"#)
+        ]
+        for (field, originalValue, peerValue, originalMetadata, peerMetadata) in conflicts {
+            var host = try VortxNativeHostPreferences(scope: scope, actor: actor)
+            try host.mergeRaw(carrier(field, originalValue, clock: "7", metadata: originalMetadata), scope: scope)
+            let peer = try carrier(field, peerValue, clock: "7", metadata: peerMetadata)
+            var isolatedPeer = try VortxNativeHostPreferences(scope: scope, actor: actor)
+            try isolatedPeer.mergeRaw(peer, scope: scope)
+            let original = try host.encoded()
+            rejects("a changed decimal, opaque leaf or metadata remains contradictory at equal clock and actor") {
+                try host.mergeRaw(peer, scope: scope)
+            }
+            check(try host.encoded() == original, "the contradictory event leaves the beforeimage intact")
+        }
     }
 
     static func uuidInterop(scope: VortxAccountScope, actor: String, eventID: String, base: VortxJSON,

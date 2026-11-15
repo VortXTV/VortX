@@ -416,7 +416,7 @@ jobs:
               echo "::error::Beta 15 packages must come from the exact protected candidate"; exit 1 ;;
             refs/tags/v0.5.6-beta.15-candidate.*:*|*:v0.5.6-beta.15-candidate.*)
               test "$GITHUB_EVENT_NAME" = workflow_dispatch && test "$GITHUB_REPOSITORY" = VortXTV/VortX &&
-                test "$GITHUB_REF" = refs/tags/v0.5.6-beta.15-candidate.1 &&
+                test "$GITHUB_REF" = refs/tags/v0.5.6-beta.15-candidate.2 &&
                 test -z "$RELEASE_TAG" && test "$BUILD_SOURCE_SHA" = "$GITHUB_SHA" || exit 1
               jq -e '.inputs == {
                 native_only:true, publish_release:false, publish_existing_055:false,
@@ -427,7 +427,7 @@ jobs:
           esac
 
       - name: Verify protected Apple legacy archive recovery
-        if: github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' || github.ref == 'refs/tags/v0.5.6-beta.15-candidate.1'
+        if: github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' || github.ref == 'refs/tags/v0.5.6-beta.15-candidate.2'
         timeout-minutes: 10
         run: bash scripts/test-native-migration-phase-a.sh bootstrap
 
@@ -579,7 +579,7 @@ jobs:
           echo "tvos_sdk=$TVOS_SDK" >> "$GITHUB_OUTPUT"
 
       - name: Verify protected Apple update checking and presentation
-        if: github.ref == 'refs/tags/v0.5.6-beta.15-candidate.1'
+        if: github.ref == 'refs/tags/v0.5.6-beta.15-candidate.2'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -914,7 +914,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' &&
           (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' ||
            github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' || github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' ||
-           github.ref == 'refs/tags/v0.5.6-beta.15-candidate.1')
+           github.ref == 'refs/tags/v0.5.6-beta.15-candidate.2')
         run: |
           set -euo pipefail
           jq -e '.inputs == {
@@ -1336,7 +1336,7 @@ jobs:
              { [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.12-candidate.3 ] ||
                [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.13-candidate.1 ] ||
                [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.14-candidate.2 ] ||
-               [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.15-candidate.1 ]; }; then
+               [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.15-candidate.2 ]; }; then
             python3 scripts/verify-protected-apple-aether.py --sign-macos --key macos \
               --packages "$AETHER_RELEASE_PACKAGES" --lock "$AETHER_RELEASE_LOCK" \
               --resolution-receipt "$AETHER_RELEASE_EVIDENCE/aether-resolved.json" \
@@ -1374,7 +1374,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' &&
           (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' ||
            github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' || github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' ||
-           github.ref == 'refs/tags/v0.5.6-beta.15-candidate.1')
+           github.ref == 'refs/tags/v0.5.6-beta.15-candidate.2')
         run: |
           set -euo pipefail
           check_app() {
@@ -1640,7 +1640,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' &&
           (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' ||
            github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' || github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' ||
-           github.ref == 'refs/tags/v0.5.6-beta.15-candidate.1')
+           github.ref == 'refs/tags/v0.5.6-beta.15-candidate.2')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-Apple-Aether-release-evidence

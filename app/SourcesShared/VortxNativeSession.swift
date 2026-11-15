@@ -2868,10 +2868,15 @@ actor VortxNativeSession {
                                     typedPeer: OwnerHistoryPeerPreparation? = nil,
                                     hostRemoteRaw: Data? = nil, reportAccountMergeFailure: Bool = false) async throws -> [String] {
         var failureStage: String? = "route"
+        var hostFailure: VortxNativeHostPreferences.RawMergeFailure?
         defer {
-            if reportAccountMergeFailure, failureStage != lastAccountMergeFailureStage {
-                lastAccountMergeFailureStage = failureStage
-                if let failureStage { diagnostics?("native_account_merge result=failed stage=\(failureStage)") }
+            if reportAccountMergeFailure {
+                let detail = hostFailure.map { " reason=\($0.rawValue)" } ?? ""
+                let failure = failureStage.map { "stage=\($0)" + detail }
+                if failure != lastAccountMergeFailureStage {
+                    lastAccountMergeFailureStage = failure
+                    if let failure { diagnostics?("native_account_merge result=failed \(failure)") }
+                }
             }
         }
         try requireActiveRoute()
@@ -2944,8 +2949,11 @@ actor VortxNativeSession {
         var candidateHost = hostPreferences
         try candidateHost.retainAuthenticatedSourceArchive(authenticatedSourceArchive)
         failureStage = "host_carrier_merge"
-        if let hostRemoteRaw { try candidateHost.mergeRaw(hostRemoteRaw, scope: scope) }
-        else { try candidateHost.merge(hostRemote, scope: scope) }
+        if let hostRemoteRaw {
+            try candidateHost.mergeRaw(hostRemoteRaw, scope: scope) { hostFailure = $0 }
+        } else {
+            try candidateHost.merge(hostRemote, scope: scope) { hostFailure = $0 }
+        }
         failureStage = "watchlist_seed"
         for (profile, entries) in legacyWatchlists {
             // The unchanged legacy roster may still carry a profile explicitly deleted by the
