@@ -22,7 +22,8 @@ globalThis.localStorage = {
   clear: () => values.clear(),
 };
 
-const { wireAddons } = await import("../views/addons.ts");
+const { renderAddons, wireAddons } = await import("../views/addons.ts");
+const { blockNativeAccountProjection, setNativeAccountProjection } = await import("./store.ts");
 
 test("persistent add-ons host receives one delegated click listener across renders", () => {
   let clickBindings = 0;
@@ -47,4 +48,48 @@ test("persistent add-ons host receives one delegated click listener across rende
 
   assert.equal(submitBindings, 3, "each newly rendered form still needs its own submit listener");
   assert.equal(clickBindings, 1, "the persistent main host must not accumulate delegated click listeners");
+});
+
+test("account recovery gives the Add-ons form an actionable refusal and keeps its draft", async () => {
+  let markup = "", elements, submit;
+  const host = {
+    get innerHTML() { return markup; },
+    set innerHTML(html) {
+      markup = html;
+      const button = { disabled: html.includes('type="submit" disabled') };
+      elements = {
+        "#addon-form": {
+          addEventListener(_type, handler) { submit = handler; },
+          querySelector() { return button; },
+        },
+        "#addon-url": { value: "" },
+        "#addon-error": { hidden: true, textContent: "" },
+      };
+    },
+    querySelector(selector) { return elements?.[selector] ?? null; },
+    querySelectorAll() { return []; },
+    addEventListener() {},
+  };
+  const url = "https://private-addon.test/configured-secret/manifest.json";
+  let fetches = 0, changes = 0;
+  globalThis.fetch = async () => { fetches++; return Response.json({ id: "sample", name: "Sample" }); };
+  try {
+    renderAddons(host, [], () => { changes++; });
+    wireAddons(host);
+    elements["#addon-url"].value = url;
+    blockNativeAccountProjection("account.example");
+    await submit({ preventDefault() {} });
+    assert.match(elements["#addon-error"].textContent, /Sync now/);
+    assert.doesNotMatch(elements["#addon-error"].textContent, /configured-secret|invalid manifest/i);
+    assert.equal(elements["#addon-error"].hidden, false);
+    assert.equal(elements["#addon-url"].value, url);
+    renderAddons(host, [{ transportUrl: url, manifest: { id: "sample", name: "Sample" } }], () => { changes++; });
+    assert.match(host.innerHTML, /type="submit" disabled/);
+    assert.doesNotMatch(host.innerHTML, /configured-secret/);
+    assert.equal(elements["#addon-url"].value, url);
+    assert.equal(fetches, 0);
+    assert.equal(changes, 0);
+  } finally {
+    setNativeAccountProjection(null);
+  }
 });

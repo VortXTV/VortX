@@ -13,7 +13,8 @@ registerHooks({ resolve(specifier, context, next) {
 const stored = new Map();
 globalThis.localStorage = { getItem: (key) => stored.get(key) ?? null, setItem: (key, value) => stored.set(key, String(value)), removeItem: (key) => stored.delete(key) };
 const { loadAddon, catalogRefs, supportsResource } = await import("./addon.ts");
-const { addAddon } = await import("./store.ts");
+const { AddonEditUnavailable, addAddon, blockNativeAccountProjection, registerAddonsSyncPusher, removeAddon, setNativeAccountProjection } = await import("./store.ts");
+const { activeProfileId } = await import("./profiles.ts");
 const base = { id: "synthetic", name: "Synthetic" };
 const respond = (manifest) => { globalThis.fetch = async () => new Response(JSON.stringify(manifest), { status: 200 }); };
 
@@ -66,4 +67,56 @@ test("the real installation path rejects a malformed manifest without persisting
   stored.clear(); respond({ ...base, resources: { catalog: true } });
   await assert.rejects(addAddon("https://synthetic.test/manifest.json"), /Not a valid add-on manifest/);
   assert.equal(stored.size, 0);
+});
+
+test("unavailable, pending or protected account profiles cannot request or mutate add-ons", async () => {
+  stored.clear();
+  const transportUrl = "https://private-addon.test/configured-secret/manifest.json";
+  const profile = { id: activeProfileId(), binding: "original", pending: false, locked: false, kids: false };
+  let fetches = 0, pushes = 0;
+  registerAddonsSyncPusher(() => { pushes++; });
+  globalThis.fetch = async () => { fetches++; return Response.json(base); };
+  const initial = new Map(stored);
+  try {
+    blockNativeAccountProjection("account.example");
+    for (const protection of [null, { pending: true }, { locked: true }, { kids: true }]) {
+      if (protection) setNativeAccountProjection({ scope: "account.example", profiles: [{ ...profile, ...protection }] });
+      await assert.rejects(addAddon(transportUrl), (error) => {
+        assert.ok(error instanceof AddonEditUnavailable);
+        assert.doesNotMatch(error.message, /configured-secret|invalid manifest/i);
+        return true;
+      });
+      assert.equal(removeAddon(transportUrl), false);
+    }
+    assert.equal(fetches, 0);
+    assert.equal(pushes, 0);
+    assert.deepEqual(stored, initial);
+  } finally {
+    setNativeAccountProjection(null);
+    registerAddonsSyncPusher(null);
+  }
+});
+
+test("a delayed add-on manifest cannot persist into a rebound profile", async () => {
+  stored.clear();
+  const profile = { id: activeProfileId(), binding: "original", pending: false, locked: false, kids: false };
+  const project = (binding) => setNativeAccountProjection({ scope: "account.example", profiles: [{ ...profile, binding }] });
+  let finish, pushes = 0;
+  registerAddonsSyncPusher(() => { pushes++; });
+  globalThis.fetch = () => new Promise((resolve) => { finish = resolve; });
+  const initial = new Map(stored);
+  try {
+    project("original");
+    const attempt = addAddon("https://private-addon.test/manifest.json");
+    const check = assert.rejects(attempt, /Account changed/);
+    assert.equal(typeof finish, "function", "the original profile could start the request");
+    project("new");
+    finish(Response.json(base));
+    await check;
+    assert.equal(pushes, 0);
+    assert.deepEqual(stored, initial);
+  } finally {
+    setNativeAccountProjection(null);
+    registerAddonsSyncPusher(null);
+  }
 });

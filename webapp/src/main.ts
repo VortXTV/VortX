@@ -27,8 +27,8 @@ import { handleSettingsClick, renderSettings } from "./views/settings";
 import { handleLoginClick, renderLogin, disposeLogin } from "./views/login";
 import { renderApprove, handleApproveClick, disposeApprove } from "./views/approve";
 import { applySettings } from "./lib/settings";
-import { ensureValidSession, startAccountSync } from "./lib/account";
-import { startSessionAuthority } from "./lib/vault";
+import { ensureValidSession, startAccountSync, subscribe } from "./lib/account";
+import { sessionOwner, startSessionAuthority, type Session } from "./lib/vault";
 import { initTvPlatform } from "./lib/tvnav";
 
 // VortX web client entry point. Flow: load installed add-ons (Cinemeta + user stream add-ons) ->
@@ -197,7 +197,10 @@ async function reloadAddonsAndRender(preservePlayback = false): Promise<void> {
   if (generation !== addonReloadGeneration) return;
   addons = loaded;
   if (preservePlayback && isPlayerOpen()) return;
-  await renderRoute(parseRoute());
+  const route = parseRoute();
+  // An account pull can finish while Login owns a pending adoption/recovery surface.
+  if (preservePlayback && (route.name === "login" || route.name === "approve")) return;
+  await renderRoute(route);
 }
 
 /** Wire the search box: Enter commits to the shareable route; typing runs a debounced live search that
@@ -388,8 +391,27 @@ async function start(): Promise<void> {
   window.addEventListener("vortx:addons-changed", () => void reloadAddonsAndRender(true));
   window.addEventListener("vortx:watchlist-changed", () => { if (parseRoute().name === "library") renderLibrary(mainHost()); });
   window.addEventListener("vortx:profile-changed", (event) => {
-    if (event instanceof CustomEvent && event.detail?.fromSync && isPlayerOpen()) return;
-    void reloadAddonsAndRender();
+    const fromSync = event instanceof CustomEvent && event.detail?.fromSync === true;
+    if (fromSync && isPlayerOpen()) return;
+    void reloadAddonsAndRender(fromSync);
+  });
+  let accountRevision = sessionOwner().revision;
+  let addonOwner: Session | null = sessionOwner().session;
+  subscribe((next) => {
+    const { revision, mode } = sessionOwner();
+    if (accountRevision === revision) return;
+    const sameData = addonOwner && next && addonOwner.account.id === next.account.id &&
+      addonOwner.dataKey.length === next.dataKey.length && addonOwner.dataKey.every((byte, index) => byte === next.dataKey[index]);
+    const dataRetired = !sameData || mode === "blocked";
+    accountRevision = revision;
+    addonOwner = next;
+    ++addonReloadGeneration;
+    addons = [];
+    if (dataRetired) {
+      if (isPlayerOpen()) closePlayer();
+      setDetailVisible(false);
+    }
+    void reloadAddonsAndRender(true);
   });
   // Validate the token in the background, then pull the account sync doc so a returning (already signed-in)
   // user's add-ons, library, and Continue Watching refresh on load - not only on a fresh sign-in. Never

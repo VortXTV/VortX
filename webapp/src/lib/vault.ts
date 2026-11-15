@@ -136,7 +136,9 @@ function syncFloor(accountId: string): number {
   return Number(localStorage.getItem("vortx.syncVer." + accountId) || "0");
 }
 function bumpSyncFloor(accountId: string, version: number): void {
-  if (version > syncFloor(accountId)) localStorage.setItem("vortx.syncVer." + accountId, String(version));
+  const key = "vortx.syncVer." + accountId;
+  // A witnessed revision zero still proves this account already has a backup.
+  if (localStorage.getItem(key) === null || version > syncFloor(accountId)) localStorage.setItem(key, String(version));
 }
 
 // A destructive reset retains the account ID but mints a different key. Only a successful reset
@@ -973,6 +975,9 @@ export interface SyncStatus {
 export class SyncUpgradeRequiredError extends Error {
   constructor() { super("Update VortX to continue syncing. Your unsaved changes are retained."); this.name = "SyncUpgradeRequiredError"; }
 }
+export class SyncSessionExpiredError extends Error {
+  constructor() { super("Sign in again to continue syncing."); this.name = "SyncSessionExpiredError"; }
+}
 function snapshotSyncSession(session: Session): Session { return copySession(session); }
 function captureSyncWriter(source: Session): () => void {
   const current = captureSessionOwnership(source);
@@ -1002,7 +1007,9 @@ export async function fetchSync(session: Session, options: { version?: number; s
     if (options.version! < syncFloor(ratchet)) return { synced: true, version: options.version, decryptFailed: true };
     return { synced: true, unchanged: true, version: options.version };
   }
-  if (r.status === 404) return { synced: false };
+  if (r.status === 404) return localStorage.getItem("vortx.syncVer." + ratchet) !== null || sawV2(ratchet)
+    ? { synced: true, decryptFailed: true } : { synced: false };
+  if (r.status === 401) throw new SyncSessionExpiredError();
   if (r.status !== 200) throw new Error("offline");
   const data = r.data as { document: string; version: number };
   if (typeof data?.document !== "string" || !Number.isSafeInteger(data.version) || data.version < 0) throw new Error("Sync data unavailable: invalid revision or document.");
@@ -1088,6 +1095,7 @@ export async function mutateSyncDoc(
     });
     guard();
     if (r.status === 426) throw new SyncUpgradeRequiredError();
+    if (r.status === 401) throw new SyncSessionExpiredError();
     if (r.status !== 200) throw new Error("Could not save to your account.");
     if (r.data?.accepted === true) {
       bumpSyncFloor(ratchet, version);                      // H-2: never accept below this again

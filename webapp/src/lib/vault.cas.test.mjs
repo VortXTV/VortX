@@ -95,6 +95,17 @@ test("candidate-bound encrypted vault writes use real mutation methods", async (
     assert.deepEqual(server.puts.map(({ baseRevision, version }) => [baseRevision, version]), [[null, 0], [null, 0], [0, 1]]);
     assert.deepEqual(server.read(), { first: true, second: true });
   });
+  await t.test("a known backup disappearing, even at revision zero, cannot be re-seeded", async () => {
+    for (const revision of [0, 20]) {
+      const s = await session(), server = relay(s, { original: true }, revision);
+      assert.equal((await vault.fetchSync(s)).version, revision);
+      server.error(404);
+      assert.deepEqual(await vault.fetchSync(s), { synced: true, decryptFailed: true });
+      await assert.rejects(vault.mutateSyncDoc(s, (doc) => { doc.mine = true; }));
+      assert.equal(server.puts.length, 0);
+      assert.deepEqual(server.read(), { original: true });
+    }
+  });
   await t.test("unknown or unreadable bases, auth failures, and numeric overflow never become default null witnesses", async () => {
     for (const version of [undefined, "20", -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Number.MAX_SAFE_INTEGER]) {
       const s = await session(), server = relay(s);

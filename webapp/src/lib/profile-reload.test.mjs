@@ -27,7 +27,9 @@ class ProfileSyncEvent extends Event {
 }
 
 function environment() {
-  let profile = "A", playerOpen = false, parseCalls = 0, application;
+  let profile = "A", playerOpen = false, parseCalls = 0, application, accountChanged;
+  let route = "home", closedPlayer = 0, clearedDetail = 0;
+  let owner = { revision: 0, session: null, mode: "guest" };
   const requests = [], renders = [], listeners = new Map();
   const window = { addEventListener(type, listener) {
     assert.equal(listeners.has(type), false, `duplicate receiver: ${type}`);
@@ -42,7 +44,11 @@ function environment() {
   const bindings = {
     window, CustomEvent: ProfileSyncEvent, loadInstalledAddons,
     isPlayerOpen: () => playerOpen,
-    parseRoute: () => { parseCalls++; return { name: "home" }; },
+    parseRoute: () => { parseCalls++; return { name: route }; },
+    sessionOwner: () => owner,
+    subscribe: (listener) => { accountChanged = listener; listener(owner.session); },
+    closePlayer: () => { closedPlayer++; playerOpen = false; },
+    setDetailVisible: (visible) => { assert.equal(visible, false); clearedDetail++; },
     renderRoute: async (route) => { renders.push({ route, addons: application.readAddons() }); },
     renderLibrary: () => assert.fail("unrelated watchlist receiver must not run"),
     mainHost: () => assert.fail("unrelated watchlist receiver must not run"),
@@ -59,6 +65,13 @@ function environment() {
     requests, renders, application,
     setProfile: (value) => { profile = value; },
     setPlayerOpen: (value) => { playerOpen = value; },
+    setRoute: (value) => { route = value; },
+    setAccount: (session, mode = "persisted") => {
+      owner = { revision: owner.revision + 1, session, mode };
+      accountChanged(session);
+    },
+    closedPlayer: () => closedPlayer,
+    clearedDetail: () => clearedDetail,
     parseCalls: () => parseCalls,
     profileChanged: (fromSync) => dispatch(typeof fromSync === "boolean"
       ? new ProfileSyncEvent(fromSync) : new Event("vortx:profile-changed")),
@@ -153,4 +166,33 @@ test("an add-ons reload checks playback when it completes, not when it starts", 
   env.setPlayerOpen(false);
   await env.finishLoad(0, a);
   assert.deepEqual(env.renders, [{ route: { name: "home" }, addons: a }]);
+});
+
+
+test("retiring an account clears displayed add-ons and fences its outstanding load", async () => {
+  const env = environment(), a = catalog("old"), b = catalog("new");
+  env.setAccount({ account: { id: "a" }, dataKey: new Uint8Array(32).fill(1) });
+  await env.finishLoad(0, a);
+  env.addonsChanged(); // An old update is still pending.
+  env.setPlayerOpen(true);
+  env.setAccount({ account: { id: "b" }, dataKey: new Uint8Array(32).fill(2) });
+  assert.deepEqual(env.application.readAddons(), []);
+  assert.equal(env.closedPlayer(), 1);
+  assert.equal(env.clearedDetail(), 2);
+  await env.finishLoad(1, a);
+  assert.deepEqual(env.application.readAddons(), []);
+  await env.finishLoad(2, b);
+  assert.equal(env.application.readAddons(), b);
+});
+
+test("sync notifications cannot recreate a pending sign-in or approval surface", async () => {
+  const env = environment(), a = catalog("sync");
+  env.setRoute("login");
+  env.profileChanged(true);
+  await env.finishLoad(0, a);
+  env.setRoute("approve");
+  env.addonsChanged();
+  await env.finishLoad(1, a);
+  assert.equal(env.application.readAddons(), a);
+  assert.deepEqual(env.renders, []);
 });

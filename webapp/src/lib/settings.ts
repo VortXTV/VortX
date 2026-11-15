@@ -177,7 +177,8 @@ const LEGACY_SUB_EDGE: Readonly<Record<string, SubtitleEdge>> = { shadow: "shade
  *  do not know what this is": every caller then keeps the value it already had rather than inventing one. */
 function canonId<T extends string>(v: unknown, ids: readonly T[], legacy: Readonly<Record<string, T>>): T | undefined {
   if (typeof v !== "string") return undefined;
-  return (ids as readonly string[]).includes(v) ? (v as T) : legacy[v];
+  if ((ids as readonly string[]).includes(v)) return v as T;
+  return Object.prototype.hasOwnProperty.call(legacy, v) ? legacy[v] : undefined;
 }
 
 export const canonSubMode = (v: unknown): SubtitlesMode | undefined => canonId(v, SUB_MODE_IDS, LEGACY_SUB_MODE);
@@ -195,6 +196,9 @@ export const canonSubScale = (n: number): number => Math.min(SUB_MAX, Math.max(S
 export function canonicalizeSettings(s: Settings): Settings {
   return {
     ...s,
+    // Old local exports may contain an unreadable preference. Keep the rest available, and keep
+    // unknown array slots because a newer build can understand them.
+    sourceOrder: Array.isArray(s.sourceOrder) ? s.sourceOrder : [...DEFAULTS.sourceOrder],
     subtitlesMode: canonSubMode(s.subtitlesMode) ?? DEFAULTS.subtitlesMode,
     safetyFilter: canonSafety(s.safetyFilter) ?? DEFAULTS.safetyFilter,
     subtitleFont: canonSubFont(s.subtitleFont) ?? DEFAULTS.subtitleFont,

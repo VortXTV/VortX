@@ -135,6 +135,7 @@ async function serverFor(s, initial = legacyDoc()) {
   let getFailures = 0;
   let conditional = true;
   let upgradeRequired = false;
+  let writeReconnectRequired = false;
   let activeGets = 0;
   let maxGets = 0;
   let activePuts = 0;
@@ -160,6 +161,7 @@ async function serverFor(s, initial = legacyDoc()) {
       if (gate) await gate;
       activePuts--;
       if (upgradeRequired) return json({ error: "upgrade_required", accepted: false }, 426);
+      if (writeReconnectRequired) return json({ error: "unauthenticated" }, 401);
       if (failures) { failures--; return json({ error: "synthetic offline" }, 503); }
       const accepted = body.baseRevision === version && body.version === version + 1;
       if (accepted) { version = body.version; document = body.document; }
@@ -186,6 +188,7 @@ async function serverFor(s, initial = legacyDoc()) {
     failGet(count = 1) { getFailures = count; },
     conditional(value) { conditional = value; },
     requireUpgrade() { upgradeRequired = true; },
+    requireWriteReconnect() { writeReconnectRequired = true; },
     holdGet() { let release; nextGetGate = new Promise((r) => { release = r; }); return release; },
     holdPut() { let release; nextPutGate = new Promise((r) => { release = r; }); return release; },
     async remote(doc) { version++; document = await seal(doc); },
@@ -383,9 +386,62 @@ test("automatic encrypted account sync uses sockets, clocks, network and durable
     await clean(); const s = makeSession(); const server = await serverFor(s, { ...legacyDoc(), nativeSync: { schemaVersion: 1, opaque: true } });
     await admit(vault, s, account); stop = account.startAccountSync();
     await until(() => account.accountSyncStatus().receivedVersion === 20, "native encrypted document received");
-    assert.deepEqual(account.accountSyncStatus(), { receivedVersion: 20, appliedVersion: undefined, projectionPending: true });
+    assert.deepEqual(account.accountSyncStatus(), { receivedVersion: 20, appliedVersion: undefined, projectionPending: true, unavailable: true });
     await advance(3_000); assert.equal(server.requests.at(-1).headers["if-none-match"], '"20"');
     assert.equal(server.puts.length, 0);
+  });
+
+  await t.test("manual retry reapplies the same authenticated revision after a local projection failure", async () => {
+    await clean(); const s = makeSession();
+    const doc = structuredClone(nativeFixture.cases[0].document);
+    doc.nativeSync.scope = doc.nativeHostPreferences.scope = `account.${s.account.id}`;
+    const server = await serverFor(s, doc);
+    await admit(vault, s, account);
+    const stopFailing = settings.onSettingsChange(() => { throw new Error("synthetic local projection failure"); });
+    try {
+      stop = account.startAccountSync();
+      await until(() => account.accountSyncStatus().receivedVersion === 20, "authenticated receive");
+      assert.equal(account.accountSyncStatus().unavailable, true);
+      assert.equal(account.accountSyncStatus().appliedVersion, undefined);
+      assert.deepEqual(store.installedUrls(), []);
+    } finally { stopFailing(); }
+    await advance(3_000);
+    assert.equal(server.requests.at(-1).headers["if-none-match"], '"20"');
+    assert.equal(account.accountSyncStatus().unavailable, true, "304 does not attest that projection applied");
+    await account.retryAccountSync();
+    assert.equal(server.requests.at(-1).headers["if-none-match"], undefined);
+    assert.equal(account.accountSyncStatus().unavailable, undefined);
+    assert.equal(account.accountSyncStatus().appliedVersion, 20);
+    assert.ok(store.installedUrls().length);
+    assert.equal(server.puts.length, 0, "a retrying read never authors edits");
+  });
+
+  await t.test("an unavailable read retains the original session and offers retry", async () => {
+    await clean(); const s = makeSession(); const server = await serverFor(s);
+    await admit(vault, s, account);
+    server.failGet();
+    stop = account.startAccountSync();
+    await until(() => account.accountSyncStatus().unavailable === true, "failed first read");
+    assert.equal(account.currentSession()?.token, s.token);
+    await account.retryAccountSync();
+    assert.equal(account.accountSyncStatus().unavailable, undefined);
+    assert.equal(account.accountSyncStatus().appliedVersion, 20);
+  });
+
+  await t.test("grace-period reads remain usable while a rejected upload waits for reconnect", async () => {
+    await clean(); const s = makeSession(); const server = await serverFor(s);
+    await admit(vault, s, account); stop = account.startAccountSync();
+    await until(() => account.accountSyncStatus().appliedVersion === 20, "read under grace session");
+    server.requireWriteReconnect();
+    settings.updateSettings({ accentID: "royal" }); await advance(800);
+    await until(() => account.accountSyncStatus().reconnectRequired === true, "write authentication refused");
+    assert.equal(server.puts.length, 1);
+    assert.ok(journalsFor(s).length, "authenticated refusal retains the exact queued intent");
+    await account.retryAccountSync();
+    await advance(10_000);
+    assert.equal(account.accountSyncStatus().reconnectRequired, true, "a successful read does not clear a write refusal");
+    assert.equal(account.currentSession()?.token, s.token);
+    assert.equal(server.puts.length, 1, "no automatic retry using the rejected token");
   });
 
   await t.test("a stalled mutation times out and retries its durable intent without blocking the writer", async () => {

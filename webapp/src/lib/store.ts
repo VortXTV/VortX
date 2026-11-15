@@ -169,14 +169,41 @@ export function registerAddonsSyncPusher(fn: ((hint?: AddonSyncHint) => void) | 
   addonAdmission = admission;
 }
 
+export class AddonEditUnavailable extends Error {}
+
+export function addonEditNotice(): string | null {
+  if (nativeBlockedScope) return "Your add-ons are unavailable. Open Settings and select Sync now to retry.";
+  if (!nativeProjection) return null;
+  const profile = nativeProfile();
+  if (!profile || profile.pending) return "Wait for this profile to sync, or open Settings and select Sync now.";
+  if (profile.locked || profile.kids) return "Manage add-ons for this protected profile in the VortX app.";
+  return null;
+}
+
+function captureAddonEdit(isCurrent: () => boolean): () => void {
+  const changed = "Account changed while loading this add-on. Please try again.";
+  if (!isCurrent()) throw new AddonEditUnavailable(changed);
+  const admitted = addonAdmission?.();
+  const scope = nativeProjection?.scope;
+  const profile = nativeProfile();
+  return () => {
+    if (!isCurrent() || (admitted && !admitted())) throw new AddonEditUnavailable(changed);
+    const notice = addonEditNotice();
+    if (notice) throw new AddonEditUnavailable(notice);
+    const current = nativeProfile();
+    if (scope !== nativeProjection?.scope || profile?.id !== current?.id || profile?.binding !== current?.binding) {
+      throw new AddonEditUnavailable(changed);
+    }
+  };
+}
+
 /** Add a stream/catalog add-on by transport URL. Validates the manifest before persisting; returns
  *  the resolved Addon so the caller can refresh the UI. Throws if the URL is not a valid add-on. */
 export async function addAddon(transportUrl: string, isCurrent: () => boolean = () => true): Promise<Addon> {
-  if (!isCurrent()) throw new Error("Account changed while loading this add-on. Please try again.");
-  const admitted = addonAdmission?.();
+  const assertCurrent = captureAddonEdit(isCurrent);
+  assertCurrent();
   const addon = await loadAddon(transportUrl.trim()); // validates scheme (https-only) + normalizes
-  if (nativeBlockedScope) throw new Error("Account native data is unavailable; retry after a compatible account update.");
-  if (!isCurrent() || (admitted && !admitted())) throw new Error("Account changed while loading this add-on. Please try again.");
+  assertCurrent();
   rememberNativeAddonEdit(addon.transportUrl, true);
   persist([...installedUrls(), addon.transportUrl]); // store exactly the normalized URL that loaded
   addonsSyncPusher?.({ added: addon.transportUrl, descriptor: addon });
@@ -184,12 +211,14 @@ export async function addAddon(transportUrl: string, isCurrent: () => boolean = 
 }
 
 /** Remove an add-on by transport URL (Cinemeta cannot be removed - it backs Home + meta). */
-export function removeAddon(transportUrl: string): void {
-  if (nativeBlockedScope) return;
-  if (transportUrl === CINEMETA_URL) return;
+export function removeAddon(transportUrl: string, isCurrent: () => boolean = () => true): boolean {
+  if (transportUrl === CINEMETA_URL || !isCurrent()) return false;
+  const admitted = addonAdmission?.();
+  if (addonEditNotice() || (admitted && !admitted()) || !isCurrent()) return false;
   rememberNativeAddonEdit(transportUrl, false);
   persist(installedUrls().filter((u) => u !== transportUrl));
   addonsSyncPusher?.({ removed: transportUrl }); // push + write the removal tombstone so apps uninstall it
+  return true;
 }
 
 // --- Library (saved titles) ---------------------------------------------------------------------
@@ -944,22 +973,31 @@ function validBackupValue(key: string, val: unknown): boolean {
   }
 }
 
-/** Restore from an exportBackup() string. Validates the envelope + every present key's shape BEFORE
- *  writing anything (all-or-nothing, so a bad file never half-applies). Returns true on success. */
+/** Validate all present slots before writing. If a write fails, undo completed local writes where
+ *  the slot still contains the value this import wrote. */
 export function importBackup(json: string): boolean {
+  const touched: { key: string; previous: string | null; next: string }[] = [];
   try {
     if (json.length > 5_000_000) return false; // 5 MB sanity cap
     const parsed = JSON.parse(json) as { data?: Record<string, unknown> };
     const data = parsed?.data;
     if (!data || typeof data !== "object" || Array.isArray(data)) return false;
-    for (const key of BACKUP_KEYS) {
-      if (key in data && !validBackupValue(key, data[key])) return false; // reject the whole import
-    }
-    for (const key of BACKUP_KEYS) {
-      if (key in data) localStorage.setItem(key, JSON.stringify(data[key]));
+    const keys = BACKUP_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(data, key));
+    if (!keys.length || keys.some((key) => !validBackupValue(key, data[key]))) return false;
+    const changes = keys.map((key) => ({ key, previous: localStorage.getItem(key), next: JSON.stringify(data[key]) }));
+    for (const change of changes) {
+      touched.push(change);
+      localStorage.setItem(change.key, change.next);
     }
     return true;
   } catch {
+    for (const { key, previous, next } of touched.reverse()) {
+      try {
+        if (localStorage.getItem(key) !== next) continue;
+        if (previous === null) localStorage.removeItem(key);
+        else localStorage.setItem(key, previous);
+      } catch { /* An unavailable store cannot be repaired from this tab. */ }
+    }
     return false;
   }
 }

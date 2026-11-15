@@ -108,6 +108,27 @@ test("backup validates and restores timestamped Continue Watching removals", () 
   assert.equal(values.get("sentinel"), "preserved");
 });
 
+test("a failed local backup write preserves earlier settings and add-on slots", () => {
+  const settingsKey = "vortx.web.settings.v1", addonsKey = "vortx.web.addons.v1", libraryKey = "vortx.web.library.v1";
+  const oldSettings = values.get(settingsKey), oldAddons = values.get(addonsKey);
+  const setItem = localStorage.setItem;
+  values.set(settingsKey, '{"accentID":"forest"}'); values.delete(addonsKey);
+  localStorage.setItem = (key, value) => {
+    if (key === libraryKey) throw new DOMException("synthetic quota", "QuotaExceededError");
+    setItem(key, value);
+  };
+  try {
+    const data = { [settingsKey]: { accentID: "royal" }, [addonsKey]: ["https://example.invalid/manifest.json"], [libraryKey]: [] };
+    assert.equal(importBackup(JSON.stringify({ data })), false);
+    assert.equal(values.get(settingsKey), '{"accentID":"forest"}');
+    assert.equal(values.has(addonsKey), false);
+  } finally {
+    localStorage.setItem = setItem;
+    if (oldSettings === undefined) values.delete(settingsKey); else values.set(settingsKey, oldSettings);
+    if (oldAddons === undefined) values.delete(addonsKey); else values.set(addonsKey, oldAddons);
+  }
+});
+
 test("web Continue Watching keeps alias removal and profile boundaries durable", () => {
   clearCW();
   values.set(
