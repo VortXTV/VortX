@@ -57,7 +57,8 @@ jobs:
               case "$GITHUB_REF:$RELEASE_TAG" in
                 refs/tags/v0.5.6-beta.12-candidate.3:v0.5.6-beta.12-candidate.3|\
                 refs/tags/v0.5.6-beta.13-candidate.1:v0.5.6-beta.13-candidate.1|\
-                refs/tags/v0.5.6-beta.14-candidate.2:v0.5.6-beta.14-candidate.2) ;;
+                refs/tags/v0.5.6-beta.14-candidate.2:v0.5.6-beta.14-candidate.2|\
+                refs/tags/v0.5.6-beta.14-candidate.3:v0.5.6-beta.14-candidate.3) ;;
                 *) echo "::error::Protected candidate ref and input must match an exact reviewed pair"; exit 1 ;;
               esac
               [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REPOSITORY" == VortXTV/VortX &&
@@ -218,7 +219,10 @@ jobs:
           retention-days: 90
 
       - name: Verify protected Android backup format and CAS
-        if: github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' || github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2'
+        if: >-
+          github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' ||
+          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' ||
+          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.3'
         working-directory: android
         timeout-minutes: 15
         env:
@@ -253,7 +257,9 @@ jobs:
           PYTEST
 
       - name: Verify protected Android account setup and release regressions
-        if: github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2'
+        if: >-
+          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' ||
+          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.3'
         working-directory: android
         timeout-minutes: 20
         env:
@@ -276,6 +282,17 @@ jobs:
             downloads.DownloadPlaybackRoutingTest
             downloads.DownloadedSeasonBoundaryTest
           )
+          if [[ "$GITHUB_REF" == refs/tags/v0.5.6-beta.14-candidate.3 ]]; then
+            suites+=(
+              diagnostics.DiagnosticExportTest
+              profile.ProfileSelectionWiringTest
+              profile.BackupRecoveryEntryWiringTest
+              ui.profilepicker.ProfilePickerToolsControllerTest
+              ui.profilepicker.ProfilePickerToolsRestoreControllerTest
+              ui.profilepicker.ProfilePickerToolsManagerTest
+              backup.accountfiles.AccountBackupDocumentsTest
+            )
+          fi
           reports=app/build/test-results/testPlayDebugUnitTest
           filters=()
           for name in "${suites[@]}"; do
@@ -484,3 +501,137 @@ jobs:
             dist/SHA256SUMS-android.txt \
             dist/SIGNING_PROVENANCE.txt \
             --clobber
+
+  tools-instrumentation:
+    name: Verify Android recovery tools on an emulator
+    if: >-
+      github.repository == 'VortXTV/VortX' &&
+      github.ref == 'refs/tags/v0.5.6-beta.14-candidate.3' &&
+      inputs.release_tag == 'v0.5.6-beta.14-candidate.3' &&
+      inputs.publish_release == false
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      TOOLS_TEST_CLASS: com.vortx.android.ui.profilepicker.ProfilePickerToolsHostTest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Bind fixture tests to the exact candidate source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^{commit})" = "$GITHUB_SHA"
+          mkdir "$RUNNER_TEMP/tools-empty-engine"
+          test ! -e "$RUNNER_TEMP/tools-empty-engine/Cargo.toml"
+          echo "VORTX_ENGINE_CORE_DIR=$RUNNER_TEMP/tools-empty-engine" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          packages: "platform-tools platforms;android-37.0 build-tools;36.0.0 cmake;4.1.2"
+
+      - name: Set up Gradle without shared build caches
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-disabled: true
+
+      - name: Prepare the Android fixture emulator
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          sdkmanager --install "emulator" "system-images;android-35;google_apis;x86_64" "ndk;30.0.16248370"
+          test -c /dev/kvm
+          sudo chmod a+rw /dev/kvm
+          printf 'no\n' | avdmanager create avd -n vortx-tools -k "system-images;android-35;google_apis;x86_64"
+
+      - name: Run the recovery tools instrumentation suite
+        timeout-minutes: 22
+        working-directory: android
+        env:
+          ANDROID_SERIAL: emulator-5554
+        run: |
+          set -euo pipefail
+          test ! -e app/build/outputs/androidTest-results/connected
+          "$ANDROID_HOME/emulator/emulator" -avd vortx-tools -port 5554 -accel on -gpu swiftshader \
+            -no-window -no-audio -no-boot-anim -no-snapshot > "$RUNNER_TEMP/tools-emulator.log" 2>&1 &
+          emulator_pid=$!
+          trap 'timeout 10s adb emu kill >/dev/null 2>&1 || kill "$emulator_pid" 2>/dev/null || true' EXIT
+          if ! timeout 240s bash -c '
+            adb wait-for-device
+            until [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" = 1 ]; do sleep 2; done
+          '; then
+            tail -n 40 "$RUNNER_TEMP/tools-emulator.log"
+            exit 1
+          fi
+          test "$(adb shell getprop ro.build.version.sdk | tr -d '\r')" = 35
+          test "$(adb shell getprop ro.product.cpu.abi | tr -d '\r')" = x86_64
+          adb shell input keyevent 82
+          # The fixture app uses synthetic accounts. Keep its normal startup clients offline.
+          adb shell cmd connectivity airplane-mode enable
+          adb shell svc wifi disable
+          adb shell svc data disable
+          ./gradlew :app:connectedPlayDebugAndroidTest --no-daemon --max-workers=1 \
+            --no-build-cache "-Pandroid.testInstrumentationRunnerArguments.class=$TOOLS_TEST_CLASS"
+
+      - name: Verify the full recovery tools test roster passed
+        working-directory: android
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PYTEST'
+          import hashlib
+          import json
+          import os
+          import re
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          suite = os.environ["TOOLS_TEST_CLASS"]
+          source = (Path("app/src/androidTest/kotlin") / (suite.replace(".", "/") + ".kt")).read_bytes()
+          expected = set(re.findall(rb"^[ \t]*@Test\s+fun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", source, re.M))
+          if not expected or len(expected) != len(re.findall(rb"^[ \t]*@Test\b", source, re.M)):
+              raise SystemExit("Cannot determine the recovery tools test roster")
+          reports = sorted(Path("app/build/outputs/androidTest-results/connected").rglob("TEST-*.xml"))
+          names = []
+          digests = []
+          for report in reports:
+              if report.is_symlink() or not 0 < report.stat().st_size <= 4 * 1024 * 1024:
+                  raise SystemExit("Invalid recovery tools report")
+              data = report.read_bytes()
+              root = ET.fromstring(data)
+              cases = root.findall(".//testcase")
+              if (root.tag != "testsuite" or root.get("tests") != str(len(cases))
+                  or any(root.get(key, "0") != "0" for key in ("skipped", "failures", "errors"))
+                  or any(case.get("classname") != suite or not case.get("name") or any(
+                      case.find(key) is not None for key in ("skipped", "failure", "error")) for case in cases)):
+                  raise SystemExit("Unexpected, failed or skipped recovery tools test")
+              names.extend(case.get("name").encode() for case in cases)
+              digests.append(hashlib.sha256(data).hexdigest())
+          if set(names) != expected or len(names) != len(expected):
+              raise SystemExit("Recovery tools did not execute the exact test roster")
+          proof = Path(os.environ["RUNNER_TEMP"]) / "tools-instrumentation-proof.json"
+          proof.write_text(json.dumps({
+              "schema": 1, "appSource": os.environ["GITHUB_SHA"], "ref": os.environ["GITHUB_REF"],
+              "run": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "emulator": "API 35 Google APIs x86_64", "suite": suite,
+              "passed": len(names), "tests": sorted(name.decode() for name in names),
+              "testSourceSha256": hashlib.sha256(source).hexdigest(), "reportSha256": digests,
+          }, sort_keys=True, indent=2) + "\n")
+          print(f"Verified {len(names)} Android recovery tools tests on the emulator")
+          PYTEST
+
+      - name: Retain the bounded instrumentation proof
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: VortX-Android-tools-instrumentation
+          path: ${{ runner.temp }}/tools-instrumentation-proof.json
+          if-no-files-found: error
+          retention-days: 30

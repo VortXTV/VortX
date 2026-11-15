@@ -1300,7 +1300,29 @@ class NativeAccountSyncTest {
             val checkpointKey = javax.crypto.KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
             val checkpoints = VortxEncryptedCheckpointStore(directory) { checkpointKey }
             val context = TestContext(); val manager = VortXSyncManager(context)
-            val runtime = NativeAccountCoordinator(bindings(), checkpoints, { noNetwork() }, { true }, { it() }, {},
+            val manifestUrl = "https://fixture.invalid/manifest.json"
+            var manifestRequests = 0
+            val resource = object : VortxResourceTransport {
+                override fun makeCancellation() = object : VortxResourceCancellation {
+                    override fun cancel() {}
+                    override fun close() {}
+                }
+
+                override fun load(requestJson: String, cancellation: VortxResourceCancellation): String {
+                    val input = JSONObject(requestJson)
+                    val request = input.getJSONObject("request")
+                    val addon = input.getJSONArray("addons").getJSONObject(0)
+                    assertEquals("manifest", request.getString("resource"))
+                    assertEquals(manifestUrl, addon.getString("transportUrl"))
+                    manifestRequests++
+                    val manifest = JSONObject("""{"id":"fixture.addon","name":"Fixture","version":"1.0.0","types":["movie"],"resources":["stream"],"catalogs":[]}""")
+                    val group = JSONObject().put("addonId", addon.getString("id")).put("status", "ready").put("content", manifest)
+                    return JSONObject().put("kind", "resource_result").put("requestId", input.getString("requestId"))
+                        .put("generation", input.getLong("generation")).put("request", request).put("cancelled", false)
+                        .put("groups", org.json.JSONArray().put(group)).toString()
+                }
+            }
+            val runtime = NativeAccountCoordinator(bindings(), checkpoints, { resource }, { true }, { it() }, {},
                 captureOwnAccountAdmission = { originalTestAdmission(manager, it) })
             var cloud: JSONObject? = null; var cloudVersion = 0L; val versions = mutableListOf<Long>(); var gets = 0
             try {
@@ -1350,6 +1372,12 @@ class NativeAccountSyncTest {
                 assertEquals(if (peerWon) "00000000-0000-0000-0000-000000001234" else UserProfile.OWNER_ID, runtime.session().scope.ownerProfileID)
                 if (!peerWon) assertEquals("authenticated-empty-v1", cloud!!.getString("nativeAccountBootstrap"))
                 assertTrue(context.getSharedPreferences("vortx_sync_state", 0).getBoolean("nativeBackupSeen.${account.id}", false))
+                if (mode == "accepted") {
+                    val repository = com.vortx.android.engine.NativeCatalogRepository { runtime.session() }
+                    repository.installAddon(manifestUrl).getOrThrow()
+                    assertEquals(1, manifestRequests)
+                    assertTrue(runtime.session().read().state.toString().contains(manifestUrl))
+                }
                 val before = runtime.session().read().state.toString(); val writes = versions.size
                 cloud = null // A previously existing backup disappearing is not a new account.
                 assertFalse(manager.syncDown(true)); assertFalse(manager.syncUp())

@@ -151,7 +151,8 @@ fun TvApp(
         val showFileRecoveryEntry = !dismissedFileRecoveryEntry && !showPicker &&
             pickerToolsModel.controller.restoreAvailable && sessionUiState == VortXSyncManager.SessionUiState.SignedOut
         LaunchedEffect(syncManager, sessionUiState) {
-            if (sessionUiState is VortXSyncManager.SessionUiState.SignedIn) dismissedFileRecoveryEntry = true
+            // The landing is hidden while signed in. Offer it again after a confirmed sign-out.
+            if (sessionUiState is VortXSyncManager.SessionUiState.SignedIn) dismissedFileRecoveryEntry = false
         }
         val restoreStatusOwner by pickerToolsModel.restoreStatusOwner.collectAsStateWithLifecycle()
         restoreStatusOwner?.let { original ->
@@ -193,12 +194,13 @@ fun TvApp(
                     recoveryPaused = pickerFileRecoveryPaused,
                     recoveryLanding = pickerFileRecoveryPaused || showFileRecoveryEntry,
                     openRecoverySignIn = pickerAccountModel?.let { it::openPickerFileRecoverySignIn },
-                    resumeRecoverySync = syncManager?.let { it::resumePickerFileRecovery }) {
+                    resumeRecoverySync = syncManager?.let { it::resumePickerFileRecovery },
+                    entryInPicker = pickerFileRecoveryPaused || showFileRecoveryEntry || pickerUnavailable || pickerRoster == null) { toolsEntry ->
                     if (pickerFileRecoveryPaused || showFileRecoveryEntry) {
-                        PickerFileRecoveryLanding(isTv = true, accountControl = control,
+                        PickerFileRecoveryLanding(isTv = true, accountControl = control, toolsEntry = toolsEntry,
                             onContinue = if (pickerFileRecoveryPaused) null else ({ dismissedFileRecoveryEntry = true }))
                     } else if (pickerUnavailable || pickerRoster == null) {
-                        PickerProfilesUnavailable(isTv = true, accountControl = control)
+                        PickerProfilesUnavailable(isTv = true, accountControl = control, toolsEntry = toolsEntry)
                     } else TvWhosWatching(pickerRoster, onDone = { manualPicker = false },
                         onSelected = { profileSelection = it }, accountControl = control)
                 }

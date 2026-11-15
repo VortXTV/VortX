@@ -600,7 +600,8 @@ fun VortXApp(
         val showFileRecoveryEntry = !dismissedFileRecoveryEntry && !showWhosWatching &&
             pickerToolsModel.controller.restoreAvailable && vortxSessionUi == VortXSyncManager.SessionUiState.SignedOut
         LaunchedEffect(syncManager, vortxSessionUi) {
-            if (vortxSessionUi is VortXSyncManager.SessionUiState.SignedIn) dismissedFileRecoveryEntry = true
+            // The landing is hidden while signed in. Offer it again after a confirmed sign-out.
+            if (vortxSessionUi is VortXSyncManager.SessionUiState.SignedIn) dismissedFileRecoveryEntry = false
         }
         val restoreStatusOwner by pickerToolsModel.restoreStatusOwner.collectAsStateWithLifecycle()
         restoreStatusOwner?.let { original ->
@@ -645,12 +646,13 @@ fun VortXApp(
                     recoveryPaused = pickerFileRecoveryPaused,
                     recoveryLanding = pickerFileRecoveryPaused || showFileRecoveryEntry,
                     openRecoverySignIn = pickerAccountModel?.let { it::openPickerFileRecoverySignIn },
-                    resumeRecoverySync = syncManager?.let { it::resumePickerFileRecovery }) {
+                    resumeRecoverySync = syncManager?.let { it::resumePickerFileRecovery },
+                    entryInPicker = pickerFileRecoveryPaused || showFileRecoveryEntry || pickerUnavailable || pickerRoster == null) { toolsEntry ->
                     if (pickerFileRecoveryPaused || showFileRecoveryEntry) {
-                        PickerFileRecoveryLanding(isTv = false, accountControl = control,
+                        PickerFileRecoveryLanding(isTv = false, accountControl = control, toolsEntry = toolsEntry,
                             onContinue = if (pickerFileRecoveryPaused) null else ({ dismissedFileRecoveryEntry = true }))
                     } else if (pickerUnavailable || pickerRoster == null) {
-                        PickerProfilesUnavailable(isTv = false, accountControl = control)
+                        PickerProfilesUnavailable(isTv = false, accountControl = control, toolsEntry = toolsEntry)
                     } else WhosWatchingScreen(pickerRoster, onDone = { showWhosWatching = false }, onSelected = {
                         profileSelection = ProfileSelectionPresentation(it,
                             if (showProfiles) ProfileSelectionOrigin.PROFILE_MANAGEMENT else ProfileSelectionOrigin.PICKER)

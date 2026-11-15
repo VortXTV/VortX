@@ -63,7 +63,11 @@ internal fun pickerRestoreStatusEntryAction(
     }
 }
 
-class ProfilePickerAccountControl(val label: String, val onClick: () -> Unit)
+class ProfilePickerAccountControl(
+    val label: String,
+    val onCheckAccount: (() -> Unit)? = null,
+    val onClick: () -> Unit,
+)
 
 /** No roster/failure fallback grants pre-profile diagnostic access. Staging re-reads this policy. */
 internal fun pickerDiagnosticExportAllowed(profiles: List<UserProfile>?): Boolean =
@@ -133,7 +137,8 @@ internal fun ProfilePickerAccountHost(
         Box(Modifier.fillMaxSize()) { key(pickerGeneration) {
             picker(ProfilePickerAccountControl(
                 if (state is VortXSyncManager.SessionUiState.SignedIn) "Sign out" else if (state == VortXSyncManager.SessionUiState.SignedOut) "Sign in" else "Account",
-                ::requestAccount))
+                onCheckAccount = if (state is VortXSyncManager.SessionUiState.SignedIn) model::openPickerPresentation else null,
+                onClick = ::requestAccount))
         } }
     }
     status?.let { message -> AlertDialog(onDismissRequest = { status = null }, title = { Text("Account") },

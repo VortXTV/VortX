@@ -356,7 +356,7 @@ class VortXSessionOwnerTransitionContractTest {
         assertTrue(reconcile.contains("accountHasSyncData(lease)"))
         assertTrue(reconcile.contains("syncUp(lease)"))
         assertTrue(source.contains("suspend fun mergeBoth(): Boolean = mergeBoth(captureSyncLease()?.takeUnless(::interactiveDecisionPending))"))
-        assertTrue(mergeBoth.contains("resolveInteractiveReconcile(owner) { mergeBoth(it) }"))
+        assertTrue(mergeBoth.contains("resolveInteractiveReconcile(owner, retryAfterQueuedUpload = true) { mergeBoth(it, allowQueuedUpload = true) }"))
         assertTrue(mergeBoth.contains("val lease = captured ?: return false"))
         assertTrue(mergeBoth.contains("syncDown(lease, force = true)"))
         assertTrue(mergeBoth.contains("syncUp(lease)"))

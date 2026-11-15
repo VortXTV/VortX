@@ -1133,6 +1133,9 @@ internal class NativeAccountCoordinator(
         val raw = checkNotNull(checkpoints.readRetained(scope))
         val typed = if (NativeOwnerHistorySessionAdapter.isEnvelope(raw))
             NativeOwnerHistoryCoordinator.decodeEnvelope(raw.toByteArray(Charsets.UTF_8), scope) else null
+        // Let the next authenticated typed pull repair this known cold checkpoint defect.
+        // Other local failures keep the normal fail-closed restore path.
+        if (typed != null && NativeOwnerHistoryCoordinator.isMissingColdOwnerLibrary(typed)) return false
         val state = if (typed == null) scope.validateSnapshot(raw) else null
         val ownerName = if (typed != null) {
             val retained = OHJson.Obj(typed.snapshot)
@@ -1411,8 +1414,23 @@ internal class NativeAccountCoordinator(
         try {
             candidate = if (stored.plaintext != null) {
                 if (NativeOwnerHistorySessionAdapter.isEnvelope(stored.plaintext)) {
-                    VortxNativeSession.openOwnerHistory(scope,
-                        NativeOwnerHistoryCoordinator.decodeEnvelope(stored.plaintext.toByteArray(Charsets.UTF_8), scope), stored,
+                    var checkpoint = NativeOwnerHistoryCoordinator.decodeEnvelope(stored.plaintext.toByteArray(Charsets.UTF_8), scope)
+                    var originalRead = stored
+                    if (NativeOwnerHistoryCoordinator.isMissingColdOwnerLibrary(checkpoint)) {
+                        val source = requireNotNull(captured) { "Authenticated cold checkpoint repair source required" }
+                        val repairAuthority = ownerHistoryAuthority(account) { active() && source.isCurrentFor(account) }
+                        checkpoint = NativeOwnerHistoryCoordinator.repairColdOwnerLibrary(checkpoint, exact, historyBindings,
+                            repairAuthority) { NativeOwnerHistorySessionAdapter.projection(scope, it) }
+                        originalRead = repairAuthority.withActive {
+                            var committed: NativeCheckpointRead? = null
+                            check(source.withCurrentFor(account) {
+                                committed = checkpoints.compareAndCommitCheckpoint(scope, stored, OHJson.utf8(checkpoint.envelope()))
+                                true
+                            }) { "Cold checkpoint repair source retired" }
+                            checkNotNull(committed)
+                        }
+                    }
+                    VortxNativeSession.openOwnerHistory(scope, checkpoint, originalRead,
                         bindings, historyBindings, checkpoints, resources, mountedAuthority, { onMutation(account) }, onAuthorityChanged,
                         { onProgressMutation(account) }, mountedCurrent, original)
                 } else VortxNativeSession.openForOwnerHistoryTransfer(scope, stored, bindings, checkpoints, resources,

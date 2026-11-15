@@ -762,6 +762,11 @@ internal class DurablePendingSyncState(
         }
     }
 
+    fun queuedUpload(expectedOwner: PendingSyncOwner): Job? = synchronized(lock) {
+        if (owner == expectedOwner && truthByAccount[expectedOwner.accountId] == PendingMarkerTruth.DIRTY_CONFIRMED)
+            attempt?.job?.takeIf { it.isActive } else null
+    }
+
     fun owns(
         expectedAttempt: PendingSyncAttempt,
         job: Job,
@@ -3652,6 +3657,13 @@ class VortXSyncManager internal constructor(
     ): Boolean {
         if (gateway !== nativeGateway || !publicationCurrent()) return false
         val account = SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch)
+        val recovering = gateway.currentMountToken(account) == null
+        fun restoreFailed(stage: String): Boolean {
+            if (recovering && isSyncLeaseCurrent(lease) && publicationCurrent()) {
+                DiagnosticsLog.log("native-account", "restore result=failed stage=$stage")
+            }
+            return false
+        }
         if (force) nativeReceiveReceipt = null
         val conditionalVersion = if (routineReceive && !force) conditionalReceiveVersion(lease, gateway) else null
         // Local availability is independent of network availability. The lease came from verified
@@ -3659,10 +3671,10 @@ class VortXSyncManager internal constructor(
         // the unscoped device roster. Failed/corrupt recovery is not permission to create an account.
         val reopened = try { conditionalVersion != null || gateway.reopenCheckpoint(account) { isSyncLeaseCurrent(lease) && publicationCurrent() } }
         catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
-        catch (_: Exception) { return false }
+        catch (_: Exception) { return restoreFailed("checkpoint_open") }
         if (!publicationCurrent()) return false
         if (conditionalVersion == null && reopened &&
-            !applyNativeHostSettings(lease, gateway.exportDocument(account), publicationCurrent)) return false
+            !applyNativeHostSettings(lease, gateway.exportDocument(account), publicationCurrent)) return restoreFailed("local_apply")
         // The secure journal is authoritative even if the process died before the ordinary
         // debounce marker was written. Re-arm its exact account before permitting a pull.
         if (com.vortx.android.integrations.NativeProviderAccess.hasPending(account) == true) armPendingSync(lease, recordEdit = true)
@@ -3681,15 +3693,16 @@ class VortXSyncManager internal constructor(
         }
         nativeReceiveReceipt = null
         if (pulled is SyncDocPull.Empty) {
-            return nativeSyncUp(lease, gateway, publicationCurrent)
+            val seeded = nativeSyncUp(lease, gateway, publicationCurrent)
+            return seeded || restoreFailed("account_create")
         }
-        val originalPull = pulled as? SyncDocPull.Doc ?: return false
+        val originalPull = pulled as? SyncDocPull.Doc ?: return restoreFailed("backup_read")
         if (!isSyncLeaseCurrent(lease) || !publicationCurrent()) return false
         if (retryPendingPushBeforePull(lease)) return false
         val pull = when {
             reopened -> originalPull
-            websiteOrigin == null -> originalPull.takeIf { permitsPreviouslyAttemptedWebsiteReadback(lease, it) } ?: return false
-            else -> pullAfterWebsiteRosterAdmission(lease, account, gateway, websiteOrigin, originalPull) ?: return false
+            websiteOrigin == null -> originalPull.takeIf { permitsPreviouslyAttemptedWebsiteReadback(lease, it) } ?: return restoreFailed("backup_admission")
+            else -> pullAfterWebsiteRosterAdmission(lease, account, gateway, websiteOrigin, originalPull) ?: return restoreFailed("backup_admission")
         }
         if (pull !== originalPull && retryPendingPushBeforePull(lease)) return false
         // A confirmed mounted checkpoint already contains this acknowledged revision. Replaying
@@ -3710,16 +3723,19 @@ class VortXSyncManager internal constructor(
             catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
             catch (_: Exception) { false }
             finally { capturedRead.retire() }
-        if (!applied) return false
+        if (!applied) return restoreFailed("account_apply")
         val appliedMount = gateway.currentMountToken(account)
         if (initialMount != null && appliedMount?.installation !== initialMount.installation) return false
-        val exported = gateway.exportDocument(account) ?: return false
-        if (!applyNativeHostSettings(lease, exported, publicationCurrent)) return false
+        val exported = gateway.exportDocument(account) ?: return restoreFailed("local_apply")
+        if (!applyNativeHostSettings(lease, exported, publicationCurrent)) return restoreFailed("local_apply")
         if (appliedMount != null && gateway.currentMountToken(account) != appliedMount) return false
         // The same atomic secure record backs provider reads and register intent. No deferred
         // credential application can replay an older pull over a newer local edit after suspension.
-        val providers = mergeNativeProviders(lease, account, pull.doc, publicationCurrent) ?: return false
-        if (!advanceVersion(lease, pull.version, publicationCurrent)) return false
+        val providers = mergeNativeProviders(lease, account, pull.doc, publicationCurrent) ?: return restoreFailed("local_apply")
+        if (!advanceVersion(lease, pull.version, publicationCurrent)) return restoreFailed("local_apply")
+        if (recovering && isSyncLeaseCurrent(lease) && publicationCurrent()) {
+            DiagnosticsLog.log("native-account", "restore result=ready stage=account_apply")
+        }
         // A higher envelope revision from an old client can carry an older causal document. The
         // authenticated native join retains our facts; publish only if that joined wire carrier
         // actually contributes facts missing from the server (never a projection or wall clock).
@@ -4735,6 +4751,7 @@ class VortXSyncManager internal constructor(
     }
     private suspend fun resolveInteractiveReconcile(
         owner: PickerAccountSnapshot,
+        retryAfterQueuedUpload: Boolean = false,
         action: suspend (SyncSessionLease) -> Boolean,
     ): Boolean {
         val lease = operations.snapshot {
@@ -4748,7 +4765,17 @@ class VortXSyncManager internal constructor(
         } ?: return false
         var settled = false
         try {
-            settled = action(lease) && isSyncLeaseCurrent(lease)
+            var completed = action(lease)
+            if (!completed && retryAfterQueuedUpload && isSyncLeaseCurrent(lease)) {
+                // A durable local edit must upload before a forced pull can proceed. Wait for
+                // the existing worker outside the sync mutex, then retry using the original lease.
+                val queued = pendingState.queuedUpload(pendingOwner(lease))
+                if (queued != null && withTimeoutOrNull(TIMEOUT_MS.toLong()) { queued.join(); true } == true &&
+                    isSyncLeaseCurrent(lease)) {
+                    completed = action(lease)
+                }
+            }
+            settled = completed && isSyncLeaseCurrent(lease)
             return settled
         } finally {
             operations.snapshot {
@@ -4794,7 +4821,7 @@ class VortXSyncManager internal constructor(
     /** Conflict resolution: adopt the account's roster (forced). Still UNIONs, so no local-only profile is lost. */
     suspend fun useAccountData(): Boolean = useAccountData(captureSyncLease()?.takeUnless(::interactiveDecisionPending))
     internal suspend fun useAccountData(owner: PickerAccountSnapshot): Boolean =
-        resolveInteractiveReconcile(owner) { useAccountData(it) }
+        resolveInteractiveReconcile(owner, retryAfterQueuedUpload = true) { useAccountData(it) }
     private suspend fun useAccountData(captured: SyncSessionLease?): Boolean {
         val lease = captured ?: return false
         val received = syncDown(lease, force = true)
@@ -4845,8 +4872,8 @@ class VortXSyncManager internal constructor(
     /** "Sync now" recommended path: union both ways so EVERY profile from both sides survives, then push. */
     suspend fun mergeBoth(): Boolean = mergeBoth(captureSyncLease()?.takeUnless(::interactiveDecisionPending))
     internal suspend fun mergeBoth(owner: PickerAccountSnapshot): Boolean =
-        resolveInteractiveReconcile(owner) { mergeBoth(it) }
-    private suspend fun mergeBoth(captured: SyncSessionLease?): Boolean {
+        resolveInteractiveReconcile(owner, retryAfterQueuedUpload = true) { mergeBoth(it, allowQueuedUpload = true) }
+    private suspend fun mergeBoth(captured: SyncSessionLease?, allowQueuedUpload: Boolean = false): Boolean {
         val lease = captured ?: return false
         if (retryPendingPushBeforePull(lease)) return false
         val received = syncDown(lease, force = true)
@@ -4854,7 +4881,11 @@ class VortXSyncManager internal constructor(
         // account restore.
         if (!received) return false
         if (!isSyncLeaseCurrent(lease)) return false
-        if (retryPendingPushBeforePull(lease)) return false
+        // The joined checkpoint is already installed. A receive that arms a durable upload
+        // has completed the first backup decision; the pending worker owns delivery.
+        if (retryPendingPushBeforePull(lease)) {
+            return allowQueuedUpload && pendingState.queuedUpload(pendingOwner(lease)) != null && isSyncLeaseCurrent(lease)
+        }
         val pushed = syncUp(lease)
         return pushed && isSyncLeaseCurrent(lease)
     }

@@ -86,14 +86,55 @@ object DiagnosticsLog {
     fun hasContent(): Boolean = snapshot().let { (probe, always) -> probe.isNotBlank() || always.isNotBlank() }
 
     /**
-     * Flush queued writes and stage one scrubbed export file, replacing any earlier staged copy. Never the raw
-     * logs: only this copy sits under [EXPORT_DIR], the one place the FileProvider can share from.
+     * Flush queued writes and stage a fresh scrubbed file. Never write to a previously granted URI.
      */
-    fun stageExport(context: Context): File {
+    fun stageExport(context: Context): File = stageExport(context, exportBody())
+
+    /** Before a profile opens, export only fixed account-recovery events and device/build details. */
+    internal fun stageAccountRecoveryExport(context: Context): File =
+        stageExport(context, accountRecoveryExportBody(header(), snapshot().second))
+
+    private fun stageExport(context: Context, body: String): File {
         val dir = File(context.applicationContext.cacheDir, EXPORT_DIR).apply { mkdirs() }
-        dir.listFiles()?.forEach { it.delete() }
-        val name = "VortX-diagnostics-" + SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date()) + ".txt"
-        return File(dir, name).apply { writeText(exportBody()) }
+        val cutoff = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(1)
+        dir.listFiles()?.filter { it.lastModified() < cutoff }?.forEach { it.delete() }
+        return File.createTempFile("VortX-diagnostics-", ".txt", dir).apply { writeText(body) }
+    }
+
+    internal fun accountRecoveryExportBody(header: String, alwaysOnContents: String): String = buildString {
+        append("Account recovery diagnostics\n").append(header).append('\n')
+        // Map known events back to constants. Never copy line arguments, message text or timestamps
+        // from retained logs into this limited export, even when those logs were already scrubbed.
+        val events = alwaysOnContents.lineSequence().mapNotNull { line ->
+            val event = line.substringAfter(" [", "")
+            when {
+                event.startsWith("native-profiles] restore result=failed stage=legacy_preparation ") ->
+                    "Legacy profile restore failed during preparation"
+                event.startsWith("native-profiles] prepare result=ready ") ->
+                    "Legacy profile restore preparation completed"
+                event == "native-account] sync result=failed reason=native_linkage_unavailable" ->
+                    "The native account engine could not be loaded"
+                event == "native-account] restore result=failed stage=checkpoint_open" ->
+                    "The local account checkpoint could not be opened"
+                event == "native-account] restore result=failed stage=backup_read" ->
+                    "The encrypted account backup could not be read"
+                event == "native-account] restore result=failed stage=account_apply" ->
+                    "The encrypted account backup could not be applied"
+                event == "native-account] restore result=failed stage=local_apply" ->
+                    "Account data could not open on this device"
+                event == "native-account] restore result=ready stage=account_apply" ->
+                    "Account restore completed"
+                event == "sync] upload result=accepted" -> "Backup upload accepted"
+                event == "sync] upload result=failed" -> "Backup upload failed"
+                event == "sync] realtime result=unavailable stage=start reason=setup_failed" ->
+                    "Live sync setup failed"
+                event == "sync] realtime result=degraded stage=connect reason=socket_start_failed" ->
+                    "Live sync connection failed"
+                else -> null
+            }
+        }.toList().takeLast(40)
+        if (events.isEmpty()) append("No account recovery events were recorded.\n")
+        else events.forEach { append(it).append('\n') }
     }
 
     /** The complete export: a device header, the probe log, then the distinct always-on tail, all re-scrubbed. */

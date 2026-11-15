@@ -83,6 +83,7 @@ fun VortXAccountScreen(viewModel: VortXAccountViewModel, onBack: () -> Unit, mod
             VortXAccountContent(viewModel, onSignOutRequest = onSignOutRequest)
             diagnosticAdmission?.let { admission ->
                 if (admission()) DiagnosticLogAction(mayShare = admission)
+                else DiagnosticLogAction(recoveryOnly = true)
             }
         }
     }

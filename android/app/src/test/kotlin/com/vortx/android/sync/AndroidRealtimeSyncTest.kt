@@ -194,25 +194,27 @@ class AndroidRealtimeSyncTest {
         init {
             manager.installSyncTestSeam(VortXSyncManager.Session("fixture-a", account, key), 10, transport = { method, _, body, token ->
                 tokens += token
-                if (method == "GET") {
-                    gets++; getGate?.await()
-                    if (getFails) 500 to null else 200 to JSONObject().put("version", version).put("document",
-                        VortXCrypto.sealDocument(key, cloud.toString().toByteArray(), account.id, version, true))
-                } else {
-                    puts++; beforePut?.invoke()
-                    if (putFails) 500 to null else {
-                        val sent = requireNotNull(body)
-                        version = sent.getLong("version")
-                        cloud = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key, sent.getString("document"), account.id, version))))
-                        200 to JSONObject().put("accepted", true)
-                    }
-                }
+                backupRequest(method, body)
             })
             manager.installSessionRestoreTestSeam(manager.currentSession())
             manager.installNativeGatewayTestSeam(gateway, providers)
             manager.installRealtimeTestSeam(realtime)
             manager.uploadClockMs = { scheduler.currentTime }
         }
+        suspend fun backupRequest(method: String, body: JSONObject?): Pair<Int, JSONObject?> =
+            if (method == "GET") {
+                gets++; getGate?.await()
+                if (getFails) 500 to null else 200 to JSONObject().put("version", version).put("document",
+                    VortXCrypto.sealDocument(key, cloud.toString().toByteArray(), account.id, version, true))
+            } else {
+                puts++; beforePut?.invoke()
+                if (putFails) 500 to null else {
+                    val sent = requireNotNull(body)
+                    version = sent.getLong("version")
+                    cloud = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key, sent.getString("document"), account.id, version))))
+                    200 to JSONObject().put("accepted", true)
+                }
+            }
         fun edit(name: String) {
             gateway.carrier.getJSONObject("facts").put(name, true)
             manager.onLocalNativeMutation(SessionOwnerSnapshot.Account(account.id, 1))
@@ -339,19 +341,13 @@ class AndroidRealtimeSyncTest {
             true
         }
         durable.javaClass.getDeclaredField("persist").apply { isAccessible = true }.set(durable, persist)
-        f.manager.installSyncTestSeam(requireNotNull(f.manager.currentSession()), 10, transport = { method, path, _, _ ->
+        f.manager.installSyncTestSeam(requireNotNull(f.manager.currentSession()), 10, transport = { method, path, body, _ ->
             when (path) {
                 "/v1/auth/prelogin" -> 200 to JSONObject()
                     .put("kdfSalt", VortXCrypto.b64(salt)).put("kdfIters", VortXCrypto.MIN_ITERS)
                 "/v1/auth/login" -> 200 to JSONObject().put("token", "fixture-b").put("wrappedKeyPassword", wrapped)
                     .put("account", JSONObject().put("id", account.id).put("email", account.email).put("username", account.username))
-                "/v1/backup" -> {
-                    assertEquals("GET", method)
-                    f.gets++
-                    f.getGate?.await()
-                    200 to JSONObject().put("version", f.version).put("document",
-                        VortXCrypto.sealDocument(key, f.cloud.toString().toByteArray(), account.id, f.version, true))
-                }
+                "/v1/backup" -> f.backupRequest(method, body)
                 else -> error("Unexpected account path")
             }
         })
@@ -1278,6 +1274,66 @@ class AndroidRealtimeSyncTest {
                 assertTrue(f.gateway.carrier.getJSONObject("facts").getBoolean("cloud-library"))
             } finally { reopenedModel.viewModelScope.cancel() }
         } finally { originalModel.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun `interactive merge opens the profile while the joined backup upload is queued`() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            val owner = adoptInteractiveFixture(f)
+            f.gateway.carrier.getJSONObject("facts").put("local-library", true)
+            f.cloud.getJSONObject("nativeSync").getJSONObject("facts").put("cloud-library", true)
+            assertEquals(VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA, f.manager.reconcileAfterSignIn(owner))
+            runCurrent()
+            assertTrue(model.showReconcile.value)
+
+            model.reconcileMergeBoth()
+            runCurrent()
+
+            assertFalse(model.showReconcile.value)
+            assertNull(model.syncNotice.value)
+            assertNull(f.manager.interactiveReconcileOwner.value)
+            assertEquals(1, f.gateway.applied)
+            assertTrue(f.dirty())
+            assertEquals(0, f.puts)
+
+            advanceTimeBy(2_500L)
+            runCurrent()
+            assertEquals(1, f.puts)
+            assertFalse(f.dirty())
+            val merged = f.cloud.getJSONObject("nativeSync").getJSONObject("facts")
+            assertTrue(merged.getBoolean("local-library"))
+            assertTrue(merged.getBoolean("cloud-library"))
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun `interactive restore retries after its original pending edit uploads`() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            val owner = adoptInteractiveFixture(f)
+            f.gateway.carrier.getJSONObject("facts").put("saved-local-edit", true)
+            f.manager.requestSyncSoon()
+            assertTrue(f.dirty())
+            assertEquals(VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA, f.manager.reconcileAfterSignIn(owner))
+            runCurrent()
+            assertEquals(0, f.puts)
+
+            model.reconcileUseAccount()
+            runCurrent()
+            assertTrue(model.showReconcile.value)
+            assertTrue(model.syncing.value)
+            assertEquals(0, f.puts)
+
+            advanceTimeBy(2_500L)
+            runCurrent()
+            assertFalse(model.showReconcile.value)
+            assertFalse(model.syncing.value)
+            assertNull(model.syncNotice.value)
+            assertEquals(1, f.puts)
+            assertFalse(f.dirty())
+            assertTrue(f.cloud.getJSONObject("nativeSync").getJSONObject("facts").getBoolean("saved-local-edit"))
+        } finally { model.viewModelScope.cancel(); f.close() }
     }
 
     @Test fun `failed reconcile choices remain visible and actionable until confirmed retry`() = test {

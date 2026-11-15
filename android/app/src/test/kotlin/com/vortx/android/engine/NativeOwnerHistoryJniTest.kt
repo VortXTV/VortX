@@ -1,7 +1,9 @@
 package com.vortx.android.engine
 
 import com.vortx.android.profile.UserProfile
+import com.vortx.android.sync.NativeAccountReadCapture
 import com.vortx.android.sync.NativeSettingsFence
+import com.vortx.android.sync.SessionOwnerSnapshot
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -254,6 +256,7 @@ class NativeOwnerHistoryJniTest {
                 runTest {
                     verifyNativeLegacyPreferenceRestore(accountId,
                         UserProfile(id = owner, name = "Owner", avatar = "star", isOwner = true), remote)
+                    verifyStrandedColdPeerRecovery(accountId, scope, remote, transport)
                 }
             } finally {
                 NativeSettingsFence.queuedNotificationsForTest = previousNotifications
@@ -414,6 +417,75 @@ class NativeOwnerHistoryJniTest {
             // Only this test's disposable directory is removed, never application storage.
             directory.listFiles()?.forEach { assertTrue(it.delete()) }
             assertTrue(directory.delete())
+        }
+    }
+
+    private suspend fun verifyStrandedColdPeerRecovery(accountId: String, scope: VortxAccountScope,
+        remote: NativeOwnerHistoryAccount, transport: VortxResourceTransport) {
+        val directory = java.nio.file.Files.createTempDirectory(java.io.File("build").toPath(),
+            "stranded-typed-restore-").toFile()
+        val key = javax.crypto.KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+        val store = VortxEncryptedCheckpointStore(directory) { key }
+        val account = SessionOwnerSnapshot.Account(accountId, 1L)
+        val authority = object : NativeOwnerHistoryAuthority { override fun <T> withActive(block: () -> T): T = block() }
+        val uid = NativeOwnerHistorySources.readOwnerUID(scope, requireNotNull(remote.raw(NativeOwnerHistoryAccount.ARCHIVE)))
+        val rawPreferences = OHJson.literal(NativeHostPreferences.local(scope).toString())
+        val prepared = NativeOwnerHistoryCoordinator.prepareColdPeer(scope,
+            NativeOwnerHistoryCoordinator.Target(scope.ownerProfileID, uid), remote, rawPreferences,
+            NativeOwnerHistoryJniBindings, authority, { NativeOwnerHistoryAccount(it).validateBudget(true) },
+            { NativeOwnerHistorySessionAdapter.projection(scope, it) })
+        val oldSnapshot = OHJson.Obj(prepared.snapshot)
+        val oldLibraries = oldSnapshot.obj("libraries")
+        val ownerLibrary = oldLibraries.raw(scope.ownerProfileID)
+        oldLibraries.remove(scope.ownerProfileID)
+        oldSnapshot.set("libraries", oldLibraries.encoded())
+        val stranded = NativeOwnerHistoryCoordinator.Checkpoint(scope, oldSnapshot.encoded(),
+            prepared.hostPreferences, prepared.localArchive, prepared.accountBase, uid)
+        val strandedPlaintext = OHJson.utf8(stranded.envelope())
+        var repairs = 0
+        val trackingStore = object : VortxCheckpointStore by store {
+            override fun compareAndCommitCheckpoint(scope: VortxAccountScope, expected: NativeCheckpointRead,
+                snapshot: String): NativeCheckpointRead {
+                if (expected.plaintext == strandedPlaintext) {
+                    val next = NativeOwnerHistoryCoordinator.decodeEnvelope(snapshot.toByteArray(Charsets.UTF_8), scope)
+                    assertArrayEquals(stranded.accountBase, next.accountBase)
+                    assertArrayEquals(stranded.hostPreferences, next.hostPreferences)
+                    assertArrayEquals(stranded.localArchive, next.localArchive)
+                    assertEquals(stranded.readOwnerUID, next.readOwnerUID)
+                    val nextState = OHJson.Obj(next.snapshot)
+                    val nextLibraries = nextState.obj("libraries")
+                    assertArrayEquals(ownerLibrary, nextLibraries.raw(scope.ownerProfileID))
+                    nextLibraries.remove(scope.ownerProfileID)
+                    assertArrayEquals(stranded.snapshot, nextState.set("libraries", nextLibraries.encoded()).encoded())
+                    repairs++
+                }
+                return store.compareAndCommitCheckpoint(scope, expected, snapshot)
+            }
+        }
+        val coordinator = NativeAccountCoordinator(VortxJniBindings, trackingStore, { transport },
+            accountCurrent = { it == account }, dispose = { it() }, project = {},
+            captureOwnAccountAdmission = { captured -> { action -> captured == account && action() } })
+        try {
+            store.compareAndCommitCheckpoint(scope, store.captureCheckpoint(scope), strandedPlaintext)
+            assertNull(store.discover(scope.accountID)) // The old Beta 14 path had not published a locator.
+            assertFalse(coordinator.reopenCheckpoint(account) { true })
+            assertTrue(runCatching { coordinator.applyRawDocument(account, remote.encoded()) { true } }.isFailure)
+            assertEquals(strandedPlaintext, store.captureCheckpoint(scope).plaintext)
+            assertEquals(0, repairs)
+
+            val read = NativeAccountReadCapture.fromAuthenticatedPull(account, 0L, account.id, account.generation,
+                100L, remote.encoded())
+            assertTrue(coordinator.applyRawDocument(account, read) { true })
+            assertEquals(1, repairs)
+            assertEquals(scope, store.discover(scope.accountID))
+            assertEquals(scope.ownerProfileID, coordinator.session().read().owner.profileID)
+            assertArrayEquals(remote.raw("future"), NativeOwnerHistoryAccount(requireNotNull(coordinator.session().rawAccount())).raw("future"))
+            coordinator.retire()
+            assertTrue(coordinator.reopenCheckpoint(account) { true })
+            assertEquals(scope.ownerProfileID, coordinator.session().read().owner.profileID)
+        } finally {
+            coordinator.retire()
+            assertTrue(directory.deleteRecursively())
         }
     }
 }
