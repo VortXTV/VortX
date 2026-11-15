@@ -625,8 +625,8 @@ class NativeBeta14Contract(NativeBeta12Contract):
 
 class NativeBeta15Contract(NativeBeta12Contract):
     tag = "v0.5.6-beta.15"
-    candidate = "v0.5.6-beta.15-candidate.2"
-    build = "297"
+    candidate = "v0.5.6-beta.15-candidate.3"
+    build = "298"
     preflight_mode = "beta15-candidate-preflight"
 
     def test_exact_frozen_project_build(self):
@@ -636,13 +636,10 @@ class NativeBeta15Contract(NativeBeta12Contract):
         self.assertEqual(MODULE.source_versions(project, gradle, "0.5.6", self.tag), self.build)
 
     def test_previous_beta15_candidate_cannot_supply_either_original_build(self):
-        previous = "v0.5.6-beta.15-candidate.1"
         receipt = {"schemaVersion": 1, "event": "workflow_dispatch", "ref": "refs/tags/" + self.candidate,
                    "sourceCommit": self.source, "workflowCommit": self.source, "runId": 5, "attempt": 1,
                    "inputs": MODULE.APPLE_INPUTS}
         MODULE.validate_dispatch(receipt, self.pointer, self.tag, self.source)
-        with self.assertRaisesRegex(ValueError, "original typed Apple dispatch inputs"):
-            MODULE.validate_dispatch({**receipt, "ref": "refs/tags/" + previous}, self.pointer, self.tag, self.source)
         evidence = [f"{name}: {value}" for name, value in (
             ("release tag", self.candidate), ("release tag commit", self.source), ("source commit", self.source),
             ("native engine source commit", MODULE.expected_engine(self.tag)),
@@ -651,14 +648,27 @@ class NativeBeta15Contract(NativeBeta12Contract):
             ("Android versionCode", self.build), ("Android versionName", "0.5.6"),
         )]
         MODULE.validate_android_evidence(evidence, self.pointer, self.tag, self.source, "0.5.6", self.build)
-        evidence[0] = f"release tag: {previous}"
-        with self.assertRaisesRegex(ValueError, "original Android evidence identity differs: release tag"):
-            MODULE.validate_android_evidence(evidence, self.pointer, self.tag, self.source, "0.5.6", self.build)
+        for previous, previous_build, previous_source in (("1", "296", "b" * 40), ("2", "297", "c" * 40)):
+            previous_tag = f"{self.tag}-candidate.{previous}"
+            with self.subTest(previous_tag=previous_tag):
+                for changed in ({"ref": "refs/tags/" + previous_tag},
+                                {"sourceCommit": previous_source, "workflowCommit": previous_source}):
+                    with self.assertRaisesRegex(ValueError, "original typed Apple dispatch inputs"):
+                        MODULE.validate_dispatch({**receipt, **changed}, self.pointer, self.tag, self.source)
+                for label, value in (("release tag", previous_tag), ("source commit", previous_source),
+                                     ("Android versionCode", previous_build)):
+                    changed = [f"{label}: {value}" if line.startswith(label + ": ") else line for line in evidence]
+                    with self.assertRaisesRegex(ValueError, f"original Android evidence identity differs: {label}"):
+                        MODULE.validate_android_evidence(changed, self.pointer, self.tag, self.source, "0.5.6", self.build)
+                with self.assertRaisesRegex(ValueError, "exact cross-platform build"):
+                    MODULE.source_versions(NativeBeta11Contract.project(build=previous_build),
+                                           NativeBeta11Contract.gradle(build=previous_build), "0.5.6", self.tag)
 
     def test_update_and_recovery_gates_cannot_be_skipped(self):
         for lane, gate in (("apple", "Verify protected Beta 15 artifact-only dispatch"),
                            ("apple", "Verify protected Apple legacy archive recovery"),
-                           ("apple", MODULE.BETA15_APPLE_UPDATE), ("android", MODULE.BETA13_ANDROID_BACKUP_CAS),
+                           ("apple", MODULE.BETA15_APPLE_UPDATE), ("apple", MODULE.BETA15_APPLE_TRAILER),
+                           ("android", MODULE.BETA13_ANDROID_BACKUP_CAS),
                            ("android", MODULE.BETA14_ANDROID_REGRESSIONS)):
             with self.subTest(lane=lane, gate=gate):
                 original = NativeBeta7Contract.job(self, lane, self.tag)
