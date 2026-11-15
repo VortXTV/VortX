@@ -175,13 +175,15 @@ enum Keychain {
     var dataKey: Data? = AppleSyncManagerPeer.key
     var isSignedIn = true
     private var accountReconnectFailureCapture: CredentialScopeRegistry.Capture?
+    private var backupUploadReconnectFailureCapture: CredentialScopeRegistry.Capture?
+    private var token: String? = "fixture-bearer"
     var hasAppliedAccountDoc = true
     private var settingsShadow: [String: Any] = [:]
     var nativeLegacyWatchlistPending = Set<String>()
     var nativeUnsupportedSettings: [String] = []
     var pendingAddonOrderIntent: AddonOrderIntent?
     var activeSyncUp: (id: UUID, capture: CredentialScopeRegistry.Capture)?
-    var syncUpCompletionWaiters: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
+    var syncCompletionWaiters: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
     var activeSyncDown: (id: UUID, capture: CredentialScopeRegistry.Capture)?
     var nativePreparedSeedCapture: CredentialScopeRegistry.Capture?
     var lastSyncedVersion = 0

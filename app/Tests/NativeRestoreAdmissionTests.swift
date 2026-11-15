@@ -105,6 +105,7 @@ private struct VortxAccountScope {
     var account: Int? = 1
     var isSignedIn: Bool { account != nil }
     var dataKey: Data? = Data(count: 32)
+    var token: String? = "fixture-bearer"
     private var accountReconnectFailureCapture: CredentialScopeRegistry.Capture?
     static let owner = UserProfile(id: UserProfile.ownerID, name: "Fixture", avatar: "x", isOwner: true)
     static var resolvedRoster: ProfileRosterSnapshot? = .init(profiles: [owner])
@@ -454,6 +455,12 @@ private struct VortxAccountScope {
         let absent = fresh()
         let absentProbe = await absent.accountHasSyncData()
         check(absentProbe == .empty && absent.requests == 1, "authenticated absence can seed")
+        let previouslyBackedUp = fresh()
+        check(previouslyBackedUp.rememberNativeBackup(capture: previouslyBackedUp.credentialAuthority.capture()),
+              "retained receipt records an existing revision zero")
+        let missingKnownBackup = await previouslyBackedUp.accountHasSyncData()
+        check(missingKnownBackup == .unreachable && previouslyBackedUp.seedCalls == 0,
+              "404 after a known backup is never a fresh sign-in decision")
         for status in [0, 304, 401, 500] {
             let f = fresh(); f.reply = (status, nil)
             let probe = await f.accountHasSyncData()

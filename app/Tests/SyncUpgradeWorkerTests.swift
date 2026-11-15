@@ -25,6 +25,7 @@ private enum CredentialScopeRegistry { struct Capture: Equatable { let generatio
     var nativeDurablePushPending = false
     var hasPendingPush = false
     var backupUploadFailure: SyncBackupUploadFailure?
+    private func backupUploadReconnectRequired(for capture: CredentialScopeRegistry.Capture) -> Bool { false }
     var attempts = 0
     var dataKey: Data? = Data([1])
     var upgradeDuringRead = false

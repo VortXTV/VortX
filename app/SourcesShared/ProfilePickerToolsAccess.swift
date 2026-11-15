@@ -1,17 +1,23 @@
 import Foundation
 
-/// Frozen admission for a device-wide log: a failed-profile grant survives presenting Tools,
-/// while any credential replacement revokes it, including an account ABA round trip.
+/// The original diagnostics scope survives presenting Tools. Credential replacement revokes it,
+/// including an account ABA round trip. A recovery-only grant never yields the device-wide log.
 struct ProfilePickerToolsDiagnosticGrant: Sendable {
     let allowed: Bool
     let credential: CredentialScopeRegistry.Capture
+    let recoveryOnly: Bool
     private let admission: @MainActor @Sendable () -> Bool
-    init(allowed: Bool, credential: CredentialScopeRegistry.Capture,
+    init(allowed: Bool, credential: CredentialScopeRegistry.Capture, recoveryOnly: Bool = false,
          admission: @escaping @MainActor @Sendable () -> Bool) {
-        self.allowed = allowed; self.credential = credential; self.admission = admission
+        self.allowed = allowed; self.credential = credential; self.recoveryOnly = recoveryOnly
+        self.admission = admission
     }
     @MainActor var permitsExport: Bool {
         allowed && CredentialScopeRegistry.shared.isCurrent(credential) && admission()
+    }
+    func limiting(to stillPresented: @escaping @MainActor @Sendable () -> Bool) -> Self {
+        .init(allowed: allowed, credential: credential, recoveryOnly: recoveryOnly,
+              admission: { stillPresented() && permitsExport })
     }
     enum Refusal: Error { case permissionChanged }
     func requireForExport() async throws {

@@ -386,7 +386,8 @@ enum FakeScene { case active, background }
             h.openToolsForTest()
             let route = h.toolsRoute!
             precondition(route.accountFiles.permits(route.accountFiles.owner!))
-            precondition(!route.diagnostics.permitsExport, "PIN success does not add a diagnostic exception")
+            precondition(route.diagnostics.permitsExport && route.diagnostics.recoveryOnly,
+                         "PIN success admits limited recovery diagnostics only")
             h.disappear(); h.restoreChanged(.ready)
             precondition(route.accountFiles.permits(route.accountFiles.owner!), "child cover retains original unlock")
             h.closeToolsForTest(); h.backForTest()
@@ -407,8 +408,8 @@ enum FakeScene { case active, background }
             precondition(h.pickerPresentation.permitsTools())
             assertNoProfileMutation(h) // Tools recovery does not require or run native profile preparation.
             h.openToolsForTest(); let route = h.toolsRoute!
-            precondition(route.accountFiles.permits(route.accountFiles.owner!) && route.diagnostics.permitsExport,
-                         "only the existing failure diagnostic policy applies after the PIN gate")
+            precondition(route.accountFiles.permits(route.accountFiles.owner!) && route.diagnostics.permitsExport && route.diagnostics.recoveryOnly,
+                         "restore failures admit limited recovery diagnostics after the original PIN gate")
             h.stop(); passed += 1
         }
         for absentPIN in [Optional<String>.none, .some("")] {
@@ -667,9 +668,7 @@ enum FakeScene { case active, background }
             default: preconditionFailure()
             }
             precondition(!route.accountFiles.permits(owner), change)
-            // Pending-PIN diagnostic revocation is an existing separate policy; this delta adds
-            // the original manual admission to every pre-existing diagnostic grant boundary.
-            if change != "pending-pin" { precondition(!route.diagnostics.permitsExport, change) }
+            precondition(!route.diagnostics.permitsExport, change)
             h.stop(); passed += 1
         }
         do {
@@ -687,14 +686,14 @@ enum FakeScene { case active, background }
         do {
             let (h, _, _) = fixture(pin: "synthetic-pin")
             h.recoverAccount()
-            precondition(h.accountHelpNeeded && !h.accountHelpAllowsDiagnostics)
+            precondition(h.accountHelpNeeded && h.accountHelpAllowsDiagnostics)
             precondition(h.accountHelpDiagnosticCredential == CredentialScopeRegistry.shared.capture())
-            let refused = h.accountHelpDiagnosticGrant!
-            precondition(!refused.permitsExport)
-            h.toolsRoute = .init(diagnostics: refused, focusDiagnostics: false)
+            let limited = h.accountHelpDiagnosticGrant!
+            precondition(limited.permitsExport && limited.recoveryOnly)
+            h.toolsRoute = .init(diagnostics: limited, focusDiagnostics: false)
             let retiredRoute = h.toolsRoute!.id
             CredentialScopeRegistry.shared.change(); h.credentialChanged()
-            precondition(!refused.permitsExport && h.toolsRoute == nil
+            precondition(!limited.permitsExport && h.toolsRoute == nil
                          && ProfilePickerToolsController.shared.dismissed.contains(retiredRoute))
             precondition(!h.accountHelpAllowsDiagnostics && h.accountHelpDiagnosticCredential == nil
                          && h.accountAuthentication.credentialChanges == 1)
@@ -708,7 +707,7 @@ enum FakeScene { case active, background }
             precondition(h.accountHelpAllowsDiagnostics
                          && h.accountHelpDiagnosticCredential == CredentialScopeRegistry.shared.capture())
             let grant = h.accountHelpDiagnosticGrant!
-            precondition(grant.permitsExport)
+            precondition(grant.permitsExport && grant.recoveryOnly)
             h.disappear() // Full-screen Account help hides its presenter.
             precondition(h.profileAction.errorMessage != nil && grant.permitsExport)
             h.restoreChanged(.ready)

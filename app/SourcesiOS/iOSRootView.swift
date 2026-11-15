@@ -406,9 +406,11 @@ struct iOSRootView: View {
         // clipped the trailing Add Profile circle off the window's right edge. iPhone / iPad keep a real
         // `.fullScreenCover`. The shell behind stays hidden by the opacity gate above.
         .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView(authentication: profileAuthentication, pickerPresentation: profiles.pickerPresentation()) }
+        .modifier(ProfilePickerRecoveryOffer(profiles: profiles, canPresent: launchReady && !playbackGate.playerActive))
         #else
         shellWithTabPreferenceRouting
             .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView(authentication: profileAuthentication, pickerPresentation: profiles.pickerPresentation()) }
+            .modifier(ProfilePickerRecoveryOffer(profiles: profiles, canPresent: launchReady && !playbackGate.playerActive))
         #endif
     }
 
@@ -2914,7 +2916,7 @@ struct iOSLibraryView: View {
                                 message: "The server did not accept this VortX session. Open Settings, then VortX account & sync, to sign in again. This device's saved data was not replaced.")
                             Button("Account settings") { showAccountRecovery = true }
                                 .buttonStyle(ChipButtonStyle())
-                            DiagnosticLogExportButton()
+                            DiagnosticLogExportButton(recoveryOnly: true)
                         }
                         .frame(minHeight: 420)
                     } else if vortxSync.isSignedIn, vortxSync.accountRestoreState == .failed {
@@ -2923,7 +2925,7 @@ struct iOSLibraryView: View {
                                 message: "Open VortX account & sync in Settings to retry. This device's saved data was not replaced.")
                             Button("Account settings") { showAccountRecovery = true }
                                 .buttonStyle(ChipButtonStyle())
-                            DiagnosticLogExportButton()
+                            DiagnosticLogExportButton(recoveryOnly: true)
                         }
                         .frame(minHeight: 420)
                     } else {

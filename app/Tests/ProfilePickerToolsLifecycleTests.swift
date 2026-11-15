@@ -125,6 +125,25 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
             h.model.cancel(); h.choose(oldPicker)
             check(h.reads == 0 && !h.model.isBusy, "cancelled input picker cannot start a late provider read")
         }
+        for failure in [false, true] {
+            let h = Harness(), route = await h.presentReady()
+            h.model.begin(.repair, route: route)
+            let request = h.model.picker!
+            if failure {
+                h.model.picked(request, result: .failure(NSError(domain: "untrusted provider detail", code: 1)))
+                check(h.model.status.message?.contains("couldn't open that location") == true &&
+                      h.model.status.message?.contains("untrusted provider") == false, "file picker failure gets a fixed retry message")
+            } else {
+                h.model.picked(request, result: .success([]))
+                check(h.model.status.message == "Cancelled.", "system picker cancellation settles the active operation")
+            }
+            check(h.model.picker == nil && !h.model.isBusy, "picker settlement releases the exact route's busy state")
+            h.model.begin(.repair, route: route)
+            h.choose(request)
+            check(h.model.picker?.id != request.id && h.model.isBusy && h.reads == 0,
+                  "late cancelled or failed picker completion cannot read or replace the succeeding selection")
+            h.model.cancel()
+        }
         do {
             let h = Harness(); let gate = Gate<ProfilePickerToolsController.Selected>(); h.readGate = gate
             let route = await h.presentReady(); h.model.begin(.repair, route: route); h.choose(h.model.picker!)

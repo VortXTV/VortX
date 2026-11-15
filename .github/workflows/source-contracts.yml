@@ -61,6 +61,7 @@ on:
       - "scripts/test-profile-picker-tools-tv-composition.sh"
       - "scripts/test-profile-picker-tools-ui-typecheck.py"
       - "scripts/test-account-file-restore-manager.sh"
+      - "scripts/test-apple-sync-recovery.mjs"
       - "scripts/test-account-file-local-adoption.sh"
       - "scripts/test-account-provider-sync-settlement.sh"
       - "scripts/run-account-provider-sync-settlement.py"
@@ -178,6 +179,7 @@ on:
       - "scripts/test-profile-picker-tools-tv-composition.sh"
       - "scripts/test-profile-picker-tools-ui-typecheck.py"
       - "scripts/test-account-file-restore-manager.sh"
+      - "scripts/test-apple-sync-recovery.mjs"
       - "scripts/test-account-file-local-adoption.sh"
       - "scripts/test-account-provider-sync-settlement.sh"
       - "scripts/run-account-provider-sync-settlement.py"
@@ -425,6 +427,9 @@ jobs:
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-account-authentication-lifecycle.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: node scripts/test-apple-sync-recovery.mjs
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+        timeout-minutes: 2
       - run: bash scripts/test-profile-roster-propagation.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: node --test test/android-profile-picker-startup.test.mjs

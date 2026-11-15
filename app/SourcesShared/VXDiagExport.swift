@@ -69,17 +69,20 @@ final class VXDiagExport: @unchecked Sendable {
 
     typealias DeliveryAuthorization = @MainActor @Sendable () -> Bool
     private let presentationOwned: Bool
+    private let recoveryOnly: Bool
     private let deliveryAuthorization: DeliveryAuthorization?
     private let deliveryRetirement = VXDiagExportStartCancellation()
-    private init(presentationOwned: Bool = false, deliveryAuthorization: DeliveryAuthorization? = nil) {
+    private init(presentationOwned: Bool = false, deliveryAuthorization: DeliveryAuthorization? = nil,
+                 recoveryOnly: Bool = false) {
         self.presentationOwned = presentationOwned
         self.deliveryAuthorization = deliveryAuthorization
+        self.recoveryOnly = recoveryOnly
     }
 
     /// A presentation owns this listener, rather than stopping an unrelated Settings export through
     /// the singleton. Each retry/presentation gets its own capability and teardown lifetime.
-    static func makeSession(deliveryAuthorization: DeliveryAuthorization? = nil) -> VXDiagExport {
-        VXDiagExport(presentationOwned: true, deliveryAuthorization: deliveryAuthorization)
+    static func makeSession(deliveryAuthorization: DeliveryAuthorization? = nil, recoveryOnly: Bool = false) -> VXDiagExport {
+        VXDiagExport(presentationOwned: true, deliveryAuthorization: deliveryAuthorization, recoveryOnly: recoveryOnly)
     }
 
     // MARK: - Public contract
@@ -351,8 +354,7 @@ final class VXDiagExport: @unchecked Sendable {
         claim: VXDiagExportPolicy.TransferClaim
     ) {
         authorizeDelivery(connection, claim: claim) { [self] in
-            let payload = Self.exportPayload()
-            let body = payload.body
+            let body = recoveryOnly ? Self.recoveryExportBody() : Self.exportPayload().body
             let head = """
             HTTP/1.1 200 OK\r
             Content-Type: text/plain; charset=utf-8\r
@@ -525,6 +527,14 @@ final class VXDiagExport: @unchecked Sendable {
     /// caller decides whether a receiver acknowledgement exists and therefore whether consumption is safe.
     static func exportBody() -> Data {
         exportPayload().body
+    }
+
+    static func recoveryExportBody() -> Data {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+        return VXDiagExportPolicy.recoveryBody(appVersion: "\(version) (\(build))",
+            platform: ProcessInfo.processInfo.operatingSystemVersionString,
+            diagnostics: DiagnosticsLog.snapshot().contents)
     }
 
     private static func lanIPv4() -> String? {

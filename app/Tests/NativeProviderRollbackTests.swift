@@ -27,6 +27,12 @@ private enum DiagnosticsLog { static func log(_ category: String, _ message: Str
     struct Account { let id = "synthetic.account" }
     var account: Account? = Account()
     var dataKey: Data? = Data([1])
+    var token: String? = "fixture-bearer"
+    var backupUploadReconnectFailureCapture: CredentialScopeRegistry.Capture?
+    private func accountReconnectRequired(for capture: CredentialScopeRegistry.Capture) -> Bool { false }
+    private func backupUploadReconnectRequired(for capture: CredentialScopeRegistry.Capture) -> Bool {
+        backupUploadReconnectFailureCapture == capture && isCurrent(capture)
+    }
     static let writeSyncDocV2 = false
     var backupUploadFailure: SyncBackupUploadFailure?
     var lastSyncedVersion = 0

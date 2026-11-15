@@ -27,7 +27,7 @@ import Foundation
     var restored = true
     var pushed = true
     var backupUploadFailure: String?
-    var accountReconnectRequired = false
+    var accountSignInAgainRequired = false
     var result = AuthResult.ok
     var replaceAfterReceipt = false
     var onCredentialChange: () -> Void = {}

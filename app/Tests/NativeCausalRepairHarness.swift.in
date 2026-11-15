@@ -25,7 +25,6 @@
     var pendingSyncID: UUID?
     var pendingSyncAwaitsProgressWindow = false
     var realtimeActive = false
-    var syncUpCompletionWaiters: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
     var nativePreparedSeedCapture: CredentialScopeRegistry.Capture?
     var pendingAddonOrderIntent: AddonOrderIntent?
     var nativeLegacyWatchlistPending: Set<String> = []

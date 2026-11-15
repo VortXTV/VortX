@@ -244,7 +244,17 @@ enum SyncBackupUploadFailure { case upgradeRequired, other
     let providerRemoteApplyMaximumAttempts = 1
     enum ConflictResolutionOutcome { case completed, pending, failed }
     private func isCurrent(_ capture: CredentialScopeRegistry.Capture) -> Bool { credentialAuthority.isCurrent(capture) }
+    private var token: String? = "fixture-bearer"
+    private var backupUploadReconnectFailureCapture: CredentialScopeRegistry.Capture?
     private func accountReconnectRequired(for capture: CredentialScopeRegistry.Capture) -> Bool { false }
+    private func backupUploadReconnectRequired(for capture: CredentialScopeRegistry.Capture) -> Bool {
+        backupUploadReconnectFailureCapture == capture && isCurrent(capture)
+    }
+    private enum NativeBackupHistory { case seen, confirmedAbsent }
+    private func nativeBackupHistory(capture: CredentialScopeRegistry.Capture) -> NativeBackupHistory { .seen }
+    private func finishSyncDown(_ id: UUID) {
+        if activeSyncDown?.id == id { activeSyncDown = nil }
+    }
     // Actual pending admission methods are selected with the actual receive below.
     private func withRemoteApplySuppressed(_ body: () -> Void) {
         AdoptionWorld.current.suppressionDepth += 1

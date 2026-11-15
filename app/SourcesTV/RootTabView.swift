@@ -309,6 +309,7 @@ struct RootView: View {
         .fullScreenCover(isPresented: pickerPresented) {
             ProfilePickerView(authentication: profileAuthentication, pickerPresentation: profiles.pickerPresentation())
         }
+        .modifier(ProfilePickerRecoveryOffer(profiles: profiles, canPresent: presenter.request == nil && presentedShellCover == nil))
         .onAppear { syncShellCover() }
         .onChange(of: playbackQueue.change) { _, _ in syncShellCover() }
         .onChange(of: router.detailTarget) { _, _ in syncShellCover() }

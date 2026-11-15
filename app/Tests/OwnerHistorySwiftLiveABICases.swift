@@ -291,6 +291,10 @@ enum OwnerHistorySwiftLiveABICases {
         rejects { _ = try store.read(scope: scope) } // No generic sidecar-stripping downgrade.
         check(coordinator.close() && abi.counts().live.isEmpty)
 
+        try verifyColdOwnerLibrary(scope: scope, target: target, host: host, local: local,
+            peer: base, directory: checkpointDirectory.appendingPathComponent("stranded-owner-library"),
+            authority: lifetime, witness: witness)
+
         // NEW Store decrypts the same real AES envelope; cold open performs production full
         // journal/source replay and native normalization verification again, not cached state.
         let coldStore = try VortxEncryptedCheckpointStore(directory: directory, key: key)
@@ -411,5 +415,65 @@ enum OwnerHistorySwiftLiveABICases {
         check(calls.keyedOracleMatches == calls.keyedEmpty + calls.keyedMutations)
         check(calls.keyedAccepts >= 1)
         print("Live Swift owner history: real canonicalizer/open/fork/request/free, production full verifier, callback denial without ACK, genuine source import, FIFO + AES CAS, cold replay, ordinary mutation and exact raw export passed")
+    }
+
+    private static func verifyColdOwnerLibrary(scope: VortxAccountScope, target: Coordinator.Target,
+        host: Data, local: Data, peer: Data, directory: URL, authority: XperienceImportLifetime,
+        witness: XperienceExportWitnessAuthority) throws {
+        let account = try OwnerHistoryAccountExport(completeAccountPlaintext: peer)
+        let native = try Exact.Object(peer).required("nativeSync")
+        let transaction = OwnerHistoryPreparedExport(completeAccount: account, scope: scope,
+            writeV2: true, authority: witness)
+        let candidate = try Coordinator.prepareColdPeer(scope: scope, target: target,
+            nativeDocument: native, localArchive: local, hostPreferences: host,
+            preservedOwnerUID: target.verifiedUID, transaction: transaction, canonicalABI: VortxCABI(),
+            sessionABI: OwnerHistorySessionCABI(), sourceAuthority: authority)
+        check(try !Coordinator.missingColdOwnerLibrary(candidate.snapshot, scope: scope))
+        var state = try Exact.Object(candidate.snapshot)
+        var libraries = try Exact.Object(state.required("libraries"))
+        libraries.remove(scope.ownerProfileID)
+        state.set("libraries", try libraries.encoded())
+        let strandedState = try state.encoded()
+        check(try Coordinator.missingColdOwnerLibrary(strandedState, scope: scope))
+
+        // Write only the synthetic old typed fixture directly. Production repair below
+        // must use the live verifier and exact encrypted CAS.
+        let key = SymmetricKey(size: .bits256)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileDigest = SHA256.hash(data: scope.authenticatedData).map { String(format: "%02x", $0) }.joined()
+        let file = directory.appendingPathComponent("native-state-v1-\(fileDigest).sealed")
+        let envelope = try JSONSerialization.data(withJSONObject: [
+            "format": "vortx-native-owner-history-checkpoint-v1",
+            "state": String(decoding: strandedState, as: UTF8.self),
+            "hostPreferences": host.base64EncodedString(),
+            "ownerHistoryLocal": local.base64EncodedString(),
+            "ownerHistoryAccountBase": peer.base64EncodedString(),
+            "ownerHistoryReadUID": target.verifiedUID,
+        ])
+        let sealed = try AES.GCM.seal(envelope, using: key, authenticating: scope.authenticatedData).combined!
+        try sealed.write(to: file, options: [.withoutOverwriting])
+        let store = try VortxEncryptedCheckpointStore(directory: directory, key: key)
+        guard let before = try store.readOwnerHistory(scope: scope) else {
+            throw VortxNativeError.invalidSnapshot
+        }
+        let wrong = try account.replacingOwned([OwnerHistoryAccountExport.archiveKey:
+            OwnerHistoryAccountExport.sourceCarrier(local: local, scope: scope, readOwnerUID: "different-owner")])
+        rejects {
+            _ = try Coordinator.repairColdOwnerLibrary(before, scope: scope, peerPlaintext: wrong.encoded(),
+                canonicalABI: VortxCABI(), sessionABI: OwnerHistorySessionCABI(), sourceAuthority: authority)
+        }
+        try store.requireCurrentOwnerHistory(before, scope: scope)
+
+        let repair = try Coordinator.repairColdOwnerLibrary(before, scope: scope, peerPlaintext: peer,
+            canonicalABI: VortxCABI(), sessionABI: OwnerHistorySessionCABI(), sourceAuthority: authority)
+        check(try Exact.canonical(repair.snapshot) == Exact.canonical(candidate.snapshot))
+        check(repair.hostPreferences == host && repair.ownerHistoryLocal == local && repair.accountBase == peer)
+        check(try Exact.Object(repair.snapshot).required("nativeSync") == state.required("nativeSync"))
+        let after = try store.commitOwnerHistory(repair, expected: before, scope: scope)
+        rejects { _ = try store.commitOwnerHistory(repair, expected: before, scope: scope) }
+        let opened = try Coordinator(scope: scope, target: target, store: store,
+            abi: OwnerHistorySessionCABI(), canonicalABI: VortxCABI(), sourceAuthority: authority, originalRead: after)
+        check(opened.close())
+        print("Live Swift typed cold restore: repaired a stranded encrypted checkpoint with exact local slices and original CAS")
     }
 }

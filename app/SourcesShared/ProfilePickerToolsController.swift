@@ -209,7 +209,11 @@ final class ProfilePickerToolsController: ObservableObject {
               captured.id == request.operationID, captured.routeID == request.routeID,
               isCurrent(captured) else { return }
         picker = nil
-        guard case .success(let urls) = result, urls.count == 1 else {
+        guard case .success(let urls) = result else {
+            fail(captured, message: "The file picker couldn't open that location. Try again or choose another provider.")
+            return
+        }
+        guard urls.count == 1 else {
             cancel(operationID: captured.id)
             return
         }

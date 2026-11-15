@@ -235,6 +235,11 @@ final class TraktNextEpisodeConsumer<Owner: Hashable & Sendable>: Sendable {}
     let directory: URL; let baseURL: URL
     let credentialAuthority = CredentialScopeRegistry.shared
     private var accountReconnectFailureCapture: CredentialScopeRegistry.Capture?
+    private var backupUploadReconnectFailureCapture: CredentialScopeRegistry.Capture?
+    private var token: String? = "fixture-bearer"
+    private var syncCompletionWaiters: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
+    private enum NativeBackupHistory { case seen, confirmedAbsent }
+    private func nativeBackupHistory(capture: CredentialScopeRegistry.Capture) -> NativeBackupHistory { .seen }
     var account: Account? = .init(id: AppleSyncReceivePublicationPeer.accountID.uuidString.lowercased())
     var dataKey: Data? = AppleSyncReceivePublicationPeer.key
     var isSignedIn = true; var hasAppliedAccountDoc = false; var hasPendingPush = false

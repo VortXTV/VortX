@@ -21,7 +21,9 @@ private enum CredentialScopeRegistry {
     var dataKey: Data? = Data(repeating: 1, count: 32)
     static let writeSyncDocV2 = false
     var pendingApply = false
+    var token: String? = "fixture-bearer"
     var accountReconnectFailureCapture: CredentialScopeRegistry.Capture?
+    var backupUploadReconnectFailureCapture: CredentialScopeRegistry.Capture?
     var backupUploadFailure: SyncBackupUploadFailure?
     var lastSyncedVersion = 9
     var backupCount = 0
@@ -60,6 +62,9 @@ private enum CredentialScopeRegistry {
     static func sawDocV2(_ accountID: String) -> Bool { versionBoundAccounts.contains(accountID) }
     static func markSawDocV2(_ accountID: String) { versionBoundAccounts.insert(accountID) }
     func accountReconnectRequired(for capture: CredentialScopeRegistry.Capture) -> Bool { accountReconnectFailureCapture == capture }
+    func backupUploadReconnectRequired(for capture: CredentialScopeRegistry.Capture) -> Bool {
+        backupUploadReconnectFailureCapture == capture && isCurrent(capture)
+    }
     func clearAccountReconnectFailure(for capture: CredentialScopeRegistry.Capture) {
         if accountReconnectFailureCapture == capture { accountReconnectFailureCapture = nil }
     }
@@ -149,6 +154,33 @@ private enum CredentialScopeRegistry {
         expect(accepted.sentBodies[0]["baseRevision"] as? Int == 9, "wire witness is exact candidate base")
         expect(!(accepted.sentBodies[0]["document"] as! String).hasPrefix(VortXSyncCrypto.docV2Prefix),
                "existing legacy rollout remains off for an unrelated account")
+
+        let grace = UploadHarness()
+        grace.reply = (401, nil)
+        let deniedByGrace = await grace.send()
+        expect(deniedByGrace == "error" && grace.backupUploadReconnectFailureCapture == grace.credentialAuthority.capture()
+               && grace.accountReconnectFailureCapture == nil, "write-only authorization loss keeps the account readable")
+        let paused = await grace.send()
+        expect(paused == "error" && grace.sentBodies.count == 1, "paused uploads do not contact the server again")
+        grace.supplyBackup(Data("{}".utf8))
+        let stillReadable = await grace.pullDocument()
+        expect(stillReadable != nil && grace.backupUploadReconnectFailureCapture != nil,
+               "an authenticated grace read stays available and does not clear the write restriction")
+        let renewed = UploadHarness()
+        renewed.reply = (401, nil)
+        renewed.whileSending = { renewed.token = "replacement-bearer" }
+        _ = await renewed.send()
+        expect(renewed.backupUploadReconnectFailureCapture == nil && renewed.backupUploadFailure == nil,
+               "the old bearer cannot pause a renewed session")
+        renewed.readReply = (401, nil)
+        renewed.whileReading = { renewed.token = "new-reader-bearer" }
+        _ = await renewed.pullDocument()
+        expect(renewed.accountReconnectFailureCapture == nil, "late read rejection cannot lock a renewed session")
+        renewed.whileReading = nil
+        _ = await renewed.pullDocument()
+        expect(renewed.accountReconnectFailureCapture == renewed.credentialAuthority.capture(),
+               "current read rejection still requires full same-account reconnect")
+
         let bound = UploadHarness()
         let largeBackup = Data(("{\"foreign\":[null" + String(repeating: ",null", count: 109_999) + "]}").utf8)
         bound.supplyBackup(largeBackup)

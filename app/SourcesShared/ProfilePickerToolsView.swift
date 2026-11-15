@@ -2,6 +2,9 @@ import SwiftUI
 #if os(iOS) || os(macOS)
 import UniformTypeIdentifiers
 #endif
+#if os(iOS)
+import UIKit
+#endif
 
 /// One main-picker destination. Authentication stays on the main picker, outside this view.
 @MainActor
@@ -26,29 +29,40 @@ struct ProfilePickerToolsView: View {
 
     var body: some View {
         GeometryReader { geometry in
-            ScrollView {
-                VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                    Text("Tools")
-                        .font(Theme.Typography.screenTitle)
-                        .foregroundStyle(Theme.Palette.textPrimary)
-                        .accessibilityAddTraits(.isHeader)
-                    Text("Backups and troubleshooting, without opening a profile.")
-                        .font(Theme.Typography.body)
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                    accountFileActions
+            ScrollViewReader { scroll in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                        Text("Tools")
+                            .font(Theme.Typography.screenTitle)
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                            .accessibilityAddTraits(.isHeader)
+                        Text("Backups and troubleshooting, without opening a profile.")
+                            .font(Theme.Typography.body)
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                        accountFileActions
                     #if !os(tvOS)
-                    diagnosticsSection
+                        diagnosticsSection
                     #endif
                     #if os(iOS)
-                    backButton
+                        backButton
                     #endif
-                }
-                .padding(Theme.Space.xl)
-                .frame(maxWidth: 760, alignment: .leading)
-                .frame(maxWidth: .infinity)
+                    }
+                    .padding(Theme.Space.xl)
+                    .frame(maxWidth: 760, alignment: .leading)
+                    .frame(maxWidth: .infinity)
                 #if !os(macOS)
-                .frame(minHeight: geometry.size.height, alignment: .top)
+                    .frame(minHeight: geometry.size.height, alignment: .top)
                 #endif
+                }
+            #if !os(tvOS)
+                .onValueChange(of: controller.status, perform: { previous, status in
+                    guard status.stage != .checkingRestore,
+                          previous.stage != .checkingRestore || controller.restoreNeedsVerification else { return }
+                    if status.message != nil || status.stage != .idle {
+                        scroll.scrollTo("profile-tools-feedback", anchor: .center)
+                    }
+                })
+            #endif
             }
             #if os(tvOS)
             // Keep diagnostics beside Back and directly above the first backup action. A remote
@@ -97,7 +111,7 @@ struct ProfilePickerToolsView: View {
             route.admission?.setForeground(scenePhase == .active)
             controller.present(route.id, services: services)
             #if os(tvOS)
-            focused = preferredFocus
+            if !focusNextAction() { focused = preferredFocus }
             #endif
         }
         .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
@@ -110,22 +124,35 @@ struct ProfilePickerToolsView: View {
         #if os(tvOS)
         .onValueChange(of: controller.isBusy) { busy in
             if !busy, focused == nil || focused == .cancel {
-                focused = preferredFocus
+                if !focusNextAction() { focused = preferredFocus }
             }
         }
-        .onValueChange(of: controller.status.stage) { stage in
-            switch stage {
-            case .reviewRepair: focused = .approveRepair
-            case .confirmRestore: focused = .confirmRestore
-            case .waitingForPhone, .outputAvailable, .localSendComplete: focused = .cancel
-            default: break
-            }
-        }
+        .onValueChange(of: controller.status.stage) { _ in focusNextAction() }
+        .onValueChange(of: controller.canRetryTVInput) { ready in if ready { focusNextAction() } }
+        .onValueChange(of: controller.canRetryTVOutput) { ready in if ready { focusNextAction() } }
+        .onValueChange(of: controller.canVerifyRestore) { ready in if ready { focusNextAction() } }
+        .onValueChange(of: controller.canFinishRestore) { ready in if ready { focusNextAction() } }
         .onExitCommand { close() }
         #endif
     }
 
     #if os(tvOS)
+    @discardableResult
+    private func focusNextAction() -> Bool {
+        switch controller.status.stage {
+        case .reviewRepair: focused = .approveRepair
+        case .confirmRestore: focused = .confirmRestore
+        default:
+            if controller.canRetryTVInput { focused = .retryInput }
+            else if controller.canRetryTVOutput { focused = .retryOutput }
+            else if controller.canVerifyRestore, !controller.isBusy { focused = .verify }
+            else if controller.canFinishRestore, !controller.isBusy { focused = .finish }
+            else if controller.canCancelFileAction { focused = .cancel }
+            else { return false }
+        }
+        return true
+    }
+
     private var preferredFocus: Focus {
         if route.focusDiagnostics && route.diagnostics.permitsExport { return .diagnostics }
         return controller.accountActionsAvailable && !controller.isBusy ? .download : .back
@@ -146,8 +173,10 @@ struct ProfilePickerToolsView: View {
             Text("Export diagnostic logs").font(Theme.Typography.eyebrow)
             diagnosticsButton
             Text(route.diagnostics.permitsExport
-                ? "Save a troubleshooting log to share with support. Review the file before sharing."
-                : "Unlock a profile to export logs. This remains available when profiles fail to open.")
+                ? (route.diagnostics.recoveryOnly
+                    ? "Share the app version and account recovery status. Full logs are available in an unlocked profile."
+                    : "Save a troubleshooting log to share with support. Review the file before sharing.")
+                : "Return to the profile picker to reopen diagnostics for this account.")
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.textSecondary)
         }
@@ -225,8 +254,22 @@ struct ProfilePickerToolsView: View {
             #if os(tvOS)
             phoneTransfer
             #endif
+            backupFeedback
+            if controller.canCancelFileAction {
+                Button("Cancel file action", role: .cancel) { controller.cancel() }
+                    .buttonStyle(ChipButtonStyle())
+                    .accessibilityIdentifier("profile-tools-cancel-file-action")
+                    #if os(tvOS)
+                    .focused($focused, equals: .cancel)
+                    #endif
+            }
+        }
+        .toolsFocusSection()
+    }
+    private var backupFeedback: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
             if let name = controller.status.selectedFilename {
-                Text(name).font(Theme.Typography.label)
+                Text(name).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textPrimary)
                     #if os(iOS) || os(macOS)
                     .textSelection(.enabled)
                     #endif
@@ -284,17 +327,10 @@ struct ProfilePickerToolsView: View {
                     #endif
                     .accessibilityHint("Receives the stored backup through normal account recovery without uploading the file again.")
             }
-            if controller.canCancelFileAction {
-                Button("Cancel file action", role: .cancel) { controller.cancel() }
-                    .buttonStyle(ChipButtonStyle())
-                    .accessibilityIdentifier("profile-tools-cancel-file-action")
-                    #if os(tvOS)
-                    .focused($focused, equals: .cancel)
-                    #endif
-            }
         }
-        .toolsFocusSection()
+        .id("profile-tools-feedback")
     }
+
     private var progressLabel: String {
         switch controller.status.stage {
         case .reading: "Reading selected file…"
@@ -359,15 +395,55 @@ private struct ProfilePickerToolsFilePicker: View {
     let request: ProfilePickerToolsController.Picker
     let completion: (ProfilePickerToolsController.Picker, Result<[URL], Error>) -> Void
     @State private var isPresented = true
-    var body: some View {
-        Color.clear.frame(width: 0, height: 0)
-            .fileImporter(isPresented: $isPresented,
-                allowedContentTypes: request.purpose == .destination ? [.folder] : [.json, .data],
-                allowsMultipleSelection: false) { result in
-                    completion(request, result)
+
+    @ViewBuilder var body: some View {
+        let types: [UTType] = request.purpose == .destination ? [.folder] : [.json, .data]
+        if #available(iOS 17, macOS 14, *) {
+            Color.clear.frame(width: 0, height: 0)
+                .fileImporter(isPresented: $isPresented, allowedContentTypes: types,
+                    allowsMultipleSelection: false,
+                    onCompletion: { result in completion(request, result) },
+                    onCancellation: { completion(request, .success([])) })
+        } else {
+            #if os(iOS)
+            Color.clear.frame(width: 0, height: 0)
+                .sheet(isPresented: $isPresented, onDismiss: { completion(request, .success([])) }) {
+                    LegacyProfilePickerDocumentDialog(types: types) { urls in
+                        completion(request, .success(urls))
+                        isPresented = false
+                    }
                 }
+            #endif
+        }
     }
 }
+
+#if os(iOS)
+/// iOS 16's SwiftUI importer has no cancellation callback.
+private struct LegacyProfilePickerDocumentDialog: UIViewControllerRepresentable {
+    let types: [UTType]
+    let completion: @MainActor ([URL]) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(completion: completion) }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types)
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ picker: UIDocumentPickerViewController, context: Context) {}
+
+    @MainActor final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let completion: @MainActor ([URL]) -> Void
+        init(completion: @escaping @MainActor ([URL]) -> Void) { self.completion = completion }
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            completion(urls)
+        }
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { completion([]) }
+    }
+}
+#endif
 #endif
 
 private extension View {

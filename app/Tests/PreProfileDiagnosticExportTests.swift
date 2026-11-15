@@ -33,8 +33,10 @@ typealias Image = String
     static var instances: [VXDiagExport] = []
     let gate = ReplyGate()
     var stops = 0
-    static func makeSession(deliveryAuthorization: (@MainActor @Sendable () -> Bool)? = nil) -> VXDiagExport {
-        let instance = VXDiagExport(); instances.append(instance); return instance
+    var recoveryOnly = false
+    static func makeSession(deliveryAuthorization: (@MainActor @Sendable () -> Bool)? = nil,
+                            recoveryOnly: Bool = false) -> VXDiagExport {
+        let instance = VXDiagExport(); instance.recoveryOnly = recoveryOnly; instances.append(instance); return instance
     }
     func startAsync() async -> (url: String, qr: Image)? { await gate.wait() }
     func stopOwnedSession() { stops += 1 }
@@ -110,6 +112,7 @@ private final class DeliveryExport: @unchecked Sendable {
     private let deliveryAuthorization: DeliveryAuthorization?
     private let deliveryRetirement = VXDiagExportStartCancellation()
     private let presentationOwned = true
+    private let recoveryOnly: Bool
     private let stateLock = NSLock()
     private let queue = DispatchQueue(label: "fixture-delivery-teardown")
     private var connections: [ObjectIdentifier: NWConnection] = [:]
@@ -122,7 +125,11 @@ private final class DeliveryExport: @unchecked Sendable {
         payloadLock.lock(); payloadCount += 1; payloadLock.unlock()
         return .init(body: Data(repeating: 0x61, count: VXDiagExportPolicy.responseChunkBytes + 7))
     }
-    init(deliveryAuthorization: DeliveryAuthorization? = nil) { self.deliveryAuthorization = deliveryAuthorization }
+    private static func recoveryExportBody() -> Data { Data("limited fixture".utf8) }
+    init(deliveryAuthorization: DeliveryAuthorization? = nil, recoveryOnly: Bool = false) {
+        self.deliveryAuthorization = deliveryAuthorization
+        self.recoveryOnly = recoveryOnly
+    }
     func request(_ connection: NWConnection) -> VXDiagExportPolicy.TransferClaim {
         stateLock.lock()
         transferGate.reset(); connections[ObjectIdentifier(connection)] = connection
@@ -162,6 +169,25 @@ private final class DeliveryExport: @unchecked Sendable {
             fatalError("fixture did not reach awaited control boundary")
         }
 
+        let retained = """
+        2026-11-15 [native-profiles] restore result=failed stage=legacy_preparation reason=raw-fixture-error
+        2026-11-15 [native-profiles] restore result=mounted mode=typed_peer ms=9
+        2026-11-15 [player] playing synthetic-title with fixture-credential
+        2026-11-15 [foreign] [native-profiles] restore result=failed stage=account_pull
+        """
+        let limited = String(decoding: VXDiagExportPolicy.recoveryBody(appVersion: "fixture", platform: "test", diagnostics: retained), as: UTF8.self)
+        expect(limited.contains("An older backup could not be prepared.") && limited.contains("Profile restore mounted."),
+               "limited Apple diagnostics retain fixed recovery events")
+        for hidden in ["2026-11-15", "raw-fixture-error", "typed_peer", "synthetic-title", "fixture-credential", "account backup could not be loaded"] {
+            expect(!limited.contains(hidden), "limited diagnostics omit \(hidden)")
+        }
+        let scoped = DiagnosticLogExportSession()
+        let grant = ProfilePickerToolsDiagnosticGrant(allowed: true, credential: CredentialScopeRegistry.shared.capture(),
+                                                       recoveryOnly: true, admission: { true })
+        let limitedStart = Task { await scoped.prepare(grant: grant) }
+        await waitFor { VXDiagExport.instances.last?.gate.continuation != nil }
+        expect(VXDiagExport.instances.last?.recoveryOnly == true, "TV uses the original limited diagnostic grant")
+        VXDiagExport.instances.last!.gate.finish(nil); await limitedStart.value
         let session = DiagnosticLogExportSession()
         let first = Task { await session.prepare(grant: nil) }
         await waitFor { VXDiagExport.instances.last?.gate.continuation != nil }

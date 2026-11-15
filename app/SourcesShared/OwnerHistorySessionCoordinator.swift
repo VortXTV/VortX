@@ -301,6 +301,7 @@ final class OwnerHistorySessionCoordinator {
             guard let full = verifier.normalized else { throw VortxNativeError.invalidSnapshot }
             let snapshot = try Exact.Snapshot.conservingColdNativeState(originalNative: nativeDocument, normalizedState: full,
                 witnessID: Exact.Object(fence).text("sourceSetWitnessId"), fence: fence)
+            try requireOwnerLibraryPresentation(snapshot, scope: scope)
             let localBytes = try local.encoded()
             let host = try OwnerHistoryAccountExport.hostProjection(hostPreferences, scope: scope)
             var checkpoint = Checkpoint(snapshot: snapshot.bytes, hostPreferences: hostPreferences,
@@ -371,8 +372,105 @@ final class OwnerHistorySessionCoordinator {
         var input = try Exact.Object(Data("{}".utf8))
         input.set("roster", try roster.encoded())
         input.set("activeProfileId", try Exact.string(target.profileID.uuidString))
+        // Fresh native stores start with this bucket. Native sync may have no library
+        // or watch entries to materialize it, but the first facade projection needs it.
+        var libraries = try Exact.Object(Data("{}".utf8))
+        libraries.set(scope.ownerProfileID, Data("{}".utf8))
+        input.set("libraries", try libraries.encoded())
         input.set("nativeSync", nativeDocument)
         return try input.encoded()
+    }
+
+    private static func requireOwnerLibraryPresentation(_ snapshot: Exact.Snapshot, scope: VortxAccountScope) throws {
+        // Use the same decode and active-library requirement as the facade before writing
+        // a first checkpoint. Keep raw transport and source archives outside this projection.
+        let value = try JSONDecoder().decode(VortxJSON.self, from: snapshot.presentationBytes)
+        guard value["activeProfileId"] == .string(scope.ownerProfileID),
+              case .object = value["libraries"]?[scope.ownerProfileID] else {
+            throw VortxNativeError.invalidSnapshot
+        }
+    }
+
+    static func missingColdOwnerLibrary(_ snapshot: Data, scope: VortxAccountScope) throws -> Bool {
+        let state = try Exact.Object(snapshot)
+        let native = try Exact.Object(state.required("nativeSync"))
+        guard native["schemaVersion"] == Data("6".utf8),
+              native["ownerHistory"] != nil,
+              try Exact.sameText(native.text("scope"), scope.account),
+              try Exact.sameText(native.text("ownerProfileId"), scope.ownerProfileID),
+              try state.text("activeProfileId") == scope.ownerProfileID else { return false }
+        return try Exact.Object(state.required("libraries"))[scope.ownerProfileID] == nil
+    }
+
+    /// A Beta 14 checkpoint may have no local active-owner bucket even after the native replay
+    /// completed. Require the same authenticated typed account and replay both source histories.
+    static func repairColdOwnerLibrary(_ old: VortxEncryptedCheckpointStore.OwnerHistoryRead,
+        scope: VortxAccountScope, peerPlaintext: Data, canonicalABI: any VortxRuntimeABI,
+        sessionABI: any OwnerHistorySessionABI, sourceAuthority: any VortxMutationAuthority) throws -> Checkpoint {
+        try sourceAuthority.withActive {}
+        guard old.format == "vortx-native-owner-history-checkpoint-v1",
+              try missingColdOwnerLibrary(old.snapshot, scope: scope),
+              let uid = old.preservedOwnerUID, let owner = UUID(uuidString: scope.ownerProfileID),
+              let host = old.hostPreferences, let localBytes = old.ownerHistoryLocal,
+              let base = old.ownerHistoryAccountBase else { throw VortxNativeError.invalidSnapshot }
+        let peer = try OwnerHistoryAccountExport(completeAccountPlaintext: peerPlaintext)
+        guard let native = peer.raw("nativeSync"), let carrier = peer.raw(OwnerHistoryAccountExport.archiveKey),
+              try Exact.sameText(OwnerHistoryAccountExport.readOwnerUID(from: carrier, scope: scope), uid) else {
+            throw VortxNativeError.superseded
+        }
+        let target = Target(profileID: owner, verifiedUID: uid)
+        let peerLocal = try Local(scope: scope, bytes: OwnerHistoryAccountExport.localArchive(from: carrier, scope: scope))
+        let validator = OwnerHistoryExactSourceValidation(abi: canonicalABI)
+        try validator.validate(snapshot: coldSnapshot(nativeDocument: native, scope: scope, target: target, preservedOwnerUID: uid),
+            journal: peerLocal.journal, scope: scope, authority: sourceAuthority)
+
+        var original = try Exact.Object(old.snapshot)
+        var libraries = try Exact.Object(original.required("libraries"))
+        libraries.set(scope.ownerProfileID, Data("{}".utf8))
+        var seeded = original
+        seeded.set("libraries", try libraries.encoded())
+        let local = try Local(scope: scope, bytes: localBytes)
+        let verifier = Verifier(scope: scope, target: target, authority: sourceAuthority, validation: validator,
+            journal: local.journal, preservedOwnerUID: uid, mode: .opening)
+        let input = try seeded.encoded()
+        let runtime = try OwnerHistorySessionRuntime(snapshot: input, abi: sessionABI, verify: verifier.callback)
+        var retirementAttempted = false
+        do {
+            let fence = try capture(runtime, target: target, verifier: verifier)
+            guard let normalized = verifier.normalized else { throw VortxNativeError.invalidSnapshot }
+            let witness = try Exact.Object(fence).text("sourceSetWitnessId")
+            let full = try Exact.Snapshot(bytes: input, witnessID: witness, fence: fence)
+                .replacingNativeState(normalized, witnessID: witness, fence: fence)
+            try requireOwnerLibraryPresentation(full, scope: scope)
+            var withoutBucket = try Exact.Object(full.bytes)
+            var remaining = try Exact.Object(withoutBucket.required("libraries"))
+            let bucket = try remaining.required(scope.ownerProfileID)
+            remaining.remove(scope.ownerProfileID)
+            withoutBucket.set("libraries", try remaining.encoded())
+            guard try equal(withoutBucket.encoded(), old.snapshot) else { throw VortxNativeError.invalidSnapshot }
+
+            // Build from the original raw slices, reusing only the native-confirmed missing bucket.
+            libraries.set(scope.ownerProfileID, bucket)
+            original.set("libraries", try libraries.encoded())
+            let candidate = Checkpoint(snapshot: try original.encoded(), hostPreferences: host,
+                ownerHistoryLocal: localBytes, scope: scope, nativeSync: try original.required("nativeSync"),
+                hostProjection: try OwnerHistoryAccountExport.hostProjection(host, scope: scope),
+                ownerHistorySources: try OwnerHistoryAccountExport.sourceCarrier(local: localBytes, scope: scope, readOwnerUID: uid),
+                preservedOwnerUID: uid, accountBase: base)
+            retirementAttempted = true
+            guard runtime.close() else {
+                FailedRetirements.shared.retain(runtime)
+                throw VortxNativeError.checkpointUncertain
+            }
+            try sourceAuthority.withActive {}
+            return candidate
+        } catch {
+            if !retirementAttempted, !runtime.close() {
+                FailedRetirements.shared.retain(runtime)
+                throw VortxNativeError.checkpointUncertain
+            }
+            throw error
+        }
     }
 
     /// An encrypted installed selector wins; a warm caller may supply only its original
@@ -401,6 +499,11 @@ final class OwnerHistorySessionCoordinator {
         retirementResult = result
         return result
     }
+    func requireCurrentCheckpoint() throws {
+        guard !requiresAuthenticatedReopen else { throw VortxNativeError.unavailable }
+        try store.requireCurrentOwnerHistory(installed, scope: scope)
+    }
+
     /// Session-owned health only; does not capture authority, retry free or reopen.
     var requiresAuthenticatedReopen: Bool {
         closed || uncertain || unconfirmedRetirement

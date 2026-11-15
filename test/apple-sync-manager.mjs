@@ -37,7 +37,8 @@ if (process.argv[2] === '--extract') {
     return text.slice(start, end);
   };
   const hasCompletePull = source.includes('case doc(doc: [String: Any], version: Int, plaintext: Data, observation: UUID?)');
-  const reconnectMembers = ['accountReconnectRequired', 'clearAccountReconnectFailure']
+  const reconnectMembers = ['accountReconnectRequired', 'clearAccountReconnectFailure', 'backupUploadReconnectRequired',
+    'finishSyncWaiters', 'recoverInitialBackupWinner']
     .filter(name => source.includes(`${name}(`));
   const activeMembers = [...members, ...(hasCompleteReceiptFeature ? [...receiptMembers, ...receiptDependencies] : []), ...reconnectMembers];
   const selected = activeMembers.flatMap(name => {

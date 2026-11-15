@@ -161,7 +161,7 @@ enum ProfilePickerLayoutTests {
             && accountInset.contains(".disabled(manualPINPending || pinTarget != nil)")
             && accountInset.contains(".accessibilityHidden(manualPINPending || pinTarget != nil)")
             && help.contains("deferredSelection.cancel()")
-            && help.contains("accountHelpAllowsDiagnostics = exportAllowedBeforeProfile && pinTarget == nil")
+            && help.contains("accountHelpAllowsDiagnostics = pinTarget == nil")
             && help.contains("accountHelpDiagnosticCredential = CredentialScopeRegistry.shared.capture()")
             && help.contains("accountHelpDiagnosticGrant = diagnosticGrant()")
             && help.contains("accountHelpNeeded = true")

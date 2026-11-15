@@ -58,7 +58,7 @@ struct MoveSeedingNagTV: View {
                 ScrollView {
                     VStack(spacing: Theme.Space.lg) {
                         VortXAccountJoinerView(onSignedIn: { dismiss() })
-                        DiagnosticLogExportButton()
+                        DiagnosticLogExportButton(recoveryOnly: true)
                     }
                     .padding(Theme.Space.lg)
                     .frame(maxWidth: .infinity)

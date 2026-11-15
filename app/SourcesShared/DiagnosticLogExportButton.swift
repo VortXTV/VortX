@@ -11,6 +11,9 @@ struct DiagnosticLogExportButton: View {
     /// Nil keeps the account-independent component's existing unlocked-settings behavior.
     /// Pre-profile routes pass their original credential and live PIN/failure admission.
     var grant: ProfilePickerToolsDiagnosticGrant? = nil
+    var recoveryOnly = false
+    private var sharesRecoveryOnly: Bool { recoveryOnly || grant?.recoveryOnly == true }
+    private var title: String { sharesRecoveryOnly ? "Share account recovery diagnostics" : "Export diagnostic log" }
     #if os(tvOS)
     @State private var showingExport = false
     #endif
@@ -18,17 +21,17 @@ struct DiagnosticLogExportButton: View {
     var body: some View {
         #if os(tvOS)
         Button { showingExport = true } label: {
-            Label("Export diagnostic log", systemImage: "square.and.arrow.up")
+            Label(title, systemImage: "square.and.arrow.up")
         }
         .buttonStyle(ChipButtonStyle())
         .accessibilityIdentifier("pre-profile-diagnostic-export")
         .disabled(grant?.permitsExport == false)
-        .fullScreenCover(isPresented: $showingExport) { DiagnosticLogExportSheet(grant: grant) }
+        .fullScreenCover(isPresented: $showingExport) { DiagnosticLogExportSheet(grant: grant, recoveryOnly: sharesRecoveryOnly) }
 
         #else
-        ShareLink(item: PreProfileDiagnosticLogTransfer(grant: grant),
-                  preview: SharePreview("VortX diagnostic log")) {
-            Label("Export diagnostic log", systemImage: "square.and.arrow.up")
+        ShareLink(item: PreProfileDiagnosticLogTransfer(grant: grant, recoveryOnly: sharesRecoveryOnly),
+                  preview: SharePreview(title)) {
+            Label(title, systemImage: "square.and.arrow.up")
         }
         .buttonStyle(ChipButtonStyle())
         .accessibilityIdentifier("pre-profile-diagnostic-export")
@@ -44,7 +47,7 @@ struct DiagnosticLogExportButton: View {
 /// Keychain/account documents. Unique destinations prevent simultaneous shares replacing one another.
 private struct PreProfileDiagnosticLogTransfer: Transferable {
     let grant: ProfilePickerToolsDiagnosticGrant?
-    private enum Failure: Error { case permissionChanged }
+    let recoveryOnly: Bool
     private static func require(_ grant: ProfilePickerToolsDiagnosticGrant?) async throws {
         try Task.checkCancellation()
         if let grant { try await grant.requireForExport() }
@@ -52,7 +55,7 @@ private struct PreProfileDiagnosticLogTransfer: Transferable {
     static var transferRepresentation: some TransferRepresentation {
         FileRepresentation(exportedContentType: .plainText) { transfer in
             try await require(transfer.grant)
-            let bytes = VXDiagExport.exportBody()
+            let bytes = transfer.recoveryOnly ? VXDiagExport.recoveryExportBody() : VXDiagExport.exportBody()
             try await require(transfer.grant)
             let directory = FileManager.default.temporaryDirectory
                 .appendingPathComponent("vortx-diag-\(UUID().uuidString.lowercased())", isDirectory: true)
@@ -78,9 +81,10 @@ private final class DiagnosticLogExportSession: ObservableObject {
     @Published private(set) var preparing = true
     private var exporter: VXDiagExport?
 
-    func prepare(grant: ProfilePickerToolsDiagnosticGrant?) async {
+    func prepare(grant: ProfilePickerToolsDiagnosticGrant?, recoveryOnly: Bool = false) async {
         guard grant?.permitsExport != false else { stop(); return }
-        let owned = VXDiagExport.makeSession(deliveryAuthorization: { grant?.permitsExport != false })
+        let owned = VXDiagExport.makeSession(deliveryAuthorization: { grant?.permitsExport != false },
+            recoveryOnly: recoveryOnly || grant?.recoveryOnly == true)
         exporter?.stopOwnedSession()
         exporter = owned
         payload = nil
@@ -106,6 +110,7 @@ private final class DiagnosticLogExportSession: ObservableObject {
 
 private struct DiagnosticLogExportSheet: View {
     let grant: ProfilePickerToolsDiagnosticGrant?
+    let recoveryOnly: Bool
     @Environment(\.dismiss) private var dismiss
     @StateObject private var session = DiagnosticLogExportSession()
     @State private var retry = 0
@@ -114,7 +119,7 @@ private struct DiagnosticLogExportSheet: View {
     var body: some View {
         ScrollView {
             VStack(spacing: Theme.Space.lg) {
-                Text("Export diagnostic log")
+                Text(recoveryOnly ? "Share account recovery diagnostics" : "Export diagnostic log")
                     .font(Theme.Typography.screenTitle)
                     .foregroundStyle(Theme.Palette.textPrimary)
                 if let export = session.payload, grant?.permitsExport != false {
@@ -139,7 +144,9 @@ private struct DiagnosticLogExportSheet: View {
                         .disabled(grant?.permitsExport == false)
                         .buttonStyle(ChipButtonStyle())
                 }
-                Text("Includes recent troubleshooting activity, even if Diagnostic logging was off. Review the file before sharing it.")
+                Text(recoveryOnly
+                    ? "Includes app version and account recovery status. Review the file before sharing it."
+                    : "Includes recent troubleshooting activity, even if Diagnostic logging was off. Review the file before sharing it.")
                     .font(Theme.Typography.label)
                     .foregroundStyle(Theme.Palette.textSecondary)
                 Button("Done") { dismiss() }
@@ -151,7 +158,7 @@ private struct DiagnosticLogExportSheet: View {
             .frame(maxWidth: .infinity)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        .task(id: retry) { await session.prepare(grant: grant) }
+        .task(id: retry) { await session.prepare(grant: grant, recoveryOnly: recoveryOnly) }
         .task {
             guard grant != nil else { return }
             while !Task.isCancelled {

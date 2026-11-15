@@ -61,6 +61,7 @@ if (process.argv[2] === '--extract') {
     source('app/SourcesShared/CatalogPreferences.swift'), source('app/SourcesShared/HomeRailPreferences.swift')]);
   const managerMethods = ['    private static func sawDocV2(', '    private static func markSawDocV2(',
     '    private func accountReconnectRequired(for capture:', '    private func clearAccountReconnectFailure(for capture:',
+    '    private func backupUploadReconnectRequired(for capture:', '    private func finishSyncWaiters(', '    private func finishSyncDown(',
     '    private func conditionalReceiveVersion(', '    private func rememberCompletedNativeReceive(',
     '    private func completedFileRestoreReceive(',
     '    private func hasPendingReceivedProviderApply(', '    private func receivedProviderOwnerIsCurrent(',

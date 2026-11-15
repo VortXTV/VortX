@@ -24,7 +24,7 @@ struct BackupImportView: View {
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: 660)
                     VortXAccountJoinerView(onSignedIn: { dismiss() })
-                    DiagnosticLogExportButton()
+                    DiagnosticLogExportButton(recoveryOnly: true)
                     Button("Back") { dismiss() }
                         .buttonStyle(ChipButtonStyle(selected: false))
                 }

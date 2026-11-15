@@ -177,7 +177,7 @@ struct LibraryView: View {
                                         .font(Theme.Typography.label)
                                     Button("Account settings") { showAccountRecovery = true }
                                         .buttonStyle(ChipButtonStyle())
-                                    DiagnosticLogExportButton()
+                                    DiagnosticLogExportButton(recoveryOnly: true)
                                 }
                                 .foregroundStyle(Theme.Palette.textSecondary)
                                 .padding(Theme.Space.xxl)
@@ -190,7 +190,7 @@ struct LibraryView: View {
                                         .font(Theme.Typography.label)
                                     Button("Account settings") { showAccountRecovery = true }
                                         .buttonStyle(ChipButtonStyle())
-                                    DiagnosticLogExportButton()
+                                    DiagnosticLogExportButton(recoveryOnly: true)
                                 }
                                 .foregroundStyle(Theme.Palette.textSecondary)
                                 .padding(Theme.Space.xxl)
@@ -298,7 +298,7 @@ struct LibraryView: View {
                     Text("Library hasn’t loaded yet.").font(Theme.Typography.body.weight(.semibold))
                     Button("Retry library") { libraryRetry = UUID() }.buttonStyle(ChipButtonStyle())
                     Button("Account settings") { showAccountRecovery = true }.buttonStyle(ChipButtonStyle())
-                    DiagnosticLogExportButton()
+                    DiagnosticLogExportButton(recoveryOnly: true)
                 }
                 .foregroundStyle(Theme.Palette.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)

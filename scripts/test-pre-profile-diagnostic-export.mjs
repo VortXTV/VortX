@@ -59,11 +59,12 @@ const pickerAccountInset = picker.indexOf('.safeAreaInset(edge: .bottom)');
 assert(pickerGridGate >= 0 && pickerAccountInset > pickerGridGate,
   'account tools must follow the real protected-PIN/profile-work grid gate');
 assert(inset.includes('.disabled(manualPINPending || pinTarget != nil)') && inset.includes('.accessibilityHidden(manualPINPending || pinTarget != nil)'));
-// A PIN-protected profile keeps the whole-device log behind a profile unlock, except when loading failed.
-assert(member(picker, 'private func diagnosticGrant()').includes('exportAllowedBeforeProfile && pinTarget == nil'));
+// A failed or PIN-protected roster can only share the original limited recovery grant.
+const grantPolicy = member(picker, 'private func diagnosticGrant()');
+assert(grantPolicy.includes('let recoveryOnly = !exportAllowedBeforeProfile') && grantPolicy.includes('pinTarget == nil && manualAdmission()'));
 assert(tools.includes('.disabled(!route.diagnostics.permitsExport)'));
 const gate = member(picker, 'private var exportAllowedBeforeProfile: Bool');
-assert(gate.includes('$0.pin != nil') && gate.includes('profileAction.errorMessage != nil') && gate.includes('accountRestoreState == .failed'));
+assert(gate.includes('$0.pin != nil') && gate.includes('profileAction.errorMessage == nil') && gate.includes('accountRestoreState == .ready'));
 // The shared call site also compiles in Lite/legacy shells. A lexical member extraction alone
 // misses an enclosing #if that removes the whole declaration in those builds.
 function requireSharedPickerMember(source, signature) {
@@ -87,26 +88,26 @@ const nativeOnlyGate = picker.replace('private var exportAllowedBeforeProfile: B
   '#if VORTX_NATIVE_DATA_ENGINE\nprivate var exportAllowedBeforeProfile: Bool');
 assert.throws(() => requireSharedPickerMember(nativeOnlyGate, 'private var exportAllowedBeforeProfile: Bool'),
   /must exist in both native and Lite\/legacy shells/);
-for (const path of paths.slice(4, 8)) assert(sources[path].includes('DiagnosticLogExportButton()'), `${path} missing export`);
-assert(sources[paths[3]].includes('DiagnosticLogExportButton(grant: exportGrant)'));
+for (const path of paths.slice(4, 8)) assert(sources[path].includes('DiagnosticLogExportButton(recoveryOnly: true)'), `${path} missing export`);
+assert(sources[paths[3]].includes('DiagnosticLogExportButton(grant: exportGrant, recoveryOnly: recoveryDiagnosticsOnly)'));
 for (const path of ['app/SourcesTV/LoginView.swift', 'app/SourcesTV/BackupImportView.swift']) {
   const scroll = member(sources[path], 'ScrollView');
-  assert(scroll.includes('DiagnosticLogExportButton()'), `${path} export must remain reachable in a tall error layout`);
+  assert(scroll.includes('DiagnosticLogExportButton(recoveryOnly: true)'), `${path} export must remain reachable in a tall error layout`);
 }
-assert(member(sources[paths[3]], 'private func qrSignInSheet(').includes('DiagnosticLogExportButton(grant: exportGrant)'));
+assert(member(sources[paths[3]], 'private func qrSignInSheet(').includes('DiagnosticLogExportButton(grant: exportGrant, recoveryOnly: recoveryDiagnosticsOnly)'));
 const entryCode = entry.split('\n').filter(line => !line.trim().startsWith('//')).join('\n');
 for (const forbidden of ['Keychain', 'CoreBridge', 'StremioAccount', 'VortXSyncManager', 'UserDefaults', '@AppStorage', 'VXProbe.enabled', 'VXProbe.logFileURL', 'consumeLogSnapshot']) {
   assert(!entryCode.includes(forbidden), `export must not depend on ${forbidden}`);
 }
-assert(entry.includes('FileRepresentation(exportedContentType: .plainText)') && entry.includes('let bytes = VXDiagExport.exportBody()') && entry.includes('try bytes.write('));
-assert(entry.includes('ShareLink(item: PreProfileDiagnosticLogTransfer(grant: grant)'));
-assert(entry.includes('preview: SharePreview("VortX diagnostic log")'));
+assert(entry.includes('FileRepresentation(exportedContentType: .plainText)') && entry.includes('let bytes = transfer.recoveryOnly ? VXDiagExport.recoveryExportBody() : VXDiagExport.exportBody()') && entry.includes('try bytes.write('));
+assert(entry.includes('ShareLink(item: PreProfileDiagnosticLogTransfer(grant: grant, recoveryOnly: sharesRecoveryOnly)'));
+assert(entry.includes('preview: SharePreview(title)'));
 assert(entry.includes('UUID().uuidString.lowercased()') && entry.includes('directory.appendingPathComponent("vortx-diag.log")'));
 assert(member(entry, '.onDisappear').includes('session.stop()'));
 assert(member(entry, '.onExitCommand').includes('dismiss()'));
-assert(member(entry, '.task(id: retry)').includes('await session.prepare(grant: grant)'));
-assert(member(backend, 'static func makeSession(').includes('VXDiagExport(presentationOwned: true, deliveryAuthorization: deliveryAuthorization)'));
-assert(backend.includes('static let shared = VXDiagExport()') && backend.includes('private init(presentationOwned: Bool = false, deliveryAuthorization: DeliveryAuthorization? = nil)'));
+assert(member(entry, '.task(id: retry)').includes('await session.prepare(grant: grant, recoveryOnly: recoveryOnly)'));
+assert(member(backend, 'static func makeSession(').includes('VXDiagExport(presentationOwned: true, deliveryAuthorization: deliveryAuthorization, recoveryOnly: recoveryOnly)'));
+assert(backend.includes('static let shared = VXDiagExport()') && backend.includes('private init(presentationOwned: Bool = false, deliveryAuthorization: DeliveryAuthorization? = nil,'));
 console.log('PASS pre-profile availability, lazy sanitized sharing, PIN and owned-session source contracts');
 
 const extracts = {

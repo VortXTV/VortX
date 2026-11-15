@@ -64,6 +64,13 @@ final class OwnerHistoryColdCoordinatorTests: XCTestCase {
         let roster = try Exact.Object(Exact.Object(snapshot.required("roster")).required("profiles"))
         XCTAssertEqual(try roster.required(owner.uuidString), try source.required("profile"))
         XCTAssertEqual(try snapshot.text("activeProfileId"), owner.uuidString)
+        XCTAssertEqual(try Exact.Object(snapshot.required("libraries")).required(owner.uuidString), Data("{}".utf8))
+        XCTAssertFalse(try OwnerHistorySessionCoordinator.missingColdOwnerLibrary(snapshot.encoded(), scope: scope))
+        var stranded = snapshot
+        stranded.set("libraries", Data("{}".utf8))
+        XCTAssertTrue(try OwnerHistorySessionCoordinator.missingColdOwnerLibrary(stranded.encoded(), scope: scope))
+        stranded.set("activeProfileId", try Exact.string(child.uuidString))
+        XCTAssertFalse(try OwnerHistorySessionCoordinator.missingColdOwnerLibrary(stranded.encoded(), scope: scope))
         XCTAssertTrue(String(decoding: try snapshot.encoded(), as: UTF8.self).contains("9007199254740993"))
         XCTAssertTrue(String(decoding: try snapshot.encoded(), as: UTF8.self).contains("-0"))
     }

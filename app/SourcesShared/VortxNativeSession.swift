@@ -913,10 +913,8 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         let checkpoint: OwnerHistoryRead
         let bootstrap: Data
     }
-    /// Authenticate the original locator, then return one original raw envelope/CAS. Generic
-    /// recovery remains unchanged and does not become a schema6/typed-format reader.
-    func ownerHistoryRecovery(account: String) throws -> OwnerHistoryRecovery? {
-        let scope: VortxAccountScope? = try lock.withLock {
+    private func authenticatedOwnerHistoryLocator(account: String) throws -> VortxAccountScope? {
+        try lock.withLock {
             let bytes: Data
             do { bytes = try Data(contentsOf: locatorURL(account)) }
             catch let error as NSError where error.domain == NSCocoaErrorDomain
@@ -929,8 +927,26 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
             try locator.scope.validate()
             return locator.scope
         }
-        guard let scope, let checkpoint = try readOwnerHistory(scope: scope) else { return nil }
-        guard checkpoint.format == "vortx-native-owner-history-checkpoint-v1" else { return nil }
+    }
+
+    /// Local/offline recovery requires the original authenticated account locator.
+    func ownerHistoryRecovery(account: String) throws -> OwnerHistoryRecovery? {
+        guard let scope = try authenticatedOwnerHistoryLocator(account: account) else { return nil }
+        return try readOwnerHistoryRecovery(scope: scope)
+    }
+
+    /// An authenticated typed peer can establish the exact scope after a first mount crashed
+    /// between state installation and locator publication. An existing locator still owns its scope.
+    func ownerHistoryRecovery(authenticatedPeerScope scope: VortxAccountScope) throws -> OwnerHistoryRecovery? {
+        if let locator = try authenticatedOwnerHistoryLocator(account: scope.account), locator != scope {
+            throw VortxNativeError.invalidSnapshot
+        }
+        return try readOwnerHistoryRecovery(scope: scope)
+    }
+
+    private func readOwnerHistoryRecovery(scope: VortxAccountScope) throws -> OwnerHistoryRecovery? {
+        guard let checkpoint = try readOwnerHistory(scope: scope),
+              checkpoint.format == "vortx-native-owner-history-checkpoint-v1" else { return nil }
         guard let bootstrap = checkpoint.bootstrap, checkpoint.ownerHistoryAccountBase != nil,
               let uid = checkpoint.preservedOwnerUID, !uid.isEmpty,
               !uid.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
@@ -1450,11 +1466,14 @@ actor VortxNativeSession {
          ownerHistoryColdTarget: OwnerHistorySessionCoordinator.Target? = nil,
          ownerHistoryColdCheckpoint: VortxEncryptedCheckpointStore.OwnerHistoryRead? = nil,
          ownerHistoryReadOnly: Bool = false,
+         ownerHistoryColdRepairSource: Data? = nil,
          ownerHistoryColdPeer: OwnerHistoryColdPeer? = nil,
          ownerHistoryLocalCheckpointPreparation: OwnerHistoryLocalCheckpointPreparation? = nil) throws {
         try scope.validate()
         self.diagnostics = diagnostics
-        guard legacy == nil || legacy?.scope == scope else { throw VortxNativeError.invalidSnapshot }
+        guard legacy == nil || legacy?.scope == scope,
+              ownerHistoryColdRepairSource == nil || (ownerHistoryColdCheckpoint != nil && ownerHistoryColdPeer == nil)
+        else { throw VortxNativeError.invalidSnapshot }
         self.scope = scope; self.abi = abi; self.store = store; self.transport = transport
         self.ownerHistoryLocalCheckpointPreparation = ownerHistoryLocalCheckpointPreparation
         if let input = ownerHistoryColdPeer {
@@ -1547,12 +1566,26 @@ actor VortxNativeSession {
             runtime = nil
             self.ownerHistoryReadOnly = ownerHistoryReadOnly
             do {
+                var opening = checkpoint
+                if try OwnerHistorySessionCoordinator.missingColdOwnerLibrary(checkpoint.snapshot, scope: scope) {
+                    guard let ownerHistoryColdRepairSource else { throw VortxNativeError.unavailable }
+                    let candidate = try OwnerHistorySessionCoordinator.repairColdOwnerLibrary(checkpoint,
+                        scope: scope, peerPlaintext: ownerHistoryColdRepairSource, canonicalABI: abi,
+                        sessionABI: OwnerHistorySessionCABI(), sourceAuthority: sourceAuthority)
+                    let coldLease = lease
+                    var installed: VortxEncryptedCheckpointStore.OwnerHistoryRead?
+                    try coldLease.withActive { try sourceAuthority.withActive {
+                        installed = try encrypted.commitOwnerHistory(candidate, expected: checkpoint, scope: scope)
+                    } }
+                    guard let installed else { throw VortxNativeError.checkpointUncertain }
+                    opening = installed
+                }
                 ownerHistory = try OwnerHistorySessionCoordinator(scope: scope, target: target, store: encrypted,
                     abi: OwnerHistorySessionCABI(), canonicalABI: abi, sourceAuthority: sourceAuthority,
-                    originalRead: checkpoint)
+                    originalRead: opening)
                 try sourceAuthority.withActive {
-                    try encrypted.requireCurrentOwnerHistory(checkpoint, scope: scope)
-                    try encrypted.rememberAuthenticatedOwnerHistoryScope(scope, expected: checkpoint)
+                    try encrypted.requireCurrentOwnerHistory(opening, scope: scope)
+                    try encrypted.rememberAuthenticatedOwnerHistoryScope(scope, expected: opening)
                 }
             } catch {
                 let typedRetired = ownerHistory?.close() ?? true
@@ -1896,6 +1929,11 @@ actor VortxNativeSession {
     func usesOwnerHistory() -> Bool { ownerHistory != nil }
     /// Ownership and health are separate after an irreversible generic-to-typed transfer.
     /// Inspect only actor-owned state: task cancellation is not session corruption.
+    func requireCurrentOwnerHistoryCheckpoint() throws {
+        guard !closed, !persistenceFailed, let ownerHistory else { throw VortxNativeError.unavailable }
+        try lease.withActive { try ownerHistory.requireCurrentCheckpoint() }
+    }
+
     func ownerHistoryRouteStatus() -> (ownsHistory: Bool, requiresAuthenticatedReopen: Bool) {
         (ownerHistory != nil,
          closed || persistenceFailed || ownerHistoryRetirementPending || genericRetirementUnconfirmed
