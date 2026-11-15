@@ -1,5 +1,13 @@
 package com.vortx.android.engine
 
+import com.vortx.android.profile.UserProfile
+import com.vortx.android.sync.NativeSettingsFence
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.setMain
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
@@ -118,13 +126,15 @@ class NativeOwnerHistoryJniTest {
         assertFalse(rejected.toString().contains("synthetic-not-for-output"))
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     @Test fun warmSchemaSixReceiveEncryptedColdReopenAndOrdinaryMutationUseRealJni() {
         load()
         // The test JVM must include the reviewed artifact directory in java.library.path.
         assertTrue("Production JNI loader must resolve the reviewed artifact", VortxCore.isAvailable())
-        val owner = "7BFA570A-1F11-4455-9876-39F451725934"
+        val accountId = "00000000-0000-0000-0000-000000000123"
+        val owner = UserProfile.OWNER_ID
         val uid = "synthetic-owner-uid"
-        val scope = VortxAccountScope("synthetic.scope", owner)
+        val scope = VortxAccountScope("account.$accountId", owner)
         class OriginalAuthority : NativeOwnerHistoryAuthority {
             var active = true
             var checks = 0
@@ -234,6 +244,21 @@ class NativeOwnerHistoryJniTest {
                 .set("nativeSync", OHJson.Obj(importedSnapshot).raw("nativeSync"))
                 .set(NativeOwnerHistoryAccount.ARCHIVE, carrier).set("future", unknown).encoded())
             remote.validateBudget(true)
+
+            // A fresh coordinator must absorb a typed cold peer carrying legacy settings, then
+            // send a real encrypted successor with the original settings still byte-identical.
+            Dispatchers.setMain(UnconfinedTestDispatcher())
+            val previousNotifications = NativeSettingsFence.queuedNotificationsForTest
+            NativeSettingsFence.queuedNotificationsForTest = mutableListOf()
+            try {
+                runBlocking {
+                    verifyNativeLegacyPreferenceRestore(accountId,
+                        UserProfile(id = owner, name = "Owner", avatar = "star", isOwner = true), remote)
+                }
+            } finally {
+                NativeSettingsFence.queuedNotificationsForTest = previousNotifications
+                Dispatchers.resetMain()
+            }
 
             VortxNativeSession.openForOwnerHistoryTransfer(scope, original, VortxJniBindings, store,
                 transport, onMutation = { notifications++ }, beforeOwnerChange = {},

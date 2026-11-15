@@ -11,6 +11,7 @@ import com.vortx.android.engine.VortxRuntimeBindings
 import com.vortx.android.engine.VortxEncryptedCheckpointStore
 import com.vortx.android.engine.VortxResourceTransport
 import com.vortx.android.engine.VortxResourceCancellation
+import com.vortx.android.engine.verifyNativeLegacyPreferenceRestore
 import java.lang.reflect.Proxy
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.Dispatchers
@@ -1190,6 +1191,8 @@ class NativeAccountSyncTest {
             assertTrue(runtime.session().read().state.getJSONObject("nativeSync").toString().contains("tt-dirty-stamp"))
             assertEquals(retained, context.getSharedPreferences("vortx_sync_dirty", 0).getString(dirtyKey, null))
         } finally { runtime.retire(); manager.cancelSyncTestWork(); directory.deleteRecursively() }
+
+        verifyNativeLegacyPreferenceRestore(account.id, owner)
     }
 
     @Test fun `real JNI native and host fields sync separately with failed push cold persistence and exact event acknowledgement`() = kotlinx.coroutines.test.runTest {
@@ -1398,7 +1401,7 @@ class NativeAccountSyncTest {
         } finally { manager.cancelSyncTestWork() }
     }
 
-    private class TestContext : ContextWrapper(null) {
+    internal class TestContext : ContextWrapper(null) {
         private val stores = mutableMapOf<String, SharedPreferences>()
         override fun getApplicationContext(): Context = this
         override fun getPackageName() = "com.vortx.android.native.test"

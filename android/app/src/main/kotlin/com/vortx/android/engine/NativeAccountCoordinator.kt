@@ -1367,7 +1367,7 @@ internal class NativeAccountCoordinator(
         val schema = incoming?.let { OHJson.integer(it.raw("schemaVersion")) }
         if (schema != 6L && exact.raw(NativeOwnerHistoryAccount.ARCHIVE) == null && !localTyped)
             return@withNativeWriter applyDocumentLocked(account, document, isCurrent,
-                originalHostPreferences = originalHostPreferences).let { applied ->
+                originalHostPreferences = originalHostPreferences, holdUnreadableSettings = captured != null).let { applied ->
                 if (!applied) return@let false
                 // The primary sync apply has already succeeded. Baseline retention is optional and
                 // limited to known schema 1–5; it must not make ordinary sync acceptance fail.
@@ -1427,7 +1427,8 @@ internal class NativeAccountCoordinator(
                 val host = NativeHostPreferences.merge(scope, NativeHostPreferences.local(scope), remoteHost)
                 val rawHost = NativeRawHostPreferences.reconcile(scope, null, host, remoteHost, originalHostPreferences)
                 val archiveInput = JSONObject(document.toString()).also { it.remove("nativeSync"); it.remove(NativeOwnerHistoryAccount.ARCHIVE) }
-                val archive = preflight?.archive ?: NativeHostDocument.archive(archiveInput)
+                val archive = preflight?.archive ?: if (captured != null) NativeHostDocument.accountRestoreArchive(archiveInput)
+                    else NativeHostDocument.archive(archiveInput)
                 val localObject = OHJson.Obj().set("hostDocument", archive.getJSONObject("document").toString().toByteArray(Charsets.UTF_8))
                     .set("excludedCredentialPaths", archive.getJSONArray("excludedCredentialPaths").toString().toByteArray(Charsets.UTF_8))
                     .set("nativeHostPreferenceState", rawHost)
@@ -1487,7 +1488,8 @@ internal class NativeAccountCoordinator(
                                            retainedWatched: JSONObject? = null,
                                            operationCurrent: () -> Boolean = isCurrent,
                                            originalHostPreferences: ByteArray? = null,
-                                           onInstalled: ((Mounted) -> Unit)? = null): Boolean {
+                                           onInstalled: ((Mounted) -> Unit)? = null,
+                                           holdUnreadableSettings: Boolean = false): Boolean {
         check(account.id !in uncertainHistoryAccounts) { "Owner history writer retirement unconfirmed" }
         check(isCurrent() && operationCurrent() && accountCurrent(account)) { "Native account changed" }
         // All callers share this transaction helper. Revoke the old authenticated baseline before
@@ -1524,7 +1526,7 @@ internal class NativeAccountCoordinator(
         // Credentials in host-only settings may be excluded from the sealed archive. Immutable
         // library/add-on/watch source values may not: stripping a nested encoded secret there
         // would bless a different descriptor or migration receipt than the authenticated input.
-        val archive = nativeLegacySourceArchive(document)
+        val archive = nativeLegacySourceArchive(document, holdUnreadableSettings)
         val watchlists = nativeLegacyWatchlists(document, roster.map { it.id }.toSet())
         archive.getJSONObject("document").put("nativeWatchlistMigrationPending", watchlists.pending)
         val materialDocument = nativeMigrationSourceDocument(archive.getJSONObject("document")).also { it.remove("profileEdits") }

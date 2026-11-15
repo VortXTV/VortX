@@ -115,7 +115,7 @@ internal object NativeWebsiteRosterAdmission {
 
 /** The exact source-only credential/archive preparation used by ordinary account apply. Keeping
  * this shared avoids a weaker detached credential policy or a second source-field inventory. */
-internal fun nativeLegacySourceArchive(document: JSONObject): JSONObject {
+internal fun nativeLegacySourceArchive(document: JSONObject, holdUnreadableSettings: Boolean = false): JSONObject {
     val sourceFields = JSONObject()
     for (key in listOf("addons", "library", "addonOrder", "webAddonRemovals", "webProgress", "webAddonEdits"))
         if (document.has(key)) sourceFields.put(key, document.get(key))
@@ -126,7 +126,8 @@ internal fun nativeLegacySourceArchive(document: JSONObject): JSONObject {
         sourceFields.put("vortx", fields)
     }
     NativeHostDocument.requireCredentialFree(sourceFields)
-    val archive = NativeHostDocument.archive(document)
+    val archive = if (holdUnreadableSettings) NativeHostDocument.accountRestoreArchive(document)
+        else NativeHostDocument.archive(document)
     nativeMigrationSidecars.forEach(archive.getJSONObject("document")::remove)
     return archive
 }

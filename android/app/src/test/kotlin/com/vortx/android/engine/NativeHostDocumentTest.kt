@@ -168,6 +168,60 @@ class NativeHostDocumentTest {
         failure(JSONObject().put("settings", blob(mapOf("safe" to "yes")) { it.put("schema", 99) }), "Unsupported settings schema")
     }
 
+    @Test fun `account restore holds unreadable preferences in the inspected copy only`() {
+        val roster = """[{"id":"profile","name":"Viewer"}]""".toByteArray()
+        val brokenKey = "stremiox.seriesSourceSticky.fixture/~"
+        val sourceBlob = blob(mapOf(SettingsBackup.ROSTER_KEY to roster, "vortx.theme" to "dark",
+            brokenKey to mapOf("accessToken" to "fixture", "bingeGroup" to "["),
+            "opaque" to byteArrayOf(0xc3.toByte(), 0x28), "kcfallback.account" to "fixture")) {
+            it.put("futureHeader", JSONObject().put("version", 7))
+        }
+        val source = JSONObject().put("settings", sourceBlob)
+        val archive = nativeLegacySourceArchive(source, holdUnreadableSettings = true)
+        val inspected = archive.getJSONObject("document")
+        val clean = inspected.getString("settings")
+        val domain = rawDomain(clean)
+
+        assertEquals(sourceBlob, source.getString("settings"))
+        assertEquals(setOf(SettingsBackup.ROSTER_KEY, "vortx.theme"), domain.keys)
+        assertArrayEquals(roster, domain[SettingsBackup.ROSTER_KEY] as ByteArray)
+        assertEquals("dark", domain["vortx.theme"])
+        assertEquals(2, envelope(clean).getInt("keyCount"))
+        assertEquals(7, envelope(clean).getJSONObject("futureHeader").getInt("version"))
+        assertEquals(listOf("/settings/payloadBase64/kcfallback.account", "held:/settings/payloadBase64/opaque",
+            "held:/settings/payloadBase64/stremiox.seriesSourceSticky.fixture~1~0"), paths(archive))
+        NativeHostDocument.requireCredentialFree(inspected)
+        assertThrows(IllegalArgumentException::class.java) { nativeLegacySourceArchive(source) }
+        assertThrows(IllegalArgumentException::class.java) { NativeHostDocument.requireCredentialFree(source) }
+    }
+
+    @Test fun `account restore still rejects unreadable roster and settings envelope`() {
+        val unreadable = listOf(
+            JSONObject().put("settings", blob(mapOf(SettingsBackup.ROSTER_KEY to "[".toByteArray()))),
+            JSONObject().put("settings", blob(mapOf("broken" to "[")) { it.put("schema", 99) }),
+            JSONObject().put("settings", "not base64!"),
+            JSONObject().put("otherCarrier", envelope(blob(mapOf("broken" to "[")))),
+            JSONObject().put("unknown", "["),
+        )
+        for (source in unreadable) {
+            assertThrows(IllegalArgumentException::class.java) { NativeHostDocument.accountRestoreArchive(source) }
+        }
+    }
+
+    @Test fun `account restore still rejects ambiguous credentials and inspection limit failures`() {
+        var tooDeep: Any = "value"
+        repeat(68) { tooDeep = listOf(tooDeep) }
+        val invalid = listOf(
+            blob(mapOf("broken" to mapOf("ambiguousToken" to "fixture"))),
+            blob(mapOf("deep" to tooDeep)),
+        )
+        for (value in invalid) {
+            assertThrows(IllegalArgumentException::class.java) {
+                NativeHostDocument.accountRestoreArchive(JSONObject().put("settings", value))
+            }
+        }
+    }
+
     @Test fun `ambiguous secret-like unmatched field fails rather than guessing`() {
         for (key in listOf("serviceToken", "secretMaterial", "credentialHints", "providerAuthKey")) {
             failure(JSONObject().put(key, "sensitive-value-must-not-be-in-error"), "Ambiguous credential-like")

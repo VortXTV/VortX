@@ -3,10 +3,12 @@ package com.vortx.android.engine
 import com.vortx.android.backup.BinaryPlist
 import com.vortx.android.backup.SettingsBackup
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import org.json.JSONTokener
 import java.net.URI
 import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.util.Base64
 import java.util.Date
@@ -18,8 +20,13 @@ import java.util.Date
  */
 internal object NativeHostDocument {
     private enum class AddonRole { ORDINARY, LEGACY_VORTX, SUMMARY_ROWS, SUMMARY, MANIFEST, DISPLAY }
+    private class UnreadablePreference(message: String) : IllegalArgumentException(archiveError(message))
 
     fun archive(document: JSONObject): JSONObject = Sanitizer().archive(document)
+
+    /** Authenticated account restore may omit unreadable settings from its local inspected copy. */
+    fun accountRestoreArchive(document: JSONObject): JSONObject =
+        Sanitizer(holdUnreadableSettings = true).archive(document)
 
     /** Validation only: never silently sanitize retained import input or rewrite an old checkpoint. */
     fun requireCredentialFree(document: JSONObject, maximumNodes: Int = 100_000) {
@@ -28,15 +35,15 @@ internal object NativeHostDocument {
             "Credential-bearing retained native host material requires reconciliation")
     }
 
-    private class Sanitizer(private val maximumNodes: Int = 100_000) {
-        private val excluded = sortedSetOf<String>()
+    private class Sanitizer(private val maximumNodes: Int = 100_000, private val holdUnreadableSettings: Boolean = false) {
+        private val excluded = mutableListOf<String>()
         private var nodes = 0
         private var inspectedBytes = 0L
 
         fun archive(document: JSONObject): JSONObject {
             val clean = json(document, "", 0, root = true) as JSONObject
             if (NativeWatchedMigrationStorage.KEYS.any(clean::has)) nativeWatchedDocumentSnapshot(clean)
-            return JSONObject().put("document", clean).put("excludedCredentialPaths", JSONArray(excluded.toList()))
+            return JSONObject().put("document", clean).put("excludedCredentialPaths", JSONArray(excluded.distinct().sorted()))
         }
 
         private fun budget(depth: Int) {
@@ -155,12 +162,12 @@ internal object NativeHostDocument {
             val envelopeBytes = decodeBase64(encoded)
             val envelope = parseJson(strictUtf8(envelopeBytes)) as? JSONObject
                 ?: reject("Settings envelope is not an object")
-            val clean = backupEnvelope(envelope, path, depth + 1)
+            val clean = backupEnvelope(envelope, path, depth + 1, holdUnreadableSettings)
             if (excluded.size == priorExclusions) return encoded
             return Base64.getEncoder().encodeToString(clean.toString().toByteArray(Charsets.UTF_8))
         }
 
-        private fun backupEnvelope(envelope: JSONObject, path: String, depth: Int): JSONObject {
+        private fun backupEnvelope(envelope: JSONObject, path: String, depth: Int, restoreSettingsDomain: Boolean = false): JSONObject {
             budget(depth)
             val priorExclusions = excluded.size
             requireArchive(envelope.opt("schema") is Number && envelope.getDouble("schema") == 1.0,
@@ -171,7 +178,7 @@ internal object NativeHostDocument {
             val payload = envelope.opt("payloadBase64") as? String ?: reject("Missing settings payload")
             val rawDomain = BinaryPlist.decode(decodeBase64(payload)) as? Map<*, *>
                 ?: reject("Settings payload is not a representable property-list dictionary")
-            val domain = plist(rawDomain, pointer(path, "payloadBase64"), depth + 1) as Map<*, *>
+            val domain = plist(rawDomain, pointer(path, "payloadBase64"), depth + 1, restoreSettingsDomain) as Map<*, *>
             val stringDomain = linkedMapOf<String, Any>()
             for ((key, child) in domain) stringDomain[key as? String ?: reject("Nonstring settings key")] = child ?: reject("Null settings value")
             val generated = SettingsBackup.encode(stringDomain, envelope.getString("bundleID"), envelope.getString("app"), Date(0))
@@ -188,7 +195,7 @@ internal object NativeHostDocument {
             return cleanEnvelope
         }
 
-        private fun plist(value: Any, path: String, depth: Int): Any {
+        private fun plist(value: Any, path: String, depth: Int, restoreSettingsDomain: Boolean = false): Any {
             budget(depth)
             return when (value) {
                 is Map<*, *> -> linkedMapOf<String, Any>().also { result ->
@@ -197,7 +204,17 @@ internal object NativeHostDocument {
                     }.sortedBy { it.first }
                     for ((key, child) in entries) {
                         val childPath = pointer(path, key)
-                        if (!excluded(key, childPath)) result[key] = plist(child, childPath, depth + 1)
+                        if (excluded(key, childPath)) continue
+                        val priorExclusions = excluded.size
+                        try {
+                            result[key] = plist(child, childPath, depth + 1)
+                        } catch (unreadable: UnreadablePreference) {
+                            if (!restoreSettingsDomain || key == SettingsBackup.ROSTER_KEY) throw unreadable
+                            // Discard the whole preference and its partial inspection. The cloud
+                            // successor is built from the authenticated input, never this copy.
+                            excluded.subList(priorExclusions, excluded.size).clear()
+                            excluded.add("held:$childPath")
+                        }
                     }
                 }
                 is List<*> -> value.mapIndexed { index, child ->
@@ -221,7 +238,7 @@ internal object NativeHostDocument {
                 val priorExclusions = excluded.size
                 val parsed = try {
                     parseJson(value)
-                } catch (malformed: IllegalArgumentException) {
+                } catch (malformed: UnreadablePreference) {
                     if (addonDisplay && literalAddonLabel(trimmed, path, depth)) return value
                     throw malformed
                 }
@@ -287,7 +304,7 @@ internal object NativeHostDocument {
                 // suffix. Both alphabet spellings can occur here, but neither makes it valid data.
                 val normalized = decodable.replace('-', '+').replace('_', '/')
                 val prefixBytes = runCatching { Base64.getDecoder().decode(normalized) }.getOrNull()
-                requireArchive(prefixBytes == null || !recognizable(prefixBytes), "Malformed recognizable base64 structure")
+                if (prefixBytes != null && recognizable(prefixBytes)) throw UnreadablePreference("Malformed recognizable base64 structure")
                 return null
             }
             inspectedBytes += decoded.size
@@ -311,17 +328,18 @@ internal object NativeHostDocument {
             val priorExclusions = excluded.size
             if (bytes.isEmpty()) return bytes.copyOf()
             if (bytes.size >= 6 && bytes.copyOfRange(0, 6).contentEquals("bplist".toByteArray(Charsets.US_ASCII))) {
-                val decoded = BinaryPlist.decode(bytes) ?: reject("Nested property-list data cannot be inspected")
+                val decoded = BinaryPlist.decode(bytes) ?: throw UnreadablePreference("Nested property-list data cannot be inspected")
                 val clean = BinaryPlist.encode(plist(decoded, path, depth + 1)) ?: reject("Nested property-list data cannot be preserved")
                 return if (excluded.size == priorExclusions) bytes.copyOf() else clean
             }
             val text = strictUtf8(bytes)
             if (!text.trimStart().startsWith('{') && !text.trimStart().startsWith('[') && !text.trimStart().startsWith('"')) {
-                val clean = encodedStructure(text, path, depth + 1) ?: reject("Opaque settings data requires reconciliation")
+                val clean = encodedStructure(text, path, depth + 1) ?: throw UnreadablePreference("Opaque settings data requires reconciliation")
                 return if (excluded.size == priorExclusions) bytes.copyOf() else clean.toByteArray(Charsets.UTF_8)
             }
             val decoded = parseJson(text)
-            requireArchive(decoded is JSONObject || decoded is JSONArray || decoded is String, "Opaque settings data requires reconciliation")
+            if (decoded !is JSONObject && decoded !is JSONArray && decoded !is String)
+                throw UnreadablePreference("Opaque settings data requires reconciliation")
             val sanitized = json(decoded, path, depth + 1)
             val clean = (if (sanitized is String) JSONObject.quote(sanitized) else sanitized.toString()).toByteArray(Charsets.UTF_8)
             return if (excluded.size == priorExclusions) bytes.copyOf() else clean
@@ -363,16 +381,19 @@ internal object NativeHostDocument {
     private fun pointer(path: String, key: String): String = path + "/" + key.replace("~", "~0").replace("/", "~1")
     private fun decodeBase64(value: String): ByteArray = runCatching { Base64.getDecoder().decode(value) }
         .getOrElse { reject("Invalid base64 settings carrier") }
-    private fun strictUtf8(bytes: ByteArray): String = runCatching {
+    private fun strictUtf8(bytes: ByteArray): String = try {
         Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT)
             .decode(ByteBuffer.wrap(bytes)).toString()
-    }.getOrElse { reject("Opaque or invalid UTF-8 settings data") }
+    } catch (_: CharacterCodingException) {
+        throw UnreadablePreference("Opaque or invalid UTF-8 settings data")
+    }
     private fun parseJson(value: String): Any = try {
         val reader = JSONTokener(value)
         val parsed = reader.nextValue()
-        requireArchive(reader.nextClean() == '\u0000', "Trailing settings data cannot be inspected")
+        if (reader.nextClean() != '\u0000') throw UnreadablePreference("Opaque or malformed structured settings data")
         parsed
-    } catch (_: Exception) { reject("Opaque or malformed structured settings data") }
+    } catch (_: JSONException) { throw UnreadablePreference("Opaque or malformed structured settings data") }
     private fun requireArchive(condition: Boolean, message: String) { if (!condition) reject(message) }
-    private fun reject(message: String): Nothing = throw IllegalArgumentException("Native host archive reconciliation required: $message")
+    private fun archiveError(message: String) = "Native host archive reconciliation required: $message"
+    private fun reject(message: String): Nothing = throw IllegalArgumentException(archiveError(message))
 }
