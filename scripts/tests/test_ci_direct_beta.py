@@ -402,10 +402,10 @@ class NativeBeta11Contract(NativeBeta7Contract):
 
     def test_builds_bind_to_the_candidate_tag_and_the_beta7_engine(self):
         self.assertEqual(MODULE.build_tag(self.tag), self.build_tag)
-        for tag in ("v0.5.6-beta.7", "v0.5.6-beta.6", "v0.5.6-beta.14"):
+        for tag in ("v0.5.6-beta.7", "v0.5.6-beta.6", "v0.5.6-beta.15"):
             self.assertEqual(MODULE.build_tag(tag), tag)
         self.assertEqual(MODULE.expected_engine(self.tag), MODULE.NATIVE_BETA7_ENGINE)
-        for tag in ("v0.5.6-beta.8", "v0.5.6-beta.9", "v0.5.6-beta.10", "v0.5.6-beta.14", self.build_tag):
+        for tag in ("v0.5.6-beta.8", "v0.5.6-beta.9", "v0.5.6-beta.10", "v0.5.6-beta.15", self.build_tag):
             with self.subTest(tag=tag), self.assertRaises(ValueError):
                 MODULE.expected_engine(tag)
         for lane in ("apple", "android"):
@@ -444,7 +444,7 @@ class NativeBeta12Contract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exact cross-platform build"):
             MODULE.source_versions(NativeBeta11Contract.project(build="282"),
                 NativeBeta11Contract.gradle(build="282"), "0.5.6", self.tag)
-        for tag in (self.candidate, "v0.5.6-beta.14",
+        for tag in (self.candidate, "v0.5.6-beta.15",
                     *(self.tag + "-candidate." + suffix for suffix in self.rejected_candidates)):
             with self.subTest(tag=tag), self.assertRaises(ValueError):
                 MODULE.expected_engine(tag)
@@ -551,6 +551,46 @@ class NativeBeta13Contract(NativeBeta12Contract):
         for tag in (self.tag, NativeBeta12Contract.candidate, self.tag + "-candidate.2"):
             with self.subTest(tag=tag), self.assertRaises(ValueError):
                 MODULE.validate_dispatch({**receipt, "ref": "refs/tags/" + tag}, self.pointer, self.tag, self.source)
+
+
+class NativeBeta14Contract(NativeBeta12Contract):
+    tag = "v0.5.6-beta.14"
+    candidate = "v0.5.6-beta.14-candidate.1"
+    build = "292"
+    preflight_mode = "beta14-candidate-preflight"
+    rejected_candidates = ("2", "9")
+
+    def test_beta14_requires_both_the_artifact_only_guard_and_android_regression_gate(self):
+        for lane, guard in (("apple", "Verify protected Beta 14 artifact-only dispatch"),
+                            ("android", MODULE.BETA14_ANDROID_REGRESSIONS)):
+            historical, _ = MODULE.job_contract(lane, NativeBeta13Contract.tag)
+            self.assertNotIn(guard, historical)
+            original = NativeBeta7Contract.job(self, lane, self.tag)
+            MODULE.successful_job([original], lane, 5, 1, self.source, self.tag)
+            original["steps"] = [step for step in original["steps"] if step["name"] != guard]
+            with self.assertRaisesRegex(ValueError, guard):
+                MODULE.successful_job([original], lane, 5, 1, self.source, self.tag)
+
+
+    def test_regression_receipt_requires_every_suite_and_matching_total(self):
+        beginning = "2026-11-15T00:00:00Z"
+        ending = "2026-11-15T00:00:02Z"
+        marker_time = "2026-11-15T00:00:01Z"
+        step = {"started_at": beginning, "completed_at": ending}
+        suites = MODULE.BETA14_ANDROID_SUITES
+        hashes = "d" * 64
+        rows = [f"{marker_time} Verified protected Android regression: {suite} (2 cases); XML SHA256 {hashes}"
+                for suite in suites]
+        total = f"{marker_time} Verified protected Android account setup and release regressions: {2 * len(suites)} cases"
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "android.log"
+            log.write_text("\n".join([*rows, total]) + "\n")
+            self.assertEqual(MODULE.android_regression_proof(log, step)["suites"],
+                             {name: {"cases": 2, "xmlSha256": hashes} for name in suites})
+            for modified in ([*rows[:-1], total], [*rows, rows[0], total], [*rows, total.replace(f": {2 * len(suites)} cases", ": 1 cases")]):
+                log.write_text("\n".join(modified) + "\n")
+                with self.assertRaisesRegex(ValueError, "log marker"):
+                    MODULE.android_regression_proof(log, step)
 
 
 if __name__ == "__main__":

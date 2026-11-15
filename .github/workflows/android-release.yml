@@ -49,9 +49,15 @@ jobs:
           case "$GITHUB_REF:$RELEASE_TAG" in
             refs/tags/v0.5.6-beta.13:*|*:v0.5.6-beta.13)
               echo "::error::Beta 13 packages must come from the exact protected candidate"; exit 1 ;;
-            refs/tags/v0.5.6-beta.12-candidate.*:*|*:v0.5.6-beta.12-candidate.*|refs/tags/v0.5.6-beta.13-candidate.*:*|*:v0.5.6-beta.13-candidate.*)
+            refs/tags/v0.5.6-beta.14:*|*:v0.5.6-beta.14)
+              echo "::error::Beta 14 packages must come from the exact protected candidate"; exit 1 ;;
+            refs/tags/v0.5.6-beta.12-candidate.*:*|*:v0.5.6-beta.12-candidate.*|\
+            refs/tags/v0.5.6-beta.13-candidate.*:*|*:v0.5.6-beta.13-candidate.*|\
+            refs/tags/v0.5.6-beta.14-candidate.*:*|*:v0.5.6-beta.14-candidate.*)
               case "$GITHUB_REF:$RELEASE_TAG" in
-                refs/tags/v0.5.6-beta.12-candidate.3:v0.5.6-beta.12-candidate.3|refs/tags/v0.5.6-beta.13-candidate.1:v0.5.6-beta.13-candidate.1) ;;
+                refs/tags/v0.5.6-beta.12-candidate.3:v0.5.6-beta.12-candidate.3|\
+                refs/tags/v0.5.6-beta.13-candidate.1:v0.5.6-beta.13-candidate.1|\
+                refs/tags/v0.5.6-beta.14-candidate.1:v0.5.6-beta.14-candidate.1) ;;
                 *) echo "::error::Protected candidate ref and input must match an exact reviewed pair"; exit 1 ;;
               esac
               [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REPOSITORY" == VortXTV/VortX &&
@@ -212,7 +218,7 @@ jobs:
           retention-days: 90
 
       - name: Verify protected Android backup format and CAS
-        if: github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1'
+        if: github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' || github.ref == 'refs/tags/v0.5.6-beta.14-candidate.1'
         working-directory: android
         timeout-minutes: 15
         env:
@@ -244,6 +250,77 @@ jobs:
                      for key in ("skipped", "failure", "error")) for case in cases)):
               raise SystemExit("Protected Android backup CAS suite differs or did not pass")
           print("Verified protected Android backup CAS: 16 cases; XML SHA256 " + hashlib.sha256(data).hexdigest())
+          PYTEST
+
+      - name: Verify protected Android account setup and release regressions
+        if: github.ref == 'refs/tags/v0.5.6-beta.14-candidate.1'
+        working-directory: android
+        timeout-minutes: 20
+        env:
+          JAVA_TOOL_OPTIONS: "-XX:ActiveProcessorCount=1"
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^{commit})" = "$SOURCE_COMMIT"
+          suites=(
+            sync.AndroidRealtimeSyncTest
+            sync.VortXSessionOwnerTransitionContractTest
+            engine.NativeAddonAccountReadinessTest
+            engine.NativeHostDocumentTest
+            integrations.TraktCredentialTruthTest
+            integrations.NativeProviderCredentialsTest
+            update.UpdatePolicyTest
+            ui.ArtworkFallbackTest
+            ui.tv.TvPosterLayoutPolicyTest
+            player.PlayerKeyboardShortcutTest
+            player.SubtitleAddonHttpTest
+            downloads.DownloadPlaybackRoutingTest
+            downloads.DownloadedSeasonBoundaryTest
+          )
+          reports=app/build/test-results/testPlayDebugUnitTest
+          filters=()
+          for name in "${suites[@]}"; do
+            suite="com.vortx.android.$name"
+            report="$reports/TEST-$suite.xml"
+            test ! -e "$report" && test ! -L "$report"
+            filters+=(--tests "$suite")
+          done
+          ./gradlew :app:testPlayDebugUnitTest "${filters[@]}" --rerun \
+            --no-build-cache --no-daemon --max-workers=1
+          python3 -I - "$reports" "${suites[@]}" <<'PYTEST'
+          import hashlib
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          reports = Path(sys.argv[1])
+          tests = Path("app/src/test/kotlin")
+          annotation = re.compile(r"^[ \t]*@Test\b", re.M)
+          declared_test = re.compile(r"^[ \t]*@Test\s+fun\s+(`[^`\r\n]+`|[A-Za-z_][A-Za-z0-9_]*)\s*\(", re.M)
+          total = 0
+          for name in sys.argv[2:]:
+              suite = "com.vortx.android." + name
+              source = (tests / (suite.replace(".", "/") + ".kt")).read_text()
+              expected_names = {test.strip("`") for test in declared_test.findall(source)}
+              count = len(expected_names)
+              if not expected_names or len(annotation.findall(source)) != count:
+                  raise SystemExit(f"Cannot determine the exact Android regression test roster: {suite}")
+              report = reports / f"TEST-{suite}.xml"
+              if not report.is_file() or report.is_symlink():
+                  raise SystemExit(f"Missing or indirect Android regression report: {suite}")
+              data = report.read_bytes()
+              root = ET.fromstring(data)
+              cases = root.findall("testcase")
+              names = {case.get("name") for case in cases}
+              if (root.tag != "testsuite" or root.get("name") != suite or root.get("tests") != str(count)
+                  or any(root.get(key) != "0" for key in ("skipped", "failures", "errors"))
+                  or len(cases) != count or names != expected_names
+                  or any(case.get("classname") != suite or any(case.find(key) is not None
+                         for key in ("skipped", "failure", "error")) for case in cases)):
+                  raise SystemExit(f"Android regression suite changed or did not pass: {suite}")
+              print(f"Verified protected Android regression: {suite} ({count} cases); XML SHA256 {hashlib.sha256(data).hexdigest()}")
+              total += count
+          print(f"Verified protected Android account setup and release regressions: {total} cases")
           PYTEST
 
       - name: Build release APKs and Play bundle
@@ -383,7 +460,10 @@ jobs:
             !startsWith(inputs.release_tag, 'v0.5.6-beta.12-candidate.') &&
             github.ref != 'refs/tags/v0.5.6-beta.13' && inputs.release_tag != 'v0.5.6-beta.13' &&
             !startsWith(github.ref, 'refs/tags/v0.5.6-beta.13-candidate.') &&
-            !startsWith(inputs.release_tag, 'v0.5.6-beta.13-candidate.') }}
+            !startsWith(inputs.release_tag, 'v0.5.6-beta.13-candidate.') &&
+            github.ref != 'refs/tags/v0.5.6-beta.14' && inputs.release_tag != 'v0.5.6-beta.14' &&
+            !startsWith(github.ref, 'refs/tags/v0.5.6-beta.14-candidate.') &&
+            !startsWith(inputs.release_tag, 'v0.5.6-beta.14-candidate.') }}
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}

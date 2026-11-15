@@ -386,6 +386,30 @@ jobs:
               }' out/native-ci-dispatch.json >/dev/null ;;
           esac
 
+      - name: Verify protected Beta 14 artifact-only dispatch
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF:$RELEASE_TAG" in
+            refs/tags/v0.5.6-beta.14:*|*:v0.5.6-beta.14)
+              echo "::error::Beta 14 packages must come from the exact protected candidate"; exit 1 ;;
+            refs/tags/v0.5.6-beta.14-candidate.*:*|*:v0.5.6-beta.14-candidate.*)
+              test "$GITHUB_EVENT_NAME" = workflow_dispatch && test "$GITHUB_REPOSITORY" = VortXTV/VortX &&
+                test "$GITHUB_REF" = refs/tags/v0.5.6-beta.14-candidate.1 &&
+                test -z "$RELEASE_TAG" && test "$BUILD_SOURCE_SHA" = "$GITHUB_SHA" || exit 1
+              jq -e '.inputs == {
+                native_only:true, publish_release:false, publish_existing_055:false,
+                tvos_test_only:false, apple_only:false, release_tag:"", recovery_source_commit:"",
+                resume_handoff:"", mpvkit_artifacts_url:"", mpvkit_artifacts_sha256:"", release_id:"", altstore_note:""
+              }' out/native-ci-dispatch.json >/dev/null ;;
+          esac
+
+      - name: Verify protected Apple legacy archive recovery
+        if: github.ref == 'refs/tags/v0.5.6-beta.14-candidate.1'
+        timeout-minutes: 10
+        run: bash scripts/test-native-migration-phase-a.sh bootstrap
+
       - name: Reject removed legacy comparison builds
         if: env.VORTX_NATIVE_ONLY != 'true'
         run: |
@@ -854,7 +878,8 @@ jobs:
 
       - name: Resolve pinned Apple Aether release packages
         if: github.event_name == 'workflow_dispatch' &&
-          (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' || github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1')
+          (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' ||
+           github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' || github.ref == 'refs/tags/v0.5.6-beta.14-candidate.1')
         run: |
           set -euo pipefail
           jq -e '.inputs == {
@@ -1274,7 +1299,8 @@ jobs:
           MAC_APP="app/build/ci-mac/Build/Products/Release/VortX.app"
           if [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ] &&
              { [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.12-candidate.3 ] ||
-               [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.13-candidate.1 ]; }; then
+               [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.13-candidate.1 ] ||
+               [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.14-candidate.1 ]; }; then
             python3 scripts/verify-protected-apple-aether.py --sign-macos --key macos \
               --packages "$AETHER_RELEASE_PACKAGES" --lock "$AETHER_RELEASE_LOCK" \
               --resolution-receipt "$AETHER_RELEASE_EVIDENCE/aether-resolved.json" \
@@ -1310,7 +1336,8 @@ jobs:
 
       - name: Verify packaged Apple Aether linkage
         if: github.event_name == 'workflow_dispatch' &&
-          (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' || github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1')
+          (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' ||
+           github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' || github.ref == 'refs/tags/v0.5.6-beta.14-candidate.1')
         run: |
           set -euo pipefail
           check_app() {
@@ -1574,7 +1601,8 @@ jobs:
 
       - name: Upload protected Apple Aether release evidence
         if: github.event_name == 'workflow_dispatch' &&
-          (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' || github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1')
+          (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' ||
+           github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' || github.ref == 'refs/tags/v0.5.6-beta.14-candidate.1')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-Apple-Aether-release-evidence
@@ -1676,6 +1704,9 @@ jobs:
       github.ref != 'refs/tags/v0.5.6-beta.13' && inputs.release_tag != 'v0.5.6-beta.13' &&
       !startsWith(github.ref, 'refs/tags/v0.5.6-beta.13-candidate.') &&
       !startsWith(inputs.release_tag, 'v0.5.6-beta.13-candidate.') &&
+      github.ref != 'refs/tags/v0.5.6-beta.14' && inputs.release_tag != 'v0.5.6-beta.14' &&
+      !startsWith(github.ref, 'refs/tags/v0.5.6-beta.14-candidate.') &&
+      !startsWith(inputs.release_tag, 'v0.5.6-beta.14-candidate.') &&
       inputs.release_tag != '' && inputs.tvos_test_only != true && inputs.native_only == true && (
         (inputs.resume_handoff == '' && needs.build-tvos.result == 'success' &&
           (github.ref == format('refs/tags/{0}', inputs.release_tag) || (github.ref == 'refs/heads/main' && inputs.recovery_source_commit != ''))) ||
