@@ -1,517 +1,29 @@
 name: Release Android
 
-# OWNER SETUP BEFORE THE FIRST REAL RUN:
-# Add VORTX_KEYSTORE_PATH, VORTX_KEYSTORE_PASSWORD, VORTX_KEY_ALIAS, and
-# VORTX_KEY_PASSWORD as secrets on the engine-ci environment. VORTX_KEYSTORE_PATH must contain the
-# base64 of the upload keystore. This workflow fails closed before any build when one is absent.
+# Proof-only rerun for the frozen Build 295 app. The signed package job already ran in the
+# original candidate workflow. This overlay has no signing, private-engine, or release job.
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing draft release tag, or an exact protected artifact-only candidate tag
+        description: Exact frozen Android artifact candidate to verify
         required: true
         type: string
       publish_release:
-        description: Deprecated safety switch. Android may attach verified assets to a draft but may never publish it.
+        description: Must be false for this proof-only operation
         required: true
         default: false
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release-android:
-    # Environment gate for this token-bearing job (trust boundary): engine-ci must restrict deployment
-    # to reviewed release refs before ENGINE_REPO_TOKEN and signing secrets become available.
-    environment: engine-ci
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.release_tag }}
-          persist-credentials: false
-
-      - name: Bind the build to the requested release tag (fail closed)
-        env:
-          RELEASE_TAG: ${{ inputs.release_tag }}
-        run: |
-          set -euo pipefail
-          git check-ref-format "refs/tags/$RELEASE_TAG" >/dev/null || { echo "::error::invalid release tag"; exit 1; }
-          tag_ref="refs/tags/$RELEASE_TAG"
-          git show-ref --verify --quiet "$tag_ref" || { echo "::error::requested release tag was not checked out"; exit 1; }
-          source_commit="$(git rev-parse HEAD^{commit})"
-          tag_commit="$(git rev-parse "${tag_ref}^{commit}")"
-          if [ "$source_commit" != "$tag_commit" ]; then
-            echo "::error::checked-out source does not match the requested release tag"
-            exit 1
-          fi
-          case "$GITHUB_REF:$RELEASE_TAG" in
-            refs/tags/v0.5.6-beta.13:*|*:v0.5.6-beta.13)
-              echo "::error::Beta 13 packages must come from the exact protected candidate"; exit 1 ;;
-            refs/tags/v0.5.6-beta.14:*|*:v0.5.6-beta.14)
-              echo "::error::Beta 14 packages must come from the exact protected candidate"; exit 1 ;;
-            refs/tags/v0.5.6-beta.12-candidate.*:*|*:v0.5.6-beta.12-candidate.*|\
-            refs/tags/v0.5.6-beta.13-candidate.*:*|*:v0.5.6-beta.13-candidate.*|\
-            refs/tags/v0.5.6-beta.14-candidate.*:*|*:v0.5.6-beta.14-candidate.*)
-              case "$GITHUB_REF:$RELEASE_TAG" in
-                refs/tags/v0.5.6-beta.12-candidate.3:v0.5.6-beta.12-candidate.3|\
-                refs/tags/v0.5.6-beta.13-candidate.1:v0.5.6-beta.13-candidate.1|\
-                refs/tags/v0.5.6-beta.14-candidate.2:v0.5.6-beta.14-candidate.2|\
-                refs/tags/v0.5.6-beta.14-candidate.3:v0.5.6-beta.14-candidate.3|\
-                refs/tags/v0.5.6-beta.14-candidate.4:v0.5.6-beta.14-candidate.4) ;;
-                *) echo "::error::Protected candidate ref and input must match an exact reviewed pair"; exit 1 ;;
-              esac
-              [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REPOSITORY" == VortXTV/VortX &&
-                 "$GITHUB_SHA" == "$source_commit" ]] || { echo '::error::Protected candidate must use the exact reviewed workflow and source'; exit 1; } ;;
-          esac
-          echo "SOURCE_COMMIT=$source_commit" >> "$GITHUB_ENV"
-          echo "RELEASE_TAG_COMMIT=$tag_commit" >> "$GITHUB_ENV"
-
-      - name: Refuse Android-only publication
-        if: inputs.publish_release == true
-        run: |
-          echo "::error::Android artifacts may only be attached to the draft. The Apple release coordinator validates the complete cross-platform set and publishes last."
-          exit 1
-
-      - name: Acquire reviewed Android mpv component from the checked-out release source
-        run: /usr/bin/python3 -I scripts/acquire-android-mpv-component.py
-
-      # The private engine pin stays in lockstep with android.yml. Artifacts package only libvortx_ffi.so.
-      - name: Preflight the engine token (fail closed)
-        env:
-          ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${ENGINE_REPO_TOKEN:-}" ]; then
-            echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine repo (VortXTV/vortx-core)"
-            exit 1
-          fi
-
-      - name: Preflight release signing inputs (fail closed)
-        env:
-          VORTX_KEYSTORE_PATH: ${{ secrets.VORTX_KEYSTORE_PATH }}
-          VORTX_KEYSTORE_PASSWORD: ${{ secrets.VORTX_KEYSTORE_PASSWORD }}
-          VORTX_KEY_ALIAS: ${{ secrets.VORTX_KEY_ALIAS }}
-          VORTX_KEY_PASSWORD: ${{ secrets.VORTX_KEY_PASSWORD }}
-        run: scripts/verify-android-release-signing.sh preflight
-
-      - name: Fetch vortx-core (private monorepo, pinned)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: VortXTV/vortx-core
-          ref: 2ea2e0f27dd2e53b7b28228435ca35a70f92831f
-          token: ${{ secrets.ENGINE_REPO_TOKEN }}
-          path: _vortx_core_src
-          persist-credentials: false
-
-      - name: Promote the vortx-core workspace + record the exact private source pin
-        run: |
-          set -euo pipefail
-          vortx_sha="$(git -C _vortx_core_src rev-parse HEAD^{commit})"
-          test "$vortx_sha" = "2ea2e0f27dd2e53b7b28228435ca35a70f92831f" \
-            || { echo "::error::vortx-core checkout does not match the reviewed private pin"; exit 1; }
-          echo "VORTX_ENGINE_SOURCE_SHA=$vortx_sha" >> "$GITHUB_ENV"
-          rm -rf vortx-core
-          mv _vortx_core_src/vortx-core vortx-core
-          rm -rf _vortx_core_src
-          test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine workspace missing after promote (vortx-core/Cargo.toml)"; exit 1; }
-          test -d vortx-core/crates     || { echo "::error::vortx-core engine crates/ missing after promote (vortx-core/crates)"; exit 1; }
-          echo "pinned private source: vortx-core@$vortx_sha (promoted monorepo subdir)"
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
-        with:
-          distribution: temurin
-          java-version: "21"
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
-        with:
-          packages: "platform-tools platforms;android-37.0 build-tools;36.0.0 cmake;4.1.2"
-
-      # The committed wrapper remains the Gradle version authority. This action supplies caching only.
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
-
-      - name: Install Android NDK (must match ndkVersion in app/build.gradle.kts)
-        run: |
-          yes | sdkmanager "ndk;30.0.16248370"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
-          # The runner image also exports an older NDK as ANDROID_NDK_ROOT; point it at the same pin
-          # so no tool can pick the other one.
-          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
-
-      - name: Install Rust nightly + Android targets
-        uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly branch, 2026-07-19
-        with:
-          toolchain: nightly-2026-07-19
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
-          components: rust-src
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          # `key` remains in the action's restore prefix; private source changes cannot fall
-          # back to an older same-ref native target cache. The checkout exists before hashing.
-          key: ${{ github.ref_name }}-native-${{ env.VORTX_ENGINE_SOURCE_SHA }}-${{ hashFiles('vortx-core/Cargo.*', 'vortx-core/rust-toolchain.toml', 'vortx-core/.cargo/**', 'vortx-core/crates/**', 'android/app/build.gradle.kts') }}
-          workspaces: |
-            vortx-core -> target-andx
-
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --version "=3.5.4" --locked
-
-      # Same protected job, same authenticated private pin, no extra credentials. Host JNI is
-      # disposable and separate from target-andx/jniLibs; it must never enter an APK or handoff.
-      - name: Build exact host JNI for native sync release tests
-        timeout-minutes: 45
-        run: |
-          set -euo pipefail
-          test "$VORTX_ENGINE_SOURCE_SHA" = 2ea2e0f27dd2e53b7b28228435ca35a70f92831f
-          test "$(git rev-parse HEAD^{commit})" = "$SOURCE_COMMIT"
-          target="$(mktemp -d "$RUNNER_TEMP/native-sync-host.XXXXXXXX")"
-          proof="$GITHUB_WORKSPACE/android/app/build/reports/native-sync-host"
-          mkdir -p "$proof"
-          source_manifest="$target/source-inputs.sha256"
-          find vortx-core \( -path vortx-core/target -o -path vortx-core/target-andx \) -prune -o \
-            -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$source_manifest"
-          test -s "$source_manifest"
-          nice -n 15 cargo +nightly-2026-07-19 build --locked \
-            --manifest-path vortx-core/Cargo.toml -p vortx-ffi --no-default-features \
-            --features jni,server,resource-host --release --target x86_64-unknown-linux-gnu \
-            --target-dir "$target" --jobs 1
-          find vortx-core \( -path vortx-core/target -o -path vortx-core/target-andx \) -prune -o \
-            -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$target/source-inputs.after.sha256"
-          cmp --silent "$source_manifest" "$target/source-inputs.after.sha256"
-          library="$target/x86_64-unknown-linux-gnu/release/libvortx_ffi.so"
-          test -s "$library" && test ! -L "$library"
-          # Host architecture + the production JNI call surface, without printing private inputs.
-          readelf -h "$library" | grep -Eq 'Machine:[[:space:]]+Advanced Micro Devices X86-64'
-          READELF=readelf bash scripts/verify-native-engine-abi.sh android "$library" owner-history
-          library_sha="$(sha256sum "$library" | cut -d' ' -f1)"
-          source_sha="$(sha256sum "$source_manifest" | cut -d' ' -f1)"
-          jq -n --arg app "$SOURCE_COMMIT" --arg source "$VORTX_ENGINE_SOURCE_SHA" \
-            --arg path "$library" --arg sha "$library_sha" --arg inputs "$source_sha" \
-            '{schema:1,appSource:$app,engineSource:$source,features:"jni,server,resource-host",
-              toolchain:"nightly-2026-07-19",hostTarget:"x86_64-unknown-linux-gnu",
-              libraryPath:$path,librarySha256:$sha,sourceInputsSha256:$inputs}' > "$proof/host-jni.json"
-          echo "VORTX_JNI_LIBRARY=$library" >> "$GITHUB_ENV"
-          echo "VORTX_JNI_EXPECTED_SHA256=$library_sha" >> "$GITHUB_ENV"
-          echo "VORTX_JNI_RECEIPT=$proof/host-jni.json" >> "$GITHUB_ENV"
-          echo "VORTX_JNI_SOURCE_MANIFEST=$source_manifest" >> "$GITHUB_ENV"
-
-      - name: Require real native sync revision and account tests before packaging
-        timeout-minutes: 30
-        working-directory: android
-        env:
-          JAVA_TOOL_OPTIONS: "-XX:ActiveProcessorCount=1"
-          VORTX_JNI_SYNC: "1"
-        run: bash ../scripts/test-android-native-sync-host.sh
-
-      - name: Retain native sync release JUnit and bounded provenance
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: VortX-Android-native-sync-host-tests
-          path: |
-            android/app/build/test-results/testPlayDebugUnitTest/*.xml
-            android/app/build/reports/native-sync-host/host-jni.json
-            android/app/build/reports/native-sync-host/host-jni-accepted.json
-          if-no-files-found: warn
-          retention-days: 90
-
-      - name: Verify protected Android backup format and CAS
-        if: >-
-          github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' ||
-          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' ||
-          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.3' ||
-          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.4'
-        working-directory: android
-        timeout-minutes: 15
-        env:
-          JAVA_TOOL_OPTIONS: "-XX:ActiveProcessorCount=1"
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD^{commit})" = "$SOURCE_COMMIT"
-          suite=com.vortx.android.sync.VortXBackupCasContractTest
-          report="app/build/test-results/testPlayDebugUnitTest/TEST-$suite.xml"
-          test ! -e "$report"
-          ./gradlew :app:testPlayDebugUnitTest --tests "$suite" --rerun \
-            --no-build-cache --no-daemon --max-workers=1
-          python3 -I - "$report" "$suite" <<'PYTEST'
-          import hashlib
-          import sys
-          import xml.etree.ElementTree as ET
-          from pathlib import Path
-
-          report, suite = Path(sys.argv[1]), sys.argv[2]
-          data = report.read_bytes()
-          root = ET.fromstring(data)
-          cases = root.findall("testcase")
-          names = {case.get("name") for case in cases}
-          if (root.tag != "testsuite" or root.get("name") != suite or root.get("tests") != "16"
-              or any(root.get(key) != "0" for key in ("skipped", "failures", "errors"))
-              or len(cases) != 16 or len(names) != 16 or not all(names)
-              or "ordinary writes preserve the authenticated head format for this account" not in names
-              or any(case.get("classname") != suite or any(case.find(key) is not None
-                     for key in ("skipped", "failure", "error")) for case in cases)):
-              raise SystemExit("Protected Android backup CAS suite differs or did not pass")
-          print("Verified protected Android backup CAS: 16 cases; XML SHA256 " + hashlib.sha256(data).hexdigest())
-          PYTEST
-
-      - name: Verify protected Android account setup and release regressions
-        if: >-
-          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' ||
-          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.3' ||
-          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.4'
-        working-directory: android
-        timeout-minutes: 20
-        env:
-          JAVA_TOOL_OPTIONS: "-XX:ActiveProcessorCount=1"
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD^{commit})" = "$SOURCE_COMMIT"
-          suites=(
-            sync.AndroidRealtimeSyncTest
-            sync.VortXSessionOwnerTransitionContractTest
-            engine.NativeAddonAccountReadinessTest
-            engine.NativeHostDocumentTest
-            integrations.TraktCredentialTruthTest
-            integrations.NativeProviderCredentialsTest
-            update.UpdatePolicyTest
-            ui.ArtworkFallbackTest
-            ui.tv.TvPosterLayoutPolicyTest
-            player.PlayerKeyboardShortcutTest
-            player.SubtitleAddonHttpTest
-            downloads.DownloadPlaybackRoutingTest
-            downloads.DownloadedSeasonBoundaryTest
-          )
-          if [[ "$GITHUB_REF" == refs/tags/v0.5.6-beta.14-candidate.[34] ]]; then
-            suites+=(
-              diagnostics.DiagnosticExportTest
-              profile.ProfileSelectionWiringTest
-              profile.BackupRecoveryEntryWiringTest
-              ui.profilepicker.ProfilePickerToolsControllerTest
-              ui.profilepicker.ProfilePickerToolsRestoreControllerTest
-              ui.profilepicker.ProfilePickerToolsManagerTest
-              backup.accountfiles.AccountBackupDocumentsTest
-              sync.SessionRenewalManagerTest
-              sync.VortXQrJoinFlowTest
-            )
-          fi
-          reports=app/build/test-results/testPlayDebugUnitTest
-          filters=()
-          for name in "${suites[@]}"; do
-            suite="com.vortx.android.$name"
-            report="$reports/TEST-$suite.xml"
-            test ! -e "$report" && test ! -L "$report"
-            filters+=(--tests "$suite")
-          done
-          ./gradlew :app:testPlayDebugUnitTest "${filters[@]}" --rerun \
-            --no-build-cache --no-daemon --max-workers=1
-          python3 -I - "$reports" "${suites[@]}" <<'PYTEST'
-          import hashlib
-          import re
-          import sys
-          import xml.etree.ElementTree as ET
-          from pathlib import Path
-
-          reports = Path(sys.argv[1])
-          tests = Path("app/src/test/kotlin")
-          annotation = re.compile(r"^[ \t]*@Test\b", re.M)
-          declared_test = re.compile(r"^[ \t]*@Test\s+fun\s+(`[^`\r\n]+`|[A-Za-z_][A-Za-z0-9_]*)\s*\(", re.M)
-          total = 0
-          for name in sys.argv[2:]:
-              suite = "com.vortx.android." + name
-              source = (tests / (suite.replace(".", "/") + ".kt")).read_text()
-              expected_names = {test.strip("`") for test in declared_test.findall(source)}
-              count = len(expected_names)
-              if not expected_names or len(annotation.findall(source)) != count:
-                  raise SystemExit(f"Cannot determine the exact Android regression test roster: {suite}")
-              report = reports / f"TEST-{suite}.xml"
-              if not report.is_file() or report.is_symlink():
-                  raise SystemExit(f"Missing or indirect Android regression report: {suite}")
-              data = report.read_bytes()
-              root = ET.fromstring(data)
-              cases = root.findall("testcase")
-              names = {case.get("name") for case in cases}
-              if (root.tag != "testsuite" or root.get("name") != suite or root.get("tests") != str(count)
-                  or any(root.get(key) != "0" for key in ("skipped", "failures", "errors"))
-                  or len(cases) != count or names != expected_names
-                  or any(case.get("classname") != suite or any(case.find(key) is not None
-                         for key in ("skipped", "failure", "error")) for case in cases)):
-                  raise SystemExit(f"Android regression suite changed or did not pass: {suite}")
-              print(f"Verified protected Android regression: {suite} ({count} cases); XML SHA256 {hashlib.sha256(data).hexdigest()}")
-              total += count
-          print(f"Verified protected Android account setup and release regressions: {total} cases")
-          PYTEST
-
-      - name: Build release APKs and Play bundle
-        working-directory: android
-        env:
-          TRAKT_CLIENT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
-          TRAKT_CLIENT_SECRET: ${{ secrets.TRAKT_CLIENT_SECRET }}
-          SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
-          SIMKL_CLIENT_SECRET: ${{ secrets.SIMKL_CLIENT_SECRET }}
-          VORTX_ENGINE_CORE_DIR: ${{ github.workspace }}/vortx-core
-          VORTX_REQUIRE_ENGINE: "1"
-          VORTX_KEYSTORE_PATH: ${{ secrets.VORTX_KEYSTORE_PATH }}
-          VORTX_KEYSTORE_PASSWORD: ${{ secrets.VORTX_KEYSTORE_PASSWORD }}
-          VORTX_KEY_ALIAS: ${{ secrets.VORTX_KEY_ALIAS }}
-          VORTX_KEY_PASSWORD: ${{ secrets.VORTX_KEY_PASSWORD }}
-        run: ./gradlew :app:assembleFullRelease :app:assemblePlayRelease :app:bundlePlayRelease --no-daemon --stacktrace
-
-      - name: Verify native-only engine in every Android artifact
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          apks=(android/app/build/outputs/apk/full/release/*.apk android/app/build/outputs/apk/play/release/*.apk)
-          bundles=(android/app/build/outputs/bundle/playRelease/*.aab)
-          if [ ${#apks[@]} -ne 2 ] || [ ${#bundles[@]} -ne 1 ]; then
-            echo "::error::expected exactly two release APKs and one AAB"
-            exit 1
-          fi
-          READELF="$ANDROID_HOME/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
-          STRIP="$ANDROID_HOME/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-          test -x "$READELF" || { echo "::error::pinned NDK llvm-readelf unavailable"; exit 1; }
-          test -x "$STRIP" || { echo "::error::pinned NDK llvm-strip unavailable"; exit 1; }
-          READELF="$READELF" STRIP="$STRIP" bash scripts/verify-native-android-artifacts.sh \
-            --native-only --staged-dir android/app/src/main/jniLibs \
-            --source-sha "$VORTX_ENGINE_SOURCE_SHA" "${apks[@]}" "${bundles[@]}" \
-            | tee "$RUNNER_TEMP/android-native-engine-provenance.txt"
-
-      - name: Verify pinned production signer on every Android artifact
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          apks=(android/app/build/outputs/apk/full/release/*.apk android/app/build/outputs/apk/play/release/*.apk)
-          bundles=(android/app/build/outputs/bundle/playRelease/*.aab)
-          if [ ${#apks[@]} -ne 2 ] || [ ${#bundles[@]} -ne 1 ]; then
-            echo "::error::expected exactly two release APKs and one release AAB before signer verification"
-            exit 1
-          fi
-          scripts/verify-android-release-signing.sh verify "${apks[@]}" "${bundles[@]}"
-
-      - name: Verify Play APK remains GPL-native-library free
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          for apk in android/app/build/outputs/apk/play/release/*.apk; do
-            listing="$(unzip -l "$apk")"
-            if grep -Eq 'lib(mpv|player|avcodec|avformat|avutil)\.so' <<<"$listing"; then
-              echo "::error::GPL native library found in play release APK: $apk"
-              exit 1
-            fi
-          done
-
-      # REL-02: stage names carry the REAL dimensions of each artifact, never a device split.
-      # The product flavor is the engine/distribution boundary only:
-      #   full-mpv     = sideloaded build carrying the GPLv3 libmpv native engine
-      #   play-media3  = Google Play-bound build carrying only the Media3/ExoPlayer engine
-      # BOTH variants contain the phone AND the Android TV activities (one APK per flavor runs
-      # on both device classes; the flavor never selects a UI), and both are universal APKs:
-      # one binary per flavor packages every shipped ABI (arm64-v8a + armeabi-v7a + x86_64). The canonical
-      # dimension table, old-to-new name mapping, and consumer guidance live in
-      # docs/RELEASE-ARTIFACTS.md.
-      - name: Stage verified release assets and provenance
-        id: assets
-        env:
-          RELEASE_TAG: ${{ inputs.release_tag }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          version="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' android/app/build.gradle.kts | head -n1)"
-          test -n "$version" || { echo "::error::could not read Android versionName"; exit 1; }
-          version_code="$(sed -n 's/^[[:space:]]*versionCode = \([0-9][0-9]*\)[[:space:]]*$/\1/p' android/app/build.gradle.kts)"
-          [[ "$version_code" =~ ^[1-9][0-9]*$ ]] || { echo "::error::expected exactly one numeric Android versionCode"; exit 1; }
-          full=(android/app/build/outputs/apk/full/release/*.apk)
-          play=(android/app/build/outputs/apk/play/release/*.apk)
-          bundle=(android/app/build/outputs/bundle/playRelease/*.aab)
-          test ${#full[@]} -eq 1 && test ${#play[@]} -eq 1 && test ${#bundle[@]} -eq 1 || { echo "::error::expected one full APK, one play APK, and one play AAB"; exit 1; }
-          rm -rf dist
-          mkdir -p dist
-          cp "${full[0]}" "dist/VortX-${version}-full-mpv-universal.apk"
-          cp "${play[0]}" "dist/VortX-${version}-play-media3-universal.apk"
-          cp "${bundle[0]}" "dist/VortX-${version}-play-media3.aab"
-          # Google's bundletool inspects the protobuf AAB manifest. Pin and hash-check the
-          # executable before using it; do not infer Android build identity from Apple metadata.
-          curl --fail --location --connect-timeout 10 --max-time 90 --retry 2 \
-            https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar \
-            --output "$RUNNER_TEMP/bundletool.jar"
-          echo "a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29  $RUNNER_TEMP/bundletool.jar" | sha256sum --check
-          scripts/verify-android-release-signing.sh verify \
-            "dist/VortX-${version}-full-mpv-universal.apk" \
-            "dist/VortX-${version}-play-media3-universal.apk" \
-            "dist/VortX-${version}-play-media3.aab" | tee dist/SIGNING_PROVENANCE.txt
-          BUNDLETOOL_JAR="$RUNNER_TEMP/bundletool.jar" bash scripts/verify-android-release-version.sh \
-            "$version_code" "$version" \
-            "dist/VortX-${version}-full-mpv-universal.apk" \
-            "dist/VortX-${version}-play-media3-universal.apk" \
-            "dist/VortX-${version}-play-media3.aab" | tee -a dist/SIGNING_PROVENANCE.txt
-          {
-            echo "release tag: $RELEASE_TAG"
-            echo "release tag commit: $RELEASE_TAG_COMMIT"
-            echo "source commit: $SOURCE_COMMIT"
-            echo "native engine source commit: $VORTX_ENGINE_SOURCE_SHA"
-            echo "native engine Cargo features: jni,server,resource-host"
-            echo "workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-            echo "workflow run attempt: $GITHUB_RUN_ATTEMPT"
-          } >> dist/SIGNING_PROVENANCE.txt
-          cat "$RUNNER_TEMP/android-native-engine-provenance.txt" >> dist/SIGNING_PROVENANCE.txt
-          sha256sum \
-            "dist/VortX-${version}-full-mpv-universal.apk" \
-            "dist/VortX-${version}-play-media3-universal.apk" \
-            "dist/VortX-${version}-play-media3.aab" \
-            | sed 's#  dist/#  #' > dist/SHA256SUMS-android.txt
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Upload the immutable Android handoff
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: VortX-Android-release
-          path: |
-            dist/*.apk
-            dist/*.aab
-            dist/SHA256SUMS-android.txt
-            dist/SIGNING_PROVENANCE.txt
-          if-no-files-found: error
-          retention-days: 90
-
-      - name: Create or append to the draft release
-        if: >-
-          ${{ !startsWith(github.ref, 'refs/tags/v0.5.6-beta.12-candidate.') &&
-            !startsWith(inputs.release_tag, 'v0.5.6-beta.12-candidate.') &&
-            github.ref != 'refs/tags/v0.5.6-beta.13' && inputs.release_tag != 'v0.5.6-beta.13' &&
-            !startsWith(github.ref, 'refs/tags/v0.5.6-beta.13-candidate.') &&
-            !startsWith(inputs.release_tag, 'v0.5.6-beta.13-candidate.') &&
-            github.ref != 'refs/tags/v0.5.6-beta.14' && inputs.release_tag != 'v0.5.6-beta.14' &&
-            !startsWith(github.ref, 'refs/tags/v0.5.6-beta.14-candidate.') &&
-            !startsWith(inputs.release_tag, 'v0.5.6-beta.14-candidate.') }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
-        run: |
-          set -euo pipefail
-          if release_json="$(gh release view "$RELEASE_TAG" --json isDraft 2>/dev/null)"; then
-            is_draft="$(python3 -c 'import json,sys; print(str(json.load(sys.stdin)["isDraft"]).lower())' <<<"$release_json")"
-            if [ "$is_draft" != "true" ]; then
-              echo "::error::release $RELEASE_TAG already exists and is not a draft"
-              exit 1
-            fi
-          else
-            gh release create "$RELEASE_TAG" --draft --verify-tag --title "$RELEASE_TAG" --notes "Android beta artifacts are named by engine and distribution, never by device: full-mpv-universal.apk is the sideloaded GPL mpv-engine build, play-media3-universal.apk and play-media3.aab are the Google Play Media3 builds. Every variant contains both the phone and the Android TV user interface. See docs/RELEASE-ARTIFACTS.md."
-          fi
-          gh release upload "$RELEASE_TAG" \
-            dist/*.apk \
-            dist/*.aab \
-            dist/SHA256SUMS-android.txt \
-            dist/SIGNING_PROVENANCE.txt \
-            --clobber
-
   tools-instrumentation:
     name: Verify Android recovery tools on an emulator
     if: >-
       github.repository == 'VortXTV/VortX' &&
-      github.ref == 'refs/tags/v0.5.6-beta.14-candidate.4' &&
+      github.ref == 'refs/tags/vortx-android-b295-tools-direct-20261115' &&
       inputs.release_tag == 'v0.5.6-beta.14-candidate.4' &&
       inputs.publish_release == false
     permissions:
@@ -519,16 +31,25 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
+      APP_SOURCE: 7b7bbf00de25f90c1e6dee167372d3d0e0c58e05
       TOOLS_TEST_CLASS: com.vortx.android.ui.profilepicker.ProfilePickerToolsHostTest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 2
           persist-credentials: false
 
-      - name: Bind fixture tests to the exact candidate source
+      - name: Bind the workflow-only overlay to the frozen app source
+        id: source_binding
         run: |
           set -euo pipefail
+          git_path=.github/workflows/android-release.yml
           test "$(git rev-parse HEAD^{commit})" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$APP_SOURCE"
+          test "$(git diff --name-status --no-renames "$APP_SOURCE" HEAD)" = "$(printf 'M\t%s' "$git_path")"
+          git -c advice.detachedHead=false checkout --detach "$APP_SOURCE"
+          test "$(git rev-parse HEAD^{commit})" = "$APP_SOURCE"
+          test -z "$(git status --porcelain)"
           mkdir "$RUNNER_TEMP/tools-empty-engine"
           test ! -e "$RUNNER_TEMP/tools-empty-engine/Cargo.toml"
           echo "VORTX_ENGINE_CORE_DIR=$RUNNER_TEMP/tools-empty-engine" >> "$GITHUB_ENV"
@@ -570,6 +91,7 @@ jobs:
           printf 'ANDROID_USER_HOME=%s\nANDROID_AVD_HOME=%s\n' "$ANDROID_USER_HOME" "$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
 
       - name: Run the recovery tools instrumentation suite
+        id: instrumentation
         timeout-minutes: 22
         working-directory: android
         env:
@@ -581,7 +103,18 @@ jobs:
           "$ANDROID_HOME/emulator/emulator" -avd vortx-tools -port 5554 -accel on -gpu swiftshader \
             -no-window -no-audio -no-boot-anim -no-snapshot > "$RUNNER_TEMP/tools-emulator.log" 2>&1 &
           emulator_pid=$!
-          trap 'timeout 10s adb emu kill >/dev/null 2>&1 || kill "$emulator_pid" 2>/dev/null || true' EXIT
+          finish_emulator() {
+            local saved_status=$?
+            trap - EXIT
+            # The verifier retains these bounded slices only if the direct checks fail.
+            {
+              timeout 8s adb logcat -d -v brief -b crash -t 60 AndroidRuntime:E '*:S' || true
+              timeout 8s adb logcat -d -v brief -b main -t 100 TestRunner:I AndroidJUnitRunner:I InstrResultPrinter:I Instrumentation:E '*:S' || true
+            } > "$RUNNER_TEMP/tools-direct-logcat.txt" 2>&1
+            timeout 10s adb emu kill >/dev/null 2>&1 || kill "$emulator_pid" 2>/dev/null || true
+            exit "$saved_status"
+          }
+          trap finish_emulator EXIT
           if ! timeout 240s bash -c '
             set -euo pipefail
             while kill -0 "$1" 2>/dev/null; do
@@ -601,11 +134,34 @@ jobs:
           adb shell cmd connectivity airplane-mode enable
           adb shell svc wifi disable
           adb shell svc data disable
-          ./gradlew :app:connectedPlayDebugAndroidTest --no-daemon --max-workers=1 \
-            --no-build-cache "-Pandroid.testInstrumentationRunnerArguments.class=$TOOLS_TEST_CLASS"
+          # This verifies the app/test APK pair directly, avoiding AGP's rendered-trace format.
+          ./gradlew :app:assemblePlayDebug :app:assemblePlayDebugAndroidTest \
+            --no-daemon --max-workers=1 --no-build-cache
+          shopt -s nullglob
+          app_apks=(app/build/outputs/apk/play/debug/*.apk)
+          test_apks=(app/build/outputs/apk/androidTest/play/debug/*.apk)
+          test "${#app_apks[@]}" = 1 && test "${#test_apks[@]}" = 1
+          aapt="$ANDROID_HOME/build-tools/36.0.0/aapt2"
+          app_badging="$("$aapt" dump badging "${app_apks[0]}")"
+          test_badging="$("$aapt" dump badging "${test_apks[0]}")"
+          grep -Eq "^package: name='com.vortx.android' versionCode='295' versionName='0.5.6'" <<<"$app_badging"
+          grep -Eq "^package: name='com.vortx.android.test' " <<<"$test_badging"
+          timeout 60s adb install -t "${app_apks[0]}"
+          timeout 60s adb install -t "${test_apks[0]}"
+          expected_runner='com.vortx.android.test/androidx.test.runner.AndroidJUnitRunner'
+          instrumentations="$(timeout 10s adb shell pm list instrumentation com.vortx.android | tr -d '\r')"
+          grep -Fxq "instrumentation:$expected_runner (target=com.vortx.android)" <<<"$instrumentations"
+          status=0
+          timeout 300s adb shell am instrument -w -r -e class "$TOOLS_TEST_CLASS" "$expected_runner" \
+            > "$RUNNER_TEMP/tools-direct-instrumentation.txt" 2>&1 || status=$?
+          printf '%s\n' "$status" > "$RUNNER_TEMP/tools-direct-status"
+          exit "$status"
 
-      - name: Verify the full recovery tools test roster passed
-        working-directory: android
+      - name: Verify the Tools roster and retain bounded failure details
+        if: always()
+        env:
+          TOOLS_RUN_OUTCOME: ${{ steps.instrumentation.outcome }}
+          TOOLS_BIND_OUTCOME: ${{ steps.source_binding.outcome }}
         run: |
           set -euo pipefail
           python3 -I - <<'PYTEST'
@@ -613,47 +169,135 @@ jobs:
           import json
           import os
           import re
-          import xml.etree.ElementTree as ET
+          from collections import Counter
           from pathlib import Path
 
           suite = os.environ["TOOLS_TEST_CLASS"]
-          source = (Path("app/src/androidTest/kotlin") / (suite.replace(".", "/") + ".kt")).read_bytes()
-          expected = set(re.findall(rb"^[ \t]*@Test\s+fun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", source, re.M))
-          if not expected or len(expected) != len(re.findall(rb"^[ \t]*@Test\b", source, re.M)):
-              raise SystemExit("Cannot determine the recovery tools test roster")
-          reports = sorted(Path("app/build/outputs/androidTest-results/connected").rglob("TEST-*.xml"))
-          names = []
-          digests = []
-          for report in reports:
-              if report.is_symlink() or not 0 < report.stat().st_size <= 4 * 1024 * 1024:
-                  raise SystemExit("Invalid recovery tools report")
-              data = report.read_bytes()
-              root = ET.fromstring(data)
-              cases = root.findall(".//testcase")
-              if (root.tag != "testsuite" or root.get("tests") != str(len(cases))
-                  or any(root.get(key, "0") != "0" for key in ("skipped", "failures", "errors"))
-                  or any(case.get("classname") != suite or not case.get("name") or any(
-                      case.find(key) is not None for key in ("skipped", "failure", "error")) for case in cases)):
-                  raise SystemExit("Unexpected, failed or skipped recovery tools test")
-              names.extend(case.get("name").encode() for case in cases)
-              digests.append(hashlib.sha256(data).hexdigest())
-          if set(names) != expected or len(names) != len(expected):
-              raise SystemExit("Recovery tools did not execute the exact test roster")
-          proof = Path(os.environ["RUNNER_TEMP"]) / "tools-instrumentation-proof.json"
-          proof.write_text(json.dumps({
-              "schema": 1, "appSource": os.environ["GITHUB_SHA"], "ref": os.environ["GITHUB_REF"],
-              "run": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
-              "emulator": "API 35 Google APIs x86_64", "suite": suite,
-              "passed": len(names), "tests": sorted(name.decode() for name in names),
-              "testSourceSha256": hashlib.sha256(source).hexdigest(), "reportSha256": digests,
-          }, sort_keys=True, indent=2) + "\n")
-          print(f"Verified {len(names)} Android recovery tools tests on the emulator")
+          tmp = Path(os.environ["RUNNER_TEMP"])
+          source_path = Path("android/app/src/androidTest/kotlin") / (suite.replace(".", "/") + ".kt")
+          source = source_path.read_bytes() if source_path.is_file() else b""
+          expected = {name.decode() for name in re.findall(rb"^[ \t]*@Test\s+fun\s+(\w+)\s*\(", source, re.M)}
+          issues = []
+          if len(expected) != 9 or len(expected) != len(re.findall(rb"^[ \t]*@Test\b", source, re.M)):
+              issues.append("Frozen UI fixture does not contain the exact nine-test roster")
+
+          def clean(line):
+              line = re.sub(r"[\x00-\x1f\x7f]", " ", line.strip()).replace("::", ":")
+              line = re.sub(r"(?:https?|file|content)://[^\s<>()]+", "[URL]", line, flags=re.I)
+              line = re.sub(r"[\w.+-]+@[\w.-]+\.[a-z]{2,}", "[EMAIL]", line, flags=re.I)
+              line = re.sub(r"\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_.=-]+", "[AUTH]", line, flags=re.I)
+              line = re.sub(r"\b(?:token|password|credential|secret|key|authorization)\s*[:=]\s*\S+", "[REDACTED]", line, flags=re.I)
+              line = re.sub(r"\b[A-Za-z0-9_-]{16,}(?:\.[A-Za-z0-9_-]{16,}){2}\b", "[TOKEN]", line)
+              line = re.sub(r"/(?:home/runner|data/(?:user|app))[/\w.+-]*", "[PATH]", line)
+              return line[:280]
+
+          def read_bounded(file, limit):
+              if not file.is_file():
+                  return b""
+              with file.open("rb") as stream:
+                  return stream.read(limit+1)
+
+          raw = read_bounded(tmp / "tools-direct-instrumentation.txt", 1024*1024)
+          if not raw or len(raw) > 1024*1024:
+              issues.append("Instrumentation output is absent or exceeds the receipt limit")
+          lines = raw[:1024*1024].decode(errors="replace").splitlines()
+          starts, passes = Counter(), Counter()
+          failures = []
+          final_codes = []
+          ok_lines = []
+          terminal_failures = []
+          fields = {}
+          field = None
+          current_test = None
+          for line in lines:
+              if (match := re.fullmatch(r"INSTRUMENTATION_STATUS: (\w+)=(.*)", line)):
+                  key, value = match.groups()
+                  field = key
+                  fields[key] = [value]
+              elif (match := re.fullmatch(r"INSTRUMENTATION_STATUS_CODE: (-?\d+)", line)):
+                  code = int(match.group(1))
+                  name = fields.get("test", [""])[0]
+                  classname = fields.get("class", [""])[0]
+                  count = fields.get("numtests", [""])[0]
+                  if name not in expected or classname != suite or count != "9":
+                      issues.append("Instrumentation reported a test outside the frozen nine-test roster")
+                  elif code == 1:
+                      if current_test is not None:
+                          issues.append("Instrumentation started a second test without completing its predecessor")
+                      current_test = name
+                      starts[name] += 1
+                  elif code == 0:
+                      if current_test != name or starts[name] != 1:
+                          issues.append("Instrumentation returned a passing result without the matching start")
+                      current_test = None
+                      passes[name] += 1
+                  else:
+                      current_test = None
+                  if code not in (0, 1):
+                      content = fields.get("stack", []) + fields.get("stream", []) + fields.get("shortMsg", [])
+                      failures.append({"test": name if name in expected else None, "statusCode": code,
+                                       "trace": [clean(part) for part in content[:20] if part.strip()]})
+                  fields, field = {}, None
+              elif (match := re.fullmatch(r"INSTRUMENTATION_CODE: (-?\d+)", line)):
+                  final_codes.append(int(match.group(1)))
+                  field = None
+              elif (match := re.fullmatch(r"OK \((\d+) tests?\)", line.strip())):
+                  ok_lines.append(int(match.group(1)))
+              elif re.search(r"INSTRUMENTATION_FAILED:|INSTRUMENTATION_ABORTED:|shortMsg=|longMsg=|FAILURES!!!|^Error:|^java\.lang\.SecurityException:|^android\.util\.AndroidException:", line):
+                  terminal_failures.append(clean(line))
+                  field = None
+              elif line.startswith("INSTRUMENTATION_RESULT:"):
+                  field = None
+              elif field in {"stack", "stream"} and len(fields[field]) < 22:
+                  fields[field].append(line)
+
+          status_path = tmp / "tools-direct-status"
+          status = status_path.read_text().strip() if status_path.is_file() else ""
+          if status != "0" or os.environ["TOOLS_RUN_OUTCOME"] != "success":
+              issues.append("Direct Android instrumentation command did not complete successfully")
+          if os.environ["TOOLS_BIND_OUTCOME"] != "success":
+              issues.append("Exact app source binding did not succeed")
+          if set(starts) != expected or set(passes) != expected or any(value != 1 for value in (*starts.values(), *passes.values())) or current_test is not None:
+              issues.append("Instrumentation did not report a single start and pass for every test")
+          if final_codes != [-1] or ok_lines != [9] or terminal_failures:
+              issues.append("Instrumentation did not report the expected final OK status")
+          ok = not issues and not failures
+          log = read_bounded(tmp / "tools-direct-logcat.txt", 128*1024).decode(errors="replace").splitlines()
+          diagnostics = [clean(line) for line in (log[:48] if not ok else []) if line.strip()]
+          proof = {
+              "schema": 4, "appSource": os.environ["APP_SOURCE"], "ref": os.environ["GITHUB_REF"],
+              "workflowSource": os.environ["GITHUB_SHA"], "workflowOnlyOverlay": os.environ["TOOLS_BIND_OUTCOME"] == "success",
+              "appCandidate": "v0.5.6-beta.14-candidate.4", "run": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"], "emulator": "API 35 Google APIs x86_64, synthetic offline account",
+              "suite": suite, "expected": sorted(expected), "starts": dict(starts), "passes": dict(passes),
+              "outcome": "success" if ok else "failure", "issues": sorted(set(issues)),
+              "instrumentationExit": int(status) if status.isdecimal() else None,
+              "terminalCodes": final_codes[:8], "okCounts": ok_lines[:8],
+              "terminalFailures": terminal_failures[:14], "failures": failures[:9], "logcatDiagnostics": diagnostics,
+              "testSourceSha256": hashlib.sha256(source).hexdigest() if source else None,
+              "traceSha256": hashlib.sha256(raw).hexdigest() if 0 < len(raw) <= 1024*1024 else None,
+          }
+          (tmp / "tools-instrumentation-direct-proof.json").write_text(json.dumps(proof, sort_keys=True, indent=2) + "\n")
+          for issue in proof["issues"]:
+              print(f"Instrumentation: {issue}")
+          for text in proof["terminalFailures"]:
+              print(f"Instrumentation terminal: {text}")
+          for failure in proof["failures"]:
+              print(f"Instrumentation test: {failure['test'] or 'runner'} status {failure['statusCode']}")
+              for line in failure["trace"]:
+                  print(f"Instrumentation stack: {line}")
+          for line in diagnostics:
+              print(f"Instrumentation logcat: {line}")
+          if not ok:
+              raise SystemExit(1)
+          print(f"Verified {len(passes)} direct Android recovery Tools tests on the emulator")
           PYTEST
 
       - name: Retain the bounded instrumentation proof
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: VortX-Android-tools-instrumentation
-          path: ${{ runner.temp }}/tools-instrumentation-proof.json
+          name: VortX-Android-tools-instrumentation-direct
+          path: ${{ runner.temp }}/tools-instrumentation-direct-proof.json
           if-no-files-found: error
           retention-days: 30
