@@ -43,9 +43,21 @@ import CryptoKit
     }
     static func taggedDisplayCarrierControls() -> [String] {
         let secret = #"{"token":"fixture-hidden"}"#
+        let tag = Data(secret.utf8).base64EncodedString().trimmingCharacters(in: CharacterSet(charactersIn: "="))
+        let standard = Data(#"{"token":"ο࿿"}"#.utf8).base64EncodedString()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+        let urlSafe = standard.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "+", with: "-")
+        let mixed = standard.replacingOccurrences(of: "/", with: "_")
+        var corruptBytes = Data(secret.utf8)
+        corruptBytes.append(contentsOf: [0xff, 0xff])
+        let corrupt = corruptBytes.base64EncodedString().replacingOccurrences(of: "/", with: "_")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "="))
         return ["[RD] - " + secret, "[RD]: " + secret, "[RD] [4K] - " + secret,
                 "[RD] - " + Data(secret.utf8).base64EncodedString(),
                 "[RD]: \u{FEFF}" + Data(secret.utf8).base64EncodedString(),
+                "[\(tag)] Movies", "{\(tag)} Movies", "[RD] [\(tag)] Movies",
+                "[\(urlSafe)] Movies", "[\(mixed)] Movies", "[\(standard)!_] Movies", "[RD] \(standard)!_",
+                "[\(corrupt)] Movies",
                 "[RD] - \"quoted\"", "[RD]: bplist00broken", "[RD] - <?xml broken",
                 "[true] trailing", "[123]: trailing", "[null] trailing",
                 "[RD] [true]", "[RD] [123]", "[RD] [null]",
@@ -860,7 +872,7 @@ import CryptoKit
             check(try data(document) == original)
         }
         let labels = ["[4K] Community catalog", "[Community]", "{Public} Catalog", " \n[EN] Films and shows.", "[日本語] アニメ", "[true]", "[123]",
-                      "[RD] [4K] Torrentio", "[TB⚡] Comet", "[Oshi no Ko]: The Movie"]
+                      "[RD] [4K] Torrentio", "[TB⚡] Comet", "[Oshi no Ko]: The Movie", "[Wyatt] Catalog", "[RD] Wyatt"]
         var journeys = 0
         for label in labels {
             let addon = descriptor(label, description: label)
