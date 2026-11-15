@@ -16,6 +16,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.Text
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsFocused
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -23,6 +24,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.click
 import androidx.core.app.ActivityOptionsCompat
@@ -46,8 +48,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import java.util.UUID
 
-/** Production host/controller with synthetic download/preparation. No provider, account or network I/O.
- * System Back/focus and absent-SAF UI are bounded instrumentation coverage only, authored but unrun. */
+/** Production host/controller with synthetic download/preparation. No provider, account or network I/O. */
 @RunWith(AndroidJUnit4::class)
 class ProfilePickerToolsHostTest {
     @get:Rule val compose = createComposeRule()
@@ -123,6 +124,15 @@ class ProfilePickerToolsHostTest {
         }
     }
 
+    private fun openToolsWithRemote(controller: ProfilePickerToolsController) {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        instrumentation.setInTouchMode(false)
+        compose.onNodeWithTag("profile-picker-tools").performSemanticsAction(SemanticsActions.RequestFocus).assertIsFocused()
+        instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_DPAD_CENTER)
+        compose.waitUntil { controller.state.value.open }
+        compose.waitForIdle()
+    }
+
     @Test fun televisionToolsIsAvailableOverBusyPickerAndSystemBackReturnsFocusWithoutOpeningProfile() {
         val f = Fixture(); var pickerCompositions = 0
         try {
@@ -132,7 +142,7 @@ class ProfilePickerToolsHostTest {
                 }
             } }
             compose.onNodeWithText("Opening profiles…").assertIsDisplayed()
-            compose.onNodeWithTag("profile-picker-tools").performClick()
+            openToolsWithRemote(f.controller)
             compose.onNodeWithTag("picker-tools-back").assertIsDisplayed()
             compose.onNodeWithTag("picker-tools-diagnostics").assertDoesNotExist()
             compose.onNodeWithTag("picker-tools-recovery-diagnostics").assertExists()
@@ -142,7 +152,10 @@ class ProfilePickerToolsHostTest {
             compose.onNodeWithTag("profile-picker-tools").assertIsDisplayed().assertIsFocused()
             compose.onNodeWithText("Opening profiles…").assertIsDisplayed()
             assertEquals(0, f.accounts.gets); assertTrue(pickerCompositions > 0)
-        } finally { f.close() }
+        } finally {
+            InstrumentationRegistry.getInstrumentation().resetInTouchMode()
+            f.close()
+        }
     }
     @Test fun unavailableSafActivityUsesFixedExplanationAndDoesNotAttemptAnotherDownload() {
         val f = Fixture()
@@ -170,7 +183,7 @@ class ProfilePickerToolsHostTest {
             compose.setContent { CompositionLocalProvider(LocalActivityResultRegistryOwner provides registry) {
                 VortXTheme { ProfilePickerToolsHost(f.model, isTv = true, diagnosticAdmission = { false }) {} }
             } }
-            compose.onNodeWithTag("profile-picker-tools").performClick()
+            openToolsWithRemote(f.controller)
             compose.onNodeWithTag("picker-tools-back").assertIsFocused()
             input.sendKeyDownUpSync(KeyEvent.KEYCODE_DPAD_DOWN)
             compose.onNodeWithTag("picker-tools-download").assertIsFocused()
@@ -183,7 +196,10 @@ class ProfilePickerToolsHostTest {
             assertEquals(1, registry.launches)
             input.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
             compose.onNodeWithTag("profile-picker-tools").assertIsFocused()
-        } finally { f.close() }
+        } finally {
+            input.resetInTouchMode()
+            f.close()
+        }
     }
     @Test fun protectedOrUnavailableRosterOffersOnlyLimitedDiagnosticsInPhoneTools() {
         val f = Fixture()
