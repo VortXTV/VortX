@@ -46,9 +46,25 @@ private enum MPVPreviewSeekStormPolicyTests {
         check("late settled event cannot undo containment", stall.hasFailed(owner: 1))
 
         var burst = armed()
-        seeks(10_000, into: &burst)
-        check("high event count alone is insufficient", !burst.observe(owner: 1, now: 11.999, sample: sample()))
-        check("count and time together contain", burst.observe(owner: 1, now: 12, sample: sample()))
+        seeks(1_023, into: &burst)
+        check("fast containment requires the full burst threshold",
+              !burst.observe(owner: 1, now: 10.25, sample: sample()))
+        seeks(1, into: &burst)
+        check("burst with repeated stall evidence contains promptly",
+              burst.observe(owner: 1, now: 10.25, sample: sample()))
+
+        var instantBurst = armed()
+        seeks(10_000, into: &instantBurst)
+        check("high event count without a second spaced sample is insufficient",
+              !instantBurst.observe(owner: 1, now: 10.249, sample: sample()))
+
+        var reportedBurst = armed()
+        seeks(950, into: &reportedBurst)
+        check("first sampled interval of reported burst stays below threshold",
+              !reportedBurst.observe(owner: 1, now: 10.25, sample: sample()))
+        seeks(2_156, into: &reportedBurst)
+        check("second sampled interval of reported burst stops within half a second",
+              reportedBurst.observe(owner: 1, now: 10.5, sample: sample()))
 
         for uncertain in [
             sample(position: nil), sample(position: .nan), sample(position: .infinity),
@@ -57,7 +73,7 @@ private enum MPVPreviewSeekStormPolicyTests {
             sample(cache: .nan), sample(cache: 0.001), sample(bytes: nil), sample(bytes: 1)
         ] {
             var policy = armed()
-            seeks(100, into: &policy)
+            seeks(2_000, into: &policy)
             check("unknown/paused/refilling sample cannot contain",
                   !policy.observe(owner: 1, now: 12, sample: uncertain))
             check("return from uncertainty starts a fresh window",
@@ -67,7 +83,7 @@ private enum MPVPreviewSeekStormPolicyTests {
         }
 
         var playback = armed()
-        seeks(100, into: &playback)
+        seeks(2_000, into: &playback)
         playback.recordSettledPlayback(owner: 1)
         check("real settled playback clears the stall interval",
               !playback.observe(owner: 1, now: 12, sample: sample()))

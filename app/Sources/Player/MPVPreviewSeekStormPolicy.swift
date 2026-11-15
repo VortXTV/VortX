@@ -76,10 +76,10 @@ struct MPVPreviewSeekStormPolicy<Owner: Equatable> {
         clearStall()
     }
 
-    /// Fail once after >=2 seconds, >=64 further native seeks, and repeated positive evidence
-    /// of a running, continuously seeking, empty-cache player at an unchanged position.
-    /// Missing/paused/refilling samples cannot authorize containment. Short normal loops have
-    /// settled playback between their seeks and therefore continually reset this window.
+    /// Fail once on repeated evidence of a running, continuously seeking, empty-cache
+    /// player at an unchanged position. A burst of 1,024 native seeks permits an earlier
+    /// stop after 250 ms. Other stalls require at least 64 seeks over two seconds.
+    /// Missing, paused or refilling samples and settled playback reset the window.
     mutating func observe(owner: Owner, now: TimeInterval, sample: Sample) -> Bool {
         guard self.owner == owner, !failed else { return false }
         guard now.isFinite,
@@ -97,7 +97,10 @@ struct MPVPreviewSeekStormPolicy<Owner: Equatable> {
             seekCount = 0
             return false
         }
-        guard now - started >= 2, seekCount >= 64 else { return false }
+        let elapsed = now - started
+        let sustainedStorm = elapsed >= 2 && seekCount >= 64
+        let rapidStorm = elapsed >= 0.25 && seekCount >= 1_024
+        guard sustainedStorm || rapidStorm else { return false }
         failed = true
         return true
     }
