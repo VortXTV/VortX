@@ -11,6 +11,9 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import kotlin.concurrent.thread
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.async
@@ -25,7 +28,14 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SubtitleAddonHttpTest {
-    private fun withServer(status: Int = 200, bodyOverride: ByteArray? = null, advertisedLength: Int? = null, locationOverride: String? = null, block: suspend (SubtitleAddonSource, List<String>) -> Unit) = runBlocking {
+    private fun withServer(
+        status: Int = 200,
+        bodyOverride: ByteArray? = null,
+        advertisedLength: Int? = null,
+        locationOverride: String? = null,
+        response: ((path: String, requestNumber: Int) -> Pair<Int, ByteArray>)? = null,
+        block: suspend (SubtitleAddonSource, List<String>) -> Unit,
+    ) = runBlocking {
         val paths = CopyOnWriteArrayList<String>()
         val server = ServerSocket(0, 10, InetAddress.getByName("127.0.0.1"))
         val worker = thread(isDaemon = true, name = "subtitle-http-fixture") {
@@ -37,12 +47,13 @@ class SubtitleAddonHttpTest {
                     val path = reader.readLine().split(' ')[1]
                     paths += path
                     while (!reader.readLine().isNullOrEmpty()) { /* request headers */ }
-                    val code = when {
+                    val customResponse = response?.invoke(path, paths.count { it == path })
+                    val code = customResponse?.first ?: when {
                         locationOverride != null -> 302
                         status in listOf(404, 405) && !path.contains("/filename=") -> 200
                         else -> status
                     }
-                    val bytes = bodyOverride ?: """{"subtitles":[{"url":"https://cdn.invalid/en.srt","lang":"eng","subtitleFileName":"Matched release"},9,{"url":null},{"url":17},{"url":"https://cdn.invalid/other.srt","lang":8,"subtitleFileName":8}]}""".toByteArray()
+                    val bytes = customResponse?.second ?: bodyOverride ?: """{"subtitles":[{"url":"https://cdn.invalid/en.srt","lang":"eng","subtitleFileName":"Matched release"},9,{"url":null},{"url":17},{"url":"https://cdn.invalid/other.srt","lang":8,"subtitleFileName":8}]}""".toByteArray()
                     val output = socket.getOutputStream()
                     output.write(("HTTP/1.1 $code Fixture\r\n" + (locationOverride?.let { "Location: $it\r\n" } ?: "") +
                         "Content-Type: application/json\r\nContent-Length: ${advertisedLength ?: bytes.size}\r\nConnection: close\r\n\r\n").toByteArray())
@@ -78,6 +89,52 @@ class SubtitleAddonHttpTest {
         val rows = SubtitleAddonService.fetch(listOf(source), "movie", "tt123", SubtitleRequestMetadata(filename = "a.mkv"))
         assertTrue(rows.isEmpty())
         assertEquals(1, paths.size)
+    }
+
+    @Test fun playbackRetryKeepsReadyRowsAndQueriesOnlyTransientFailuresOnce() = withServer(
+        response = { path, requestNumber ->
+            when (path.substringBefore("/subtitles/")) {
+                "/recover" -> if (requestNumber == 1) 502 to ByteArray(0)
+                    else 200 to """{"subtitles":[{"url":"https://cdn.invalid/recovered.srt"}]}""".toByteArray()
+                "/empty" -> 200 to """{"subtitles":[]}""".toByteArray()
+                "/ready" -> 200 to """{"subtitles":[{"url":"https://cdn.invalid/ready.srt"}]}""".toByteArray()
+                "/unauthorized" -> 401 to ByteArray(0)
+                else -> 503 to ByteArray(0)
+            }
+        },
+    ) { source, paths ->
+        val sources = listOf("recover", "empty", "ready", "unauthorized", "unavailable")
+            .map { source.copy(baseUrl = "${source.baseUrl}/$it", name = it) }
+        val batches = mutableListOf<List<String>>()
+        SubtitleAddonService.discoverForPlayback(
+            sources, "movie", "tt123", SubtitleRequestMetadata(),
+            publish = { rows -> batches += rows.map { it.addonName }; true },
+            awaitRetry = { true },
+        )
+        assertEquals(listOf(listOf("ready"), listOf("recover", "ready")), batches)
+        assertEquals(
+            mapOf("/recover" to 2, "/empty" to 1, "/ready" to 1, "/unauthorized" to 1, "/unavailable" to 2),
+            paths.groupingBy { it.substringBefore("/subtitles/") }.eachCount(),
+        )
+    }
+
+    @Test fun cancelingPlaybackWhileWaitingForSheetDoesNotRetry() = withServer(502) { source, paths ->
+        coroutineScope {
+            val awaitingRetry = CompletableDeferred<Unit>()
+            val discovery = launch {
+                SubtitleAddonService.discoverForPlayback(
+                    listOf(source), "movie", "tt123", SubtitleRequestMetadata(),
+                    publish = { true },
+                    awaitRetry = {
+                        awaitingRetry.complete(Unit)
+                        awaitCancellation()
+                    },
+                )
+            }
+            withTimeout(5_000) { awaitingRetry.await() }
+            discovery.cancelAndJoin()
+        }
+        assertEquals(listOf("/subtitles/movie/tt123.json"), paths)
     }
 
     @Test fun relativeRowsResolveAgainstFinalIndexAndRetainOriginalInstalledBase() = runBlocking {

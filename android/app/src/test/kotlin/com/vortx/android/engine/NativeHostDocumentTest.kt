@@ -25,6 +25,73 @@ class NativeHostDocumentTest {
         assertTrue("Expected '$phrase', got $error", error is IllegalArgumentException && error.message.orEmpty().contains(phrase))
     }
 
+    private fun addonSummary(name: String) = JSONObject()
+        .put("transportUrl", "https://addons.example/CaseSensitive/manifest.json")
+        .put("name", name)
+
+    private fun addonDescriptor(name: String, description: String) = addonSummary(name)
+        .put("manifest", JSONObject().put("id", "fixture.addon").put("name", name)
+            .put("version", "1.0.0").put("description", description))
+
+    @Test fun `native account source archive keeps tagged producer summaries and complete descriptors`() {
+        val summary = addonSummary("[4K] [HDR] Movies")
+        val descriptor = addonDescriptor("[TB⚡] Cinema", "{Community}: Film and TV")
+        val source = JSONObject()
+            .put("addons", JSONArray().put(summary))
+            .put("vortx", JSONObject().put("addons", JSONArray().put(descriptor).put(summary)))
+        val before = source.toString()
+        val archived = nativeLegacySourceArchive(source)
+
+        assertEquals(before, source.toString())
+        assertTrue(NativeHostPreferences.equal(source, archived.getJSONObject("document")))
+        assertTrue(paths(archived).isEmpty())
+        // Complete descriptor display fields also appear in typed import material and registers.
+        NativeHostDocument.requireCredentialFree(JSONObject().put("register", JSONObject().put("descriptor", descriptor)))
+    }
+
+    @Test fun `only owned summary arrays and qualified descriptor fields accept literal labels`() {
+        val name = "[4K] Movies"
+        val summary = addonSummary(name)
+        val invalid = listOf(
+            JSONObject().put("unknown", JSONObject().put("addons", JSONArray().put(summary))),
+            JSONObject().put("addons", JSONArray().put(addonSummary(name).put("manifest", JSONObject.NULL))),
+            JSONObject().put("addons", JSONArray().put(addonSummary(name).put("transportUrl", "file:///manifest.json"))),
+            JSONObject().put("addons", JSONArray().put(addonSummary(name).put("manifest", JSONObject().put("name", name)))),
+            JSONObject().put("addons", JSONArray().put(addonSummary("Fixture").put("future", name))),
+            JSONObject().put("addons", JSONArray().put(addonSummary(JSONObject.quote(name)))),
+        )
+        invalid.forEach { failure(it, "structured settings data") }
+    }
+
+    @Test fun `structured or encoded data cannot hide behind an add-on display label`() {
+        val secret = """{"token":"fixture-hidden","keep":true}"""
+        val encoded = Base64.getEncoder().encodeToString(secret.toByteArray())
+        val encodedWithBom = Base64.getEncoder().encodeToString(("\uFEFF" + secret).toByteArray())
+        val encodedUtf16 = Base64.getEncoder().encodeToString(secret.toByteArray(Charsets.UTF_16LE))
+        val tokenTag = "eyJ0b2tlbiI6InN5bnRoZXRpYyJ9"
+        val wrappedTokenTag = Base64.getEncoder().withoutPadding().encodeToString(tokenTag.toByteArray())
+        val malformed = listOf(
+            "[RD] - $secret", "[RD]: \uFEFF$encoded", "[RD] [4K] $encodedWithBom",
+            "[RD] $encodedUtf16", "[RD] bplist00broken", "[RD] - <?xml broken",
+            "[true] trailing", "[RD] [123]", "[RD] \"quoted\"", "[[RD]] Movies",
+            "[$tokenTag] Movies", "[RD] [$wrappedTokenTag] Movies", "[$tokenTag!] Movies", "[$secret] Movies",
+            "[\uFEFF$tokenTag] Movies", "[eyJ0b2tlbiI6Ij8+Pz8ifQ!_] Movies",
+        )
+        for (label in malformed) {
+            val source = JSONObject().put("addons", JSONArray().put(addonSummary(label)))
+            assertTrue(runCatching { nativeLegacySourceArchive(source) }.isFailure)
+        }
+        for (carrier in listOf(secret, encoded)) {
+            val descriptor = addonDescriptor("[4K] Movies", carrier).put("apiKey", "fixture-sibling")
+            val source = JSONObject().put("descriptor", descriptor)
+            val archive = NativeHostDocument.archive(source)
+            assertEquals(listOf("/descriptor/apiKey", "/descriptor/manifest/description/token"), paths(archive))
+            assertFalse(archive.toString().contains("fixture-hidden"))
+            assertFalse(archive.toString().contains("fixture-sibling"))
+            assertTrue(runCatching { NativeHostDocument.requireCredentialFree(source) }.isFailure)
+        }
+    }
+
     @Test fun `known credential carriers omitted with escaped deterministic paths no source mutation`() {
         val source = JSONObject().put("apiKeys", JSONObject().put("realdebrid", "hidden-value"))
             .put("nativeProviderCredentials", JSONObject().put("fields", JSONObject().put("tmdb", "hidden-register")))

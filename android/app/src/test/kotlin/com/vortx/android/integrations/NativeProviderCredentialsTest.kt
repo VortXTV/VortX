@@ -508,6 +508,36 @@ class NativeProviderCredentialsTest {
         assertTrue(rejected)
     }
 
+    @Test fun `native Trakt receives a sibling rotation without letting old requests use its bearer`() = runBlocking {
+        val store = NativeProviderTestStore()
+        val account = SessionOwnerSnapshot.Account(id, 1)
+        bind(store, Owner(account))
+        val now = System.currentTimeMillis() / 1000L
+        val persistence = TraktAuth.TokenPersistence(NativeProviderAccess.oauthStore("trakt")) { now }
+        persistence.save(TraktToken("expired", "expired-refresh", expiresIn = 60, createdAt = now - 3600))
+        val operation = CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[0]).operation()
+        val spent = requireNotNull(persistence.loadStored())
+
+        val receiving = runCatching {
+            TraktAuth.performRefresh(
+                operation, spent, persistence,
+                clearCurrent = { error("A synced replacement must survive the rejected refresh") },
+                awaitSiblingRotation = {
+                    checkNotNull(NativeProviderAccess.merge(account,
+                        JSONObject().put("nativeProviderCredentials", wire(tuple("remote")))))
+                },
+                request = { IntegrationsHttp.Response(401, "") },
+            )
+        }
+        val queued = runCatching {
+            TraktAuth.refreshAfterSerialization(operation, persistence) { error("An old request cannot refresh the replacement") }
+        }
+
+        assertSame(TraktAuthException.SessionChanged, receiving.exceptionOrNull())
+        assertSame(TraktAuthException.NotSignedIn, queued.exceptionOrNull())
+        assertEquals("remote", persistence.load()?.accessToken)
+    }
+
     @Test fun `native credential journal and installation actor are excluded from system backup and transfer`() {
         fun source(name: String): String = listOf(java.io.File("src/main/res/xml/$name"), java.io.File("app/src/main/res/xml/$name"))
             .first { it.isFile }.readText()

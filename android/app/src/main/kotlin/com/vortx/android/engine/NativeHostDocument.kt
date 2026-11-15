@@ -17,6 +17,8 @@ import java.util.Date
  * result, independently of the kernel snapshot, and keeps the original authenticated cloud carrier.
  */
 internal object NativeHostDocument {
+    private enum class AddonRole { ORDINARY, LEGACY_VORTX, SUMMARY_ROWS, SUMMARY, MANIFEST, DISPLAY }
+
     fun archive(document: JSONObject): JSONObject = Sanitizer().archive(document)
 
     /** Validation only: never silently sanitize retained import input or rewrite an old checkpoint. */
@@ -56,25 +58,36 @@ internal object NativeHostDocument {
             return false
         }
 
-        private fun json(value: Any?, path: String, depth: Int, root: Boolean = false): Any {
+        private fun json(value: Any?, path: String, depth: Int, root: Boolean = false,
+                         addonRole: AddonRole = AddonRole.ORDINARY): Any {
             budget(depth)
             return when (value) {
                 null, JSONObject.NULL -> JSONObject.NULL
                 is JSONObject -> if (recognizableBackup(value)) backupEnvelope(value, path, depth + 1)
-                    else jsonObject(value, path, depth, root)
+                    else jsonObject(value, path, depth, root, addonRole = addonRole)
                 is JSONArray -> JSONArray().also { result ->
-                    for (index in 0 until value.length()) result.put(json(value.get(index), pointer(path, index.toString()), depth + 1))
+                    for (index in 0 until value.length()) {
+                        val row = value.get(index)
+                        val role = if (addonRole == AddonRole.SUMMARY_ROWS && row is JSONObject &&
+                            !row.has("manifest") && row.opt("name") is String && hasAddonTransport(row)) {
+                            AddonRole.SUMMARY
+                        } else AddonRole.ORDINARY
+                        result.put(json(row, pointer(path, index.toString()), depth + 1, addonRole = role))
+                    }
                 }
-                is String -> structuredString(value, path, depth)
+                is String -> structuredString(value, path, depth, addonRole == AddonRole.DISPLAY)
                 is Boolean -> value
                 is Number -> value.also { requireArchive(it.toDouble().isFinite(), "Nonfinite host document number") }
                 else -> reject("Unsupported host document value")
             }
         }
 
-        private fun jsonObject(value: JSONObject, path: String, depth: Int, root: Boolean = false, skip: Set<String> = emptySet()): JSONObject = JSONObject().also { result ->
+        private fun jsonObject(value: JSONObject, path: String, depth: Int, root: Boolean = false,
+                               skip: Set<String> = emptySet(), addonRole: AddonRole = AddonRole.ORDINARY): JSONObject = JSONObject().also { result ->
             val watched = if (NativeWatchedMigrationStorage.KEYS.any(value::has)) NativeWatchedMigrationStorage.read(value) else null
             if (watched != null) watched.writeTo(result)
+            val descriptor = (value.opt("manifest") as? JSONObject)?.takeIf { hasAddonTransport(value) }
+                ?.let { manifest -> listOf("id", "name", "version").all { (manifest.opt(it) as? String)?.isNotBlank() == true } } == true
             for (key in value.keys().asSequence().toList().sorted()) {
                 if (key in skip || key in NativeWatchedMigrationStorage.KEYS) continue
                 val childPath = pointer(path, key)
@@ -94,13 +107,21 @@ internal object NativeHostDocument {
                 // every other field still pass through recursive credential inspection.
                 val websiteAddonID = key == "eventId" && child is String && Regex("[0-9a-f]{32}").matches(child) &&
                     websiteAddonIdentity(value)
+                val addonChildRole = when {
+                    root && key == "vortx" && child is JSONObject -> AddonRole.LEGACY_VORTX
+                    (root || addonRole == AddonRole.LEGACY_VORTX) && key == "addons" && child is JSONArray -> AddonRole.SUMMARY_ROWS
+                    descriptor && key == "manifest" -> AddonRole.MANIFEST
+                    (descriptor || addonRole == AddonRole.SUMMARY) && key == "name" && child is String -> AddonRole.DISPLAY
+                    addonRole == AddonRole.MANIFEST && key in setOf("name", "description") && child is String -> AddonRole.DISPLAY
+                    else -> AddonRole.ORDINARY
+                }
                 result.put(key, if (streamingUID || websiteAddonID || (profileName || watchlistName) && cannotBeEncodedText(child)) child
                 else if (key == "authenticatedOwnAccountSources")
                     validateNativeOwnAccountArchive(child as? JSONObject ?: reject("Malformed authenticated source archive"))
                 else if (key == "nativeOwnAccountCandidates")
                     validateNativeOwnAccountCandidates(child as? JSONObject ?: reject("Malformed pending account candidates"))
                 else if (root && key == "settings" && child != JSONObject.NULL)
-                    settings(child, childPath, depth + 1) else json(child, childPath, depth + 1))
+                    settings(child, childPath, depth + 1) else json(child, childPath, depth + 1, addonRole = addonChildRole))
             }
         }
 
@@ -192,21 +213,54 @@ internal object NativeHostDocument {
             }
         }
 
-        private fun structuredString(value: String, path: String, depth: Int): String {
+        private fun structuredString(value: String, path: String, depth: Int, addonDisplay: Boolean = false): String {
             // Both settings and unknown document fields may carry nested JSON as STRING, including
             // strings inside JSON Data. Recurse while preserving the carrier, not just the first level.
             val trimmed = value.trimStart()
             if (trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')) {
                 val priorExclusions = excluded.size
-                val sanitized = json(parseJson(value), path, depth + 1)
+                val parsed = try {
+                    parseJson(value)
+                } catch (malformed: IllegalArgumentException) {
+                    if (addonDisplay && literalAddonLabel(trimmed, path, depth)) return value
+                    throw malformed
+                }
+                // Display roles never transfer into a carrier parsed from the string.
+                val sanitized = json(parsed, path, depth + 1)
                 val clean = if (sanitized is String) JSONObject.quote(sanitized) else sanitized.toString()
                 return if (excluded.size == priorExclusions) value else clean
             }
             return encodedStructure(value, path, depth + 1) ?: value
         }
 
+        /** Only schema-qualified, bounded plain labels can survive a failed JSON parse. */
+        private fun literalAddonLabel(text: String, path: String, depth: Int): Boolean {
+            if (text.length > 1024) return false
+            var rest = text
+            var tagged = false
+            while (rest.startsWith('[') || rest.startsWith('{')) {
+                val open = rest[0]
+                val end = rest.indexOf(if (open == '[') ']' else '}', startIndex = 1)
+                if (end !in 2..65) return false
+                val tag = rest.substring(1, end).trim()
+                if (tag.isEmpty() || tag.any { it.isISOControl() || it.category == CharCategory.FORMAT ||
+                        it in forbiddenAddonTagCharacters } ||
+                    (open == '[' && jsonScalar.matches(tag)) || hasDisplayCarrier(tag, path, depth)) return false
+                rest = rest.substring(end + 1)
+                if (rest.isNotEmpty() && !rest[0].isWhitespace() && rest[0] !in addonLabelSeparators) return false
+                rest = rest.trimStart()
+                tagged = true
+            }
+            val suffix = rest.dropWhile { it.isWhitespace() || it == '\uFEFF' || it in addonLabelSeparators }
+            return tagged && !hasDisplayCarrier(suffix, path, depth)
+        }
+
+        private fun hasDisplayCarrier(text: String, path: String, depth: Int): Boolean =
+            displayCarrierPrefix(text) || encodedStructure(text, path, depth + 1, ::recognizableDisplayCarrierBytes) != null
+
         /** Only recognizable structured base64 is a carrier; opaque ordinary strings remain exact. */
-        private fun encodedStructure(value: String, path: String, depth: Int): String? {
+        private fun encodedStructure(value: String, path: String, depth: Int,
+                                     recognizable: (ByteArray) -> Boolean = ::recognizableBytes): String? {
             budget(depth)
             // UUIDs (including random register actors) are identifiers, not base64url carriers.
             // Some random UUID bytes otherwise happen to start with a quote or JSON delimiter.
@@ -229,18 +283,21 @@ internal object NativeHostDocument {
                 // pass-through. Inspect the valid complete-quantum prefix before deciding it is plain.
                 val prefix = candidate.takeWhile { it.isLetterOrDigit() && it.code < 128 || it in "+/-_" }
                 val decodable = if (prefix.length % 4 == 1) prefix.dropLast(1) else prefix
-                val prefixBytes = runCatching { decoder.decode(decodable) }.getOrNull()
-                requireArchive(prefixBytes == null || !recognizableBytes(prefixBytes), "Malformed recognizable base64 structure")
+                // Choose the recognition alphabet from the prefix, independent of the malformed
+                // suffix. Both alphabet spellings can occur here, but neither makes it valid data.
+                val normalized = decodable.replace('-', '+').replace('_', '/')
+                val prefixBytes = runCatching { Base64.getDecoder().decode(normalized) }.getOrNull()
+                requireArchive(prefixBytes == null || !recognizable(prefixBytes), "Malformed recognizable base64 structure")
                 return null
             }
             inspectedBytes += decoded.size
             requireArchive(inspectedBytes <= 32L * 1024 * 1024, "Encoded host document exceeds inspection limits")
             val priorExclusions = excluded.size
-            val clean = if (recognizableBytes(decoded)) inspectData(decoded, path, depth + 1) else {
+            val clean = if (recognizable(decoded)) inspectData(decoded, path, depth + 1) else {
                 // A base64 layer can itself wrap another base64 string. Only accept that inference if
                 // recursive inspection actually recognizes a structured payload within the limits.
                 val nested = runCatching { strictUtf8(decoded) }.getOrNull() ?: return null
-                val inspected = encodedStructure(nested, path, depth + 1) ?: return null
+                val inspected = encodedStructure(nested, path, depth + 1, recognizable) ?: return null
                 inspected.toByteArray(Charsets.UTF_8)
             }
             if (excluded.size == priorExclusions) return value
@@ -274,6 +331,26 @@ internal object NativeHostDocument {
     private val credentialKeys = setOf("auth", "authkey", "password", "apikey", "apikeys", "authorization", "bearer", "datakey",
         "token", "accesstoken", "refreshtoken", "authtoken", "clientsecret", "credentials", "nativeprovidercredentials")
     private val suspiciousSuffixes = listOf("token", "password", "authkey", "apikey")
+    private val forbiddenAddonTagCharacters = """[]{}"'\:=;<,`"""
+    private const val addonLabelSeparators = ":-.,!?)"
+    private val jsonScalar = Regex("""(?:true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)""")
+
+    private fun hasAddonTransport(value: JSONObject): Boolean {
+        val url = (value.opt("transportUrl") as? String)?.let { runCatching { URI(it) }.getOrNull() }
+        return url?.scheme?.lowercase() in setOf("http", "https") && !url?.host.isNullOrBlank()
+    }
+
+    private fun displayCarrierPrefix(text: String): Boolean =
+        text.firstOrNull() in listOf('{', '[', '"', '\'') ||
+            text.startsWith("bplist") || text.startsWith("<?xml") || text.startsWith("<plist")
+
+    private fun recognizableDisplayCarrierBytes(bytes: ByteArray): Boolean {
+        if (recognizableBytes(bytes)) return true
+        // Treat a BOM or UTF-16/32 padding as carrier syntax. This only makes display admission stricter.
+        val significant = bytes.toString(Charsets.UTF_8).filterNot { it == '\u0000' }
+            .trimStart { it.isWhitespace() || it == '\uFEFF' || it == '\uFFFD' }
+        return displayCarrierPrefix(significant)
+    }
 
     private fun recognizableBackup(value: JSONObject): Boolean = value.opt("format") == SettingsBackup.FORMAT_TAG ||
         value.has("payloadBase64") && (value.has("bundleID") || value.has("keyCount"))

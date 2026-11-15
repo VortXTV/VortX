@@ -30,7 +30,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import coil3.compose.AsyncImage
 import com.vortx.android.metadata.LocalizedMetadataStore
 import com.vortx.android.metadata.PosterArtwork
 import com.vortx.android.model.Catalog
@@ -42,10 +41,8 @@ import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.theme.vortxGlass
 
-/// [PosterCard]'s `art` slot for a real catalog item: a Coil [AsyncImage] with crossfade when a poster
-/// is present, falling back to [DefaultPosterArt] (the deterministic brand-tinted placeholder) when
-/// it's null. This is the ONE place every poster image request in the app goes through, so cache
-/// config and crossfade behavior stay consistent (see `VortXApplication`'s ImageLoader).
+/// [PosterCard]'s `art` slot loads catalog posters through the app-wide Coil image loader.
+/// If the localized or ratings image fails, it can still show the original provider's image.
 ///
 /// When [id] is supplied it routes the poster URL through [PosterArtwork] (the Kotlin port of Apple's
 /// poster router): a localized-title poster override first (item 9, gated off for English), then the
@@ -59,24 +56,21 @@ fun BoxScope.PosterArt(
     id: String? = null,
     type: String = "movie",
     showRatingBadge: Boolean = true,
+    fallbackUrl: String? = null,
 ) {
     // Observe the localized-metadata store so a poster override that resolves after first paint re-renders.
     val l10nEntries by LocalizedMetadataStore.entries.collectAsStateWithLifecycle()
     val localizedPoster = remember(id, l10nEntries) { id?.let { LocalizedMetadataStore.poster(it) } }
-    val base = localizedPoster ?: posterUrl
+    val base = localizedPoster?.takeIf(String::isNotBlank) ?: posterUrl?.takeIf(String::isNotBlank)
     val landscapeCard = LocalPosterCardLandscape.current
     val resolved = if (id != null && !landscapeCard) PosterArtwork.poster(id, base) else base
 
-    if (resolved.isNullOrBlank()) {
-        DefaultPosterArt(title)
-    } else {
-        AsyncImage(
-            model = resolved,
-            contentDescription = title,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxSize(),
-        )
-    }
+    FallbackArtwork(
+        urls = listOf(resolved, base, posterUrl, fallbackUrl),
+        contentDescription = title,
+        modifier = Modifier.fillMaxSize(),
+        placeholder = { DefaultPosterArt(title) },
+    )
     // The rating badge sits over CLEAN art only: when the active provider will actually bake a rating onto
     // this id's poster, suppress it (no double badge). Placed top-start so it never collides with the
     // watched checkmark (top-end) or the Continue-Watching progress track (bottom).
@@ -93,18 +87,31 @@ fun BoxScope.PosterArt(
 /** Wide Cinema art with a readable poster inset when the provider supplied only portrait artwork. */
 @Composable
 fun BoxScope.CinemaLandscapeArt(item: MetaItem) {
-    val artwork = cinemaLandscapeArtwork(item)
-    if (artwork == null) {
-        DefaultPosterArt(item.name)
-    } else {
-        AsyncImage(model = artwork, contentDescription = null, contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxSize())
-    }
-    Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.45f)))))
-    if (item.background.isNullOrBlank() && !item.poster.isNullOrBlank()) {
-        AsyncImage(model = item.poster, contentDescription = null, contentScale = ContentScale.Fit,
-            modifier = Modifier.align(Alignment.Center).fillMaxHeight().aspectRatio(2f / 3f))
-    }
+    val backdrop = cinemaLandscapeArtwork(item).takeIf { !item.background.isNullOrBlank() }
+    val poster = item.poster?.trim()?.takeIf { it.isNotEmpty() && it != backdrop?.trim() }
+    val scrim = Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.45f)))
+    ArtworkOverFallback(
+        preferred = listOf(backdrop),
+        contentDescription = null,
+        fallback = {
+            FallbackArtwork(
+                urls = listOf(poster),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                placeholder = { DefaultPosterArt(item.name) },
+            )
+            Box(Modifier.fillMaxSize().background(scrim))
+            if (poster != null) {
+                FallbackArtwork(
+                    urls = listOf(poster),
+                    contentDescription = null,
+                    modifier = Modifier.align(Alignment.Center).fillMaxHeight().aspectRatio(2f / 3f),
+                    contentScale = ContentScale.Fit,
+                )
+            }
+        },
+        preferredOverlay = { Box(Modifier.fillMaxSize().background(scrim)) },
+    )
     item.resumeLabel?.let { label ->
         Badge(label, modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp))
     }
@@ -229,7 +236,8 @@ fun PosterRail(
                         onQuickView = onQuickView?.let { quickView -> { quickView(item) } },
                         art = {
                             if (continueWatching) CinemaLandscapeArt(item)
-                            else PosterArt(item.poster, item.name, id = item.id, type = item.type.id)
+                            else PosterArt(item.poster, item.name, id = item.id, type = item.type.id,
+                                fallbackUrl = item.background)
                         },
                         cinema = true,
                         landscape = true.takeIf { continueWatching },

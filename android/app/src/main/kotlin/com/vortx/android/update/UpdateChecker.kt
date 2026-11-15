@@ -47,8 +47,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  *     is the file handed over via FileProvider + ACTION_VIEW. An unverified installUrl is NEVER opened.
  *
  * Compares by BUILD ([BuildConfig.VERSION_CODE]), not the marketing version: betas share the marketing
- * version and differ only by build, so a version-only compare could never see a beta -> beta bump. Only a
- * NON-prerelease ("Latest") entry raises the notice, exactly like the Apple original.
+ * version and differ only by build, so a version-only compare could never see a beta -> beta bump.
+ * A published beta needs an eligible signed APK entry in the official appcast to raise a notice.
  *
  * Signals, all StateFlows the Compose surfaces collect:
  *  - [available]: the PASSIVE banner state; cleared when up to date, skipped, or Later-ed for this session.

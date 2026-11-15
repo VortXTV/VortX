@@ -6,7 +6,9 @@ import android.content.Context
 import android.util.Log
 import com.vortx.android.BuildConfig
 import com.vortx.android.security.PersistentCredentialAvailability
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -75,6 +77,7 @@ object TraktAuth {
     /// concurrent refreshes would race and the loser 401s on an already-spent token, dropping the session.
     /// The mutex collapses concurrent callers into one rotation (the Apple `inFlightRefresh` single-flight).
     private val refreshMutex = Mutex()
+    private val siblingRotationDelaysMs = longArrayOf(3_000, 6_000, 12_000)
 
     /// Idempotent init: build the encrypted token store from the app context. Safe to call from every
     /// entry point (the Integrations screen, the player scrobble hook); only the first call does work.
@@ -343,7 +346,10 @@ object TraktAuth {
                 result.value ?: throw TraktAuthException.NotSignedIn
             CredentialMutationResult.Stale -> {
                 val peer = operation.readCurrentOwner(persistence::loadStored)
-                val token = (peer as? CredentialMutationResult.Applied)?.value?.token
+                // A synced replacement drops local issuance metadata. Its Trakt identity is
+                // unknown, so an older request can only reuse a locally issued winner.
+                val token = (peer as? CredentialMutationResult.Applied)?.value
+                    ?.takeIf { it.lineage.createdAt != null }?.token
                 if (token != null && !token.isExpired) return@withLock token
                 throw TraktAuthException.NotSignedIn
             }
@@ -374,6 +380,7 @@ object TraktAuth {
             spentToken = spentToken,
             persistence = persistence,
             clearCurrent = ::signOut,
+            awaitSiblingRotation = if (mirror == null) ::delay else null,
             request = {
                 if (mirror == null) {
                     IntegrationsHttp.request(
@@ -407,34 +414,59 @@ object TraktAuth {
         spentToken: TokenPersistence.StoredToken,
         persistence: TokenPersistence,
         clearCurrent: () -> Unit,
+        awaitSiblingRotation: (suspend (Long) -> Unit)? = null,
         request: suspend () -> IntegrationsHttp.Response,
     ): TraktToken {
         if (!operation.isCurrent()) throw TraktAuthException.NotSignedIn
         val publication = operation.publishAfter(
             awaitValue = request,
             publish = { response ->
-                if (response.status != 200) {
-                    // Only clear a rejected session when it still carries the token this request spent.
-                    // A device-flow winner may have installed a newer session during the network await.
-                    if (response.status == 401) {
-                        val preserved = handleUnauthorizedRefresh(
-                            spentLineage = spentToken.lineage,
-                            loadStored = persistence::loadStored,
-                            clearCurrent = clearCurrent,
-                        )
-                        if (preserved != null) {
-                            return@publishAfter preserved
-                        }
+                when (response.status) {
+                    200 -> {
+                        val token = parseToken(response.body) ?: throw TraktAuthException.Decoding
+                        persistence.saveRefreshIfCurrent(spentToken.lineage, token)
                     }
-                    throw TraktAuthException.Server(response.status)
+                    401 -> null
+                    else -> throw TraktAuthException.Server(response.status)
                 }
-                val token = parseToken(response.body) ?: throw TraktAuthException.Decoding
-                persistence.saveRefreshIfCurrent(spentToken.lineage, token)
             },
         )
         return when (publication) {
             is CredentialMutationResult.Applied -> publication.value
-            CredentialMutationResult.Stale -> throw TraktAuthException.NotSignedIn
+                ?: recoverRejectedRefresh(operation, spentToken.lineage, persistence, clearCurrent, awaitSiblingRotation)
+            CredentialMutationResult.Stale -> throw TraktAuthException.SessionChanged
+        }
+    }
+
+    private suspend fun recoverRejectedRefresh(
+        operation: CredentialMutationCoordinator.Operation,
+        spentLineage: TokenPersistence.PersistedLineage,
+        persistence: TokenPersistence,
+        clearCurrent: () -> Unit,
+        awaitSiblingRotation: (suspend (Long) -> Unit)?,
+    ): TraktToken {
+        if (awaitSiblingRotation != null) {
+            // The authenticated account receiver already checks for newer backups while active.
+            // Give it time to confirm the winning device's tuple before ending this session.
+            for (wait in siblingRotationDelaysMs) {
+                currentCoroutineContext().ensureActive()
+                val current = operation.mutate(persistence::loadStored)
+                if ((current as? CredentialMutationResult.Applied)?.value?.lineage != spentLineage) {
+                    // A replacement may be a different Trakt account. The pending request gets no
+                    // successor bearer, and the new tuple remains available to fresh requests.
+                    throw TraktAuthException.SessionChanged
+                }
+                awaitSiblingRotation(wait)
+            }
+        }
+        currentCoroutineContext().ensureActive()
+        return when (val outcome = operation.mutate {
+            val stored = persistence.loadStored()
+            if (awaitSiblingRotation != null && stored?.lineage != spentLineage) throw TraktAuthException.SessionChanged
+            handleUnauthorizedRefresh(spentLineage, { stored }, clearCurrent)
+        }) {
+            is CredentialMutationResult.Applied -> outcome.value ?: throw TraktAuthException.Server(401)
+            CredentialMutationResult.Stale -> throw TraktAuthException.SessionChanged
         }
     }
 
@@ -690,6 +722,7 @@ private fun traktTokenExpired(expiresAt: Long, lifetime: Long, now: Long): Boole
 sealed class TraktAuthException(message: String) : Exception(message) {
     data object NotConfigured : TraktAuthException("Trakt is not configured in this build.")
     data object NotSignedIn : TraktAuthException("You are not connected to Trakt.")
+    data object SessionChanged : TraktAuthException("Your Trakt connection changed. Please try again.")
     data object InvalidDeviceCode : TraktAuthException("This Trakt sign-in code is not valid.")
     data object CodeAlreadyUsed : TraktAuthException("This Trakt sign-in code was already used.")
     data object Expired : TraktAuthException("The Trakt sign-in code expired. Please try again.")

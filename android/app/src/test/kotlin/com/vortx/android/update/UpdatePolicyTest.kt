@@ -48,11 +48,12 @@ class UpdatePolicyTest {
         applicationId: String = "\"com.vortx.android\"",
         engine: String? = if (flavorKey == "play") "media3" else "mpv",
         extraFields: String = "",
+        tag: String = "v0.3.15",
     ): String {
         val engineField = if (engine != null) """"engine": "$engine",""" else ""
         val urlField = if (url != null) """"url": "$url",""" else ""
         return """{
-            "tag": "v0.3.15",
+            "tag": "$tag",
             "version": $version,
             "build": $build,
             "name": $name,
@@ -488,9 +489,51 @@ class UpdatePolicyTest {
     }
 
     @Test
-    fun prereleasesStaySilentButAMistypedPrereleaseFlagIsMalformed() {
-        assertTrue(evaluate(splitAppcast(flavorEntry("full", prerelease = "true"), null), 188)
-            is UpdatePolicy.UpdateDecision.None)
+    fun offersNewerPublicBetaForTheExactInstalledFlavor() {
+        val tag = "v0.5.6-beta.14"
+        val baseUrl = "https://github.com/VortXTV/VortX/releases/download/$tag"
+        val fullUrl = "$baseUrl/VortX-0.5.6-full-mpv-universal.apk"
+        val playUrl = "$baseUrl/VortX-0.5.6-play-media3-universal.apk"
+        val feed = splitAppcast(
+            flavorEntry("full", build = 286, version = "\"0.5.6\"", prerelease = "true", apk = fullUrl, tag = tag),
+            flavorEntry("play", build = 286, version = "\"0.5.6\"", prerelease = "true", apk = playUrl, tag = tag),
+        )
+        for ((flavor, url) in mapOf("full" to fullUrl, "play" to playUrl)) {
+            val offer = evaluate(feed, currentBuild = 285, flavor = flavor) as UpdatePolicy.UpdateDecision.Offer
+            assertEquals(286, offer.release.build)
+            assertEquals("0.5.6", offer.release.version)
+            assertEquals(url, offer.release.artifactUrl)
+            assertTrue(evaluate(feed, currentBuild = 286, flavor = flavor) is UpdatePolicy.UpdateDecision.None)
+        }
+    }
+
+    @Test
+    fun publicBetaMustStillBindTheExactUniversalAssetAndTrustMetadata() {
+        val tag = "v0.5.6-beta.14"
+        val url = "https://github.com/VortXTV/VortX/releases/download/$tag/VortX-0.5.6-full-mpv-universal.apk"
+        val genuine = flavorEntry("full", build = 286, version = "\"0.5.6\"", prerelease = "true", apk = url, tag = tag)
+        val mutations = listOf(
+            "\"tag\": \"$tag\"" to "\"tag\": \"v0.5.5-beta.14\"",
+            url to url.replace("beta.14", "beta.13"),
+            url to url.replace("full-mpv", "play-media3"),
+            url to url.replace("universal", "arm64-v8a"),
+            "\"artifactType\": \"apk\"" to "\"artifactType\": \"aab\"",
+            "\"engine\": \"mpv\"" to "\"engine\": \"media3\"",
+            "\"signed\": true" to "\"signed\": false",
+            pinnedSigner to "b".repeat(64),
+            "a".repeat(64) to "invalid-digest",
+        )
+        for ((value, replacement) in mutations) {
+            assertTrue(
+                "accepted mutated beta field: $value",
+                evaluate(splitAppcast(genuine.replace(value, replacement), null), currentBuild = 285)
+                    is UpdatePolicy.UpdateDecision.Malformed,
+            )
+        }
+    }
+
+    @Test
+    fun mistypedPrereleaseFlagIsMalformed() {
         assertTrue(evaluate(splitAppcast(flavorEntry("full", prerelease = "\"yes\""), null), 188)
             is UpdatePolicy.UpdateDecision.Malformed)
     }

@@ -42,6 +42,7 @@ internal object UpdatePolicy {
     const val MAX_REDIRECT_HOPS = 5
 
     private val HEX_64_ANY_CASE = Regex("^[0-9a-fA-F]{64}$")
+    private val PRERELEASE_TAG = Regex("""v([0-9]+\.[0-9]+\.[0-9]+)-[0-9A-Za-z.]+""")
 
     /** Field length caps; anything longer is hostile feed content, not prose. */
     private const val MAX_VERSION_CHARS = 64
@@ -141,7 +142,7 @@ internal object UpdatePolicy {
 
     /** What [evaluateFeed] decided about one fetched appcast. */
     internal sealed interface UpdateDecision {
-        /** No android entry, build at or below the running one, or a silent prerelease: nothing to offer. */
+        /** No Android entry or the build is at or below the running one. */
         data object None : UpdateDecision
 
         /** The feed is unusable or hostile: fail closed, offer nothing, keep the reason for logs/tests. */
@@ -198,7 +199,8 @@ internal object UpdatePolicy {
      * Strictness notes:
      *  - `build` must be a JSON integer (org.json would otherwise coerce "189"), strictly above the running one.
      *  - `signed` must be exactly boolean true.
-     *  - `prerelease` true keeps the entry silent (stable-build semantics), a mistyped prerelease is Malformed.
+     *  - Prereleases selected by the official appcast are eligible with their exact GitHub tag and universal APK.
+     *    A mistyped `prerelease` flag is Malformed.
      *  - `apk` and `url`, when both present, must agree; at least one must be present.
      *  - `signer` must normalize to [PINNED_SIGNER_SHA256]; anything else is refused before download.
      *  - optional `applicationId`, when present, must equal [expectedApplicationId].
@@ -273,9 +275,9 @@ internal object UpdatePolicy {
             )
         }
 
-        when (val prerelease = entry.opt("prerelease") ?: JSONObject.NULL) {
-            JSONObject.NULL -> Unit // absent reads as stable; the publisher always sends the field today
-            is Boolean -> if (prerelease) return UpdateDecision.None
+        val isPrerelease = when (val prerelease = entry.opt("prerelease") ?: JSONObject.NULL) {
+            JSONObject.NULL -> false // absent reads as stable; the publisher always sends the field today
+            is Boolean -> prerelease
             else -> return UpdateDecision.Malformed("prerelease is not a boolean")
         }
 
@@ -310,6 +312,19 @@ internal object UpdatePolicy {
             ?: return UpdateDecision.Malformed("no apk/url artifact URL")
         val artifactUrl = validateArtifactUrl(rawArtifactUrl)
             ?: return UpdateDecision.Malformed("artifact URL rejected by host policy")
+        if (isPrerelease) {
+            val tag = optionalString(entry, "tag")
+            if (tag == null || tag.length > MAX_VERSION_CHARS ||
+                PRERELEASE_TAG.matchEntire(tag)?.groupValues?.get(1) != version
+            ) {
+                return UpdateDecision.Malformed("prerelease tag does not match the marketing version")
+            }
+            val asset = "VortX-$version-$currentFlavor-$requiredEngine-universal.apk"
+            val canonicalUrl = "https://github.com/VortXTV/VortX/releases/download/$tag/$asset"
+            if (optionalString(entry, "artifactType") != "apk" || artifactUrl != canonicalUrl) {
+                return UpdateDecision.Malformed("prerelease does not identify the exact universal APK")
+            }
+        }
 
         val sizeRaw = entry.opt("size")
         val size = when (sizeRaw) {

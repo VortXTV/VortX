@@ -43,6 +43,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -119,6 +120,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
@@ -1646,11 +1648,8 @@ fun PlayerScreen(
         seekNudgeTargetMs = null
     }
 
-    // ADD-ON SUBTITLES (the Android port of Apple SubtitleAddons.swift:37 `installedSources` +
-    // :54 `fetch`): once per load, union the installed subtitle-capable add-ons (minus any the
-    // active profile turned off) and fetch their external tracks for THIS title, keyed by the
-    // playable's imdb identity. Fail-soft at every step -- a trailer, an id-less playable, no
-    // subtitle add-ons installed, or a flaky add-on simply leaves the sheet's add-on section empty.
+    // Look up enabled subtitle add-ons for this loaded title. Opening the subtitle sheet
+    // can retry a failed provider once for this load, while keeping the rows already found.
     // The results list in the chrome's subtitle sheet under the embedded tracks; picking one mounts
     // it on the live engine. Each engine selects the exact requested file; the UI never guesses
     // identity from inventory count/order, which can change when unrelated sidecars finish.
@@ -1941,30 +1940,48 @@ fun PlayerScreen(
         request.start()
     }
     LaunchedEffect(playbackSessionKey, engine) {
-        addonLookupSettled = false
+        fun admitLookup(action: () -> Boolean): Boolean = withCurrentSubtitleOwnerState {
+            latestSubtitleEngine === engine && action()
+        }
         try {
             if (currentPlayable.isTrailer) return@LaunchedEffect
             val ref = currentPlayable.mediaRef ?: return@LaunchedEffect
             val (type, videoId) = SubtitleAddonService.queryFor(ref) ?: return@LaunchedEffect
             val repo = (context.applicationContext as? VortXApplication)?.catalogRepository ?: return@LaunchedEffect
+            if (!admitLookup { true }) return@LaunchedEffect
             val sources = SubtitleAddonService.installedSources(repo.installedAddons().getOrNull().orEmpty())
-            if (sources.isEmpty()) return@LaunchedEffect
+            if (sources.isEmpty() || !admitLookup { true }) return@LaunchedEffect
             val store = TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context))
-            val found = TrackSelector.keepingPreferredSubtitleLanguages(
-                items = SubtitleAddonService.fetch(sources, type, videoId, currentPlayable.subtitleMetadata),
-                enabled = store.subtitlesOnlyPreferred,
-                preferredLanguages = store.current.subtitleLanguages,
-                language = AddonSubtitle::lang,
+            val lookupContext = currentCoroutineContext()
+            SubtitleAddonService.discoverForPlayback(
+                sources, type, videoId, currentPlayable.subtitleMetadata,
+                publish = { rows ->
+                    lookupContext.ensureActive()
+                    val found = TrackSelector.keepingPreferredSubtitleLanguages(
+                        items = rows,
+                        enabled = store.subtitlesOnlyPreferred,
+                        preferredLanguages = store.current.subtitleLanguages,
+                        language = AddonSubtitle::lang,
+                    )
+                    admitLookup {
+                        addonSubtitles = found
+                        addonLookupSettled = true
+                        true
+                    }
+                },
+                awaitRetry = {
+                    snapshotFlow { controlSheet.value }.first { it == ControlSheet.SUBTITLE }
+                    lookupContext.ensureActive()
+                    admitLookup { true }
+                },
             )
-            currentCoroutineContext().ensureActive()
-            admitCurrentSubtitleEngine { addonSubtitles = found; true }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
             // A terminal lookup failure may use the pool, but canceled old work may not publish.
         } finally {
             currentCoroutineContext().ensureActive()
-            admitCurrentSubtitleEngine { addonLookupSettled = true; true }
+            admitLookup { addonLookupSettled = true; true }
         }
     }
     // Preference-driven auto track selection (the Android port of Apple TrackSelector). Audio and subtitle
