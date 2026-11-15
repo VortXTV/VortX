@@ -491,7 +491,12 @@ final class CoreBridge: ObservableObject {
         try publicationSource?.withActive {}
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               let facade = nativeFacadeLock.withLock({ nativeCredentialCapture == capture ? nativeFacadeStorage : nil }) else { throw VortxNativeError.closed }
-        let baseline = try VortxNativeProfileEditHost.baselines(nativeProfileBaseline)
+        let baseline: VortxNativeProfileEditHost.Baselines
+        do { baseline = try VortxNativeProfileEditHost.baselines(nativeProfileBaseline) }
+        catch {
+            DiagnosticsLog.log("sync", "operation=native_account_merge result=failed stage=profile_baseline reason=\(VortxNativeError.diagnosticCode(error))")
+            throw error
+        }
         let cloudCommit = publicationSource.map { VortxNativeHostFieldCommitLatch(source: sourceAuthority ?? $0) }
         let commitSource: (any VortxMutationAuthority)? = cloudCommit.map { $0 as any VortxMutationAuthority } ?? sourceAuthority
         let document = try await withTaskCancellationHandler {
@@ -502,7 +507,11 @@ final class CoreBridge: ObservableObject {
         try publicationSource?.withActive {}
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeCredentialCapture == capture }) else { throw VortxNativeError.superseded }
-        try refreshNativeProfiles()
+        do { try refreshNativeProfiles() }
+        catch {
+            DiagnosticsLog.log("sync", "operation=native_account_merge result=failed stage=profile_projection reason=\(VortxNativeError.diagnosticCode(error))")
+            throw error
+        }
         return document
     }
     @MainActor

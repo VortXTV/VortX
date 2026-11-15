@@ -143,8 +143,9 @@ struct HomeView: View {
                     // on every stream). Unmounting tears it down the moment the player presents; it remounts
                     // fresh on close.
                     HomeHeroTrailerLayer(model: heroTrailer,
-                                         enabled: autoplayTrailers && RemoteConfig.snapshot.isFeatureOn("trailers", default: true)
-                                            && !reduceMotion && presenter.request == nil)
+                                         enabled: isActive && homeContentVisible && scenePhase == .active
+                                            && autoplayTrailers && !reduceMotion
+                                            && RemoteConfig.snapshot.isFeatureOn("trailers", default: true))
                 }
                 // Leaves the hierarchy when a detail page is pushed over Home (or the tab is hidden).
                 .onAppear { homeContentVisible = true }
@@ -705,27 +706,40 @@ struct HomeView: View {
 /// only this layer.
 private struct HomeHeroTrailerLayer: View {
     @ObservedObject var model: HomeHeroTrailerModel
+    @EnvironmentObject private var presenter: PlayerPresenter
     let enabled: Bool
 
+    private var presentation: UUID? {
+        enabled && presenter.request == nil ? presenter.requestGeneration : nil
+    }
+
     var body: some View {
-        if enabled, let url = model.url {
-            TVInHeroTrailerView(url: url)
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
+        ZStack {
+            if let presentation, let url = model.url(for: presentation) {
+                TVInHeroTrailerView(url: url)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+            }
         }
+        .onChange(of: presentation, initial: true) { _, generation in
+            model.updatePresentation(presenter, generation: generation)
+        }
+        .onDisappear { model.updatePresentation(presenter, generation: nil) }
     }
 }
 
 @MainActor final class HomeHeroTrailerModel: ObservableObject {
     /// The settled item's resolved trailer URL, or nil while debouncing / when no trailer exists. Mounting
     /// `TVInHeroTrailerView` on this means clearing it tears the libmpv layer down at once.
-    @Published private(set) var url: URL?
+    @Published private var url: URL?
 
     /// Seconds focus must rest on one item before its trailer loads, so flicking past catalogs never loads.
     private static let settleDelay: Duration = .seconds(3)
 
     private var pending: Task<Void, Never>?
-    private var currentItemID: String?
+    private var focusedHero: FocusedHero?
+    private weak var presenter: PlayerPresenter?
+    private var presentationGeneration: UUID?
     /// Base URLs of the user's meta-serving add-ons (set by HomeView via `configureMetaSources`), walked to
     /// resolve the focused item's meta the same way `FocusedItemModel` enriches the backdrop.
     private var metaSourceBases: [String] = []
@@ -740,52 +754,80 @@ private struct HomeHeroTrailerLayer: View {
     /// settle timer; if focus moves again before it fires the timer is cancelled, so no request is made.
     /// `hero == nil` (focus left the rails) just tears down.
     func focusChanged(to hero: FocusedHero?) {
-        guard hero?.id != currentItemID else { return }
-        currentItemID = hero?.id
+        guard hero?.id != focusedHero?.id else { return }
+        focusedHero = hero
+        restartPreview()
+    }
+
+    /// A hidden Home keeps its settled focus, but stops the debounce and all associated resolution.
+    /// A new presentation generation may resume only the title that is still focused.
+    func updatePresentation(_ presenter: PlayerPresenter, generation: UUID?) {
+        guard self.presenter !== presenter || presentationGeneration != generation else { return }
+        self.presenter = presenter
+        presentationGeneration = generation
+        restartPreview()
+    }
+
+    func url(for generation: UUID) -> URL? {
+        presentationGeneration == generation ? url : nil
+    }
+
+    private func restartPreview() {
         pending?.cancel()
-        // Tear the previous trailer down the moment focus leaves it.
+        pending = nil
         if url != nil { url = nil }
-        guard let hero else { return }
+        guard let hero = focusedHero, let generation = presentationGeneration,
+              mayResolve(hero, generation: generation) else { return }
         pending = Task { [weak self] in
             try? await Task.sleep(for: Self.settleDelay)
-            guard !Task.isCancelled else { return }
-            await self?.resolveTrailer(for: hero)
+            await self?.resolveTrailer(for: hero, generation: generation)
         }
+    }
+
+    private func mayResolve(_ hero: FocusedHero, generation: UUID) -> Bool {
+        !Task.isCancelled && focusedHero?.id == hero.id && presentationGeneration == generation &&
+            presenter?.request == nil && presenter?.requestGeneration == generation
     }
 
     /// Settled for the full delay: resolve the focused item's trailer to a playable URL (preferring a direct
     /// stream, else the embedded server's `/yt` redirect) and publish it. Only applies if focus is still on
     /// this item, so a late network reply for a since-abandoned item never paints.
-    private func resolveTrailer(for hero: FocusedHero) async {
-        guard let request = await fetchTrailer(for: hero), let playable = request.playableURL else { return }
+    private func resolveTrailer(for hero: FocusedHero, generation: UUID) async {
+        guard mayResolve(hero, generation: generation),
+              let request = await fetchTrailer(for: hero, generation: generation),
+              mayResolve(hero, generation: generation), let playable = request.playableURL else { return }
         // yt-direct: try the DEVICE-DIRECT stream first (resolved on the user's own IP). The hero clip is
         // MUTED, so a video-only adaptive pick needs no audio sidecar; a miss keeps the /yt worker URL.
         // A direct (non-YouTube) trailer stream already IS `playable`, so only YouTube ids resolve here.
         var chosen = playable
-        if request.directURL == nil, let yt = request.youTubeID, !yt.isEmpty,
-           let resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080) {
-            chosen = resolved.videoURL
-            NSLog("[yt-direct] tvOS home ambient: %@ h=%d", resolved.isMuxed ? "direct-muxed" : "direct-pair", resolved.height)
-        } else if request.directURL == nil {
-            NSLog("[yt-direct] tvOS home ambient: fallback-worker")
+        if request.directURL == nil, let yt = request.youTubeID, !yt.isEmpty {
+            let resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080)
+            guard mayResolve(hero, generation: generation) else { return }
+            if let resolved {
+                chosen = resolved.videoURL
+                NSLog("[yt-direct] tvOS home ambient: %@ h=%d", resolved.isMuxed ? "direct-muxed" : "direct-pair", resolved.height)
+            } else {
+                NSLog("[yt-direct] tvOS home ambient: fallback-worker")
+            }
         }
-        guard currentItemID == hero.id, !Task.isCancelled else { return }
         url = chosen
     }
 
     /// Walk Cinemeta (for tt ids) + every installed meta add-on for this item's meta, building a
     /// `TrailerRequest` from the first response that carries a trailer. Mirrors `FocusedItemModel`'s
     /// enrichment fetch (short timeout, cache-first), so it is cheap and never blocks.
-    private func fetchTrailer(for hero: FocusedHero) async -> TrailerRequest? {
+    private func fetchTrailer(for hero: FocusedHero, generation: UUID) async -> TrailerRequest? {
         var bases = metaSourceBases
         if hero.id.hasPrefix("tt") { bases.insert("https://v3-cinemeta.strem.io/", at: 0) }
         let candidates = bases.compactMap { URL(string: "\($0)meta/\(hero.type)/\(hero.id).json") }
         let imdbID = hero.id.hasPrefix("tt") ? hero.id : nil
         for url in candidates {
+            guard mayResolve(hero, generation: generation) else { return nil }
             var request = URLRequest(url: url)
             request.timeoutInterval = 6
             request.cachePolicy = .returnCacheDataElseLoad
             guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  mayResolve(hero, generation: generation),
                   (response as? HTTPURLResponse)?.statusCode == 200,
                   let decoded = try? JSONDecoder().decode(TrailerMetaResponse.self, from: data),
                   let meta = decoded.meta else { continue }

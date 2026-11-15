@@ -638,7 +638,7 @@ struct RootTabView: View {
             Task { await armSeedingNag() }
         }) { release in
             UpdatePromptView(release: release) {
-                updates.dismissPrompt()
+                updates.dismissPrompt(matching: release.key)
             }
         }
         // Phase-0 seeding nag for the com.vortx move (see MoveSeeding): once per launch, only while this

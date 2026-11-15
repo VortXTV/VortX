@@ -293,7 +293,7 @@ struct iOSRootView: View {
             Task { await armSeedingNag() }
         }) { release in
             UpdatePromptView(release: release) {
-                updates.dismissPrompt()
+                updates.dismissPrompt(matching: release.key)
             }
         }
         .onValueChange(of: launchReady) { _ in presentUpdateIfReady() }

@@ -44,12 +44,16 @@ NATIVE_BETA11_BUILD_TAG = "v0.5.6-beta.11-candidate.1"
 NATIVE_BETA12_TAG = "v0.5.6-beta.12"
 NATIVE_BETA13_TAG = "v0.5.6-beta.13"
 NATIVE_BETA14_TAG = "v0.5.6-beta.14"
+NATIVE_BETA15_TAG = "v0.5.6-beta.15"
 # Final tag -> exact build tag, cross-platform build, local preflight receipt mode.
 PROTECTED_RELEASES = {
     NATIVE_BETA12_TAG: ("v0.5.6-beta.12-candidate.3", "283", "beta12-candidate-preflight"),
     NATIVE_BETA13_TAG: ("v0.5.6-beta.13-candidate.1", "285", "beta13-candidate-preflight"),
     NATIVE_BETA14_TAG: ("v0.5.6-beta.14-candidate.2", "293", "beta14-candidate-preflight"),
+    NATIVE_BETA15_TAG: ("v0.5.6-beta.15-candidate.1", "296", "beta15-candidate-preflight"),
 }
+NATIVE_BACKUP_CAS_TAGS = (NATIVE_BETA13_TAG, NATIVE_BETA14_TAG, NATIVE_BETA15_TAG)
+NATIVE_ACCOUNT_REGRESSION_TAGS = (NATIVE_BETA14_TAG, NATIVE_BETA15_TAG)
 NATIVE_TAGS = (NATIVE_BETA7_TAG, NATIVE_BETA11_TAG, *PROTECTED_RELEASES)
 NATIVE_TARGETS = ("VortXiOSNative", "VortXMac", "VortXTV", "VortXTopShelf", "VortXTVLite")
 NATIVE_TAG_TARGETS = {tag: NATIVE_TARGETS + (() if tag == NATIVE_BETA7_TAG else ("VortXAetherKit",)) for tag in NATIVE_TAGS}
@@ -77,6 +81,12 @@ BETA12_TOOLS = (
     "scripts/test-account-file-repair-service-live-abi.sh", "scripts/test-account-file-restore-live-abi.sh",
     "scripts/test-android-native-sync-host.sh", "android/native-sync-hosted.init.gradle",
     "scripts/verify-protected-apple-aether.py",
+)
+BETA15_UPDATE_TOOLS = (
+    "app/SourcesShared/UpdateChecker.swift", "app/SourcesShared/UpdatePromptView.swift",
+    "app/SourcesTV/RootTabView.swift", "app/SourcesTV/SettingsView.swift",
+    "app/SourcesiOS/VortXiOSApp.swift", "app/SourcesiOS/iOSRootView.swift", "app/SourcesiOS/iOSSettingsView.swift",
+    "app/Tests/UpdateCheckerTests.swift", "app/Tests/UpdateNotificationPresentationContractTests.swift",
 )
 APPLE_STEPS = (
     "Select the authenticated native source revision",
@@ -146,6 +156,8 @@ BETA12_AETHER_VERIFY = "Verify packaged Apple Aether linkage"
 BETA12_AETHER_EVIDENCE = "Upload protected Apple Aether release evidence"
 BETA13_ANDROID_BACKUP_CAS = "Verify protected Android backup format and CAS"
 BETA14_ANDROID_REGRESSIONS = "Verify protected Android account setup and release regressions"
+BETA15_APPLE_UPDATE = "Verify protected Apple update checking and presentation"
+BETA15_APPLE_UPDATE_MARKER = "Apple update checker and presentation contracts: verified"
 BETA14_ANDROID_SUITES = tuple("com.vortx.android." + name for name in (
     "sync.AndroidRealtimeSyncTest",
     "sync.VortXSessionOwnerTransitionContractTest",
@@ -160,6 +172,17 @@ BETA14_ANDROID_SUITES = tuple("com.vortx.android." + name for name in (
     "player.SubtitleAddonHttpTest",
     "downloads.DownloadPlaybackRoutingTest",
     "downloads.DownloadedSeasonBoundaryTest",
+))
+BETA15_ANDROID_SUITES = BETA14_ANDROID_SUITES + tuple("com.vortx.android." + name for name in (
+    "diagnostics.DiagnosticExportTest",
+    "profile.ProfileSelectionWiringTest",
+    "profile.BackupRecoveryEntryWiringTest",
+    "ui.profilepicker.ProfilePickerToolsControllerTest",
+    "ui.profilepicker.ProfilePickerToolsRestoreControllerTest",
+    "ui.profilepicker.ProfilePickerToolsManagerTest",
+    "backup.accountfiles.AccountBackupDocumentsTest",
+    "sync.SessionRenewalManagerTest",
+    "sync.VortXQrJoinFlowTest",
 ))
 ANDROID_DRAFT_STEP = "Create or append to the draft release"
 BETA12_AETHER_PACKAGES = {
@@ -384,7 +407,12 @@ def source_contract(root, source, version, tag):
     require(subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip() == source,
             "verifier checkout is not the exact source commit")
     hashes = {}
-    for relative in TOOLS + (BETA12_TOOLS if tag in PROTECTED_RELEASES else ()):
+    tools = TOOLS
+    if tag in PROTECTED_RELEASES:
+        tools += BETA12_TOOLS
+    if tag == NATIVE_BETA15_TAG:
+        tools += BETA15_UPDATE_TOOLS
+    for relative in tools:
         recorded = subprocess.check_output(["git", "-C", str(root), "show", f"{source}:{relative}"])
         require((root / relative).read_bytes() == recorded, f"working file differs from source: {relative}")
         hashes[relative] = hashlib.sha256(recorded).hexdigest()
@@ -444,14 +472,16 @@ def job_contract(lane, tag):
         else:
             required = tuple(name for name in required if name != ANDROID_DRAFT_STEP)
             skipped += (ANDROID_DRAFT_STEP,)
-    if tag in (NATIVE_BETA13_TAG, NATIVE_BETA14_TAG):
+    if tag in NATIVE_BACKUP_CAS_TAGS:
         if lane == "apple":
             required += (f"Verify protected Beta {tag.rsplit('.', 1)[1]} artifact-only dispatch",)
         else:
             required += (BETA13_ANDROID_BACKUP_CAS,)
-    if tag == NATIVE_BETA14_TAG:
+    if tag in NATIVE_ACCOUNT_REGRESSION_TAGS:
         required += (("Verify protected Apple legacy archive recovery",) if lane == "apple"
                      else (BETA14_ANDROID_REGRESSIONS,))
+    if tag == NATIVE_BETA15_TAG and lane == "apple":
+        required += (BETA15_APPLE_UPDATE,)
     return required, skipped
 
 
@@ -552,9 +582,10 @@ def unique_step_marker(log, step, prefix, pattern):
     return found[0]
 
 
-def android_regression_proof(log, step):
+def android_regression_proof(log, step, tag):
     suites = {}
-    for suite in BETA14_ANDROID_SUITES:
+    expected_suites = {NATIVE_BETA14_TAG: BETA14_ANDROID_SUITES, NATIVE_BETA15_TAG: BETA15_ANDROID_SUITES}[tag]
+    for suite in expected_suites:
         prefix = f"Verified protected Android regression: {suite} "
         pattern = re.escape(prefix) + r"\(([1-9][0-9]{0,3}) cases\); XML SHA256 ([0-9a-f]{64})"
         marker = unique_step_marker(log, step, prefix, pattern)
@@ -670,6 +701,10 @@ def protected_gate_proof(lane, pointer, tag, source, repo_id, job, log, work):
     steps = {step["name"]: step for step in job["steps"]}
     run_id, attempt = pointer["runId"], pointer["attempt"]
     if lane == "apple":
+        if tag == NATIVE_BETA15_TAG:
+            require_step_order(steps, ("Show toolchain", BETA15_APPLE_UPDATE, "Verify complete native engine ABI"))
+            unique_step_marker(log, steps[BETA15_APPLE_UPDATE], BETA15_APPLE_UPDATE_MARKER,
+                               re.escape(BETA15_APPLE_UPDATE_MARKER))
         require_step_order(steps, ("Verify complete native engine ABI", BETA12_LIVE_ABI, BETA12_APPLE_GATE,
             BETA12_APPLE_EVIDENCE, "Capture exact native SDK and player inputs before app compilation", "Build tvOS (Full)"))
         unique_step_marker(log, steps[BETA12_LIVE_ABI], "app/Tests/VortxNativeLiveABITests.swift:",
@@ -684,9 +719,9 @@ def protected_gate_proof(lane, pointer, tag, source, repo_id, job, log, work):
         contents, artifact = protected_gate_zip(name, names, run_id, repo_id, tag, source, steps[BETA12_APPLE_EVIDENCE], log, work)
         return {**artifact, **protected_apple_gate(contents, pointer, tag, source), "fullLiveAbi": runtime}
     ordered = ("Build exact host JNI for native sync release tests", BETA12_ANDROID_GATE, BETA12_ANDROID_EVIDENCE)
-    if tag in (NATIVE_BETA13_TAG, NATIVE_BETA14_TAG):
+    if tag in NATIVE_BACKUP_CAS_TAGS:
         ordered += (BETA13_ANDROID_BACKUP_CAS,)
-    if tag == NATIVE_BETA14_TAG:
+    if tag in NATIVE_ACCOUNT_REGRESSION_TAGS:
         ordered += (BETA14_ANDROID_REGRESSIONS,)
     require_step_order(steps, (*ordered, "Build release APKs and Play bundle"))
     marker = (f"Verified exact JUnit XML: {BETA12_JNI_TOTAL} executed, {BETA12_REAL_JNI} real-JNI-required cases; "
@@ -697,12 +732,12 @@ def protected_gate_proof(lane, pointer, tag, source, repo_id, job, log, work):
     contents, artifact = protected_gate_zip("VortX-Android-native-sync-host-tests", names, run_id, repo_id, tag, source,
                                            steps[BETA12_ANDROID_EVIDENCE], log, work)
     result = {**artifact, **protected_android_gate(contents, tag, source)}
-    if tag in (NATIVE_BETA13_TAG, NATIVE_BETA14_TAG):
+    if tag in NATIVE_BACKUP_CAS_TAGS:
         prefix = "Verified protected Android backup CAS: 16 cases; XML SHA256 "
         result["backupCas"] = {"cases": 16, "xmlSha256": unique_step_marker(
             log, steps[BETA13_ANDROID_BACKUP_CAS], prefix, re.escape(prefix) + r"[0-9a-f]{64}").rsplit(" ", 1)[1]}
-    if tag == NATIVE_BETA14_TAG:
-        result["accountRegressions"] = android_regression_proof(log, steps[BETA14_ANDROID_REGRESSIONS])
+    if tag in NATIVE_ACCOUNT_REGRESSION_TAGS:
+        result["accountRegressions"] = android_regression_proof(log, steps[BETA14_ANDROID_REGRESSIONS], tag)
     return result
 
 

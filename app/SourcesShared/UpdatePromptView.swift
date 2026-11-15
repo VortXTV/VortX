@@ -12,13 +12,12 @@ import UIKit
 /// for free, so the dialog is navigable with the Siri Remote without any custom focus wiring.
 struct UpdatePromptView: View {
     let release: UpdateChecker.Release
-    /// Called for both "Later" and after "Get the update" so the checker can clear `prompt` and remember the
-    /// build. The view also calls `dismiss()` to tear down the sheet.
+    /// Clears this release from the root-owned sheet after "Later" or a successful open.
     let onDismiss: () -> Void
 
     @Environment(\.openURL) private var openURL
-    @Environment(\.dismiss) private var dismiss
     @State private var openFailed = false
+    @State private var openRequest: UUID?
 
     private var versionLine: String {
         let v = release.version.isEmpty ? "" : "Version \(release.version)"
@@ -79,6 +78,7 @@ struct UpdatePromptView: View {
                 // PrimaryActionStyle uses Theme.Palette.onAccent for the label; the old `.borderedProminent`
                 // + `.tint(accent)` auto-picked white text that vanished on the gold accent (invisible-text).
                 .buttonStyle(PrimaryActionStyle())
+                .disabled(openRequest != nil)
                 .accessibilityValue(openFailed ? openFailureMessage : "")
 
                 if openFailed {
@@ -113,11 +113,12 @@ struct UpdatePromptView: View {
         .background(Theme.Palette.canvas.ignoresSafeArea())
         #endif
         .tint(Theme.Palette.accent)
+        .onDisappear { openRequest = nil }
     }
 
     private func finish() {
+        openRequest = nil
         onDismiss()
-        dismiss()
     }
 
     private var installActionTitle: String {
@@ -130,7 +131,7 @@ struct UpdatePromptView: View {
 
     private var installDestination: URL? {
         #if os(tvOS)
-        return URL(string: "https://github.com/VortXTV/VortX/releases/latest")
+        return release.releasePageURL
         #else
         return release.installURL
         #endif
@@ -145,13 +146,22 @@ struct UpdatePromptView: View {
     }
 
     private func openInstallDestination() {
+        guard openRequest == nil else { return }
         guard let url = installDestination else { showOpenFailure(); return }
-        openURL(url) { accepted in
-            if accepted {
-                // On tvOS this only confirms that the release page opened. The copy never claims an IPA installed.
-                finish()
-            } else {
-                showOpenFailure()
+        let request = UUID()
+        openRequest = request
+        openFailed = false
+        // Launch Services can complete on a background queue. SwiftUI state and dismissal belong on the main actor.
+        openURL(url) { @Sendable [self] accepted in
+            Task { @MainActor in
+                guard openRequest == request else { return }
+                if accepted {
+                    // On tvOS this only confirms that the release page opened.
+                    finish()
+                } else {
+                    openRequest = nil
+                    showOpenFailure()
+                }
             }
         }
     }

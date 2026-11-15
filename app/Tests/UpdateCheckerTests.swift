@@ -242,6 +242,14 @@ struct UpdateCheckerTests {
         await waitForAvailable(stable, build: 233)
         let stableBuild = await MainActor.run { stable.available?.build }
         check(stableBuild == 233, "later launch refreshes to current stable build")
+        let dismissBehavior = await MainActor.run {
+            stable.presentAvailableIfNeeded(force: true)
+            stable.dismissPrompt(matching: "0.3.15.232")
+            let heldNewerPrompt = stable.prompt?.build == 233
+            if let key = stable.prompt?.key { stable.dismissPrompt(matching: key) }
+            return heldNewerPrompt && stable.prompt == nil
+        }
+        check(dismissBehavior, "a stale browser callback cannot dismiss a newer release")
 
         // A non-200 response must not consume the automatic check budget. The next active call retries.
         let retryDefaults = UserDefaults(suiteName: "\(suiteName).retry")!
@@ -1142,6 +1150,15 @@ struct UpdateCheckerTests {
                                                           ipa: canonicalArtifact, altstore: nil, size: nil, sha256: nil)
         check(trustedDirectRelease.installURL?.absoluteString == canonicalArtifact,
               "Release intrinsically accepts only the canonical stable artifact")
+        let betaRelease = UpdateChecker.Release(version: "0.5.6", tag: "v0.5.6-beta.15", build: 296,
+                                                name: "VortX Beta 15", notes: "",
+                                                ipa: nil, altstore: nil, size: nil, sha256: nil)
+        check(betaRelease.releasePageURL?.absoluteString == "https://github.com/VortXTV/VortX/releases/tag/v0.5.6-beta.15",
+              "Apple TV opens the selected prerelease page")
+        check(["v0.5.5-beta.15", "v0.5.6/../../latest", "v0.5.6-beta.15?x=1", "v0.5.6-%2Fbeta.15"].allSatisfy {
+            UpdateChecker.Release(version: "0.5.6", tag: $0, build: 296, name: "VortX", notes: "",
+                                  ipa: nil, altstore: nil, size: nil, sha256: nil).releasePageURL == nil
+        }, "release page requires a safe tag matching the selected version")
         let unsafeAltstores = [
             "https://vortx.tv/altstore.json?x=1", "https://user@vortx.tv/altstore.json",
             "https://vortx.tv:443/altstore.json", "https://vortx.tv/altstore.json#x", "http://vortx.tv/altstore.json"

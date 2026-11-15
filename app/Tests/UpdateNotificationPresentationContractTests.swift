@@ -50,6 +50,10 @@ let checks = [
     (iOSRootSource.contains("UpdateCheckFeedback") && iOSRootSource.contains(".alert(item: $updateCheckFeedback)"), "macOS menu checks have visible current and failure feedback"),
     (promptSource.contains(".accessibilityHidden(true)") && promptSource.contains(".accessibilityAddTraits(.isHeader)"), "update prompt exposes a clean accessibility hierarchy"),
     (promptSource.contains("Open release page") && promptSource.contains("Apple TV cannot install an IPA from inside VortX"), "tvOS prompt does not claim that opening a page installs an IPA"),
+    (promptSource.contains("return release.releasePageURL") && !promptSource.contains("/releases/latest"), "tvOS links to the selected release"),
+    (promptSource.contains("openURL(url) { @Sendable [self] accepted in\n            Task { @MainActor in\n                guard openRequest == request else { return }"), "background open completion switches to the main actor before checking or changing UI state"),
+    (promptSource.contains("guard openRequest == nil else { return }") && promptSource.contains("private func finish() {\n        openRequest = nil"), "repeat activation and late callbacks are fenced by the open request"),
+    (source.contains("updates.dismissPrompt(matching: release.key)") && iOSRootSource.contains("updates.dismissPrompt(matching: release.key)") && !promptSource.contains("dismiss()"), "an older sheet cannot close its replacement"),
     (promptSource.contains("UIAccessibility.post(notification: .announcement") && promptSource.contains("accessibilityValue(openFailed ? openFailureMessage : \"\")"), "tvOS open failures are exposed to VoiceOver"),
     (!tvSettingsSource.contains("GitHub releases page") && !iOSSettingsSource.contains("GitHub releases page"), "Settings hint copy does not name an implementation host")
 ]

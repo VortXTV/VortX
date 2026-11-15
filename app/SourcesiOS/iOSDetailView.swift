@@ -346,6 +346,7 @@ struct iOSDetailView: View {
     @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source floats to top + badges/menu (#15)
     @ObservedObject private var debridKeys = DebridKeys.shared
     @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized detail title/logo override
+    @ObservedObject private var playbackGate = FullscreenPlaybackGate.shared
     /// Observed so the episode ticks repaint when an async Trakt shadow pull lands while this page is open.
     /// The Trakt episode mirror is read synchronously from a non-observable cache, so without this the page
     /// would show the pre-pull state until some unrelated event happened to re-evaluate it. WatchedIndex
@@ -1945,20 +1946,24 @@ struct iOSDetailView: View {
     /// a missing / slow / blocked trailer never blanks the band, and no error is ever surfaced.
     /// Re-logged when the title or its trailer resolution changes, never per render.
     private var detailTrailerGateKey: String {
-        "\(id)|\(detailNativeTrailerURL != nil)|\(detailTrailerYouTubeID != nil)|\(detailTrailerClipURL != nil)"
+        "\(id)|\(detailNativeTrailerURL != nil)|\(detailTrailerYouTubeID != nil)|\(detailTrailerClipURL != nil)|\(detailTrailerBlockReason ?? "allowed")"
     }
-    /// One diagnostics line per detail title: whether the muted hero trailer could mount, and if not which gate
-    /// stopped it. No title identity is logged.
+    private var detailTrailerBlockReason: String? {
+        if playbackGate.playerActive || presentation != nil { return "playback_active" }
+        if !autoplayTrailers { return "autoplay_off" }
+        if reduceMotion { return "reduce_motion" }
+        return LiveTypes.contains(type) ? "live" : nil
+    }
+
+    /// Log trailer eligibility without claiming that a decoder started. No title identity is logged.
     private func logDetailTrailerGate() {
-        let reason = !autoplayTrailers ? "autoplay_off"
-            : reduceMotion ? "reduce_motion"
-            : LiveTypes.contains(type) ? "live"
-            : (detailNativeTrailerURL == nil && detailTrailerYouTubeID == nil && detailTrailerClipURL == nil) ? "no_trailer" : nil
-        DiagnosticsLog.log("trailer", "hero surface=detail result=" + (reason.map { "skip reason=\($0)" } ?? "mount"))
+        let reason = detailTrailerBlockReason
+            ?? ((detailNativeTrailerURL == nil && detailTrailerYouTubeID == nil && detailTrailerClipURL == nil) ? "no_trailer" : nil)
+        DiagnosticsLog.log("trailer", "hero surface=detail result=" + (reason.map { "skip reason=\($0)" } ?? "eligible"))
     }
 
     @ViewBuilder private func heroTrailerClip(height: CGFloat) -> some View {
-        if autoplayTrailers, !reduceMotion, !LiveTypes.contains(type) {
+        if detailTrailerBlockReason == nil {
             if let native = detailNativeTrailerURL {
                 // FULL trailer (direct stream OR the /yt resolver) muted + looping in libmpv (window nil = whole
                 // trailer, looped). This is the owner's FINAL detail-hero path - same native route as the button.
@@ -2021,8 +2026,10 @@ struct iOSDetailView: View {
     /// yt-direct: one attempt per ambient YouTube id at resolving the detail-hero clip on the user's own IP.
     /// Fail-soft: any miss records `url = nil`, which mounts the existing /yt worker URL unchanged.
     private func resolveDetailAmbientDirect() async {
-        guard let yt = detailAmbientYouTubeID, detailAmbientDirect?.ytID != yt else { return }
+        guard !Task.isCancelled, detailTrailerBlockReason == nil,
+              let yt = detailAmbientYouTubeID, detailAmbientDirect?.ytID != yt else { return }
         let resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080)
+        guard !Task.isCancelled, detailTrailerBlockReason == nil, detailAmbientYouTubeID == yt else { return }
         NSLog("[yt-direct] detail ambient: %@",
               resolved.map { $0.isMuxed ? "direct-muxed" : "direct-pair" } ?? "fallback-worker")
         detailAmbientDirect = (yt, resolved?.videoURL)

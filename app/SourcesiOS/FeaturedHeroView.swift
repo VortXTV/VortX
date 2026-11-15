@@ -57,6 +57,7 @@ struct FeaturedHeroView: View {
     var extraHeight: CGFloat = 0
 
     @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized hero title/logo override
+    @ObservedObject private var playbackGate = FullscreenPlaybackGate.shared
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.cinemaNavigationArtworkInset) private var navigationArtworkInset
@@ -77,10 +78,15 @@ struct FeaturedHeroView: View {
     /// YouTube id): a small auto-dismissing capsule over the hero, never the full source-error screen.
     @State private var trailerNotice = false
     @State private var trailerNoticeTask: Task<Void, Never>?
-    /// yt-direct: the ambient hero clip's ATTEMPTED device-direct resolve, keyed by hero id so a stale
-    /// resolve never paints another title's clip. `url == nil` = attempted, no direct stream (mount the
+    private struct AmbientTrailerRequest: Equatable {
+        let heroID: String
+        let trailerURL: URL
+    }
+
+    /// yt-direct: the ambient hero clip's attempted device-direct resolve, keyed by title and trailer URL.
+    /// `url == nil` = attempted, no direct stream (mount the
     /// /yt worker URL). The clip waits for the attempt so it never remounts mid-loop on a late resolve.
-    @State private var heroClipDirect: (heroID: String, url: URL?)?
+    @State private var heroClipDirect: (request: AmbientTrailerRequest, url: URL?)?
     /// Dynamic dominant-color backdrop: the featured art's average color (PosterImageLoader.averageColor),
     /// painted as the band's BASE layer in place of flat canvas, so the load-in / fallback state and the
     /// atmosphere behind the art already carry the title's palette. nil (no art / not computed yet) keeps
@@ -254,8 +260,8 @@ struct FeaturedHeroView: View {
         // Also gated by the RemoteConfig fleet kill-switch `features.trailers` (baked default true, so an
         // absent/null remote is identical to shipping): a remote `false` force-disables ambient hero trailers
         // fleet-wide; the user's "Auto-play trailers" setting still governs.
-        if autoplayTrailers, RemoteConfig.snapshot.isFeatureOn("trailers", default: true),
-           !reduceMotion, let hero = model.hero, let clip = hero.ambientTrailerURL {
+        if heroTrailerBlockReason == nil, let hero = model.hero, let clip = hero.ambientTrailerURL {
+            let request = AmbientTrailerRequest(heroID: hero.id, trailerURL: clip)
             // Owner directive: the muted ambient in-hero trailer now plays the SAME full `/yt/{id}` trailer as
             // the Trailer button (`ambientTrailerURL` -> the native resolver), just muted + looping, instead of
             // the retired R2 `/clip` snippet or the flaky YouTube IFrame (the 151/152/153 embedder family). The
@@ -269,40 +275,50 @@ struct FeaturedHeroView: View {
             // Home clip ever mounted (0.5.4 Mac log: no Home trailer lines at all).
             ZStack {
                 Color.clear
-                if let attempt = heroClipDirect, attempt.heroID == hero.id {
+                if let attempt = heroClipDirect, attempt.request == request {
                     InHeroTrailerView(url: attempt.url ?? clip, height: heroHeight, window: nil)
                         .id("hero-clip-\(hero.id)")    // reload the clip for each new featured item / rotation
                         .transition(reduceMotion ? .identity : .opacity)
                 }
             }
             .allowsHitTesting(false)
-            .task(id: hero.id) { await resolveHeroClipDirect(hero) }
+            .task(id: request) { await resolveHeroClipDirect(request, youTubeID: hero.trailerYouTubeID) }
         }
     }
 
-    /// One diagnostics line per featured title: whether the ambient trailer was allowed to mount, and if not
-    /// which gate stopped it. No title identity is logged.
+    /// Gate the whole preview, including the direct resolver and the decoder's reachability probe.
+    private var heroTrailerBlockReason: String? {
+        if playbackGate.playerActive { return "playback_active" }
+        if !autoplayTrailers { return "autoplay_off" }
+        if !RemoteConfig.snapshot.isFeatureOn("trailers", default: true) { return "remote_off" }
+        return reduceMotion ? "reduce_motion" : nil
+    }
+
+    /// Log trailer eligibility without claiming that a decoder started. No title identity is logged.
     private func logHeroTrailerGate() {
         guard let hero = model.hero else { return }
-        let reason = !autoplayTrailers ? "autoplay_off"
-            : !RemoteConfig.snapshot.isFeatureOn("trailers", default: true) ? "remote_off"
-            : reduceMotion ? "reduce_motion"
-            : hero.ambientTrailerURL == nil ? "no_trailer" : nil
-        DiagnosticsLog.log("trailer", "hero surface=home result=" + (reason.map { "skip reason=\($0)" } ?? "mount"))
+        let reason = heroTrailerBlockReason ?? (hero.ambientTrailerURL == nil ? "no_trailer" : nil)
+        DiagnosticsLog.log("trailer", "hero surface=home result=" + (reason.map { "skip reason=\($0)" } ?? "eligible"))
     }
 
-    /// yt-direct: one attempt per featured item at resolving the ambient clip on the user's own IP.
+    private func heroTrailerRequestIsCurrent(_ request: AmbientTrailerRequest) -> Bool {
+        !Task.isCancelled && heroTrailerBlockReason == nil
+            && model.hero?.id == request.heroID && model.hero?.ambientTrailerURL == request.trailerURL
+    }
+
+    /// yt-direct: one attempt per featured trailer at resolving the ambient clip on the user's own IP.
     /// Fail-soft: any miss records `url = nil`, which mounts the existing /yt worker URL unchanged.
-    private func resolveHeroClipDirect(_ hero: FeaturedHeroItem) async {
-        guard heroClipDirect?.heroID != hero.id else { return }
-        var direct: URL? = nil
-        if let yt = hero.trailerYouTubeID, !yt.isEmpty {
+    private func resolveHeroClipDirect(_ request: AmbientTrailerRequest, youTubeID: String?) async {
+        guard heroTrailerRequestIsCurrent(request), heroClipDirect?.request != request else { return }
+        if let yt = youTubeID, !yt.isEmpty {
             let resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080)
-            direct = resolved?.videoURL
+            guard heroTrailerRequestIsCurrent(request) else { return }
             NSLog("[yt-direct] hero ambient: %@",
                   resolved.map { $0.isMuxed ? "direct-muxed" : "direct-pair" } ?? "fallback-worker")
+            heroClipDirect = (request, resolved?.videoURL)
+        } else {
+            heroClipDirect = (request, nil)
         }
-        heroClipDirect = (hero.id, direct)
     }
 
     // MARK: Backdrop (full-bleed still art + dual scrim, lifted from iOSDetailView.backdrop)

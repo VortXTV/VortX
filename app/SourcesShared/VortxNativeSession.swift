@@ -1420,6 +1420,7 @@ actor VortxNativeSession {
     private(set) var legacyReconciliation: LegacyReconciliation?
     /// Host diagnostics sink. Only outcome transitions are reported, never material bytes.
     private let diagnostics: (@Sendable (String) -> Void)?
+    private var lastAccountMergeFailureStage: String?
     private var closed = false
     private var persistenceFailed = false
     // Playback position ticks are applied in memory at once but written to the sealed checkpoint at most
@@ -2865,14 +2866,23 @@ actor VortxNativeSession {
                                     checkpointValidator: (any VortxProspectiveCheckpointValidator)? = nil,
                                     fifoAuthority: (any VortxMutationAuthority)? = nil,
                                     typedPeer: OwnerHistoryPeerPreparation? = nil,
-                                    hostRemoteRaw: Data? = nil) async throws -> [String] {
+                                    hostRemoteRaw: Data? = nil, reportAccountMergeFailure: Bool = false) async throws -> [String] {
+        var failureStage: String? = "route"
+        defer {
+            if reportAccountMergeFailure, failureStage != lastAccountMergeFailureStage {
+                lastAccountMergeFailureStage = failureStage
+                if let failureStage { diagnostics?("native_account_merge result=failed stage=\(failureStage)") }
+            }
+        }
         try requireActiveRoute()
         // Retire at actual execution, not when a later FIFO member is merely enqueued.
         externalCWGeneration.retire()
+        failureStage = "snapshot_read"
         let old = try stateJSON()
         let typedCapture: OwnerHistorySessionCoordinator.Capture?
         let typedTransaction: (any OwnerHistoryCompleteCheckpointAuthority)?
         var candidate: NativeCandidate
+        failureStage = "candidate_hydrate"
         if let ownerHistory {
             // Account-native commands do not fetch/import Stremio data. The real original
             // account source, running FIFO member and complete-account CAS remain mandatory.
@@ -2912,6 +2922,7 @@ actor VortxNativeSession {
         var installed = false
         defer { if !installed { candidate.close() } }
         var results: [String] = []
+        failureStage = "kernel_actions"
         for action in actions {
             let result = try candidate.dispatch(action, now: now)
             let value = try JSONDecoder().decode(VortxJSON.self, from: Data(result.utf8))
@@ -2919,18 +2930,23 @@ actor VortxNativeSession {
             results.append(result)
         }
         if let legacyMaterial {
+            failureStage = "legacy_receipt"
             recordLegacyReconciliation(try Self.validateLegacyReceipt(candidate, scope: scope, material: legacyMaterial, baselineMaterial: legacyBaseline, abi: abi))
         }
+        failureStage = "merged_snapshot"
         var state = try candidate.state(scope: scope)
         if legacyMaterial != nil, let shrink = try? Self.libraryShrink(from: JSONDecoder().decode(VortxJSON.self, from: Data(old.utf8)),
                                                                        to: state, ownerProfileID: scope.ownerProfileID) {
             diagnostics?("library_shrink stage=sync removed=\(shrink)")
         }
+        failureStage = "source_archive"
         try Self.validateAuthenticatedSources(authenticatedSourceArchive, state: state)
         var candidateHost = hostPreferences
         try candidateHost.retainAuthenticatedSourceArchive(authenticatedSourceArchive)
+        failureStage = "host_carrier_merge"
         if let hostRemoteRaw { try candidateHost.mergeRaw(hostRemoteRaw, scope: scope) }
         else { try candidateHost.merge(hostRemote, scope: scope) }
+        failureStage = "watchlist_seed"
         for (profile, entries) in legacyWatchlists {
             // The unchanged legacy roster may still carry a profile explicitly deleted by the
             // native peer. Preserve that old array in its source document, never resurrect the
@@ -2938,6 +2954,7 @@ actor VortxNativeSession {
             guard let record = state["roster"]?["profiles"]?[profile.uuidString], record["deleted"] != .bool(true) else { continue }
             try VortxNativeWatchlist.seed(entries, profileID: profile, into: &candidateHost)
         }
+        failureStage = "host_edits"
         if let hostFieldCAS {
             let matches: Bool
             if let raw = hostFieldCAS.raw {
@@ -2964,6 +2981,7 @@ actor VortxNativeSession {
                 }
             }
         }
+        failureStage = "profile_events"
         let pending = candidateHost.local.websitePending ?? []
         let hasWebsiteWork = !websiteEvents.isEmpty || !pending.isEmpty
         if hasWebsiteWork {
@@ -3017,6 +3035,7 @@ actor VortxNativeSession {
             candidateHost.local.websiteConflicts = conflicts
             state = try candidate.state(scope: scope)
         }
+        failureStage = "addon_events"
         let addonPending = candidateHost.local.websiteAddonPending ?? []
         let hasAddonWork = !websiteAddonEvents.isEmpty || !addonPending.isEmpty
         if hasAddonWork {
@@ -3064,9 +3083,11 @@ actor VortxNativeSession {
             candidateHost.local.websiteAddonConflicts = conflicts
             state = try candidate.state(scope: scope)
         }
+        failureStage = "checkpoint_encode"
         let updated = try candidate.stateJSON()
         let hasHostChanges = hostRemoteRaw != nil || hostRemote != nil || !hostEdits.isEmpty || !legacyWatchlists.isEmpty || hasWebsiteWork || hasAddonWork || authenticatedSourceArchive != nil
         let encodedHost = hasHostChanges ? try candidateHost.encoded() : nil
+        failureStage = "checkpoint_commit"
         if case .owner(let value) = candidate {
             guard let ownerHistory, let typedTransaction, typedCapture != nil else { throw VortxNativeError.superseded }
             do {
@@ -3082,6 +3103,7 @@ actor VortxNativeSession {
             if try JSONDecoder().decode(VortxJSON.self, from: Data(old.utf8))["activeProfileId"] != state["activeProfileId"] {
                 invalidateScreens()
             }
+            failureStage = nil
             return results
         }
         let uptime = ProcessInfo.processInfo.systemUptime
@@ -3130,6 +3152,7 @@ actor VortxNativeSession {
         guard case .generic(let generic) = candidate else { throw VortxNativeError.invalidSnapshot }
         let previous = runtime!; runtime = generic; hostPreferences = candidateHost; if hasHostChanges { hostPublicationCache = nil }; installed = true; previous.close()
         if try scope.validateSnapshot(old)["activeProfileId"] != state["activeProfileId"] { invalidateScreens() }
+        failureStage = nil
         return results
     }
     /// The witness came from the complete existing sync/export pipeline after Save confirmation.

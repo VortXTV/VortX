@@ -93,10 +93,15 @@ struct DetailView: View {
     @State private var langChipsKey = ""
     @State private var langChipsDebounce: Task<Void, Never>? = nil
     private static let langChipsDebounceMs = 400   // settle window before the off-main name/regex parse, mirrors coalesceMs intent
-    /// yt-direct: the ambient hero trailer's ATTEMPTED device-direct resolve, keyed by meta id so a stale
-    /// resolve never paints over another title. `url == nil` = attempted, no direct stream (mount the /yt
-    /// worker URL). The layer waits for the attempt so the clip never remounts mid-play on a late resolve.
-    @State private var heroDirectTrailer: (metaID: String, url: URL?)?
+    private struct HeroTrailerTarget: Equatable {
+        let metaID: String
+        let fallbackURL: URL
+        let youTubeID: String?
+        let presentation: UUID
+    }
+    /// A completed resolution for this exact title, trailer and player generation. A nil direct URL
+    /// uses the fallback. The layer waits for the attempt before mounting a clip.
+    @State private var heroDirectTrailer: (target: HeroTrailerTarget, url: URL?)?
     /// Dynamic dominant-color backdrop: the page art's average color (PosterImageLoader.averageColor),
     /// washed into the page background below the hero so the detail page carries the title's palette
     /// instead of flat canvas. nil (no art / not computed) keeps today's canvas exactly.
@@ -1792,8 +1797,7 @@ struct DetailView: View {
         // its looping 1080p trailer underneath the whole movie: micro stutter and audio crackle on every
         // stream started from this page. Unmounting tears the clip down the moment the player presents;
         // it remounts fresh when playback closes.
-        if autoplayTrailers, !reduceMotion, !LiveTypes.contains(type), presenter.request == nil,
-           let url = TrailerRequest.from(meta: m)?.playableURL {
+        if let target = heroTrailerTarget(m) {
             // Owner directive: play the WHOLE trailer muted + looping (window nil), the same full `/yt` trailer
             // as the Trailer button, not a 10s snippet (that only suited the retired short `/clip` mp4). For a
             // SERIES this `m` is the series meta, so a series-episode hero shows the SERIES trailer.
@@ -1804,28 +1808,39 @@ struct DetailView: View {
             // `.task` on an empty view, so with only the conditional clip inside, the attempt never ran.
             ZStack {
                 Color.clear
-                if let attempt = heroDirectTrailer, attempt.metaID == m.id {
-                    TVInHeroTrailerView(url: attempt.url ?? url, window: nil)
+                if let attempt = heroDirectTrailer, attempt.target == target {
+                    TVInHeroTrailerView(url: attempt.url ?? target.fallbackURL, window: nil)
                 }
             }
             .allowsHitTesting(false)
-            .task(id: m.id) { await resolveHeroDirectTrailer(m) }
+            .task(id: target) { await resolveHeroDirectTrailer(target) }
         }
     }
 
-    /// yt-direct: one attempt per meta id at resolving the ambient hero trailer on the user's own IP.
-    /// Fail-soft: any miss records `url = nil`, which mounts the existing /yt worker URL unchanged.
-    private func resolveHeroDirectTrailer(_ m: CoreMetaItem) async {
-        guard heroDirectTrailer?.metaID != m.id else { return }
-        var direct: URL? = nil
-        // A direct (non-YouTube) trailer stream needs no resolver; only a YouTube trailer is resolvable.
-        if directTrailerURL(m) == nil, let yt = m.trailerYouTubeID, !yt.isEmpty {
-            let resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080)
-            direct = resolved?.videoURL
+    private func heroTrailerTarget(_ m: CoreMetaItem) -> HeroTrailerTarget? {
+        guard autoplayTrailers, !reduceMotion, !LiveTypes.contains(type), presenter.request == nil,
+              let trailer = TrailerRequest.from(meta: m), let fallbackURL = trailer.playableURL else { return nil }
+        return HeroTrailerTarget(metaID: m.id, fallbackURL: fallbackURL,
+                                 youTubeID: trailer.directURL == nil ? trailer.youTubeID : nil,
+                                 presentation: presenter.requestGeneration)
+    }
+
+    /// An attempt under a previous playback or metadata generation cannot replace the current hero.
+    private func resolveHeroDirectTrailer(_ target: HeroTrailerTarget) async {
+        guard !Task.isCancelled, fencedMeta.flatMap(heroTrailerTarget) == target,
+              heroDirectTrailer?.target != target else { return }
+        let resolved: YouTubeDirectResolver.Resolved?
+        if let yt = target.youTubeID {
+            resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080)
+        } else {
+            resolved = nil
+        }
+        guard !Task.isCancelled, fencedMeta.flatMap(heroTrailerTarget) == target else { return }
+        if target.youTubeID != nil {
             NSLog("[yt-direct] tvOS detail ambient: %@",
                   resolved.map { $0.isMuxed ? "direct-muxed" : "direct-pair" } ?? "fallback-worker")
         }
-        heroDirectTrailer = (m.id, direct)
+        heroDirectTrailer = (target, resolved?.videoURL)
     }
 
     /// A direct (non-YouTube) trailer stream the meta carried, if any. Always preferred (needs no resolver).

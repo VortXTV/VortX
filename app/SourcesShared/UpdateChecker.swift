@@ -49,6 +49,12 @@ final class UpdateChecker: ObservableObject {
             return Self.canonicalArtifactURL(ipa, version: version, tag: tag)
         }
 
+        var releasePageURL: URL? {
+            let resolvedTag = tag ?? "v\(version)"
+            guard Self.numericVersion(from: resolvedTag) == version else { return nil }
+            return URL(string: "https://github.com/VortXTV/VortX/releases/tag/\(resolvedTag)")
+        }
+
         private static func canonicalAltstoreURL(_ rawURL: String) -> URL? {
             guard let url = URL(string: rawURL),
                   let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
@@ -327,7 +333,8 @@ final class UpdateChecker: ObservableObject {
         monitoringTask = nil
     }
 
-    func dismissPrompt() {
+    func dismissPrompt(matching releaseKey: String? = nil) {
+        if let releaseKey, prompt?.key != releaseKey { return }
         if let key = prompt?.key {
             defaults.set(key, forKey: Self.dismissedKey)
         }

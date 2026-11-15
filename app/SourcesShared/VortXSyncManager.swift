@@ -5617,11 +5617,19 @@ final class VortXSyncManager: ObservableObject {
             exportedDirtySettings = dirtySettings
             var globalEdits = try nativeGlobalEdits()
             exportedDirtySettings = nativeDirtySettingsForExport(globalEdits, snapshot: exportedDirtySettings)
+            exportStage = "profile_events"
+            let websiteEvents = try Self.nativeWebsiteEvents(doc)
+            exportStage = "addon_events"
+            let websiteAddonEvents = try Self.nativeWebsiteAddonEvents(doc)
+            exportStage = "legacy_watchlists"
+            let legacyWatchlists = try self.nativeLegacyWatchlists(doc)
+            exportStage = "host_carrier_read"
+            let hostRemoteRaw = try OwnerHistoryExactJSON.Object(originalPlaintext)["nativeHostPreferences"]
             exportStage = "native_merge"
             var receipt = try await CoreBridge.shared.mergeNativeAccountDocumentReceipt(remote, hostRemote: hostRemote, capture: capture,
-                                                                               legacyMaterial: prepared?.material, hostEdits: globalEdits, websiteEvents: Self.nativeWebsiteEvents(doc), websiteAddonEvents: Self.nativeWebsiteAddonEvents(doc), legacyWatchlists: self.nativeLegacyWatchlists(doc),
+                                                                               legacyMaterial: prepared?.material, hostEdits: globalEdits, websiteEvents: websiteEvents, websiteAddonEvents: websiteAddonEvents, legacyWatchlists: legacyWatchlists,
                                                                                sourceAuthority: cloudAuthority.including(prepared?.authority), authenticatedSourceArchive: prepared?.sourceArchive,
-                                                                               hostRemoteRaw: try OwnerHistoryExactJSON.Object(originalPlaintext)["nativeHostPreferences"],
+                                                                               hostRemoteRaw: hostRemoteRaw,
                                                                                publicationSource: cloudAuthority)
             try cloudAuthority.withActive {}
             var merged = receipt.presentation

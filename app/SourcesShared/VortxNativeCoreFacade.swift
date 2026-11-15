@@ -984,7 +984,8 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                         websiteEvents: websiteEvents, websiteAddonEvents: websiteAddonEvents, websiteBaseline: websiteBaseline,
                         sourceAuthority: mutationAuthority, authenticatedSourceArchive: authenticatedSourceArchive,
                         hostFieldCAS: hostFieldCAS, checkpointValidator: checkpointValidator,
-                        fifoAuthority: queueMember.runningAuthority, hostRemoteRaw: hostRemoteRaw)
+                        fifoAuthority: queueMember.runningAuthority, hostRemoteRaw: hostRemoteRaw,
+                        reportAccountMergeFailure: type == "merge_native_sync" || hostRemoteRaw != nil || hostRemote != nil)
                 }
                 durableCommitted = true
                 let addonSnapshot = try await session.addonSnapshot()

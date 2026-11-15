@@ -403,10 +403,10 @@ class NativeBeta11Contract(NativeBeta7Contract):
 
     def test_builds_bind_to_the_candidate_tag_and_the_beta7_engine(self):
         self.assertEqual(MODULE.build_tag(self.tag), self.build_tag)
-        for tag in ("v0.5.6-beta.7", "v0.5.6-beta.6", "v0.5.6-beta.15"):
+        for tag in ("v0.5.6-beta.7", "v0.5.6-beta.6", "v0.5.6-beta.16"):
             self.assertEqual(MODULE.build_tag(tag), tag)
         self.assertEqual(MODULE.expected_engine(self.tag), MODULE.NATIVE_BETA7_ENGINE)
-        for tag in ("v0.5.6-beta.8", "v0.5.6-beta.9", "v0.5.6-beta.10", "v0.5.6-beta.15", self.build_tag):
+        for tag in ("v0.5.6-beta.8", "v0.5.6-beta.9", "v0.5.6-beta.10", "v0.5.6-beta.16", self.build_tag):
             with self.subTest(tag=tag), self.assertRaises(ValueError):
                 MODULE.expected_engine(tag)
         for lane in ("apple", "android"):
@@ -445,7 +445,7 @@ class NativeBeta12Contract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exact cross-platform build"):
             MODULE.source_versions(NativeBeta11Contract.project(build="282"),
                 NativeBeta11Contract.gradle(build="282"), "0.5.6", self.tag)
-        for tag in (self.candidate, "v0.5.6-beta.15",
+        for tag in (self.candidate, "v0.5.6-beta.16",
                     *(self.tag + "-candidate." + suffix for suffix in self.rejected_candidates)):
             with self.subTest(tag=tag), self.assertRaises(ValueError):
                 MODULE.expected_engine(tag)
@@ -573,7 +573,7 @@ class NativeBeta14Contract(NativeBeta12Contract):
                 MODULE.successful_job([original], lane, 5, 1, self.source, self.tag)
 
 
-    def test_aether_evidence_accepts_the_same_exact_candidate_as_packaging(self):
+    def test_aether_evidence_accepts_the_same_exact_candidates_as_packaging(self):
         release_script = Path(__file__).resolve().parents[1] / "verify-protected-apple-aether.py"
         spec = importlib.util.spec_from_file_location("protected_apple_aether", release_script)
         verifier = importlib.util.module_from_spec(spec)
@@ -584,37 +584,68 @@ class NativeBeta14Contract(NativeBeta12Contract):
             "GITHUB_RUN_ID": "5", "GITHUB_RUN_ATTEMPT": "1",
             "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REPOSITORY": "VortXTV/VortX",
         }
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(verifier, "run", return_value=self.source):
-            identity = verifier.identity()
-            self.assertEqual(identity["ref"], "refs/tags/" + self.candidate)
-            self.assertEqual(identity["sourceCommit"], self.source)
-            for ref in (self.tag, self.tag + "-candidate.1", self.tag + "-candidate.3"):
-                with mock.patch.dict(os.environ, {"GITHUB_REF": "refs/tags/" + ref}):
+        for tag in (self.tag, MODULE.NATIVE_BETA15_TAG):
+            candidate = MODULE.build_tag(tag)
+            env["GITHUB_REF"] = "refs/tags/" + candidate
+            with self.subTest(tag=tag), mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(verifier, "run", return_value=self.source):
+                identity = verifier.identity()
+                self.assertEqual(identity["ref"], "refs/tags/" + candidate)
+                self.assertEqual(identity["sourceCommit"], self.source)
+                for ref in (tag, tag + "-candidate.9"):
+                    with mock.patch.dict(os.environ, {"GITHUB_REF": "refs/tags/" + ref}):
+                        with self.assertRaisesRegex(ValueError, "exact candidate"):
+                            verifier.identity()
+                with mock.patch.dict(os.environ, {"GITHUB_SHA": "b" * 40}):
                     with self.assertRaisesRegex(ValueError, "exact candidate"):
                         verifier.identity()
-            with mock.patch.dict(os.environ, {"GITHUB_SHA": "b" * 40}):
-                with self.assertRaisesRegex(ValueError, "exact candidate"):
-                    verifier.identity()
 
     def test_regression_receipt_requires_every_suite_and_matching_total(self):
         beginning = "2026-11-15T00:00:00Z"
         ending = "2026-11-15T00:00:02Z"
         marker_time = "2026-11-15T00:00:01Z"
         step = {"started_at": beginning, "completed_at": ending}
-        suites = MODULE.BETA14_ANDROID_SUITES
         hashes = "d" * 64
-        rows = [f"{marker_time} Verified protected Android regression: {suite} (2 cases); XML SHA256 {hashes}"
-                for suite in suites]
-        total = f"{marker_time} Verified protected Android account setup and release regressions: {2 * len(suites)} cases"
-        with tempfile.TemporaryDirectory() as temporary:
-            log = Path(temporary) / "android.log"
-            log.write_text("\n".join([*rows, total]) + "\n")
-            self.assertEqual(MODULE.android_regression_proof(log, step)["suites"],
-                             {name: {"cases": 2, "xmlSha256": hashes} for name in suites})
-            for modified in ([*rows[:-1], total], [*rows, rows[0], total], [*rows, total.replace(f": {2 * len(suites)} cases", ": 1 cases")]):
-                log.write_text("\n".join(modified) + "\n")
-                with self.assertRaisesRegex(ValueError, "log marker"):
-                    MODULE.android_regression_proof(log, step)
+        for tag, suites in ((self.tag, MODULE.BETA14_ANDROID_SUITES),
+                            (MODULE.NATIVE_BETA15_TAG, MODULE.BETA15_ANDROID_SUITES)):
+            rows = [f"{marker_time} Verified protected Android regression: {suite} (2 cases); XML SHA256 {hashes}"
+                    for suite in suites]
+            total = f"{marker_time} Verified protected Android account setup and release regressions: {2 * len(suites)} cases"
+            with self.subTest(tag=tag), tempfile.TemporaryDirectory() as temporary:
+                log = Path(temporary) / "android.log"
+                log.write_text("\n".join([*rows, total]) + "\n")
+                self.assertEqual(MODULE.android_regression_proof(log, step, tag)["suites"],
+                                 {name: {"cases": 2, "xmlSha256": hashes} for name in suites})
+                for modified in ([*rows[:-1], total], [*rows, rows[0], total],
+                                 [*rows, total.replace(f": {2 * len(suites)} cases", ": 1 cases")]):
+                    log.write_text("\n".join(modified) + "\n")
+                    with self.assertRaisesRegex(ValueError, "log marker"):
+                        MODULE.android_regression_proof(log, step, tag)
+
+
+class NativeBeta15Contract(NativeBeta12Contract):
+    tag = "v0.5.6-beta.15"
+    candidate = "v0.5.6-beta.15-candidate.1"
+    build = "296"
+    preflight_mode = "beta15-candidate-preflight"
+
+    def test_exact_frozen_project_build(self):
+        root = Path(__file__).resolve().parents[2]
+        project = (root / "app/project.yml").read_text()
+        gradle = (root / "android/app/build.gradle.kts").read_text()
+        self.assertEqual(MODULE.source_versions(project, gradle, "0.5.6", self.tag), self.build)
+
+    def test_update_and_recovery_gates_cannot_be_skipped(self):
+        for lane, gate in (("apple", "Verify protected Beta 15 artifact-only dispatch"),
+                           ("apple", "Verify protected Apple legacy archive recovery"),
+                           ("apple", MODULE.BETA15_APPLE_UPDATE), ("android", MODULE.BETA13_ANDROID_BACKUP_CAS),
+                           ("android", MODULE.BETA14_ANDROID_REGRESSIONS)):
+            with self.subTest(lane=lane, gate=gate):
+                original = NativeBeta7Contract.job(self, lane, self.tag)
+                MODULE.successful_job([original], lane, 5, 1, self.source, self.tag)
+                original["steps"] = [step for step in original["steps"] if step["name"] != gate]
+                with self.assertRaisesRegex(ValueError, gate):
+                    MODULE.successful_job([original], lane, 5, 1, self.source, self.tag)
 
 
 if __name__ == "__main__":
