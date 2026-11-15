@@ -4,9 +4,9 @@ import com.vortx.android.profile.UserProfile
 import com.vortx.android.sync.NativeSettingsFence
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -251,7 +251,7 @@ class NativeOwnerHistoryJniTest {
             val previousNotifications = NativeSettingsFence.queuedNotificationsForTest
             NativeSettingsFence.queuedNotificationsForTest = mutableListOf()
             try {
-                runBlocking {
+                runTest {
                     verifyNativeLegacyPreferenceRestore(accountId,
                         UserProfile(id = owner, name = "Owner", avatar = "star", isOwner = true), remote)
                 }
