@@ -251,6 +251,7 @@ fun TvSettingsScreen(
             onBack = ::returnFromAddons,
             onDiscover = { route = TvSettingsRoute.ADDON_STORE },
             onInstallByQr = { route = TvSettingsRoute.ADDON_PAIRING },
+            onOpenAccount = if (syncManager != null) ({ route = TvSettingsRoute.ADDON_ACCOUNT }) else null,
             modifier = modifier,
         )
         return
@@ -283,13 +284,14 @@ fun TvSettingsScreen(
         return
     }
 
-    if (route == TvSettingsRoute.ACCOUNT) {
-        BackHandler { route = TvSettingsRoute.ROOT }
+    if (route == TvSettingsRoute.ACCOUNT || route == TvSettingsRoute.ADDON_ACCOUNT) {
+        val returnRoute = route.back()
+        BackHandler { route = returnRoute }
         TvAccountRoute(
             repo = repo,
             auth = auth,
             syncManager = syncManager,
-            onBack = { route = TvSettingsRoute.ROOT },
+            onBack = { route = returnRoute },
             modifier = modifier,
         )
         return
@@ -998,6 +1000,7 @@ internal enum class TvSettingsRoute {
     ADDONS,
     ADDON_STORE,
     ADDON_PAIRING,
+    ADDON_ACCOUNT,
     DEBRID,
     WHATS_NEW,
     CUSTOMIZE_HOME,
@@ -1019,8 +1022,8 @@ internal enum class TvSettingsRoute {
     DIAGNOSTICS;
 
     internal fun back(): TvSettingsRoute = when (this) {
-        // The store + pairing screens are nested under Add-ons; Back returns there, not to the root.
-        ADDON_STORE, ADDON_PAIRING -> ADDONS
+        // Routes opened by Add-ons return there.
+        ADDON_STORE, ADDON_PAIRING, ADDON_ACCOUNT -> ADDONS
         else -> ROOT
     }
 }
@@ -1301,7 +1304,7 @@ private val tvSkipProviderOptions: List<Pair<String, Pair<String, String>>> = li
 /// rows drive. The VortX side ([VortXAccountViewModel]) needs the app-process [VortXSyncManager] and is only
 /// built when one is available; the Stremio side ([AccountViewModel]) rides the shared [AuthRepository].
 @Composable
-private fun TvAccountRoute(
+internal fun TvAccountRoute(
     repo: CatalogRepository,
     auth: AuthRepository,
     syncManager: VortXSyncManager?,

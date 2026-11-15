@@ -1268,6 +1268,12 @@ class VortXSyncManager internal constructor(
     private val _syncProblem = MutableStateFlow<String?>(null)
     /** Writer/engine incompatibility, surfaced by the existing account status line. */
     val syncProblem: StateFlow<String?> = _syncProblem.asStateFlow()
+    // Protected by the session coordinator. An interactive sign-in owns the first backup decision.
+    private var interactiveSetupSession: Session? = null
+    private var claimedReconcileOwner: PickerAccountSnapshot? = null
+    private val _interactiveReconcileOwner = MutableStateFlow<PickerAccountSnapshot?>(null)
+    internal val interactiveReconcileOwner: StateFlow<PickerAccountSnapshot?> = _interactiveReconcileOwner.asStateFlow()
+    private val interactiveProbeMutex = Mutex()
     @Volatile private var upgradeRequiredLease: SyncSessionLease? = null
 
     private fun requiresUpgrade(lease: SyncSessionLease): Boolean {
@@ -1644,6 +1650,9 @@ class VortXSyncManager internal constructor(
             if (!sessionTruthMatches(live, persisted) || sessionState.ownerEpoch != persistedOwnerEpoch) {
                 com.vortx.android.player.PlaybackOwnerEpoch.transition {
                     sessionState.restore(persisted, persistedOwnerEpoch)
+                    interactiveSetupSession = null
+                    claimedReconcileOwner = null
+                    _interactiveReconcileOwner.value = null
                 }
             } // Equal confirmed truth retains the ORIGINAL Session and immutable lease token.
             if (pickerFileRecoverySession != null && pickerFileRecoverySession !== sessionState.value)
@@ -1847,6 +1856,28 @@ class VortXSyncManager internal constructor(
     private fun routineSyncAllowed(lease: SyncSessionLease): Boolean = operations.snapshot { generation ->
         generation == lease.operationGeneration && sessionState.serialized {
             sessionMatchesLease(lease) && pickerFileRecoverySession !== sessionState.value
+        }
+    }
+
+    private fun interactiveSetupPending(lease: SyncSessionLease): Boolean = operations.snapshot { generation ->
+        generation == lease.operationGeneration && sessionState.serialized {
+            sessionMatchesLease(lease) && interactiveSetupSession === sessionState.value
+        }
+    }
+
+    private fun interactiveDecisionPending(lease: SyncSessionLease): Boolean = operations.snapshot { generation ->
+        generation == lease.operationGeneration && sessionState.serialized {
+            sessionMatchesLease(lease) && (interactiveSetupSession === sessionState.value ||
+                _interactiveReconcileOwner.value?.matchesOwner(this, sessionState.ownerEpoch, sessionState.value) == true)
+        }
+    }
+
+    private fun releaseInteractiveSetup(lease: SyncSessionLease): Boolean = operations.snapshot { generation ->
+        generation == lease.operationGeneration && sessionState.serialized {
+            if (!sessionMatchesLease(lease)) false else {
+                interactiveSetupSession = null
+                true
+            }
         }
     }
 
@@ -2317,6 +2348,9 @@ class VortXSyncManager internal constructor(
             cancelSessionWork()
             sessionState.clear {
                 publishPickerFileRecoverySession(null)
+                interactiveSetupSession = null
+                claimedReconcileOwner = null
+                _interactiveReconcileOwner.value = null
                 bindLibraryAccount(null)
                 AddonTombstones.activateAccount(null)
                 AddonPrefsStore.activateAccount(null)
@@ -3588,7 +3622,7 @@ class VortXSyncManager internal constructor(
      * optimistic-concurrency recovery. Mirrors Apple `syncUp`.
      */
     suspend fun syncUp(): Boolean {
-        val lease = captureSyncLease() ?: return false
+        val lease = captureSyncLease()?.takeUnless(::interactiveDecisionPending) ?: return false
         if (retryPendingPushBeforePull(lease)) return false
         val synced = syncUp(lease)
         return synced && isSyncLeaseCurrent(lease)
@@ -4278,7 +4312,7 @@ class VortXSyncManager internal constructor(
      * guard. A `.failed` / `.empty` pull applies NOTHING (never wipes local). Mirrors Apple `syncDown`.
      */
     suspend fun syncDown(force: Boolean = false): Boolean {
-        val lease = captureSyncLease() ?: return false
+        val lease = captureSyncLease()?.takeUnless(::interactiveDecisionPending) ?: return false
         val synced = syncDown(lease, force)
         return synced && isSyncLeaseCurrent(lease)
     }
@@ -4470,7 +4504,7 @@ class VortXSyncManager internal constructor(
         progressOnly: Boolean = false,
     ): Boolean = accountFileManagedWriter(refused = true, observedEdit = recordEdit) {
         if (!isSyncLeaseCurrent(lease)) return@accountFileManagedWriter false
-        if (!recordEdit && !routineSyncAllowed(lease)) return@accountFileManagedWriter true
+        if (!recordEdit && (!routineSyncAllowed(lease) || interactiveSetupPending(lease))) return@accountFileManagedWriter true
         val owner = pendingOwner(lease)
         val proposedAttempt = PendingSyncAttempt(owner)
         val claim = if (recordEdit) {
@@ -4480,7 +4514,8 @@ class VortXSyncManager internal constructor(
         }
         claim.replacedJob?.cancel()
         // Already-observed edits retain their marker. Only a resumed routine lease starts delivery.
-        if (!routineSyncAllowed(lease) || requiresUpgrade(lease)) return@accountFileManagedWriter claim.blockPull
+        if (!routineSyncAllowed(lease) || interactiveSetupPending(lease) || requiresUpgrade(lease))
+            return@accountFileManagedWriter claim.blockPull
         val attempt = claim.attemptToStart ?: return@accountFileManagedWriter claim.blockPull
 
         val job = scope.launch(start = CoroutineStart.LAZY) {
@@ -4555,8 +4590,8 @@ class VortXSyncManager internal constructor(
 
     /** Catch-up PULL entry point (manual "Sync now"); [startRealtime] is the foreground entry point. */
     fun syncDownSoon() {
-        val lease = captureSyncLease() ?: return
-        scope.launch { syncDown(lease) }
+        val lease = captureSyncLease()?.takeUnless(::interactiveDecisionPending) ?: return
+        scope.launch { syncDown(lease, publicationCurrent = { !interactiveDecisionPending(lease) }) }
     }
 
     // ---- Real-time pull channel (WebSocket SyncRoom + while-active poll fallback) ----
@@ -4628,7 +4663,8 @@ class VortXSyncManager internal constructor(
     // Realtime work carries the session captured when its channel opened, never recaptures a
     // replacement session after a queued callback. Generation + ownerEpoch also fence A→B→A.
     private fun realtimeOwnerAvailable(lease: SyncSessionLease): Boolean =
-        foregroundStillCurrent() && (applicationForeground == null || sessionUiConfirms(lease))
+        !interactiveDecisionPending(lease) && foregroundStillCurrent() &&
+            (applicationForeground == null || sessionUiConfirms(lease))
 
     internal fun captureRealtimeLease(): SyncSessionLease? =
         captureSyncLease()?.takeIf { routineSyncAllowed(it) && realtimeOwnerAvailable(it) }
@@ -4656,13 +4692,13 @@ class VortXSyncManager internal constructor(
     }
 
     private suspend fun accountHasSyncData(lease: SyncSessionLease): AccountDataProbe {
-        if (retryPendingPushBeforePull(lease)) return AccountDataProbe.UNREACHABLE
+        // The interactive probe only classifies the authenticated GET. It cannot pre-empt the choice
+        // by dispatching pending writes. The selected action resumes the durable pending work.
+        if (!interactiveSetupPending(lease) && retryPendingPushBeforePull(lease)) return AccountDataProbe.UNREACHABLE
         val pull = pullSyncDocResult(lease)
-        if (retryPendingPushBeforePull(lease)) return AccountDataProbe.UNREACHABLE
+        if (!interactiveSetupPending(lease) && retryPendingPushBeforePull(lease)) return AccountDataProbe.UNREACHABLE
         return when (pull) {
-            is SyncDocPull.Doc ->
-                if (pull.doc.has("vortx") || pull.doc.has("settings") || pull.doc.has("apiKeys"))
-                    AccountDataProbe.HAS_DATA else AccountDataProbe.EMPTY
+            is SyncDocPull.Doc -> AccountDataProbe.HAS_DATA
             is SyncDocPull.Empty -> AccountDataProbe.EMPTY       // genuinely no backup yet: safe to seed
             is SyncDocPull.Failed, is SyncDocPull.Unchanged -> AccountDataProbe.UNREACHABLE // blip / refused doc: retry, NEVER seed
         }
@@ -4676,31 +4712,86 @@ class VortXSyncManager internal constructor(
      * doc returns [SignInReconcile.UNREACHABLE] and pushes NOTHING (a blip is never treated as a fresh account).
      */
     suspend fun reconcileAfterSignIn(): SignInReconcile = reconcileAfterSignIn(captureSyncLease())
-    internal suspend fun reconcileAfterSignIn(owner: PickerAccountSnapshot): SignInReconcile =
-        reconcileAfterSignIn(captureCompletionLease(owner))
+    internal suspend fun reconcileAfterSignIn(owner: PickerAccountSnapshot): SignInReconcile = interactiveProbeMutex.withLock {
+        val lease = captureCompletionLease(owner) ?: return@withLock SignInReconcile.UNREACHABLE
+        if (_interactiveReconcileOwner.value?.let(::isPickerCompletionOwnerCurrent) == true)
+            SignInReconcile.HAS_ACCOUNT_DATA else reconcileAfterSignIn(lease, owner)
+    }
+
+    internal fun pendingInteractiveProbeOwner(): PickerAccountSnapshot? = operations.snapshot {
+        if (_interactiveReconcileOwner.value != null ||
+            captureSyncLease()?.let(::interactiveSetupPending) != true) null else capturePickerCompletionOwner()
+    }
+
+    internal fun interactiveReconcileChoiceFor(owner: PickerAccountSnapshot): PickerAccountSnapshot? = operations.snapshot {
+        if (!isPickerCompletionOwnerCurrent(owner)) null
+        else _interactiveReconcileOwner.value?.takeIf(::isPickerCompletionOwnerCurrent)
+    }
     private fun captureCompletionLease(owner: PickerAccountSnapshot): SyncSessionLease? = operations.snapshot {
         if (!isPickerCompletionOwnerCurrent(owner)) null else captureSyncLease()
     }
-    private suspend fun reconcileAfterSignIn(captured: SyncSessionLease?): SignInReconcile {
-        val lease = captured ?: return SignInReconcile.UNREACHABLE
-        val probe = accountHasSyncData(lease)
-        if (!isSyncLeaseCurrent(lease)) return SignInReconcile.UNREACHABLE
-        return when (probe) {
-            AccountDataProbe.HAS_DATA -> SignInReconcile.HAS_ACCOUNT_DATA
-            AccountDataProbe.UNREACHABLE -> SignInReconcile.UNREACHABLE
-            AccountDataProbe.EMPTY -> {
-                if (syncUp(lease) && isSyncLeaseCurrent(lease)) {
-                    SignInReconcile.SEEDED_FROM_DEVICE
-                } else {
-                    SignInReconcile.UNREACHABLE
+    private suspend fun resolveInteractiveReconcile(
+        owner: PickerAccountSnapshot,
+        action: suspend (SyncSessionLease) -> Boolean,
+    ): Boolean {
+        val lease = operations.snapshot {
+            val current = captureCompletionLease(owner) ?: return@snapshot null
+            val pending = _interactiveReconcileOwner.value
+            if (pending != null && pending !== owner) return@snapshot null
+            if (claimedReconcileOwner?.let(::isPickerCompletionOwnerCurrent) == true) return@snapshot null
+            if (!releaseInteractiveSetup(current)) return@snapshot null
+            claimedReconcileOwner = owner
+            current
+        } ?: return false
+        var settled = false
+        try {
+            settled = action(lease) && isSyncLeaseCurrent(lease)
+            return settled
+        } finally {
+            operations.snapshot {
+                if (claimedReconcileOwner === owner) {
+                    if (!settled) claimedReconcileOwner = null
+                    else if (_interactiveReconcileOwner.value === owner) _interactiveReconcileOwner.value = null
                 }
             }
         }
     }
 
+    private suspend fun reconcileAfterSignIn(
+        captured: SyncSessionLease?,
+        owner: PickerAccountSnapshot? = null,
+    ): SignInReconcile {
+        val lease = captured ?: return SignInReconcile.UNREACHABLE
+        var awaitingChoice = false
+        try {
+            val probe = accountHasSyncData(lease)
+            if (!isSyncLeaseCurrent(lease)) return SignInReconcile.UNREACHABLE
+            return when (probe) {
+                AccountDataProbe.HAS_DATA -> {
+                    // The picker and Settings can hold different view models for the same account.
+                    awaitingChoice = owner != null && publishIfPickerCompletionOwnerCurrent(owner) {
+                        _interactiveReconcileOwner.value = owner
+                    }
+                    SignInReconcile.HAS_ACCOUNT_DATA
+                }
+                AccountDataProbe.UNREACHABLE -> SignInReconcile.UNREACHABLE
+                AccountDataProbe.EMPTY -> if (syncUp(lease) && isSyncLeaseCurrent(lease))
+                    SignInReconcile.SEEDED_FROM_DEVICE else SignInReconcile.UNREACHABLE
+            }
+        } catch (cancel: kotlinx.coroutines.CancellationException) {
+            // A recreated account screen can retry the original probe. No automatic backup
+            // decision should follow a cancelled sign-in presentation.
+            awaitingChoice = owner != null && interactiveSetupPending(lease)
+            throw cancel
+        } finally {
+            if (!awaitingChoice) releaseInteractiveSetup(lease)
+        }
+    }
+
     /** Conflict resolution: adopt the account's roster (forced). Still UNIONs, so no local-only profile is lost. */
-    suspend fun useAccountData(): Boolean = useAccountData(captureSyncLease())
-    internal suspend fun useAccountData(owner: PickerAccountSnapshot): Boolean = useAccountData(captureCompletionLease(owner))
+    suspend fun useAccountData(): Boolean = useAccountData(captureSyncLease()?.takeUnless(::interactiveDecisionPending))
+    internal suspend fun useAccountData(owner: PickerAccountSnapshot): Boolean =
+        resolveInteractiveReconcile(owner) { useAccountData(it) }
     private suspend fun useAccountData(captured: SyncSessionLease?): Boolean {
         val lease = captured ?: return false
         val received = syncDown(lease, force = true)
@@ -4709,18 +4800,22 @@ class VortXSyncManager internal constructor(
 
     /** Conflict resolution / "Sync now": push this device's roster + overlays to the account. */
     suspend fun pushThisDevice(): Boolean {
-        val lease = captureSyncLease() ?: return false
+        val lease = captureSyncLease()?.takeUnless(::interactiveDecisionPending) ?: return false
         if (retryPendingPushBeforePull(lease)) return false
         val pushed = syncUp(lease)
         return pushed && isSyncLeaseCurrent(lease)
     }
 
     /** Explicit Keep device choice only. Sync now, automatic empty seeding, and Merge both never grant. */
-    suspend fun importThisDeviceLibraryAndPush(): Boolean = importThisDeviceLibraryAndPush(captureSyncLease())
-    internal suspend fun importThisDeviceLibraryAndPush(owner: PickerAccountSnapshot): Boolean = importThisDeviceLibraryAndPush(captureCompletionLease(owner))
+    suspend fun importThisDeviceLibraryAndPush(): Boolean =
+        importThisDeviceLibraryAndPush(captureSyncLease()?.takeUnless(::interactiveDecisionPending))
+    internal suspend fun importThisDeviceLibraryAndPush(owner: PickerAccountSnapshot): Boolean =
+        resolveInteractiveReconcile(owner) { importThisDeviceLibraryAndPush(it) }
     private suspend fun importThisDeviceLibraryAndPush(captured: SyncSessionLease?): Boolean {
         val lease = captured?.takeIf(::routineSyncAllowed) ?: return false
-        val gateway = libraryGateway ?: return false
+        // The native app keeps its library in the authenticated checkpoint. Its upload path reads
+        // and joins that checkpoint with the cloud backup without importing an unscoped library.
+        val gateway = libraryGateway ?: return syncUp(lease) && isSyncLeaseCurrent(lease)
         val nativeLease = gateway.captureAccountLibraryLease() ?: return false
         val native = gateway.nativeLibraryOwner(nativeLease) ?: return false
         val snapshot = gateway.accountLibrarySnapshot(nativeLease, syncLeaseAdmission(lease)) ?: return false
@@ -4745,8 +4840,9 @@ class VortXSyncManager internal constructor(
     }
 
     /** "Sync now" recommended path: union both ways so EVERY profile from both sides survives, then push. */
-    suspend fun mergeBoth(): Boolean = mergeBoth(captureSyncLease())
-    internal suspend fun mergeBoth(owner: PickerAccountSnapshot): Boolean = mergeBoth(captureCompletionLease(owner))
+    suspend fun mergeBoth(): Boolean = mergeBoth(captureSyncLease()?.takeUnless(::interactiveDecisionPending))
+    internal suspend fun mergeBoth(owner: PickerAccountSnapshot): Boolean =
+        resolveInteractiveReconcile(owner) { mergeBoth(it) }
     private suspend fun mergeBoth(captured: SyncSessionLease?): Boolean {
         val lease = captured ?: return false
         if (retryPendingPushBeforePull(lease)) return false
@@ -4798,6 +4894,9 @@ class VortXSyncManager internal constructor(
                 }
                 sessionState.replace(s) {
                     publishPickerFileRecoverySession(s.takeIf { recoveryIntent != null })
+                    interactiveSetupSession = s.takeIf { completion != null && recoveryIntent == null }
+                    claimedReconcileOwner = null
+                    _interactiveReconcileOwner.value = null
                     nativeGateway?.retire()
                     bindLibraryAccount(account.id)
                     AddonTombstones.activateAccount(account.id)
@@ -4813,7 +4912,7 @@ class VortXSyncManager internal constructor(
                 else if (recoveryRetired) SessionAdoption.STALE else SessionAdoption.STORAGE_FAILURE
             SessionMutationResult.Stale -> SessionAdoption.STALE
         }
-        if (adoption == SessionAdoption.ADOPTED && recoveryIntent == null) {
+        if (adoption == SessionAdoption.ADOPTED && completion == null && recoveryIntent == null) {
             captureSyncLease()?.takeIf { it.accountId == account.id && it.token == token }?.let { lease ->
                 armPendingSync(lease, recordEdit = false)
                 scope.launch { syncDown(lease, force = true) }

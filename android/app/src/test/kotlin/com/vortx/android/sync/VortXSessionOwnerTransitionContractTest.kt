@@ -61,7 +61,8 @@ class VortXSessionOwnerTransitionContractTest {
         assertTrue(restore.contains("sessionState.restore(persisted, persistedOwnerEpoch)"))
         assertTrue(restore.contains("AddonTombstones.activateAccount(persisted?.account?.id)"))
         assertTrue(restore.contains("_account.value = persisted?.account"))
-        assertTrue(restore.contains("SessionOwnerSnapshot.SignedOutLocal(sessionState.ownerEpoch)"))
+        assertTrue(restore.contains("publishSessionUiState(SessionUiState.SignedOut)"))
+        assertTrue(source.contains("SessionUiState.SignedOut -> SessionOwnerSnapshot.SignedOutLocal(sessionState.ownerEpoch)"))
         assertTrue(
             restore.indexOf("if (_sessionUiState.value == SessionUiState.UnknownOrUnavailable)") <
                 restore.indexOf("sessionState.restore(persisted, persistedOwnerEpoch)"),
@@ -76,7 +77,7 @@ class VortXSessionOwnerTransitionContractTest {
         )
         assertTrue(
             restore.indexOf("sessionState.restore(persisted, persistedOwnerEpoch)") <
-                restore.indexOf("SessionOwnerSnapshot.SignedOutLocal(sessionState.ownerEpoch)"),
+                restore.indexOf("publishSessionUiState(SessionUiState.SignedOut)"),
         )
         assertFalse(restore.contains("sessionState.replace"))
         assertFalse(restore.contains("sessionState.clear"))
@@ -330,9 +331,9 @@ class VortXSessionOwnerTransitionContractTest {
         assertTrue(matching.contains("current.token == lease.token"))
         assertTrue(matching.contains("lease.matchesDataKey(current.dataKey)"))
         assertTrue(hostSettings.contains("publishIfSyncLeaseCurrent(lease)"))
-        assertTrue(nativeReceive.contains("mergeNativeProviders(lease, account, pull.doc)"))
+        assertTrue(nativeReceive.contains("mergeNativeProviders(lease, account, pull.doc, publicationCurrent)"))
         assertTrue(providerMerge.contains("publishIfSyncLeaseCurrent(lease)"))
-        assertTrue(nativeReceive.contains("advanceVersion(lease, pull.version)"))
+        assertTrue(nativeReceive.contains("advanceVersion(lease, pull.version, publicationCurrent)"))
     }
 
     @Test
@@ -346,15 +347,16 @@ class VortXSessionOwnerTransitionContractTest {
             .substringBefore("// MARK: - Session adoption + persistence")
 
         assertTrue(source.contains("suspend fun reconcileAfterSignIn(): SignInReconcile = reconcileAfterSignIn(captureSyncLease())"))
-        assertTrue(reconcile.contains("reconcileAfterSignIn(captureCompletionLease(owner))"))
+        assertTrue(reconcile.contains("val lease = captureCompletionLease(owner) ?: return@withLock SignInReconcile.UNREACHABLE"))
+        assertTrue(reconcile.contains("reconcileAfterSignIn(lease, owner)"))
         assertTrue(reconcile.contains("val lease = captured ?: return SignInReconcile.UNREACHABLE"))
         val completionCapture = reconcile.substringAfter("private fun captureCompletionLease(").substringBefore("private suspend fun reconcileAfterSignIn(")
         assertTrue(completionCapture.contains("operations.snapshot"))
         assertTrue(completionCapture.contains("if (!isPickerCompletionOwnerCurrent(owner)) null else captureSyncLease()"))
         assertTrue(reconcile.contains("accountHasSyncData(lease)"))
         assertTrue(reconcile.contains("syncUp(lease)"))
-        assertTrue(source.contains("suspend fun mergeBoth(): Boolean = mergeBoth(captureSyncLease())"))
-        assertTrue(mergeBoth.contains("mergeBoth(captureCompletionLease(owner))"))
+        assertTrue(source.contains("suspend fun mergeBoth(): Boolean = mergeBoth(captureSyncLease()?.takeUnless(::interactiveDecisionPending))"))
+        assertTrue(mergeBoth.contains("resolveInteractiveReconcile(owner) { mergeBoth(it) }"))
         assertTrue(mergeBoth.contains("val lease = captured ?: return false"))
         assertTrue(mergeBoth.contains("syncDown(lease, force = true)"))
         assertTrue(mergeBoth.contains("syncUp(lease)"))
@@ -377,7 +379,8 @@ class VortXSessionOwnerTransitionContractTest {
             adopt.replace("completion?.record(capturePickerCompletionOwner())", "completion?.retiredRecord(capturePickerCompletionOwner())"),
             adopt.replace("sessionState.replace(s) {", "completion?.record(capturePickerCompletionOwner())\n                sessionState.replace(s) {"),
             adopt.replace("armPendingSync(lease, recordEdit = false)", "retiredArm(lease)"),
-            adopt.replace("if (adoption == SessionAdoption.ADOPTED && recoveryIntent == null)", "if (adoption == SessionAdoption.ADOPTED)"),
+            adopt.replace("completion == null && recoveryIntent == null", "recoveryIntent == null"),
+            adopt.replace("interactiveSetupSession = s.takeIf { completion != null && recoveryIntent == null }", "interactiveSetupSession = null"),
             adopt.replace("publishPickerFileRecoverySession(s.takeIf { recoveryIntent != null })", "publishPickerFileRecoverySession(null)"),
             adopt.replace("val account = Account(", "sessionState.serialized {}\n        val account = Account("),
         )
@@ -418,7 +421,9 @@ class VortXSessionOwnerTransitionContractTest {
         assertTrue(adopt.indexOf("sessionState.replace(s) {") < adopt.indexOf("completion?.record("))
         val pause = adopt.indexOf("publishPickerFileRecoverySession(s.takeIf { recoveryIntent != null })")
         assertTrue(pause in adopt.indexOf("sessionState.replace(s) {") until adopt.indexOf("completion?.record("))
-        val ordinary = adopt.indexOf("if (adoption == SessionAdoption.ADOPTED && recoveryIntent == null)")
+        val interactive = adopt.indexOf("interactiveSetupSession = s.takeIf { completion != null && recoveryIntent == null }")
+        assertTrue(interactive in adopt.indexOf("sessionState.replace(s) {") until adopt.indexOf("publishSessionUiState("))
+        val ordinary = adopt.indexOf("if (adoption == SessionAdoption.ADOPTED && completion == null && recoveryIntent == null)")
         val lease = adopt.indexOf("captureSyncLease()?.takeIf { it.accountId == account.id && it.token == token }")
         val arm = adopt.indexOf("armPendingSync(lease, recordEdit = false)")
         assertTrue(ordinary > adopt.indexOf("completion?.record(") && lease > ordinary && arm > lease)

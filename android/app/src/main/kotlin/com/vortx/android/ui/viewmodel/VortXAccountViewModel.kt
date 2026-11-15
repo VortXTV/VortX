@@ -266,6 +266,19 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         viewModelScope.launch { sync.pickerAccountRevision.collect { retireObsoleteCompletion() } }
         viewModelScope.launch { sync.sessionUiState.collect { retireObsoleteCompletion() } }
         viewModelScope.launch {
+            var sharedOwner: PickerAccountSnapshot? = null
+            sync.interactiveReconcileOwner.collect { owner ->
+                val previous = sharedOwner
+                sharedOwner = owner
+                if (owner != null) requireAccountReconcile(owner)
+                else if (previous != null && completionOwner === previous) {
+                    _showReconcile.value = false
+                    _syncNotice.value = sync.syncProblem.value
+                    settleCompletionIfFinished()
+                }
+            }
+        }
+        viewModelScope.launch {
             sync.syncProblem.collect { problem -> _syncNotice.value = problem }
         }
     }
@@ -548,7 +561,8 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
             VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> publishCompletion(original) {
                 _syncNotice.value = null; sync.startRealtime()
             }
-            VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA -> requireAccountReconcile(original)
+            VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA ->
+                requireAccountReconcile(sync.interactiveReconcileChoiceFor(original) ?: original)
             VortXSyncManager.SignInReconcile.UNREACHABLE -> publishCompletion(original) {
                 _syncNotice.value = sync.syncProblem.value ?: "Signed in. Your synced data wasn't reachable yet; it will catch up automatically."
                 sync.startRealtime()
@@ -564,9 +578,10 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         when (sync.reconcileAfterSignIn(original)) {
             VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> publishCompletion(original) { _syncNotice.value = null }
             VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA -> {
-                val restored = sync.useAccountData(original)
-                publishCompletion(original) { if (!restored) _syncNotice.value = sync.syncProblem.value
-                    ?: "Signed in. Your saved data is preserved, but the account restore could not finish yet. Try Sync now again." }
+                val restored = sync.useAccountData(sync.interactiveReconcileChoiceFor(original) ?: original)
+                publishCompletion(original) {
+                    if (!restored) _syncNotice.value = sync.syncProblem.value ?: RECONCILE_RETRY_NOTICE
+                }
             }
             VortXSyncManager.SignInReconcile.UNREACHABLE -> publishCompletion(original) {
                 _syncNotice.value = sync.syncProblem.value ?: "Signed in. Your synced data wasn't reachable yet; it will catch up automatically."
@@ -629,15 +644,13 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
             try {
                 val reconciled = action(owner)
                 admit {
-                    if (_showReconcile.value) {
-                        if (reconciled) {
-                            _showReconcile.value = false
-                            settleCompletionIfFinished()
-                            _syncNotice.value = null
-                            sync.startRealtime() // Only a confirmed choice settles reconciliation.
-                        } else {
-                            _syncNotice.value = sync.syncProblem.value ?: RECONCILE_RETRY_NOTICE
-                        }
+                    if (reconciled) {
+                        _showReconcile.value = false
+                        settleCompletionIfFinished()
+                        _syncNotice.value = null
+                        sync.startRealtime() // Only a confirmed choice settles reconciliation.
+                    } else if (_showReconcile.value) {
+                        _syncNotice.value = sync.syncProblem.value ?: RECONCILE_RETRY_NOTICE
                     }
                     true
                 }
@@ -655,7 +668,11 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
 
     /// Manual "Sync now": the documented recommended path (union both ways, then push).
     fun syncNow() {
-        if (_syncing.value) return
+        if (_syncing.value || _postAuthCompleting.value) return
+        sync.pendingInteractiveProbeOwner()?.let { owner ->
+            viewModelScope.launch { onAuthed(owner) }
+            return
+        }
         _syncing.value = true
         val admit = sync.captureLocalLibraryMutationAdmission()
         viewModelScope.launch {

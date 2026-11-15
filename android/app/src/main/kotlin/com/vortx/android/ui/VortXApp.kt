@@ -1531,6 +1531,7 @@ fun VortXApp(
                 onBack = { showAddons = false },
                 onDiscover = { showAddonStore = true },
                 onInstallByQr = { showAddonPairing = true },
+                onOpenAccount = if (syncManager != null) ({ showVortxAccount = true }) else null,
             )
             return@VortXTheme
         }
@@ -2287,6 +2288,7 @@ fun VortXApp(
                     modifier = content.consumeWindowInsets(padding),
                     onDiscover = { showAddonStore = true },
                     onInstallByQr = { showAddonPairing = true },
+                    onOpenAccount = if (syncManager != null) ({ showVortxAccount = true }) else null,
                 )
                 Tab.SETTINGS -> SettingsScreen(
                     authState = authState,

@@ -57,6 +57,7 @@ import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.vortx.android.R
+import com.vortx.android.data.AddonAccountReadiness
 import com.vortx.android.engine.AddonHealth
 import com.vortx.android.engine.AddonHealthStore
 import com.vortx.android.model.InstalledAddon
@@ -69,6 +70,7 @@ import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.AddonsViewModel
+import com.vortx.android.ui.viewmodel.ADDON_ACCOUNT_SETUP_MESSAGE
 import kotlin.math.roundToInt
 
 /// Add-on management (S04, DESIGN-SYSTEM.md §4 "Add-ons"): title + a short debrid explainer ->
@@ -85,8 +87,11 @@ fun AddonsScreen(
     modifier: Modifier = Modifier,
     onDiscover: () -> Unit = {},
     onInstallByQr: () -> Unit = {},
+    onOpenAccount: (() -> Unit)? = null,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val accountReadiness by viewModel.accountReadiness.collectAsStateWithLifecycle()
+    val canManageAddons = accountReadiness == AddonAccountReadiness.Ready
     val urlInput by viewModel.urlInput.collectAsStateWithLifecycle()
     val installing by viewModel.installing.collectAsStateWithLifecycle()
     val installMessage by viewModel.installMessage.collectAsStateWithLifecycle()
@@ -104,7 +109,7 @@ fun AddonsScreen(
 
     // Change-URL sheet state (Apple `EditAddonURLView`): the add-on being edited, or null when closed.
     var changeUrlAddon by remember { mutableStateOf<InstalledAddon?>(null) }
-    changeUrlAddon?.let { addon ->
+    if (canManageAddons) changeUrlAddon?.let { addon ->
         ChangeAddonUrlDialog(
             addon = addon,
             viewModel = viewModel,
@@ -115,7 +120,7 @@ fun AddonsScreen(
     // Update-if-installed confirm (SRC-8, Apple `AddonsView` confirmationDialog): pasting a URL that is
     // already installed pops this instead of silently re-installing, so an accidental re-paste is a
     // deliberate refresh, and the success line reads "Updated." rather than "Installed.".
-    if (pendingUpdate != null) {
+    if (canManageAddons && pendingUpdate != null) {
         AlertDialog(
             onDismissRequest = viewModel::cancelUpdate,
             title = { Text(stringResource(R.string.addon_update_confirm_title), style = VortXTheme.type.cardTitle) },
@@ -138,6 +143,13 @@ fun AddonsScreen(
     // a mode toggle): the normal management list swaps for a drag list of the same add-ons.
     var reorderMode by remember { mutableStateOf(false) }
     val installed = (state as? UiState.Success)?.data.orEmpty()
+    LaunchedEffect(canManageAddons) {
+        if (!canManageAddons) {
+            changeUrlAddon = null
+            reorderMode = false
+            viewModel.cancelUpdate()
+        }
+    }
 
     Column(modifier = modifier.fillMaxSize()) {
         TopAppBar(
@@ -150,14 +162,14 @@ fun AddonsScreen(
             actions = {
                 // Reorder needs at least two add-ons to mean anything (same practical gate as
                 // Apple's Reorder entry point). Each drop applies immediately, so "Done" just exits.
-                if (installed.size > 1) {
+                if (canManageAddons && installed.size > 1) {
                     TextButton(onClick = { reorderMode = !reorderMode }) {
                         Text(if (reorderMode) "Done" else "Reorder", color = colors.accent, style = VortXTheme.type.label)
                     }
                 }
             },
         )
-        if (reorderMode) {
+        if (canManageAddons && reorderMode) {
             AddonReorderList(
                 addons = installed,
                 onApply = viewModel::applyOrder,
@@ -170,6 +182,27 @@ fun AddonsScreen(
             verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
             modifier = Modifier.fillMaxSize(),
         ) {
+            if (!canManageAddons) {
+                item {
+                    if (accountReadiness == AddonAccountReadiness.Checking) {
+                        EmptyState("Checking your VortX account…")
+                    } else {
+                        SurfaceCard(modifier = Modifier.fillMaxWidth()) {
+                            Column(
+                                modifier = Modifier.padding(VortXTheme.spacing.md),
+                                verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                            ) {
+                                Text(ADDON_ACCOUNT_SETUP_MESSAGE, style = VortXTheme.type.body)
+                                onOpenAccount?.let {
+                                    Chip(label = "Open VortX Account", selected = true, onClick = it)
+                                }
+                            }
+                        }
+                    }
+                }
+                item { CommunityJsProviderCard() }
+                return@LazyColumn
+            }
             item {
                 Text(
                     text = "Add-ons provide catalogs and sources: direct HTTPS links play instantly, " +

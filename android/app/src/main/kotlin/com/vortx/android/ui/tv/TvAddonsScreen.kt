@@ -35,6 +35,7 @@ import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import com.vortx.android.R
+import com.vortx.android.data.AddonAccountReadiness
 import com.vortx.android.engine.AddonHealth
 import com.vortx.android.engine.AddonHealthStore
 import com.vortx.android.model.InstalledAddon
@@ -43,6 +44,7 @@ import com.vortx.android.ui.screens.AddonHealthIndicator
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.AddonsViewModel
+import com.vortx.android.ui.viewmodel.ADDON_ACCOUNT_SETUP_MESSAGE
 
 internal enum class TvAddonsFocusEvent {
     SCREEN_ENTRY,
@@ -92,8 +94,11 @@ internal fun TvAddonsScreen(
     modifier: Modifier = Modifier,
     onDiscover: () -> Unit = {},
     onInstallByQr: () -> Unit = {},
+    onOpenAccount: (() -> Unit)? = null,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val accountReadiness by viewModel.accountReadiness.collectAsStateWithLifecycle()
+    val canManageAddons = accountReadiness == AddonAccountReadiness.Ready
     val health by viewModel.health.collectAsStateWithLifecycle()
     val installed = (state as? UiState.Success)?.data.orEmpty()
     val latestInstalled by rememberUpdatedState(installed)
@@ -114,7 +119,7 @@ internal fun TvAddonsScreen(
     // Per-add-on Configure QR (Apple `ConfigureAddonView` tvOS path): TV has no browser, so it shows the
     // add-on's configuration page as a QR to finish on a phone. Null when no Configure sheet is open.
     var configureAddon by remember { mutableStateOf<InstalledAddon?>(null) }
-    configureAddon?.let { addon ->
+    if (canManageAddons) configureAddon?.let { addon ->
         TvAddonConfigureDialog(addon = addon, onDismiss = { configureAddon = null })
     }
     var showCommunityProviders by remember { mutableStateOf(false) }
@@ -124,6 +129,12 @@ internal fun TvAddonsScreen(
 
     LaunchedEffect(viewModel) {
         viewModel.onScreenEntry()
+    }
+    LaunchedEffect(canManageAddons) {
+        if (!canManageAddons) {
+            configureAddon = null
+            moveFocus = null
+        }
     }
 
     LazyColumn(
@@ -148,18 +159,32 @@ internal fun TvAddonsScreen(
                 )
             }
         }
+        if (!canManageAddons) {
+            item {
+                Text(
+                    if (accountReadiness == AddonAccountReadiness.Checking) "Checking your VortX account…"
+                    else ADDON_ACCOUNT_SETUP_MESSAGE,
+                    style = VortXTheme.type.body,
+                )
+            }
+            if (accountReadiness == AddonAccountReadiness.SetupRequired && onOpenAccount != null) {
+                item { TvAddonAction(label = "Open VortX Account", onClick = onOpenAccount) }
+            }
+        }
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
-                TvAddonAction(
-                    label = stringResource(R.string.addon_install_by_qr),
-                    onClick = onInstallByQr,
-                    modifier = Modifier.width(260.dp),
-                )
-                TvAddonAction(
-                    label = stringResource(R.string.addon_discover),
-                    onClick = onDiscover,
-                    modifier = Modifier.width(260.dp),
-                )
+                if (canManageAddons) {
+                    TvAddonAction(
+                        label = stringResource(R.string.addon_install_by_qr),
+                        onClick = onInstallByQr,
+                        modifier = Modifier.width(260.dp),
+                    )
+                    TvAddonAction(
+                        label = stringResource(R.string.addon_discover),
+                        onClick = onDiscover,
+                        modifier = Modifier.width(260.dp),
+                    )
+                }
                 TvAddonAction(
                     label = "Community JS providers",
                     onClick = { showCommunityProviders = true },
@@ -167,6 +192,7 @@ internal fun TvAddonsScreen(
                 )
             }
         }
+        if (!canManageAddons) return@LazyColumn
         if (installed.isNotEmpty()) {
             item {
                 TvAddonAction(

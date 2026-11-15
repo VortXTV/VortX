@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -422,6 +423,13 @@ internal class NativeCatalogRepository(
     }
     private fun unsupported(capability: String): Nothing = throw UnsupportedOperationException("Native $capability is not enabled in this build")
     private fun session() = sessionProvider()
+    // sessionProvider checks the current authenticated mount before any native or network work.
+    private fun addonSession(): VortxNativeSession = try {
+        session()
+    } catch (error: IllegalStateException) {
+        if (error is CancellationException) throw error
+        throw AddonAccountSetupRequiredException()
+    }
     private fun action(type: String) = JSONObject().put("type", type)
     private fun library(read: VortxNativeRead) = read.state.getJSONObject("libraries").getJSONObject(read.owner.profileID)
     private fun profile(read: VortxNativeRead) = read.state.getJSONObject("roster").getJSONObject("profiles").getJSONObject(read.owner.profileID)
@@ -1451,9 +1459,17 @@ internal class NativeCatalogRepository(
         return EngineState.parseInstalledAddons(ctx.toString()).map { it.copy(isDisabled = AddonOrder.normalize(it.transportUrl) in disabled) }
     }
     override suspend fun installedAddons() = attempt {
-        val session = session()
+        val session = addonSession()
         session.withCurrentRead { installedAddonRows(it) }
     }
+    override fun addonAccountReadiness(): Flow<AddonAccountReadiness> = sessionChanges.map {
+        try {
+            addonSession()
+            AddonAccountReadiness.Ready
+        } catch (_: AddonAccountSetupRequiredException) {
+            AddonAccountReadiness.SetupRequired
+        }
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
     private class AddonManagementOwner(
         val issuer: NativeCatalogRepository,
         val session: VortxNativeSession,
@@ -1477,7 +1493,7 @@ internal class NativeCatalogRepository(
         return AddonManagementSnapshot(installedAddonRows(read), authority, publication)
     }
     override suspend fun addonManagementSnapshot() = attempt {
-        val session = session()
+        val session = addonSession()
         session.withCurrentRead { read -> addonManagementSnapshot(session, read) }
     }
     override suspend fun setAddonVisibility(snapshot: AddonManagementSnapshot, addon: InstalledAddon, disabled: Boolean) =
@@ -1515,7 +1531,7 @@ internal class NativeCatalogRepository(
         URI("${uri.scheme.lowercase()}://${uri.rawAuthority.lowercase()}$path").toASCIIString()
     }.getOrNull()
     override suspend fun installAddon(url: String) = attempt {
-        val session = session(); val read = session.read(); val normalized = requireNotNull(normalizedAddonUrl(url))
+        val session = addonSession(); val read = session.read(); val normalized = requireNotNull(normalizedAddonUrl(url))
         check(addonOwner(read) == read.owner.profileID) { "Shared profiles customize visibility; install add-ons from the owner profile" }
         val addon = VortxResourceAddon.fromTransportUrl(normalized)
         val response = session.load("install", read.owner, listOf(VortxResourceRequest(VortxResourceRequest.Resource.MANIFEST, "", "") to listOf(addon))).single()
@@ -1532,7 +1548,7 @@ internal class NativeCatalogRepository(
         session.dispatch(listOf(action("remove_addon").put("profileId", addonOwner(read)).put("transportUrl", addon.transportUrl)), read.owner); Unit
     }
     override suspend fun changeAddonUrl(oldAddon: InstalledAddon, newUrl: String) = attempt {
-        val session = session(); val read = session.read(); val bucket = addonOwner(read)
+        val session = addonSession(); val read = session.read(); val bucket = addonOwner(read)
         check(bucket == read.owner.profileID) { "Shared profiles cannot replace account add-ons" }
         val before = addonDescriptors(read)
         val oldKey = AddonOrder.normalize(oldAddon.transportUrl)

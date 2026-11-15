@@ -332,6 +332,8 @@ fun TvShell(
                 TvDestination.ADDONS ->
                     TvAddonsDestination(
                         repo = repo,
+                        auth = auth,
+                        syncManager = syncManager,
                         reselectSignal = reselectSignal,
                         onExit = { changeDestination(TvDestination.HOME) },
                     )
@@ -471,6 +473,8 @@ private fun TvNavItem(destination: TvDestination, selected: Boolean, onClick: ()
 @Composable
 private fun TvAddonsDestination(
     repo: CatalogRepository,
+    auth: AuthRepository,
+    syncManager: VortXSyncManager?,
     reselectSignal: Int,
     onExit: () -> Unit,
     modifier: Modifier = Modifier,
@@ -488,6 +492,10 @@ private fun TvAddonsDestination(
             val pairingVm: AddonPairingViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo))
             TvAddonPairingScreen(viewModel = pairingVm, onBack = { route = TvAddonsRoute.ROOT }, modifier = modifier)
         }
+        TvAddonsRoute.ACCOUNT -> {
+            BackHandler { route = TvAddonsRoute.ROOT }
+            TvAccountRoute(repo, auth, syncManager, onBack = { route = TvAddonsRoute.ROOT }, modifier = modifier)
+        }
         TvAddonsRoute.ROOT -> {
             val addonsVm: AddonsViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo))
             TvAddonsScreen(
@@ -495,10 +503,11 @@ private fun TvAddonsDestination(
                 onBack = onExit,
                 onDiscover = { route = TvAddonsRoute.STORE },
                 onInstallByQr = { route = TvAddonsRoute.PAIRING },
+                onOpenAccount = if (syncManager != null) ({ route = TvAddonsRoute.ACCOUNT }) else null,
                 modifier = modifier,
             )
         }
     }
 }
 
-private enum class TvAddonsRoute { ROOT, STORE, PAIRING }
+private enum class TvAddonsRoute { ROOT, STORE, PAIRING, ACCOUNT }

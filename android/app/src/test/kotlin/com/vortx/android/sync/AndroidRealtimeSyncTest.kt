@@ -1111,6 +1111,168 @@ class AndroidRealtimeSyncTest {
         model.requireAccountReconcile()
     }
 
+    @Test fun `authenticated native-only backup awaits a decision without publishing`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            f.cloud = document(native(JSONObject().put("cloud-library", true)))
+                .put("future", JSONObject().put("unknown", "keep"))
+            val original = f.cloud.toString()
+            val owner = f.manager.capturePickerCompletionOwner()
+            assertEquals(VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA, f.manager.reconcileAfterSignIn(owner))
+            runCurrent()
+            assertEquals(1, f.gets)
+            assertEquals(0, f.puts)
+            assertEquals(0, f.gateway.applied)
+            assertEquals(original, f.cloud.toString())
+        } finally { f.close() }
+    }
+
+    @Test fun `authenticated absence produces exactly one create-only seed`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val requests = mutableListOf<String>()
+            f.manager.installSyncTestSeam(requireNotNull(f.manager.currentSession()), 0, transport = { method, path, body, token ->
+                assertEquals("/v1/backup", path)
+                assertEquals("fixture-a", token)
+                requests += method
+                when (method) {
+                    "GET" -> if (requests.contains("PUT")) {
+                        200 to JSONObject().put("version", f.version).put("document",
+                            VortXCrypto.sealDocument(key, f.cloud.toString().toByteArray(), account.id, f.version, true))
+                    } else 404 to null
+                    "PUT" -> {
+                        val sent = requireNotNull(body)
+                        assertTrue(sent.has("baseRevision"))
+                        assertTrue(sent.isNull("baseRevision"))
+                        assertEquals(0L, sent.getLong("version"))
+                        f.version = 0L
+                        val plaintext = requireNotNull(VortXCrypto.openDocument(key, sent.getString("document"), account.id, f.version))
+                        f.cloud = JSONObject(plaintext.toString(Charsets.UTF_8))
+                        200 to JSONObject().put("accepted", true).put("version", f.version)
+                    }
+                    else -> error("Unexpected backup method")
+                }
+            })
+            val owner = f.manager.capturePickerCompletionOwner()
+            assertEquals(VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE, f.manager.reconcileAfterSignIn(owner))
+            assertEquals(listOf("GET", "GET", "PUT"), requests)
+            assertEquals(1, f.gateway.applied)
+            assertEquals(VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA, f.manager.reconcileAfterSignIn(owner))
+            assertEquals(listOf("GET", "GET", "PUT", "GET"), requests)
+        } finally { f.close() }
+    }
+
+    @Test fun `keep device uses the native writer and retains local cloud and unknown data`() = test {
+        val f = Fixture(testScheduler)
+        val model = pendingReconcile(f.manager)
+        try {
+            f.gateway.carrier.getJSONObject("facts").put("local-library", true)
+            f.cloud.getJSONObject("nativeSync").getJSONObject("facts").put("cloud-library", true)
+            f.cloud.put("future", JSONObject().put("unknown", "keep"))
+
+            model.reconcileKeepDevice()
+            runCurrent()
+
+            assertFalse(model.showReconcile.value)
+            assertFalse(model.syncing.value)
+            assertNull(model.syncNotice.value)
+            assertEquals(1, f.puts)
+            assertEquals(11L, f.version)
+            assertTrue(f.cloud.getJSONObject("nativeSync").getJSONObject("facts").getBoolean("local-library"))
+            assertTrue(f.cloud.getJSONObject("nativeSync").getJSONObject("facts").getBoolean("cloud-library"))
+            assertEquals("keep", f.cloud.getJSONObject("future").getString("unknown"))
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun `real interactive sign in holds routine work until the owner chooses an account restore`() = test {
+        val f = Fixture(testScheduler)
+        val originalModel = VortXAccountViewModel(f.manager)
+        try {
+            val password = "fixture-password"
+            val salt = ByteArray(16) { 23 }
+            val master = VortXCrypto.masterKey(password, salt, VortXCrypto.MIN_ITERS)
+            val wrapped = try { requireNotNull(VortXCrypto.seal(master, key)) } finally { master.fill(0) }
+            // Keep the real durable session transition. Substitute only its OS-backed persistence.
+            val durable = f.manager.javaClass.getDeclaredField("sessionState").apply { isAccessible = true }.get(f.manager)
+            val persist: (VortXSyncManager.Session, Long) -> Boolean = { session, epoch ->
+                f.manager.installSessionRestoreTestSeam(session, epoch)
+                true
+            }
+            durable.javaClass.getDeclaredField("persist").apply { isAccessible = true }.set(durable, persist)
+            f.cloud.getJSONObject("nativeSync").getJSONObject("facts").put("cloud-library", true)
+            f.manager.installSyncTestSeam(requireNotNull(f.manager.currentSession()), 10, transport = { method, path, _, _ ->
+                when (path) {
+                    "/v1/auth/prelogin" -> 200 to JSONObject()
+                        .put("kdfSalt", VortXCrypto.b64(salt)).put("kdfIters", VortXCrypto.MIN_ITERS)
+                    "/v1/auth/login" -> 200 to JSONObject().put("token", "fixture-b").put("wrappedKeyPassword", wrapped)
+                        .put("account", JSONObject().put("id", account.id).put("email", account.email).put("username", account.username))
+                    "/v1/backup" -> {
+                        assertEquals("GET", method)
+                        f.gets++
+                        f.getGate?.await()
+                        200 to JSONObject().put("version", f.version).put("document",
+                            VortXCrypto.sealDocument(key, f.cloud.toString().toByteArray(), account.id, f.version, true))
+                    }
+                    else -> error("Unexpected account path")
+                }
+            })
+            val completion = PickerAuthCompletion()
+            assertEquals(VortXSyncManager.AuthResult.Ok,
+                f.manager.signIn("fixture", password, totp = null, completion = completion))
+            f.manager.setRealtimeForeground(true)
+            runCurrent()
+            assertEquals(0, f.gets)
+            assertEquals(0, f.gateway.applied)
+            assertTrue(f.sockets.isEmpty())
+
+            val owner = requireNotNull(completion.owner)
+            assertEquals(account, owner.account)
+            f.getGate = CompletableDeferred()
+            val interruptedProbe = async { f.manager.reconcileAfterSignIn(owner) }
+            runCurrent()
+            assertEquals(1, f.gets)
+            interruptedProbe.cancel()
+            runCurrent()
+            f.getGate = null
+            originalModel.syncNow()
+            runCurrent()
+            assertTrue(originalModel.showReconcile.value)
+            assertNotNull(f.manager.interactiveReconcileOwner.value)
+            assertEquals(2, f.gets)
+            f.manager.setRealtimeForeground(false)
+            f.manager.setRealtimeForeground(true)
+            runCurrent()
+            assertEquals(2, f.gets)
+            assertEquals(0, f.gateway.applied)
+            assertTrue(f.sockets.isEmpty())
+
+            val reopenedModel = VortXAccountViewModel(f.manager)
+            try {
+                runCurrent()
+                assertTrue(originalModel.showReconcile.value)
+                assertTrue(reopenedModel.showReconcile.value)
+                assertSame(f.manager.interactiveReconcileOwner.value, f.manager.interactiveReconcileChoiceFor(owner))
+                f.manager.setRealtimeForeground(false)
+                f.getGate = CompletableDeferred()
+                reopenedModel.reconcileUseAccount()
+                runCurrent()
+                assertTrue(reopenedModel.syncing.value)
+                originalModel.reconcileKeepDevice()
+                runCurrent()
+                assertEquals(3, f.gets)
+                f.getGate?.complete(Unit)
+                runCurrent()
+
+                assertFalse(originalModel.showReconcile.value)
+                assertFalse(reopenedModel.showReconcile.value)
+                assertNull(f.manager.interactiveReconcileOwner.value)
+                assertEquals(3, f.gets)
+                assertEquals(1, f.gateway.applied)
+                assertTrue(f.gateway.carrier.getJSONObject("facts").getBoolean("cloud-library"))
+            } finally { reopenedModel.viewModelScope.cancel() }
+        } finally { originalModel.viewModelScope.cancel(); f.close() }
+    }
+
     @Test fun `failed reconcile choices remain visible and actionable until confirmed retry`() = test {
         val choices: List<(VortXAccountViewModel) -> Unit> = listOf(
             { it.reconcileUseAccount() }, { it.reconcileMergeBoth() }, { it.reconcileKeepDevice() })
