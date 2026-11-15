@@ -112,6 +112,8 @@ object DiagnosticsLog {
                     "Legacy profile restore failed during preparation"
                 event.startsWith("native-profiles] prepare result=ready ") ->
                     "Legacy profile restore preparation completed"
+                event == "native-account] sync result=failed reason=backup_sign_in_required" ->
+                    "The backup service requires a fresh sign-in"
                 event == "native-account] sync result=failed reason=native_linkage_unavailable" ->
                     "The native account engine could not be loaded"
                 event == "native-account] restore result=failed stage=checkpoint_open" ->

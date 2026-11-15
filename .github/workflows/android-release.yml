@@ -58,7 +58,8 @@ jobs:
                 refs/tags/v0.5.6-beta.12-candidate.3:v0.5.6-beta.12-candidate.3|\
                 refs/tags/v0.5.6-beta.13-candidate.1:v0.5.6-beta.13-candidate.1|\
                 refs/tags/v0.5.6-beta.14-candidate.2:v0.5.6-beta.14-candidate.2|\
-                refs/tags/v0.5.6-beta.14-candidate.3:v0.5.6-beta.14-candidate.3) ;;
+                refs/tags/v0.5.6-beta.14-candidate.3:v0.5.6-beta.14-candidate.3|\
+                refs/tags/v0.5.6-beta.14-candidate.4:v0.5.6-beta.14-candidate.4) ;;
                 *) echo "::error::Protected candidate ref and input must match an exact reviewed pair"; exit 1 ;;
               esac
               [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REPOSITORY" == VortXTV/VortX &&
@@ -222,7 +223,8 @@ jobs:
         if: >-
           github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' ||
           github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' ||
-          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.3'
+          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.3' ||
+          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.4'
         working-directory: android
         timeout-minutes: 15
         env:
@@ -259,7 +261,8 @@ jobs:
       - name: Verify protected Android account setup and release regressions
         if: >-
           github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' ||
-          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.3'
+          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.3' ||
+          github.ref == 'refs/tags/v0.5.6-beta.14-candidate.4'
         working-directory: android
         timeout-minutes: 20
         env:
@@ -282,7 +285,7 @@ jobs:
             downloads.DownloadPlaybackRoutingTest
             downloads.DownloadedSeasonBoundaryTest
           )
-          if [[ "$GITHUB_REF" == refs/tags/v0.5.6-beta.14-candidate.3 ]]; then
+          if [[ "$GITHUB_REF" == refs/tags/v0.5.6-beta.14-candidate.[34] ]]; then
             suites+=(
               diagnostics.DiagnosticExportTest
               profile.ProfileSelectionWiringTest
@@ -291,6 +294,8 @@ jobs:
               ui.profilepicker.ProfilePickerToolsRestoreControllerTest
               ui.profilepicker.ProfilePickerToolsManagerTest
               backup.accountfiles.AccountBackupDocumentsTest
+              sync.SessionRenewalManagerTest
+              sync.VortXQrJoinFlowTest
             )
           fi
           reports=app/build/test-results/testPlayDebugUnitTest
@@ -506,8 +511,8 @@ jobs:
     name: Verify Android recovery tools on an emulator
     if: >-
       github.repository == 'VortXTV/VortX' &&
-      github.ref == 'refs/tags/v0.5.6-beta.14-candidate.3' &&
-      inputs.release_tag == 'v0.5.6-beta.14-candidate.3' &&
+      github.ref == 'refs/tags/v0.5.6-beta.14-candidate.4' &&
+      inputs.release_tag == 'v0.5.6-beta.14-candidate.4' &&
       inputs.publish_release == false
     permissions:
       contents: read
@@ -551,7 +556,18 @@ jobs:
           sdkmanager --install "emulator" "system-images;android-35;google_apis;x86_64" "ndk;30.0.16248370"
           test -c /dev/kvm
           sudo chmod a+rw /dev/kvm
-          printf 'no\n' | avdmanager create avd -n vortx-tools -k "system-images;android-35;google_apis;x86_64"
+          avd_root="$(mktemp -d "$RUNNER_TEMP/tools-android.XXXXXXXX")"
+          export ANDROID_USER_HOME="$avd_root/user"
+          export ANDROID_AVD_HOME="$ANDROID_USER_HOME/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          avdmanager create avd --name vortx-tools --package "system-images;android-35;google_apis;x86_64" \
+            --device pixel_2 --path "$ANDROID_AVD_HOME/vortx-tools.avd" </dev/null
+          test -s "$ANDROID_AVD_HOME/vortx-tools.avd/config.ini"
+          test -s "$ANDROID_AVD_HOME/vortx-tools.ini"
+          grep -Fxq "path=$ANDROID_AVD_HOME/vortx-tools.avd" "$ANDROID_AVD_HOME/vortx-tools.ini"
+          listed_avds="$("$ANDROID_HOME/emulator/emulator" -list-avds)"
+          grep -Fxq vortx-tools <<<"$listed_avds"
+          printf 'ANDROID_USER_HOME=%s\nANDROID_AVD_HOME=%s\n' "$ANDROID_USER_HOME" "$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
 
       - name: Run the recovery tools instrumentation suite
         timeout-minutes: 22
@@ -560,15 +576,21 @@ jobs:
           ANDROID_SERIAL: emulator-5554
         run: |
           set -euo pipefail
+          test -s "$ANDROID_AVD_HOME/vortx-tools.ini"
           test ! -e app/build/outputs/androidTest-results/connected
           "$ANDROID_HOME/emulator/emulator" -avd vortx-tools -port 5554 -accel on -gpu swiftshader \
             -no-window -no-audio -no-boot-anim -no-snapshot > "$RUNNER_TEMP/tools-emulator.log" 2>&1 &
           emulator_pid=$!
           trap 'timeout 10s adb emu kill >/dev/null 2>&1 || kill "$emulator_pid" 2>/dev/null || true' EXIT
           if ! timeout 240s bash -c '
-            adb wait-for-device
-            until [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" = 1 ]; do sleep 2; done
-          '; then
+            set -euo pipefail
+            while kill -0 "$1" 2>/dev/null; do
+              ready="$(timeout 5s adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r" || true)"
+              if [ "$ready" = 1 ]; then exit 0; fi
+              sleep 2
+            done
+            exit 1
+          ' _ "$emulator_pid"; then
             tail -n 40 "$RUNNER_TEMP/tools-emulator.log"
             exit 1
           fi

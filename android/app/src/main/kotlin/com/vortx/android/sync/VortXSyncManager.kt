@@ -1024,9 +1024,42 @@ class VortXSyncManager internal constructor(
         val pairingID: String,
         val code: String,
         val devicePublicKey: String,
-        internal val ephemeralPrivateKey: ByteArray,
+        private val ephemeralPrivateKey: ByteArray,
         internal val operation: SessionOperationCoordinator.AuthOperation,
-    )
+        private val startedAtNanos: Long = System.nanoTime(),
+    ) : AutoCloseable {
+        internal class Approval(val token: String, val payload: String) {
+            override fun toString() = "QrApproval(redacted)"
+        }
+
+        internal val pollLock = Mutex()
+        @Volatile private var closed = false
+        private var approval: Approval? = null
+
+        internal fun isOpen() = !closed
+        internal fun isExpired() = System.nanoTime() - startedAtNanos >= QR_JOIN_MAX_AGE_NANOS
+
+        @Synchronized internal fun currentApproval() = approval
+
+        @Synchronized internal fun retainApproval(token: String, payload: String): Approval? =
+            if (closed) null else Approval(token, payload).also { approval = it }
+
+        @Synchronized internal fun unwrap(approved: Approval): ByteArray? =
+            if (closed || approval !== approved) null else unwrapQrPayload(approved.payload, ephemeralPrivateKey)
+
+        /** Entered only from the original auth operation's commit. Close uses this monitor alone. */
+        @Synchronized internal fun admitAdoption(approved: Approval, callerIsActive: () -> Boolean,
+            replace: () -> Boolean): Boolean? {
+            if (closed || approval !== approved || isExpired() || !callerIsActive()) return null
+            return replace()
+        }
+
+        @Synchronized override fun close() {
+            closed = true
+            approval = null
+            ephemeralPrivateKey.fill(0)
+        }
+    }
 
     sealed interface QrJoinResult {
         data object Pending : QrJoinResult
@@ -1280,6 +1313,25 @@ class VortXSyncManager internal constructor(
     internal val interactiveReconcileOwner: StateFlow<PickerAccountSnapshot?> = _interactiveReconcileOwner.asStateFlow()
     private val interactiveProbeMutex = Mutex()
     @Volatile private var upgradeRequiredLease: SyncSessionLease? = null
+    @Volatile private var rejectedBackupBearer: Pair<SyncSessionLease, String>? = null
+
+    private fun backupWritesRequireSignIn(lease: SyncSessionLease): Boolean {
+        val (original, bearer) = rejectedBackupBearer ?: return false
+        return original.operationGeneration == lease.operationGeneration && original.ownerEpoch == lease.ownerEpoch &&
+            original.accountId == lease.accountId && lease.currentBearer() == bearer
+    }
+
+    private fun markBackupSignInRequired(lease: SyncSessionLease, sentBearer: String) {
+        var firstNotice = false
+        publishIfSyncLeaseCurrent(lease) {
+            if (lease.currentBearer() == sentBearer && !requiresUpgrade(lease)) {
+                firstNotice = !backupWritesRequireSignIn(lease)
+                rejectedBackupBearer = lease to sentBearer
+                _syncProblem.value = BACKUP_SIGN_IN_REQUIRED
+            }
+        }
+        if (firstNotice) DiagnosticsLog.log("native-account", "sync result=failed reason=backup_sign_in_required")
+    }
 
     private fun requiresUpgrade(lease: SyncSessionLease): Boolean {
         val blocked = upgradeRequiredLease ?: return false
@@ -1297,7 +1349,7 @@ class VortXSyncManager internal constructor(
     private fun markNativeAccountUnavailable(lease: SyncSessionLease, gateway: NativeAccountGateway) {
         var firstNotice = false
         publishIfSyncLeaseCurrent(lease) {
-            if (nativeGateway === gateway && !requiresUpgrade(lease)) {
+            if (nativeGateway === gateway && !requiresUpgrade(lease) && !backupWritesRequireSignIn(lease)) {
                 firstNotice = _syncProblem.value != NATIVE_ACCOUNT_UNAVAILABLE
                 _syncProblem.value = NATIVE_ACCOUNT_UNAVAILABLE
             }
@@ -1789,6 +1841,7 @@ class VortXSyncManager internal constructor(
         pendingState.resetTransient()?.cancel()
         applyingRemote = false
         upgradeRequiredLease = null
+        rejectedBackupBearer = null
         _syncProblem.value = null
     }
 
@@ -2143,64 +2196,89 @@ class VortXSyncManager internal constructor(
     suspend fun qrStart(): QrJoinSession? {
         val operation = beginAuthOperation()
         val ephemeral = VortXPairingCrypto.newEphemeral()
-        val permit = operation.acquireCallPermit() ?: return null
-        val (status, json) = request(
-            method = "POST",
-            path = "/v1/qr/start",
-            body = JSONObject().put("devicePublicKey", ephemeral.publicKeyBase64URL),
-            callPermit = permit,
-        )
-        if (!operation.isCurrent() || status != 200) return null
-        val pairingID = json?.optString("pairingID")?.takeIf { it.isNotBlank() } ?: return null
-        val code = json.optString("code").takeIf { it.isNotBlank() } ?: return null
-        return QrJoinSession(
-            pairingID = pairingID,
-            code = code.uppercase(),
-            devicePublicKey = ephemeral.publicKeyBase64URL,
-            ephemeralPrivateKey = ephemeral.privateKey,
-            operation = operation,
-        )
+        val startedAtNanos = System.nanoTime()
+        var transferred = false
+        try {
+            val permit = operation.acquireCallPermit() ?: return null
+            val (status, json) = request(
+                method = "POST",
+                path = "/v1/qr/start",
+                body = JSONObject().put("devicePublicKey", ephemeral.publicKeyBase64URL),
+                callPermit = permit,
+            )
+            currentCoroutineContext().ensureActive()
+            if (!operation.isCurrent() || status != 200) return null
+            val pairingID = json?.optString("pairingID")?.takeIf { it.isNotBlank() } ?: return null
+            val code = json.optString("code").takeIf { it.isNotBlank() } ?: return null
+            return QrJoinSession(pairingID, code.uppercase(), ephemeral.publicKeyBase64URL,
+                ephemeral.privateKey, operation, startedAtNanos).also { transferred = true }
+        } finally {
+            if (!transferred) ephemeral.privateKey.fill(0)
+        }
     }
 
     /** Poll once, adopting only after the approved payload decrypts to a valid 32-byte data key. */
     suspend fun qrPoll(session: QrJoinSession, completion: PickerAuthCompletion? = null): QrJoinResult {
-        val statusPermit = session.operation.acquireCallPermit() ?: return QrJoinResult.Failed
-        val encodedID = URLEncoder.encode(session.pairingID, Charsets.UTF_8.name())
-        val (status, json) = request(
-            method = "GET",
-            path = "/v1/qr/status?id=$encodedID",
-            body = null,
-            callPermit = statusPermit,
-        )
-        if (!session.operation.isCurrent()) return QrJoinResult.Failed
-        val token = json?.optString("token")?.takeIf { it.isNotBlank() }
-        val payload = json?.optString("payload")?.takeIf { it.isNotBlank() }
-        val approved = token != null && payload != null && !json.optBoolean("pending", false)
-        when (qrPollDisposition(status, approved)) {
-            QrPollDisposition.EXPIRED -> return QrJoinResult.Expired
-            QrPollDisposition.RETRIABLE_ERROR -> return QrJoinResult.TransportError
-            QrPollDisposition.PENDING -> return QrJoinResult.Pending
-            QrPollDisposition.READY -> Unit
+        val caller = currentCoroutineContext()[Job]
+        if (!session.pollLock.tryLock()) return QrJoinResult.Pending
+        try {
+            return pollQrJoin(session, completion) { caller?.isActive != false }
+        } finally {
+            if (caller?.isActive == false) session.close()
+            session.pollLock.unlock()
+        }
+    }
+
+    private suspend fun pollQrJoin(session: QrJoinSession, completion: PickerAuthCompletion?,
+        callerIsActive: () -> Boolean): QrJoinResult {
+        fun terminal(result: QrJoinResult): QrJoinResult {
+            session.close()
+            return result
+        }
+        fun inactive(): QrJoinResult? = when {
+            !callerIsActive() || !session.isOpen() || !session.operation.isCurrent() -> QrJoinResult.Failed
+            session.isExpired() -> QrJoinResult.Expired
+            else -> null
+        }
+        inactive()?.let { return terminal(it) }
+        // The server consumes the approval when it delivers /status. Keep it in this live
+        // operation so account lookup can retry without asking the relay to deliver it again.
+        val approval = session.currentApproval() ?: run {
+            val permit = session.operation.acquireCallPermit() ?: return terminal(QrJoinResult.Failed)
+            val encodedID = URLEncoder.encode(session.pairingID, Charsets.UTF_8.name())
+            val (status, json) = request("GET", "/v1/qr/status?id=$encodedID", null, callPermit = permit,
+                candidateCurrent = { inactive() == null })
+            inactive()?.let { return terminal(it) }
+            val token = (json?.opt("token") as? String)?.takeIf { it.isNotBlank() }
+            val payload = (json?.opt("payload") as? String)?.takeIf { it.isNotBlank() }
+            when (qrPollDisposition(status, token != null && payload != null && json?.optBoolean("pending", false) != true)) {
+                QrPollDisposition.EXPIRED -> return terminal(QrJoinResult.Expired)
+                QrPollDisposition.RETRIABLE_ERROR -> return QrJoinResult.TransportError
+                QrPollDisposition.PENDING -> return QrJoinResult.Pending
+                QrPollDisposition.READY -> Unit
+            }
+            session.retainApproval(checkNotNull(token), checkNotNull(payload)) ?: return terminal(QrJoinResult.Failed)
         }
 
-        val dataKey = unwrapQrPayload(payload.orEmpty(), session.ephemeralPrivateKey)
-            ?: return QrJoinResult.Failed
-        val mePermit = session.operation.acquireCallPermit() ?: return QrJoinResult.Failed
-        val (meStatus, meJson) = request(
-            method = "GET",
-            path = "/v1/auth/me",
-            body = null,
-            bearerToken = token,
-            callPermit = mePermit,
-        )
-        if (!session.operation.isCurrent()) return QrJoinResult.Failed
-        val account = meJson?.optJSONObject("account")
-        if (meStatus != 200 || account == null) return QrJoinResult.Failed
-        return when (adopt(session.operation, token.orEmpty(), account, dataKey, completion)) {
-            SessionAdoption.ADOPTED -> QrJoinResult.SignedIn(account.optString("email"))
-            SessionAdoption.STALE,
-            SessionAdoption.STORAGE_FAILURE,
-            -> QrJoinResult.Failed
+        val dataKey = session.unwrap(approval) ?: return terminal(QrJoinResult.Failed)
+        var adopted = false
+        try {
+            val permit = session.operation.acquireCallPermit() ?: return terminal(QrJoinResult.Failed)
+            val (status, json) = request("GET", "/v1/auth/me", null, bearerToken = approval.token,
+                callPermit = permit, candidateCurrent = { inactive() == null })
+            inactive()?.let { return terminal(it) }
+            if (retryableQrStatus(status)) return QrJoinResult.TransportError
+            val account = json?.optJSONObject("account")
+            if (status != 200 || account == null || (account.opt("id") as? String).isNullOrBlank()) {
+                return terminal(QrJoinResult.Failed)
+            }
+            val adoption = adopt(session.operation, approval.token, account, dataKey, completion, qrAdmission = { replace ->
+                session.admitAdoption(approval, callerIsActive, replace)
+            })
+            adopted = adoption == SessionAdoption.ADOPTED
+            return terminal(if (adopted) QrJoinResult.SignedIn(account.optString("email")) else QrJoinResult.Failed)
+        } finally {
+            if (!adopted) dataKey.fill(0)
         }
     }
 
@@ -2553,6 +2631,7 @@ class VortXSyncManager internal constructor(
     internal fun replaceSyncSessionTestSeam(session: Session) {
         operations.invalidate {
             upgradeRequiredLease = null
+            rejectedBackupBearer = null
             _syncProblem.value = null
             sessionState.restore(session)
             bindLibraryAccount(session.account.id)
@@ -3264,6 +3343,7 @@ class VortXSyncManager internal constructor(
         if (!routineSyncAllowed(lease) || !publicationCurrent()) return SyncDocPull.Failed
         val callPermit = acquireSyncCallPermit(lease) ?: return SyncDocPull.Failed
         var etag: String? = null
+        var sentBearer: String? = null
         val (code, json) = request(
             "GET",
             "/v1/backup",
@@ -3273,6 +3353,7 @@ class VortXSyncManager internal constructor(
             ifNoneMatch = ifNoneMatch?.let { "\"$it\"" },
             receiveETag = { etag = it },
             candidateCurrent = publicationCurrent,
+            observeSentBearer = { sentBearer = it },
         )
         if (!isSyncLeaseCurrent(lease) || !publicationCurrent()) return SyncDocPull.Failed
         if (code == 304) return if (ifNoneMatch != null && etag == "\"$ifNoneMatch\"")
@@ -3286,6 +3367,7 @@ class VortXSyncManager internal constructor(
                 isSyncLeaseCurrent(lease) && publicationCurrent()) SyncDocPull.Empty(BackupReadWitness(lease, null))
             else SyncDocPull.Failed
         }
+        if (code == 401) sentBearer?.let { markBackupSignInRequired(lease, it) }
         if (code != 200) return SyncDocPull.Failed                // network/server error: do not clobber
         val body = json ?: return SyncDocPull.Failed
         val docStr = (body.opt("document") as? String)?.takeIf { it.isNotEmpty() } ?: return SyncDocPull.Failed
@@ -3328,7 +3410,8 @@ class VortXSyncManager internal constructor(
         publicationCurrent: () -> Boolean = { true },
         beforeSubmit: (suspend (String, JSONObject) -> Boolean)? = null,
     ): PushOutcome {
-        if (!candidateHealthIsCurrent(lease, candidate) || !publicationCurrent() || requiresUpgrade(lease)) return PushOutcome.Error
+        if (!candidateHealthIsCurrent(lease, candidate) || !publicationCurrent() ||
+            requiresUpgrade(lease) || backupWritesRequireSignIn(lease)) return PushOutcome.Error
         val version = BackupRevisionPolicy.next(candidate.witness.baseRevision) ?: return PushOutcome.Error
         val plaintext = candidate.plaintext.toByteArray(Charsets.UTF_8)
         // An authenticated v2 head stays v2 even while upgrades of legacy accounts are disabled.
@@ -3348,12 +3431,14 @@ class VortXSyncManager internal constructor(
             .put("baseRevision", candidate.witness.baseRevision ?: JSONObject.NULL)
         if (beforeSubmit != null && !beforeSubmit(ciphertext, body)) return PushOutcome.Error
         val callPermit = acquireSyncCallPermit(lease) ?: return PushOutcome.Error
+        var sentBearer: String? = null
         val (code, json) = request(
             "PUT",
             "/v1/backup",
             body,
             bearerToken = lease.token,
             callPermit = callPermit,
+            observeSentBearer = { sentBearer = it },
             candidateCurrent = {
                 candidateIsCurrent(lease, candidate) && publicationCurrent() &&
                     (!sawDocV2(lease.accountId) || (writeV2 && candidate.witness.baseRevision != null))
@@ -3366,6 +3451,7 @@ class VortXSyncManager internal constructor(
             markUpgradeRequired(lease)
             return PushOutcome.UpgradeRequired
         }
+        if (code == 401) sentBearer?.let { markBackupSignInRequired(lease, it) }
         if (code != 200) return PushOutcome.Error
         val accepted = json?.opt("accepted") as? Boolean ?: return PushOutcome.Error
         if (accepted) {
@@ -3634,10 +3720,11 @@ class VortXSyncManager internal constructor(
     }
 
     private suspend fun syncUp(lease: SyncSessionLease): Boolean = accountFileManagedWriter(false) {
-        if (!routineSyncAllowed(lease) || requiresUpgrade(lease)) return@accountFileManagedWriter false
+        if (!routineSyncAllowed(lease) || requiresUpgrade(lease) || backupWritesRequireSignIn(lease))
+            return@accountFileManagedWriter false
         return@accountFileManagedWriter try { withContext(nativeWorkDispatcher) {
             nativeSyncMutex.withLock {
-                if (!routineSyncAllowed(lease)) return@withLock false
+                if (!routineSyncAllowed(lease) || backupWritesRequireSignIn(lease)) return@withLock false
                 val gateway = nativeGateway ?: return@withLock false
                 runNativeAccountAttempt(onUnavailable = { markNativeAccountUnavailable(lease, gateway) }) {
                     nativeSyncUp(lease, gateway)
@@ -4530,8 +4617,8 @@ class VortXSyncManager internal constructor(
         }
         claim.replacedJob?.cancel()
         // Already-observed edits retain their marker. Only a resumed routine lease starts delivery.
-        if (!routineSyncAllowed(lease) || interactiveSetupPending(lease) || requiresUpgrade(lease))
-            return@accountFileManagedWriter claim.blockPull
+        if (!routineSyncAllowed(lease) || interactiveSetupPending(lease) || requiresUpgrade(lease) ||
+            backupWritesRequireSignIn(lease)) return@accountFileManagedWriter claim.blockPull
         val attempt = claim.attemptToStart ?: return@accountFileManagedWriter claim.blockPull
 
         val job = scope.launch(start = CoroutineStart.LAZY) {
@@ -4544,6 +4631,7 @@ class VortXSyncManager internal constructor(
                     isActive &&
                         isSyncLeaseCurrent(lease) &&
                         !requiresUpgrade(lease) &&
+                        !backupWritesRequireSignIn(lease) &&
                         pendingState.owns(attempt, runningJob)
                 },
                 // The loop's delay is the ordinary debounce until an upload fails, then its backoff.
@@ -4907,6 +4995,7 @@ class VortXSyncManager internal constructor(
         recoveryIntent: PickerFileRecoverySignIn? = null,
         recoveryCaller: Job? = null,
         recoveryAttemptCurrent: (() -> Boolean)? = null,
+        qrAdmission: ((() -> Boolean) -> Boolean?)? = null,
     ): SessionAdoption {
         val account = Account(
             id = acct.optString("id"),
@@ -4915,7 +5004,7 @@ class VortXSyncManager internal constructor(
             twoFactorEnabled = acct.optBoolean("twoFactorEnabled", false),
         )
         val s = Session(token, account, dataKey)
-        var recoveryRetired = false
+        var admissionRetired = false
         val adoption = when (
             val result = operation.commitSessionMutation(
                 onCommitted = ::cancelSessionWork,
@@ -4923,27 +5012,33 @@ class VortXSyncManager internal constructor(
                 if (recoveryIntent != null &&
                     (recoveryCaller?.isActive == false || recoveryAttemptCurrent?.invoke() != true ||
                         !pickerFileRecoveryIntentCurrent(recoveryIntent))) {
-                    recoveryRetired = true
+                    admissionRetired = true
                     return@commitSessionMutation false
                 }
-                sessionState.replace(s) {
-                    publishPickerFileRecoverySession(s.takeIf { recoveryIntent != null })
-                    interactiveSetupSession = s.takeIf { completion != null && recoveryIntent == null }
-                    claimedReconcileOwner = null
-                    _interactiveReconcileOwner.value = null
-                    nativeGateway?.retire()
-                    bindLibraryAccount(account.id)
-                    AddonTombstones.activateAccount(account.id)
-                    AddonPrefsStore.activateAccount(account.id)
-                    _account.value = account
-                    publishSessionUiState(SessionUiState.SignedIn(account))
-                    completion?.record(capturePickerCompletionOwner())
+                val replace = {
+                    sessionState.replace(s) {
+                        publishPickerFileRecoverySession(s.takeIf { recoveryIntent != null })
+                        interactiveSetupSession = s.takeIf { completion != null && recoveryIntent == null }
+                        claimedReconcileOwner = null
+                        _interactiveReconcileOwner.value = null
+                        nativeGateway?.retire()
+                        bindLibraryAccount(account.id)
+                        AddonTombstones.activateAccount(account.id)
+                        AddonPrefsStore.activateAccount(account.id)
+                        _account.value = account
+                        publishSessionUiState(SessionUiState.SignedIn(account))
+                        completion?.record(capturePickerCompletionOwner())
+                    }
+                }
+                if (qrAdmission == null) replace() else qrAdmission(replace) ?: run {
+                    admissionRetired = true
+                    false
                 }
             }
         ) {
             is SessionMutationResult.Applied ->
                 if (result.value) SessionAdoption.ADOPTED
-                else if (recoveryRetired) SessionAdoption.STALE else SessionAdoption.STORAGE_FAILURE
+                else if (admissionRetired) SessionAdoption.STALE else SessionAdoption.STORAGE_FAILURE
             SessionMutationResult.Stale -> SessionAdoption.STALE
         }
         if (adoption == SessionAdoption.ADOPTED && completion == null && recoveryIntent == null) {
@@ -4986,7 +5081,11 @@ class VortXSyncManager internal constructor(
                 ?: store.renew(owner, captured.sentToken, captured.ownerEpoch, next)
             if (saved && permit.isCurrent() && sessionState.value === owner &&
                 sessionState.ownerEpoch == captured.ownerEpoch && owner.dataKey.contentEquals(captured.dataKey)) {
-                owner.publishConfirmedRenewal(captured.sentToken, next)
+                if (owner.publishConfirmedRenewal(captured.sentToken, next) &&
+                    rejectedBackupBearer?.second == captured.sentToken) {
+                    rejectedBackupBearer = null
+                    if (_syncProblem.value == BACKUP_SIGN_IN_REQUIRED) _syncProblem.value = null
+                }
             }
         } }
     }
@@ -5029,9 +5128,11 @@ class VortXSyncManager internal constructor(
         receiveETag: ((String?) -> Unit)? = null,
         candidateCurrent: () -> Boolean = { true },
         accountFileDownload: AccountFileDownload? = null,
+        observeSentBearer: ((String?) -> Unit)? = null,
     ): Pair<Int, JSONObject?> {
         val renewalCapture = captureSessionRenewal(bearerToken, callPermit)
         val effectiveBearer = renewalCapture?.sentToken ?: bearerToken
+        observeSentBearer?.invoke(effectiveBearer)
         sessionRenewalTransportTestSeam?.let { transport ->
             try {
                 if (!callPermit.isCurrent() || !candidateCurrent()) return 0 to null
@@ -5106,7 +5207,7 @@ class VortXSyncManager internal constructor(
                         // The session bearer for the backup/sync endpoints. `api.vortx.tv` is the account-authed
                         // host and is deliberately NOT edge-signed (excluded from VortXEdgeAuth's gate).
                         // Never follow a response to another origin with a stored bearer.
-                        if (renewalCapture != null) instanceFollowRedirects = false
+                        if (effectiveBearer != null) instanceFollowRedirects = false
                         effectiveBearer?.let { setRequestProperty("authorization", "Bearer $it") }
                         if (method == "GET" && path == "/v1/backup") ifNoneMatch?.let { setRequestProperty("If-None-Match", it) }
                         if (bodyBytes != null) {
@@ -5145,6 +5246,8 @@ class VortXSyncManager internal constructor(
                         accountFileDownload.response = raw
                         return@withContext status to null
                     }
+                    // Backup authorization is conclusive even when the error body is missing.
+                    if (path == "/v1/backup" && status == 401) return@withContext 401 to null
                     if (status == 304) return@withContext if (emptyNotModified) 304 to null else 0 to null
                     val stream = if (status in 200..399) opened.inputStream else opened.errorStream
                     val text = try { stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty() }
@@ -5344,9 +5447,14 @@ class VortXSyncManager internal constructor(
     }
 
     companion object {
+        private const val QR_JOIN_MAX_AGE_NANOS = 240_000_000_000L
+
+        private fun retryableQrStatus(status: Int): Boolean =
+            status == 0 || status == 408 || status == 429 || status >= 500
+
         internal fun qrPollDisposition(status: Int, hasApproval: Boolean): QrPollDisposition = when {
             status == 404 || status == 410 -> QrPollDisposition.EXPIRED
-            status == 0 || status == 429 || status >= 500 -> QrPollDisposition.RETRIABLE_ERROR
+            retryableQrStatus(status) -> QrPollDisposition.RETRIABLE_ERROR
             status == 200 && hasApproval -> QrPollDisposition.READY
             else -> QrPollDisposition.PENDING
         }
@@ -5371,6 +5479,7 @@ class VortXSyncManager internal constructor(
             "Secure storage is unavailable. Your VortX session was not changed. Please try again."
         private const val AUTH_SUPERSEDED =
             "This account action was superseded by a newer sign-in or sign-out."
+        private const val BACKUP_SIGN_IN_REQUIRED = "Sign in to this VortX account again to resume sync. Your saved data and pending changes are preserved."
         private const val NATIVE_ACCOUNT_UNAVAILABLE =
             "The native engine is unavailable or incompatible. Your saved data and pending changes are preserved. Update VortX or export diagnostics, then retry sync."
 

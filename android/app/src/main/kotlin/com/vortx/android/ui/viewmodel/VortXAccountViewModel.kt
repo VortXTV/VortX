@@ -331,39 +331,41 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
                 _qrJoinState.value = VortXQrJoinState.Failed
                 return
             }
-            val mintedAt = System.currentTimeMillis()
-            val reducer = QrJoinerReducer()
-            val approvalUrl = vortxApprovalUrl(session.code, session.devicePublicKey)
-            _qrJoinState.value = VortXQrJoinState.Waiting(session.code, approvalUrl, false)
+            session.use {
+                val mintedAt = System.currentTimeMillis()
+                val reducer = QrJoinerReducer()
+                val approvalUrl = vortxApprovalUrl(session.code, session.devicePublicKey)
+                _qrJoinState.value = VortXQrJoinState.Waiting(session.code, approvalUrl, false)
 
-            var remint = false
-            while (currentCoroutineContext().isActive && !remint) {
-                delay(QR_POLL_INTERVAL_MS)
-                val completion = PickerAuthCompletion()
-                when (
-                    val action = reducer.onResult(
-                        sync.qrPoll(session, completion),
-                        System.currentTimeMillis() - mintedAt,
-                    )
-                ) {
-                    is QrJoinerAction.KeepWaiting ->
-                        _qrJoinState.value = VortXQrJoinState.Waiting(
-                            session.code,
-                            approvalUrl,
-                            action.reachTrouble,
+                var remint = false
+                while (currentCoroutineContext().isActive && !remint) {
+                    delay(QR_POLL_INTERVAL_MS)
+                    val completion = PickerAuthCompletion()
+                    when (
+                        val action = reducer.onResult(
+                            sync.qrPoll(session, completion),
+                            System.currentTimeMillis() - mintedAt,
                         )
-                    QrJoinerAction.Remint -> remint = true
-                    QrJoinerAction.Failed -> {
-                        _qrJoinState.value = VortXQrJoinState.Failed
-                        return
-                    }
-                    is QrJoinerAction.SignedIn -> {
-                        // Adoption updates sessionUiState immediately, which removes this QR composable.
-                        // Detach the current job first so its onDispose does not cancel reconciliation.
-                        qrJoinJob = null
-                        _qrJoinState.value = VortXQrJoinState.SignedIn(action.email)
-                        onQrAuthed(completion.owner)
-                        return
+                    ) {
+                        is QrJoinerAction.KeepWaiting ->
+                            _qrJoinState.value = VortXQrJoinState.Waiting(
+                                session.code,
+                                approvalUrl,
+                                action.reachTrouble,
+                            )
+                        QrJoinerAction.Remint -> remint = true
+                        QrJoinerAction.Failed -> {
+                            _qrJoinState.value = VortXQrJoinState.Failed
+                            return
+                        }
+                        is QrJoinerAction.SignedIn -> {
+                            // Adoption updates sessionUiState immediately, which removes this QR composable.
+                            // Detach the current job first so its onDispose does not cancel reconciliation.
+                            qrJoinJob = null
+                            _qrJoinState.value = VortXQrJoinState.SignedIn(action.email)
+                            onQrAuthed(completion.owner)
+                            return
+                        }
                     }
                 }
             }

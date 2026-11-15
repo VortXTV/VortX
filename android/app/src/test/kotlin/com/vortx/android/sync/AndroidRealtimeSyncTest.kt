@@ -178,7 +178,9 @@ class AndroidRealtimeSyncTest {
         var gets = 0
         var puts = 0
         var putFails = false
+        var putFailureStatus = 500
         var getFails = false
+        var getFailureStatus = 500
         var beforePut: (() -> Unit)? = null
         var getGate: CompletableDeferred<Unit>? = null
         val tokens = mutableListOf<String?>()
@@ -204,11 +206,11 @@ class AndroidRealtimeSyncTest {
         suspend fun backupRequest(method: String, body: JSONObject?): Pair<Int, JSONObject?> =
             if (method == "GET") {
                 gets++; getGate?.await()
-                if (getFails) 500 to null else 200 to JSONObject().put("version", version).put("document",
+                if (getFails) getFailureStatus to null else 200 to JSONObject().put("version", version).put("document",
                     VortXCrypto.sealDocument(key, cloud.toString().toByteArray(), account.id, version, true))
             } else {
                 puts++; beforePut?.invoke()
-                if (putFails) 500 to null else {
+                if (putFails) putFailureStatus to null else {
                     val sent = requireNotNull(body)
                     version = sent.getLong("version")
                     cloud = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key, sent.getString("document"), account.id, version))))
@@ -1305,6 +1307,41 @@ class AndroidRealtimeSyncTest {
             assertTrue(merged.getBoolean("local-library"))
             assertTrue(merged.getBoolean("cloud-library"))
         } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun `read only grace backup keeps local edits and stops rejected upload retries`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            assertTrue(f.manager.syncDown(force = true))
+            f.putFails = true
+            f.putFailureStatus = 401
+            f.edit("local-unsent")
+            advanceTimeBy(2_501L)
+            runCurrent()
+
+            assertEquals(1, f.puts)
+            assertEquals(account, f.manager.currentSession()?.account)
+            assertTrue(f.dirty())
+            assertTrue(f.gateway.carrier.getJSONObject("facts").getBoolean("local-unsent"))
+            assertTrue(f.manager.syncProblem.value.orEmpty().contains("Sign in to this VortX account again"))
+            advanceTimeBy(180_000L)
+            runCurrent()
+            assertEquals(1, f.puts)
+            assertTrue(f.dirty())
+        } finally { f.close() }
+    }
+
+    @Test fun `backup read rejects the expired login without clearing the signed in account`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            f.getFails = true
+            f.getFailureStatus = 401
+            assertFalse(f.manager.syncDown(force = true))
+            assertEquals(account, f.manager.currentSession()?.account)
+            assertTrue(f.manager.syncProblem.value.orEmpty().contains("Sign in to this VortX account again"))
+            assertEquals(0, f.puts)
+            assertEquals(0, f.gateway.applied)
+        } finally { f.close() }
     }
 
     @Test fun `interactive restore retries after its original pending edit uploads`() = test {
