@@ -1625,9 +1625,17 @@ fun PlayerScreen(
     // The auto-hide countdown: runs only while the controls are up and playback is actually rolling.
     // Paused, buffering, or errored playback keeps the controls on screen (hiding them over a stall or a
     // dead frame would look like a hang); any state flip or interaction tick restarts the countdown.
-    LaunchedEffect(controlsVisible, controlsInteractionTick, playerState.isPaused, playerState.isBuffering, effectiveError) {
-        if (!controlsVisible || playerState.isPaused || playerState.isBuffering || effectiveError) return@LaunchedEffect
-        delay(CONTROLS_AUTO_HIDE_MS)
+    // On TV, let the viewer finish using a control sheet before restarting the countdown.
+    val tvControlSheetOpen = isTvPlayer && controlSheet.value != ControlSheet.NONE
+    val controlsAutoHideMs = if (isTvPlayer) TV_CONTROLS_AUTO_HIDE_MS else CONTROLS_AUTO_HIDE_MS
+    LaunchedEffect(
+        controlsVisible, controlsInteractionTick, playerState.isPaused, playerState.isBuffering,
+        effectiveError, tvControlSheetOpen, controlsAutoHideMs,
+    ) {
+        if (!controlsVisible || playerState.isPaused || playerState.isBuffering || effectiveError || tvControlSheetOpen) {
+            return@LaunchedEffect
+        }
+        delay(controlsAutoHideMs)
         controlsVisible = false
     }
 
@@ -2451,6 +2459,15 @@ fun PlayerScreen(
     fun keyboardOverlayOpen() = controlSheet.value != ControlSheet.NONE || showSkipEditor || partyPanelOpen ||
         castChooserOpen || castOwned || stillWatchingPrompt
     val overlayOpen = keyboardOverlayOpen()
+    // Once the TV player is mounted, Back clears its visible chrome before leaving playback.
+    // Child sheets handle their own Back. The earlier exit handler still covers startup.
+    BackHandler(enabled = isTvPlayer && !playerExitRequested) {
+        if (controlsVisible && !controlsLocked && !pip.isInPip && !effectiveError && !keyboardOverlayOpen()) {
+            controlsVisible = false
+        } else {
+            exitPlayer()
+        }
+    }
     LaunchedEffect(controlsVisible, overlayOpen) {
         // Phone/tablet has no TV chrome focus parking, so the video receives keys immediately on entry
         // and again after a sheet closes. While an overlay is open, leave its focus where it belongs.
@@ -3397,8 +3414,8 @@ internal tailrec fun Context.findActivity(): Activity? = when (this) {
 private const val CAST_PROGRESS_WRITEBACK_MS = 5_000L
 
 /// How long the chrome stays up with no interaction while playback is rolling before it auto-hides.
-/// 3.5s sits in the standard mobile-player band (3-4s); paused/buffering/error states never hide.
 private const val CONTROLS_AUTO_HIDE_MS = 3_500L
+private const val TV_CONTROLS_AUTO_HIDE_MS = 3_000L
 
 /// How long the locked player's "Tap to unlock" pill stays up after each reveal. Shorter than the
 /// chrome's auto-hide: while locked the whole point is an undisturbed frame.

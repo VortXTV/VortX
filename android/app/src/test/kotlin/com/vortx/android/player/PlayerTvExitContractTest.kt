@@ -22,6 +22,30 @@ class PlayerTvExitContractTest {
     }
 
     @Test
+    fun `mounted TV Back hides the controls before leaving the player`() {
+        val screen = source("src/main/kotlin/com/vortx/android/player/PlayerScreen.kt")
+        val tvBack = "BackHandler(enabled = isTvPlayer && !playerExitRequested)"
+        val handler = screen.substringAfter(tvBack, "").substringBefore("LaunchedEffect(controlsVisible, overlayOpen)")
+
+        assertTrue(screen.indexOf(tvBack) > screen.indexOf("if (engine == null) {"))
+        assertTrue(screen.indexOf(tvBack) < screen.indexOf("            controlsVisible = controlsVisible &&"))
+        assertTrue(handler.contains("controlsVisible && !controlsLocked && !pip.isInPip && !effectiveError && !keyboardOverlayOpen()"))
+        assertTrue(handler.contains("controlsVisible = false\n        } else {\n            exitPlayer()"))
+    }
+
+    @Test
+    fun `TV auto-hide restarts when the control sheet closes and uses three seconds`() {
+        val screen = source("src/main/kotlin/com/vortx/android/player/PlayerScreen.kt")
+
+        assertTrue(screen.contains("tvControlSheetOpen = isTvPlayer && controlSheet.value != ControlSheet.NONE"))
+        assertTrue(screen.contains("if (isTvPlayer) TV_CONTROLS_AUTO_HIDE_MS else CONTROLS_AUTO_HIDE_MS"))
+        assertTrue(screen.contains("effectiveError, tvControlSheetOpen, controlsAutoHideMs,"))
+        assertTrue(screen.contains("effectiveError || tvControlSheetOpen) {"))
+        assertTrue(screen.contains("delay(controlsAutoHideMs)"))
+        assertTrue(screen.contains("TV_CONTROLS_AUTO_HIDE_MS = 3_000L"))
+    }
+
+    @Test
     fun `original orientation survives in-player retry and Up Next session replacement`() {
         val screen = source("src/main/kotlin/com/vortx/android/player/PlayerScreen.kt")
 
