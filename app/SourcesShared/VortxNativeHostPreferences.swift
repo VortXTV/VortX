@@ -349,6 +349,10 @@ extension VortxNativeHostPreferences {
         case mergedAdmission = "merged_admission"
         case unknownWrapper = "unknown_wrapper"
         case equalEvent = "equal_event"
+        case equalEventEvidenceLimit = "equal_event_evidence_limit"
+        case equalEventMetadata = "equal_event_metadata"
+        case equalEventForYou = "equal_event_for_you"
+        case equalEventKnownPreference = "equal_event_known_preference"
     }
     /// Merge complete raw registers. Equal clock+actor must carry the same evidence, with
     /// numeric spelling compatibility limited to already-owned fields shared with Android.
@@ -406,8 +410,8 @@ extension VortxNativeHostPreferences {
             if let old = fields[name] {
                 let prior = try JSONDecoder().decode(Register.self, from: typedRegisterData(old, name: name))
                 if prior.clock == value.clock && prior.actor == value.actor {
-                    guard sameRawEvent(old, bytes, name: name, global: global) else {
-                        throw RawMergeFailure.equalEvent
+                    if let mismatch = rawEventMismatch(old, bytes, name: name, global: global) {
+                        throw mismatch
                     }
                 } else if value.clock > prior.clock || (value.clock == prior.clock && value.actor > prior.actor) {
                     fields.set(name, bytes)
@@ -416,20 +420,29 @@ extension VortxNativeHostPreferences {
         }
         left.set("fields", try fields.encoded()); return try left.encoded()
     }
-    private static func sameRawEvent(_ first: Data, _ second: Data, name: String, global: Bool) -> Bool {
-        if first == second { return true }
+    private static func rawEventMismatch(_ first: Data, _ second: Data, name: String,
+                                         global: Bool) -> RawMergeFailure? {
+        if first == second { return nil }
         guard let a = try? VortxRawHostRegister.boundedCanonical(first),
-              let b = try? VortxRawHostRegister.boundedCanonical(second) else { return false }
-        if a == b { return true }
-        // Canonical JSON here preserves number tokens and exact strings. Comparing its object
-        // slices recursively only relaxes the explicitly enumerated schema-owned numbers.
-        return (try? sameMembers(OwnerHistoryExactJSON.Object(a), OwnerHistoryExactJSON.Object(b)) { key, first, second in
-            switch key {
-            case "clock": return HostDecimal.same(first, second)
-            case "value": return try sameRawPreference(first, second, name: name, global: global, path: [])
-            default: return first == second
-            }
-        }) == true
+              let b = try? VortxRawHostRegister.boundedCanonical(second) else { return .equalEventEvidenceLimit }
+        if a == b { return nil }
+        guard let firstEvent = try? OwnerHistoryExactJSON.Object(a),
+              let secondEvent = try? OwnerHistoryExactJSON.Object(b),
+              let firstValue = firstEvent["value"], let secondValue = secondEvent["value"] else { return .equalEvent }
+        guard sameMembers(firstEvent, secondEvent, { key, first, second in
+            if key == "clock" { return HostDecimal.same(first, second) }
+            return key == "value" || first == second
+        }) else { return .equalEventMetadata }
+        if (try? sameRawPreference(firstValue, secondValue, name: name, global: global, path: [])) == true {
+            return nil
+        }
+        // Fixed categories identify the guard without logging field names, IDs or values.
+        if !global && (name == forYouPrefix + "interests" || isForYouCollection(name)) { return .equalEventForYou }
+        if global ? globalIntegers.contains(name) :
+            (name == "playback" || name == "discovery" || name.hasPrefix(VortxNativeWatchlist.prefix)) {
+            return .equalEventKnownPreference
+        }
+        return .equalEvent
     }
     private static func sameMembers(_ a: OwnerHistoryExactJSON.Object, _ b: OwnerHistoryExactJSON.Object,
                                     _ equal: (String, Data, Data) throws -> Bool) rethrows -> Bool {
@@ -457,18 +470,69 @@ extension VortxNativeHostPreferences {
             }
         }
         let collection = isForYouCollection(name)
+        let interests = name == forYouPrefix + "interests"
+        if (interests && path == ["people"]) || (collection && path == ["rules", "people"]) {
+            return try sameRawPeople(first, second)
+        }
         if collection, path == ["createdAt"] ||
             path.count == 2 && path[0] == "rules" && ["yearFrom", "yearTo", "minRating"].contains(path[1]) {
             return HostDecimal.same(first, second)
         }
-        // The only owned nested numeric paths are the collection's rules. Unknown metadata,
-        // unknown preference names, and future nested members keep exact numeric evidence.
+        // Descend only into owned shapes. Unknown members keep exact numeric evidence.
         guard path.isEmpty && (name == "playback" || name == "discovery" ||
-                name.hasPrefix(VortxNativeWatchlist.prefix) || collection) ||
+                name.hasPrefix(VortxNativeWatchlist.prefix) || interests || collection) ||
                 collection && path == ["rules"], first.first == 123, second.first == 123 else { return false }
         return try sameMembers(OwnerHistoryExactJSON.Object(first), OwnerHistoryExactJSON.Object(second)) { key, first, second in
             try sameRawPreference(first, second, name: name, global: false, path: path + [key])
         }
+    }
+    private static func sameRawPeople(_ first: Data, _ second: Data) throws -> Bool {
+        guard first.first == 91, second.first == 91 else { return false }
+        let left = try OwnerHistoryExactJSON.array(first), right = try OwnerHistoryExactJSON.array(second)
+        guard left.count == right.count else { return false }
+        let leftRows = try left.map(rawPersonObject), rightRows = try right.map(rawPersonObject)
+        let leftReservations = personReservations(leftRows), rightReservations = personReservations(rightRows)
+        for index in left.indices where left[index] != right[index] {
+            guard let a = leftRows[index], let b = rightRows[index],
+                  let id = exactPersonID(a), exactPersonID(b) == id,
+                  leftReservations[id] == 1, rightReservations[id] == 1,
+                  sameMembers(a, b, { key, first, second in
+                      key == "id" ? HostDecimal.same(first, second) : first == second
+                  }) else { return false }
+        }
+        return true
+    }
+    private static func rawPersonObject(_ bytes: Data) throws -> OwnerHistoryExactJSON.Object? {
+        guard bytes.first == 123 else { return nil }
+        return try OwnerHistoryExactJSON.Object(bytes)
+    }
+    private static func exactPersonID(_ row: OwnerHistoryExactJSON.Object) -> Int32? {
+        guard let bytes = row["id"],
+              let id = try? JSONDecoder().decode(Int32.self, from: bytes), id > 0,
+              HostDecimal.same(bytes, Data(String(id).utf8)),
+              let name = try? row.text("name"), !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        if let department = row["department"], department != Data("null".utf8),
+           (try? row.text("department")) == nil { return nil }
+        return id
+    }
+    private static func personReservations(_ rows: [OwnerHistoryExactJSON.Object?]) -> [Int32: Int] {
+        var reservations: [Int32: Int] = [:]
+        for row in rows {
+            guard let bytes = row?["id"] else { continue }
+            // A malformed or out-of-range row can still collide in another client's numeric
+            // projection. Reserve those IDs too, but only exact IDs can establish equality.
+            var ids = Set<Int32>()
+            if let value = try? JSONDecoder().decode(Double.self, from: bytes), value.isFinite, value >= 1 {
+                ids.insert(Int32(min(value.rounded(.towardZero), Double(Int32.max))))
+            }
+            if let value = try? JSONDecoder().decode(Int64.self, from: bytes) {
+                let truncated = Int32(truncatingIfNeeded: value)
+                if truncated > 0 { ids.insert(truncated) }
+            }
+            for id in ids { reservations[id, default: 0] += 1 }
+        }
+        return reservations
     }
     /// One new Xperience value with complete original-register metadata retained. The DTO is
     /// used only for existing reserved-name/credential/schema admission, never as saved bytes.
