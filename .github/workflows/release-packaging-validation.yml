@@ -11,8 +11,8 @@ jobs:
       github.repository == 'VortXTV/VortX' &&
       github.event_name == 'workflow_dispatch' &&
       github.actor == 'mamaclapper' && github.triggering_actor == 'mamaclapper' &&
-      github.ref == 'refs/tags/vortx-beta15-b301-android-update-ui-20261116' &&
-      github.workflow_ref == 'VortXTV/VortX/.github/workflows/release-packaging-validation.yml@refs/tags/vortx-beta15-b301-android-update-ui-20261116' &&
+      github.ref == 'refs/tags/vortx-beta15-b301-android-update-ui-v2-20261116' &&
+      github.workflow_ref == 'VortXTV/VortX/.github/workflows/release-packaging-validation.yml@refs/tags/vortx-beta15-b301-android-update-ui-v2-20261116' &&
       github.run_attempt == '1'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -21,19 +21,20 @@ jobs:
       APK_SHA256: 7c3d007eeae0007dd9d616627e79ae307830bc02ed72f9b645aff8fdfe96b4fb
       APK_SIZE: '86653823'
       APK_SIGNER: fc22b87ecd9e4fa26930a1c3e227d8f7d918c646b216032b5da820ef1ac218ca
-      ARTIFACT_DIR: ${{ runner.temp }}/vortx-android-update-smoke
     steps:
       - name: Verify exact public workflow attempt
         run: |
           set -euo pipefail
-          mkdir "$ARTIFACT_DIR"
+          artifact_dir="$RUNNER_TEMP/vortx-android-update-smoke"
+          mkdir "$artifact_dir"
+          printf 'ARTIFACT_DIR=%s\n' "$artifact_dir" >> "$GITHUB_ENV"
           curl -fsS --proto '=https' --max-time 15 --max-filesize 131072 \
             "https://api.github.com/repos/VortXTV/VortX/actions/runs/$GITHUB_RUN_ID" | \
             jq -e --arg sha "$GITHUB_SHA" 'select(
               .workflow_id == 343149688 and .run_attempt == 1 and .event == "workflow_dispatch" and
-              .head_branch == "vortx-beta15-b301-android-update-ui-20261116" and
+              .head_branch == "vortx-beta15-b301-android-update-ui-v2-20261116" and
               .head_sha == $sha and .actor.login == "mamaclapper" and .triggering_actor.login == "mamaclapper"
-            ) | {id, workflow_id, run_attempt, head_sha, head_branch}' | tee "$ARTIFACT_DIR/run-identity.json"
+            ) | {id, workflow_id, run_attempt, head_sha, head_branch}' | tee "$artifact_dir/run-identity.json"
 
       - name: Verify public feed offers Build 301
         run: |
