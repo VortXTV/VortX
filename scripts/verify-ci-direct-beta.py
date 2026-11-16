@@ -50,7 +50,7 @@ PROTECTED_RELEASES = {
     NATIVE_BETA12_TAG: ("v0.5.6-beta.12-candidate.3", "283", "beta12-candidate-preflight"),
     NATIVE_BETA13_TAG: ("v0.5.6-beta.13-candidate.1", "285", "beta13-candidate-preflight"),
     NATIVE_BETA14_TAG: ("v0.5.6-beta.14-candidate.2", "293", "beta14-candidate-preflight"),
-    NATIVE_BETA15_TAG: ("v0.5.6-beta.15-candidate.4", "299", "beta15-candidate-preflight"),
+    NATIVE_BETA15_TAG: ("v0.5.6-beta.15-candidate.5", "300", "beta15-candidate-preflight"),
 }
 NATIVE_BACKUP_CAS_TAGS = (NATIVE_BETA13_TAG, NATIVE_BETA14_TAG, NATIVE_BETA15_TAG)
 NATIVE_ACCOUNT_REGRESSION_TAGS = (NATIVE_BETA14_TAG, NATIVE_BETA15_TAG)
@@ -92,6 +92,7 @@ BETA15_APPLE_TOOLS = (
     "app/Sources/PlayerScreen.swift", "app/SourcesTV/TVPlayerView.swift",
     "scripts/test-watched-playback-dwell.py", "app/Tests/WatchedPlaybackDwellCallsiteTests.swift",
     "app/SourcesShared/WatchedPlaybackDwell.swift", "app/SourcesShared/CoreModels.swift",
+    "app/SourcesShared/VortxNativeHostPreferences.swift", "app/Tests/VortxNativeProfileEditHostTests.swift",
 )
 APPLE_STEPS = (
     "Select the authenticated native source revision",
@@ -168,6 +169,7 @@ BETA15_APPLE_TRAILER_MARKER = "MPVPreviewSeekStormPolicyTests: all checks passed
 BETA15_APPLE_SHORT_HISTORY = "Verify protected Apple short playback history"
 BETA15_APPLE_SHORT_HISTORY_MARKER = "PlaybackCompletionEvidenceTests: "
 BETA15_APPLE_WATCHED_CALLSITE_MARKER = "PASS: actual iOS/macOS and tvOS watched/EOF/film-exit methods"
+BETA15_APPLE_HOST_PREFS_MARKER = "Apple host preference equivalence and conflict diagnostics: verified"
 BETA14_ANDROID_SUITES = tuple("com.vortx.android." + name for name in (
     "sync.AndroidRealtimeSyncTest",
     "sync.VortXSessionOwnerTransitionContractTest",
@@ -728,6 +730,9 @@ def protected_gate_proof(lane, pointer, tag, source, repo_id, job, log, work):
             BETA12_APPLE_EVIDENCE, "Capture exact native SDK and player inputs before app compilation", "Build tvOS (Full)"))
         unique_step_marker(log, steps[BETA12_LIVE_ABI], "app/Tests/VortxNativeLiveABITests.swift:",
                            r"app/Tests/VortxNativeLiveABITests\.swift: OK")
+        if tag == NATIVE_BETA15_TAG:
+            unique_step_marker(log, steps[BETA12_LIVE_ABI], BETA15_APPLE_HOST_PREFS_MARKER,
+                               re.escape(BETA15_APPLE_HOST_PREFS_MARKER))
         runtime = {}
         for kind in ("library", "header"):
             prefix = "Verified unchanged " + kind + " "

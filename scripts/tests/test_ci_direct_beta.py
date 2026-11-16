@@ -625,8 +625,8 @@ class NativeBeta14Contract(NativeBeta12Contract):
 
 class NativeBeta15Contract(NativeBeta12Contract):
     tag = "v0.5.6-beta.15"
-    candidate = "v0.5.6-beta.15-candidate.4"
-    build = "299"
+    candidate = "v0.5.6-beta.15-candidate.5"
+    build = "300"
     preflight_mode = "beta15-candidate-preflight"
 
     def test_exact_frozen_project_build(self):
@@ -648,7 +648,9 @@ class NativeBeta15Contract(NativeBeta12Contract):
             ("Android versionCode", self.build), ("Android versionName", "0.5.6"),
         )]
         MODULE.validate_android_evidence(evidence, self.pointer, self.tag, self.source, "0.5.6", self.build)
-        previous_candidates = (("1", "296", "b" * 40), ("2", "297", "c" * 40), ("3", "298", "d" * 40))
+        previous_candidates = (
+            ("1", "296", "b" * 40), ("2", "297", "c" * 40), ("3", "298", "d" * 40), ("4", "299", "e" * 40),
+        )
         for previous, previous_build, previous_source in previous_candidates:
             previous_tag = f"{self.tag}-candidate.{previous}"
             with self.subTest(previous_tag=previous_tag):
@@ -669,7 +671,7 @@ class NativeBeta15Contract(NativeBeta12Contract):
         for lane, gate in (("apple", "Verify protected Beta 15 artifact-only dispatch"),
                            ("apple", "Verify protected Apple legacy archive recovery"),
                            ("apple", MODULE.BETA15_APPLE_UPDATE), ("apple", MODULE.BETA15_APPLE_TRAILER),
-                           ("apple", MODULE.BETA15_APPLE_SHORT_HISTORY),
+                           ("apple", MODULE.BETA15_APPLE_SHORT_HISTORY), ("apple", MODULE.BETA12_LIVE_ABI),
                            ("android", MODULE.BETA13_ANDROID_BACKUP_CAS),
                            ("android", MODULE.BETA14_ANDROID_REGRESSIONS)):
             with self.subTest(lane=lane, gate=gate):
@@ -678,6 +680,50 @@ class NativeBeta15Contract(NativeBeta12Contract):
                 original["steps"] = [step for step in original["steps"] if step["name"] != gate]
                 with self.assertRaisesRegex(ValueError, gate):
                     MODULE.successful_job([original], lane, 5, 1, self.source, self.tag)
+
+    def test_host_preference_marker_binds_to_live_abi_step_and_source(self):
+        self.assertTrue({
+            "app/SourcesShared/VortxNativeHostPreferences.swift", "app/Tests/VortxNativeProfileEditHostTests.swift",
+            "scripts/test-native-cutover-live-abi.sh", "app/Tests/VortxNativeLiveABITests.swift",
+        } <= set(MODULE.BETA12_TOOLS + MODULE.BETA15_APPLE_TOOLS))
+        ordered = (
+            "Show toolchain", MODULE.BETA15_APPLE_UPDATE, MODULE.BETA15_APPLE_TRAILER,
+            MODULE.BETA15_APPLE_SHORT_HISTORY, "Verify complete native engine ABI", MODULE.BETA12_LIVE_ABI,
+            MODULE.BETA12_APPLE_GATE, MODULE.BETA12_APPLE_EVIDENCE,
+            "Capture exact native SDK and player inputs before app compilation", "Build tvOS (Full)",
+        )
+        def stamp(second):
+            return f"2026-11-16T00:00:{second:02d}Z"
+
+        steps = [{"name": name, "number": index + 1, "started_at": stamp(3 * index),
+                  "completed_at": stamp(3 * index + 2)} for index, name in enumerate(ordered)]
+        job = {"steps": steps}
+        moments = {name: stamp(3 * index + 1) for index, name in enumerate(ordered)}
+        live_abi = moments[MODULE.BETA12_LIVE_ABI]
+        marker = f"{live_abi} {MODULE.BETA15_APPLE_HOST_PREFS_MARKER}"
+        standalone_markers = [
+            f"{moments[MODULE.BETA15_APPLE_UPDATE]} {MODULE.BETA15_APPLE_UPDATE_MARKER}",
+            f"{moments[MODULE.BETA15_APPLE_TRAILER]} {MODULE.BETA15_APPLE_TRAILER_MARKER}",
+            f"{moments[MODULE.BETA15_APPLE_SHORT_HISTORY]} {MODULE.BETA15_APPLE_SHORT_HISTORY_MARKER}1 checks passed",
+            f"{moments[MODULE.BETA15_APPLE_SHORT_HISTORY]} {MODULE.BETA15_APPLE_WATCHED_CALLSITE_MARKER}",
+            f"{live_abi} app/Tests/VortxNativeLiveABITests.swift: OK",
+            f"{live_abi} Verified unchanged library {'a' * 64}",
+            f"{live_abi} Verified unchanged header {'b' * 64}",
+        ]
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(MODULE, "protected_gate_zip", return_value=({}, {})), \
+                mock.patch.object(MODULE, "protected_apple_gate", return_value={}):
+            work = Path(directory)
+            log = work / "apple.log"
+            log.write_text("\n".join([*standalone_markers, marker]) + "\n")
+            MODULE.protected_gate_proof("apple", self.pointer, self.tag, self.source, 1, job, log, work)
+            for host_markers in ([], [marker, marker], [
+                marker.replace(live_abi, moments[MODULE.BETA15_APPLE_SHORT_HISTORY]),
+            ], [marker + " unexpectedly"]):
+                with self.subTest(host_markers=host_markers):
+                    log.write_text("\n".join([*standalone_markers, *host_markers]) + "\n")
+                    with self.assertRaisesRegex(ValueError, "log marker"):
+                        MODULE.protected_gate_proof("apple", self.pointer, self.tag, self.source, 1, job, log, work)
 
 
 if __name__ == "__main__":
