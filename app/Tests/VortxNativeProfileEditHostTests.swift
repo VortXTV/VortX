@@ -59,7 +59,12 @@ struct VortxNativeProfileEditHostTests {
         let watch = try VortxNativeWatchlist.field(id: "tt-fixture", type: "movie")
         let interests = "forYou.interests"
         let collection = "forYou.collection.00000000-0000-0000-0000-000000000002"
-        func carrier(_ field: String, _ suppliedValue: String, clock: String, metadata: String = "", global: Bool = false) throws -> Data {
+        let localAddedAt = "1700000000.1234567", peerAddedAt = "1700000000.1234568", adjacentAddedAt = "1700000000.123457"
+        func watchlistValue(_ timestamp: String, name: String = "Fixture") -> String {
+            #"{"id":"tt-fixture","type":"movie","name":"\#(name)","addedAt":\#(timestamp)}"#
+        }
+        func carrier(_ field: String, _ suppliedValue: String, clock: String, metadata: String = "",
+                     profileMetadata: String = "", global: Bool = false) throws -> Data {
             var value = suppliedValue
             if field == "playback" {
                 var playback = try OwnerHistoryExactJSON.Object(Data(value.utf8))
@@ -68,10 +73,27 @@ struct VortxNativeProfileEditHostTests {
                 for (key, setting) in defaults { playback.set(key, try OwnerHistoryExactJSON.string(setting)) }
                 value = String(decoding: try playback.encoded(), as: UTF8.self)
             }
-            let fields = #"{"fields":{"\#(field)":{"clock":\#(clock),"actor":"\#(actor)","value":\#(value)\#(metadata)}}}"#
+            let fields = #"{"fields":{"\#(field)":{"clock":\#(clock),"actor":"\#(actor)","value":\#(value)\#(metadata)}}\#(profileMetadata)}"#
             let profiles = global ? "{}" : #"{"\#(scope.ownerProfileID)":\#(fields)}"#
             let globals = global ? fields : #"{"fields":{}}"#
             return Data(#"{"schemaVersion":1,"scope":"\#(scope.account)","ownerProfileId":"\#(scope.ownerProfileID)","profiles":\#(profiles),"globals":\#(globals)}"#.utf8)
+        }
+        let timestamps = try [localAddedAt, peerAddedAt, adjacentAddedAt].map {
+            try JSONDecoder().decode(Double.self, from: Data($0.utf8))
+        }
+        check(timestamps[0].bitPattern == timestamps[1].bitPattern && timestamps[0].nextUp == timestamps[2],
+              "the fixture contains one binary64 alias and the immediately adjacent timestamp")
+        for (local, peer) in [(localAddedAt, peerAddedAt), (peerAddedAt, localAddedAt)] {
+            var host = try VortxNativeHostPreferences(scope: scope, actor: actor)
+            let registerMetadata = #", "futureRegister": {"decimal":1.0}"#
+            let profileMetadata = #", "futureProfile": {"decimal":2.0}"#
+            try host.mergeRaw(carrier(watch, watchlistValue(local), clock: "7", metadata: registerMetadata,
+                                      profileMetadata: profileMetadata), scope: scope)
+            let original = try host.rawDocumentData()
+            try host.mergeRaw(carrier(watch, watchlistValue(peer), clock: "7", metadata: registerMetadata,
+                                      profileMetadata: profileMetadata), scope: scope)
+            check(try host.rawDocumentData() == original && host.local.counter == 7,
+                  "watchlist timestamp alias retains the original carrier, opaque siblings and clock")
         }
         let aliases: [(field: String, local: String, peer: String, global: Bool)] = [
             ("avatar", #""star""#, #""star""#, false),
@@ -104,6 +126,17 @@ struct VortxNativeProfileEditHostTests {
             ("reordered providers", "discovery", #"{"providerOrder":[1.0,2]}"#, #"{"providerOrder":[2,1]}"#, "", ""),
             ("rewritten register metadata", "playback", #"{"maxFileSizeGB":1.0}"#, #"{"maxFileSizeGB":1}"#,
              #", "futureRegister": 1.0"#, #", "futureRegister": 1"#),
+            ("adjacent binary64 watchlist timestamp", watch,
+             watchlistValue(localAddedAt), watchlistValue(adjacentAddedAt), "", ""),
+            ("different watchlist timestamp", watch,
+             watchlistValue(localAddedAt), watchlistValue("1700000001.1234567"), "", ""),
+            ("changed watchlist name alongside timestamp alias", watch,
+             watchlistValue(localAddedAt), watchlistValue(peerAddedAt, name: "Renamed"), "", ""),
+            ("rewritten watchlist metadata alongside timestamp alias", watch,
+             watchlistValue(localAddedAt), watchlistValue(peerAddedAt),
+             #", "futureRegister": 1.0"#, #", "futureRegister": 1"#),
+            ("different playback decimals with identical binary64 values", "playback",
+             #"{"maxFileSizeGB":\#(localAddedAt)}"#, #"{"maxFileSizeGB":\#(peerAddedAt)}"#, "", ""),
             ("duplicate person ID", interests,
              #"{"people":[{"id":7.0,"name":"Fixture"},{"id":7,"name":"Duplicate"}]}"#,
              #"{"people":[{"id":7,"name":"Fixture"},{"id":7,"name":"Duplicate"}]}"#, "", ""),
@@ -158,7 +191,7 @@ struct VortxNativeProfileEditHostTests {
                 expectedReason = "equal_event_metadata"
             } else if fixture.field == interests || fixture.field == collection {
                 expectedReason = "equal_event_for_you"
-            } else if fixture.field == "playback" || fixture.field == "discovery" {
+            } else if fixture.field == "playback" || fixture.field == "discovery" || fixture.field == watch {
                 expectedReason = "equal_event_known_preference"
             } else {
                 expectedReason = "equal_event"
@@ -166,6 +199,17 @@ struct VortxNativeProfileEditHostTests {
             check(try failure?.rawValue == expectedReason && host.encoded() == original,
                   "\(fixture.label) reports \(expectedReason) and leaves the beforeimage intact")
         }
+        var host = try VortxNativeHostPreferences(scope: scope, actor: actor)
+        try host.mergeRaw(carrier(watch, watchlistValue(localAddedAt), clock: "7",
+                                  profileMetadata: #", "futureProfile": {"decimal":2.0}"#), scope: scope)
+        let original = try host.encoded()
+        var failure: VortxNativeHostPreferences.RawMergeFailure?
+        rejects("watchlist timestamp alias cannot authorize a changed opaque profile member") {
+            try host.mergeRaw(carrier(watch, watchlistValue(peerAddedAt), clock: "7",
+                                      profileMetadata: #", "futureProfile": {"decimal":2}"#), scope: scope) { failure = $0 }
+        }
+        check(try failure?.rawValue == "unknown_wrapper" && host.encoded() == original,
+              "the opaque profile conflict leaves the beforeimage intact")
     }
 
     static func uuidInterop(scope: VortxAccountScope, actor: String, eventID: String, base: VortxJSON,

@@ -312,6 +312,37 @@ class NativeRawHostPreferencesTest {
         val merged = NativeRawHostPreferences.reconcile(scope, firstWatchlist,
             NativeHostPreferences.merge(scope, decoded(firstWatchlist), peer), peer, NativeRawHostPreferences.document(secondWatchlist))
         assertArrayEquals(profileEvent(firstWatchlist, watchlistField), profileEvent(merged, watchlistField))
+
+        // Different exact decimals can represent the same binary64 epoch instant after a peer
+        // serializes a complete Watchlist event. The original register and owner clock must survive.
+        val timestamp = "1700000000.12345670"
+        val alias = "1700000000.12345671"
+        assertTrue(java.math.BigDecimal(timestamp).compareTo(java.math.BigDecimal(alias)) != 0)
+        assertEquals(timestamp.toDouble(), alias.toDouble(), 0.0)
+        fun watchlistEvent(addedAt: String, title: String = "Fixture") =
+            event("""{"id":"tt123","type":"movie","name":"$title","addedAt":$addedAt}""", "7.0")
+        val before = withProfileField(local(), watchlistField, watchlistEvent(timestamp))
+        fun mergeWatchlist(register: ByteArray): ByteArray {
+            val raw = NativeRawHostPreferences.document(withProfileField(local(), watchlistField, register))
+            val remote = JSONObject(OHJson.utf8(raw))
+            return NativeRawHostPreferences.reconcile(scope, before,
+                NativeHostPreferences.merge(scope, decoded(before), remote), remote, raw)
+        }
+        val replayed = mergeWatchlist(watchlistEvent(alias))
+        assertArrayEquals(profileEvent(before, watchlistField), profileEvent(replayed, watchlistField))
+        assertEquals(7L, decoded(replayed).getLong("counter"))
+        val adjacent = Math.nextUp(timestamp.toDouble()).toString()
+        val aliasRegister = OHJson.Obj(watchlistEvent(alias))
+        val extended = aliasRegister.copy().set("value", aliasRegister.obj("value").set("future", b("1")).encoded()).encoded()
+        val metadata = aliasRegister.copy().set("futureRegister", b("1")).encoded()
+        for (conflict in listOf(watchlistEvent(adjacent), watchlistEvent(alias, "Changed"),
+            watchlistEvent(OHJson.utf8(OHJson.quote(alias))), watchlistEvent("-1"),
+            watchlistEvent("9007199254740992"), extended, metadata)) {
+            assertThrows(IllegalArgumentException::class.java) { mergeWatchlist(conflict) }
+            assertThrows(IllegalArgumentException::class.java) {
+                NativeRawHostPreferences.requireEqualEvent(watchlistField, true, watchlistEvent(timestamp), conflict)
+            }
+        }
     }
 
     @Test fun `controlled rounded projections reach immutable event and opaque mutation refusals`() {

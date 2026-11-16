@@ -592,7 +592,7 @@ class NativeBeta14Contract(NativeBeta12Contract):
                 identity = verifier.identity()
                 self.assertEqual(identity["ref"], "refs/tags/" + candidate)
                 self.assertEqual(identity["sourceCommit"], self.source)
-                for ref in (tag, tag + "-candidate.1", tag + "-candidate.9"):
+                for ref in (tag, tag + "-candidate.1", tag + "-candidate.5", tag + "-candidate.9"):
                     with mock.patch.dict(os.environ, {"GITHUB_REF": "refs/tags/" + ref}):
                         with self.assertRaisesRegex(ValueError, "exact candidate"):
                             verifier.identity()
@@ -625,8 +625,8 @@ class NativeBeta14Contract(NativeBeta12Contract):
 
 class NativeBeta15Contract(NativeBeta12Contract):
     tag = "v0.5.6-beta.15"
-    candidate = "v0.5.6-beta.15-candidate.5"
-    build = "300"
+    candidate = "v0.5.6-beta.15-candidate.6"
+    build = "301"
     preflight_mode = "beta15-candidate-preflight"
 
     def test_exact_frozen_project_build(self):
@@ -650,6 +650,7 @@ class NativeBeta15Contract(NativeBeta12Contract):
         MODULE.validate_android_evidence(evidence, self.pointer, self.tag, self.source, "0.5.6", self.build)
         previous_candidates = (
             ("1", "296", "b" * 40), ("2", "297", "c" * 40), ("3", "298", "d" * 40), ("4", "299", "e" * 40),
+            ("5", "300", "f" * 40),
         )
         for previous, previous_build, previous_source in previous_candidates:
             previous_tag = f"{self.tag}-candidate.{previous}"

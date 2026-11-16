@@ -458,7 +458,14 @@ extension VortxNativeHostPreferences {
         if path.count == 1 {
             let key = path[0]
             if name.hasPrefix(VortxNativeWatchlist.prefix) && key == "addedAt" {
-                return HostDecimal.same(first, second)
+                if HostDecimal.same(first, second) { return true }
+                // The watchlist schema owns this timestamp as binary64 epoch seconds.
+                // Encoders can emit different decimals for the same exact Double.
+                let decoder = JSONDecoder()
+                guard let a = try? decoder.decode(Double.self, from: first),
+                      let b = try? decoder.decode(Double.self, from: second),
+                      a.isFinite, a >= 0, a <= Double(maxClock) else { return false }
+                return a.bitPattern == b.bitPattern
             }
             if name == "playback", ["subSizeScale", "maxFileSizeGB", "maxResolution", "minResolution", "titleMatchThreshold"].contains(key) {
                 return HostDecimal.same(first, second)

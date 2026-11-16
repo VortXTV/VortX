@@ -50,7 +50,7 @@ PROTECTED_RELEASES = {
     NATIVE_BETA12_TAG: ("v0.5.6-beta.12-candidate.3", "283", "beta12-candidate-preflight"),
     NATIVE_BETA13_TAG: ("v0.5.6-beta.13-candidate.1", "285", "beta13-candidate-preflight"),
     NATIVE_BETA14_TAG: ("v0.5.6-beta.14-candidate.2", "293", "beta14-candidate-preflight"),
-    NATIVE_BETA15_TAG: ("v0.5.6-beta.15-candidate.5", "300", "beta15-candidate-preflight"),
+    NATIVE_BETA15_TAG: ("v0.5.6-beta.15-candidate.6", "301", "beta15-candidate-preflight"),
 }
 NATIVE_BACKUP_CAS_TAGS = (NATIVE_BETA13_TAG, NATIVE_BETA14_TAG, NATIVE_BETA15_TAG)
 NATIVE_ACCOUNT_REGRESSION_TAGS = (NATIVE_BETA14_TAG, NATIVE_BETA15_TAG)
