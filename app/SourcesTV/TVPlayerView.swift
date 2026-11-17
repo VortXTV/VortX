@@ -3022,7 +3022,8 @@ struct TVPlayerView: View {
         // left/right seeks on the scrubber or moves within the button row.
         switch type {
         case .menu:
-            if scrubbing { cancelScrub() } else { saveProgress(at: currentTime); leavePlayback() }
+            // Back/Menu dismisses the visible control bar first; pressing Menu while hidden exits playback.
+            if scrubbing { cancelScrub() } else { withAnimation { showInfo = false } }
         case .playPause: toggle()
         case .select: activate(selected)
         case .leftArrow: horizontal(-1)
