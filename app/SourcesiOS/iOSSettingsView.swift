@@ -4,6 +4,8 @@ import UniformTypeIdentifiers
 import CoreTransferable
 #if os(iOS)
 import UIKit
+#elseif os(macOS)
+import AppKit
 #endif
 
 #if os(macOS)
@@ -1214,6 +1216,9 @@ struct iOSSettingsView: View {
 
     @ViewBuilder private var downloadsSection: some View {
         Section {
+            #if os(macOS)
+            MacDownloadLocationSettings()
+            #endif
             Toggle("Auto-delete watched downloads", isOn: $autoDeleteWatched)
                 .tint(Theme.Palette.accent)
         } header: {
@@ -2385,7 +2390,13 @@ private enum SettingsSearchSection: CaseIterable {
                                 "trickplay", "autoplay trailers", "trailer language", "default volume",
                                 "auto-add watched", "landscape", "background playback", "keep playing", "play in",
                                 "external player", "still watching", "idle"]
-        case .downloads: return ["downloads", "auto-delete", "delete watched", "offline", "storage", "reclaim space"]
+        case .downloads:
+            let terms = ["downloads", "auto-delete", "delete watched", "offline", "storage", "reclaim space"]
+            #if os(macOS)
+            return terms + ["download folder", "download location", "external drive", "finder"]
+            #else
+            return terms
+            #endif
         case .notifications: return ["new episode alerts", "episode", "notification"]
         case .streams: return ["quality preset", "smart source selection", "add-on ranking", "source type",
                                "safety filter", "regex", "max quality", "minimum quality", "max file size",
@@ -2474,6 +2485,114 @@ struct BackupDocument: FileDocument {
         FileWrapper(regularFileWithContents: data)
     }
 }
+
+#if os(macOS)
+@MainActor
+private struct MacDownloadLocationSettings: View {
+    @ObservedObject private var locations = MacDownloadLocations.shared
+    @State private var chooseError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            Text("Location for new downloads")
+                .font(.headline)
+            if let name = locations.selectedFolderName {
+                if let folder = locations.selectedFolderURL {
+                    locationPath(folder)
+                } else {
+                    Text("Reconnect the drive containing \(name).")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                locationPath(DownloadStore.downloadsDirectory)
+            }
+            if locations.selectedFolderName != nil {
+                Text("Keep VortX open while downloading to the selected drive. Resuming an interrupted download starts it again.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: Theme.Space.sm) {
+                Button("Choose Folder…", action: chooseFolder)
+                Button("Use Default") { locations.useDefault() }
+                    .disabled(locations.selectedFolderName == nil)
+                MacDownloadFolderButton()
+            }
+            .buttonStyle(.bordered)
+        }
+        .alert("Couldn’t choose download folder", isPresented: Binding(
+            get: { chooseError != nil }, set: { if !$0 { chooseError = nil } }
+        )) {
+            Button("OK", role: .cancel) { chooseError = nil }
+        } message: {
+            Text(chooseError ?? "")
+        }
+    }
+
+    private func locationPath(_ folder: URL) -> some View {
+        Text(folder.path)
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+    }
+
+    private func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.title = String(localized: "Choose Download Folder")
+        panel.prompt = String(localized: "Choose")
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = locations.selectedFolderURL ?? DownloadStore.downloadsDirectory
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        do {
+            try locations.choose(folder)
+        } catch {
+            chooseError = (error as? MacDownloadLocations.LocationError)?.errorDescription
+                ?? String(localized: "Choose a folder on a connected drive that VortX can write to.")
+        }
+    }
+}
+
+@MainActor
+struct MacDownloadFolderButton: View {
+    @ObservedObject private var locations = MacDownloadLocations.shared
+    @State private var showsOpenError = false
+
+    var body: some View {
+        Button(action: showFolder) {
+            Label("Show in Finder", systemImage: "folder")
+        }
+        .help("Show the folder for new downloads")
+        .alert("Download folder unavailable", isPresented: $showsOpenError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("If the folder is on an external drive, reconnect the drive and try again.")
+        }
+    }
+
+    private func showFolder() {
+        locations.refresh()
+        let folder: URL?
+        if locations.selectedFolderName == nil {
+            do {
+                try DownloadStore.ensureDownloadsDirectoryExists()
+            } catch {
+                showsOpenError = true
+                return
+            }
+            folder = DownloadStore.downloadsDirectory
+        } else {
+            folder = locations.selectedFolderURL
+        }
+        guard let folder, NSWorkspace.shared.open(folder) else {
+            showsOpenError = true
+            return
+        }
+    }
+}
+#endif
 
 /// Identifiable wrapper so a backup / restore result can drive a one-off `.alert(item:)`.
 struct BackupAlert: Identifiable {

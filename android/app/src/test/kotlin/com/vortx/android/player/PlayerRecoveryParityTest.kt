@@ -81,6 +81,26 @@ class PlayerRecoveryParityTest {
         assertTrue(canReportPlayerProgress(outgoing.copy(expectedDurationMs = 300_000), 1_000, 300_000))
     }
 
+    @Test fun `thirty second error clip cannot report or complete around ten minute runtime`() {
+        val clip = 30_016L
+        for (expected in listOf(0L, 600_000L, 601_000L, 605_000L, 660_000L, 7_200_000L)) {
+            val playable = outgoing.copy(expectedDurationMs = expected, userForcedSource = true)
+            assertTrue(isJunkPlayerDuration(clip, playable))
+            assertTrue(isJunkPlayerEof(clip, clip, playable))
+            assertFalse(canReportPlayerProgress(playable, clip, clip))
+        }
+    }
+
+    @Test fun `matching short film and shorter legitimate cut can still complete`() {
+        val shortFilm = outgoing.copy(expectedDurationMs = 30_000L)
+        val cut = outgoing.copy(expectedDurationMs = 605_000L)
+        for ((playable, duration) in listOf(shortFilm to 30_016L, cut to 480_000L)) {
+            assertFalse(isJunkPlayerDuration(duration, playable))
+            assertFalse(isJunkPlayerEof(duration, duration, playable))
+            assertTrue(canReportPlayerProgress(playable, duration, duration))
+        }
+    }
+
     @Test fun `episode rails restore opaque current target and clamp page boundaries`() {
         val ids = List(100) { "opaque-$it" }
         assertEquals(87, episodeRailTargetIndex(ids, "opaque-87")); assertNull(episodeRailTargetIndex(ids, "missing"))

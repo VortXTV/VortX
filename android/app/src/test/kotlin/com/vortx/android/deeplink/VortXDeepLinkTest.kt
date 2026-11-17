@@ -86,7 +86,7 @@ class VortXDeepLinkTest {
         val recreatedActivity = DeepLinkDeliveryState(firstActivity.consumedDeliveryId)
         assertNull(recreatedActivity.consume("delivery-a", raw))
 
-        assertEquals(accepted, recreatedActivity.consume("delivery-b", raw))
+        assertEquals(accepted?.target, recreatedActivity.consume("delivery-b", raw)?.target)
     }
 
     @Test
@@ -98,7 +98,7 @@ class VortXDeepLinkTest {
         assertNull(state.consume("delivery-a", oldUrl))
         assertEquals(
             VortXDeepLink(MediaType.SERIES, "tt-new"),
-            state.consume("delivery-b", newUrl),
+            state.consume("delivery-b", newUrl)?.target,
         )
     }
 
@@ -108,12 +108,132 @@ class VortXDeepLinkTest {
             readProjectFile("src/main/kotlin/com/vortx/android/MainActivity.kt"),
             readProjectFile("src/main/kotlin/com/vortx/android/ui/tv/TvActivity.kt"),
         ).forEach { source ->
-            assertTrue(source.contains("restoredConsumedDeliveryId = restoredDeliveryId"))
-            assertTrue(source.contains("forceNewDelivery = true"))
-            assertTrue(source.contains("outState.putString(STATE_DEEP_LINK_DELIVERY_ID"))
-            assertTrue(source.contains("source.data = null"))
+            assertTrue(source.contains("deepLinks.restore(savedInstanceState)"))
+            assertTrue(source.contains("deepLinks.route(intent, forceNewDelivery = true)"))
+            assertTrue(source.contains("deepLinks.save(outState)"))
+            assertTrue(source.contains("deepLinkEvent = deepLinks.pendingEvent"))
+            assertTrue(source.contains("onDeepLinkHandled = deepLinks::acknowledge"))
         }
+        val adapter = readProjectFile("src/main/kotlin/com/vortx/android/deeplink/ActivityDeepLinkDelivery.kt")
+        assertTrue(adapter.contains("restoredConsumedDeliveryId = saved?.getString(STATE_DELIVERY_ID)"))
+        assertTrue(adapter.contains("source.data = null"))
+        val saved = adapter.substringAfter("fun save(outState: Bundle)").substringBefore("private companion object")
+        val savedKeys = Regex("""outState\.put\w+\((STATE_[A-Z_]+),""").findAll(saved)
+            .map { it.groupValues[1] }.toList()
+        assertEquals(listOf("STATE_DELIVERY_ID", "STATE_LAUNCH_FINGERPRINT", "STATE_LATEST_FINGERPRINT",
+            "STATE_TITLE_TYPE", "STATE_TITLE_ID", "STATE_TITLE_SEQUENCE"), savedKeys)
     }
+
+    @Test
+    fun `unhandled plain title survives recreation and retained intent still cannot replay`() {
+        val raw = "vortx://open?type=movie&id=tt123"
+        val original = DeepLinkDeliveryState()
+        val a = checkNotNull(original.consume("delivery-a", raw))
+
+        val recreated = DeepLinkDeliveryState("delivery-a", a.target.type.id, a.target.id, a.sequence)
+        val restored = checkNotNull(recreated.pendingEvent)
+        assertEquals(a, restored)
+        assertFalse(recreated.acknowledge(a))
+        assertNull(recreated.consume("delivery-a", raw))
+        assertSame(restored, recreated.pendingEvent)
+        assertTrue(recreated.acknowledge(restored))
+        assertNull(recreated.pendingEvent)
+
+        val afterAcknowledgement = DeepLinkDeliveryState(recreated.consumedDeliveryId)
+        assertNull(afterAcknowledgement.pendingEvent)
+        assertNull(afterAcknowledgement.consume("delivery-a", raw))
+        assertNotNull(afterAcknowledgement.consume("delivery-b", raw))
+    }
+
+    @Test
+    fun `invalid warm intent preserves pending and an old acknowledgement cannot discard a newer intent`() {
+        val state = DeepLinkDeliveryState("delivery-a", "series", "same-id", 41L)
+        val a = checkNotNull(state.pendingEvent)
+        assertNull(state.consume("invalid-delivery", "vortx://open?type=channel&id=bad"))
+        assertSame(a, state.pendingEvent)
+        assertEquals("delivery-a", state.consumedDeliveryId)
+
+        val b = checkNotNull(state.consume("delivery-b", "vortx://open?type=series&id=same-id"))
+        assertEquals(a.target, b.target)
+        assertEquals(42L, b.sequence)
+        assertFalse(state.acknowledge(a))
+        assertFalse(state.acknowledge(b.copy()))
+        assertSame(b, state.pendingEvent)
+        assertTrue(state.acknowledge(b))
+    }
+
+    @Test
+    fun `malformed restored title is discarded without resetting intent replay protection`() {
+        val invalid = listOf(
+            DeepLinkDeliveryState("delivery-a", "channel", "tt123", 1L),
+            DeepLinkDeliveryState("delivery-a", "movie", "", 1L),
+            DeepLinkDeliveryState("delivery-a", "movie", " tt123 ", 1L),
+            DeepLinkDeliveryState("delivery-a", "movie", "x".repeat(257), 1L),
+            DeepLinkDeliveryState("delivery-a", "movie", "tt123", 0L),
+            DeepLinkDeliveryState("delivery-a", "movie", "tt123", -1L),
+            DeepLinkDeliveryState(null, "movie", "tt123", 1L),
+        )
+        assertTrue(invalid.all { it.pendingEvent == null })
+        assertNull(invalid.first().consume("delivery-a", "vortx://open?type=movie&id=tt123"))
+        assertNotNull(invalid.first().consume("delivery-b", "vortx://open?type=movie&id=tt123"))
+    }
+
+    @Test
+    fun `unmarked original launch cannot replace a newer pending or acknowledged title after recreation`() {
+        val launchUrl = "vortx://open?type=movie&id=tt-original"
+        val warmUrl = "vortx://open?type=series&id=tt-newer"
+        val original = DeepLinkDeliveryState()
+        assertTrue(original.route("delivery-a", launchUrl, coldLaunch = true) is DeepLinkDeliveryState.IntentAdmission.Accepted)
+        val warm = checkNotNull(original.consume("delivery-b", warmUrl))
+        assertEquals(64, original.launchFingerprint?.length)
+        assertEquals(64, original.latestFingerprint?.length)
+        assertNotEquals(original.launchFingerprint, original.latestFingerprint)
+
+        fun recreate(pending: VortXDeepLinkEvent?) = DeepLinkDeliveryState(
+            original.consumedDeliveryId, pending?.target?.type?.id, pending?.target?.id, pending?.sequence ?: 0L,
+            original.launchFingerprint, original.latestFingerprint,
+        )
+        val pending = recreate(warm)
+        val retained = pending.pendingEvent
+        assertEquals(DeepLinkDeliveryState.IntentAdmission.Replay,
+            pending.route("unmarked-original", "vortx://open?id=%74t-original&type=movie", coldLaunch = true))
+        assertEquals(DeepLinkDeliveryState.IntentAdmission.Replay,
+            pending.route("unmarked-warm", warmUrl, coldLaunch = true))
+        assertSame(retained, pending.pendingEvent)
+        assertEquals("delivery-b", pending.consumedDeliveryId)
+
+        assertTrue(original.acknowledge(warm))
+        val acknowledged = recreate(original.pendingEvent)
+        assertEquals(DeepLinkDeliveryState.IntentAdmission.Replay,
+            acknowledged.route("unmarked-original", launchUrl, coldLaunch = true))
+        assertNull(acknowledged.pendingEvent)
+        assertNotNull(acknowledged.consume("genuine-new-warm", launchUrl))
+    }
+
+    @Test
+    fun `a distinct valid cold title can replace a restored pending title`() {
+        val original = DeepLinkDeliveryState()
+        val url = "vortx://open?type=movie&id=old"
+        val a = (original.route("delivery-a", url, coldLaunch = true) as DeepLinkDeliveryState.IntentAdmission.Accepted).event
+        val recreated = DeepLinkDeliveryState("delivery-a", a.target.type.id, a.target.id, a.sequence,
+            original.launchFingerprint, original.latestFingerprint)
+        val replacement = recreated.route("delivery-c", "vortx://open?type=movie&id=new", coldLaunch = true)
+        assertTrue(replacement is DeepLinkDeliveryState.IntentAdmission.Accepted)
+        assertEquals("new", recreated.pendingEvent?.target?.id)
+        assertFalse(recreated.acknowledge(a))
+    }
+
+    @Test
+    fun `legacy consumed state suppresses unmarked recreation without blocking a warm link`() {
+        val restored = DeepLinkDeliveryState(restoredConsumedDeliveryId = "legacy-delivery")
+        val raw = "vortx://open?type=movie&id=old"
+        assertEquals(DeepLinkDeliveryState.IntentAdmission.Replay, restored.route("recreated", raw, coldLaunch = true))
+        assertNull(restored.pendingEvent)
+        assertNotNull(restored.consume("genuine-new-warm", raw))
+    }
+
+    private fun DeepLinkDeliveryState.consume(deliveryId: String, rawUrl: String?): VortXDeepLinkEvent? =
+        (route(deliveryId, rawUrl) as? DeepLinkDeliveryState.IntentAdmission.Accepted)?.event
 
     @Test
     fun `phone and tv activities forward pre-S home presses to the shared PiP bridge`() {
@@ -143,7 +263,7 @@ class VortXDeepLinkTest {
         assertNull(state.consumedDeliveryId)
         assertEquals(
             VortXDeepLink(MediaType.SERIES, "tt456"),
-            state.consume("delivery-b", "vortx://open?type=series&id=tt456"),
+            state.consume("delivery-b", "vortx://open?type=series&id=tt456")?.target,
         )
     }
 

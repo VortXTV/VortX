@@ -150,8 +150,9 @@ private fun TvHeroBackdropLayer(item: MetaItem?, reducedMotion: Boolean) {
     Box(Modifier.fillMaxSize()) {
         val kenBurns = kenBurnsTransform(reducedMotion)
         TvBackdrop(
-            url = item?.background ?: item?.poster,
+            url = item?.background,
             seed = item?.id ?: "vortx",
+            fallbackUrls = listOf(item?.poster),
             modifier = Modifier
                 .fillMaxSize()
                 .graphicsLayer {

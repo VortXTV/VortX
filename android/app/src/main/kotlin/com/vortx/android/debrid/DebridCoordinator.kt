@@ -83,7 +83,7 @@ internal class DebridCoordinator(
         pair.second,
         context,
         context?.let {
-            UsenetProviderStore(it, pair.second::ownerToken, pair.second::mutateCurrentOwner)
+            UsenetProviderStore(it, pair.second::readDownloadOwner, pair.second::mutateCurrentUsenetOwner)
         },
     )
 

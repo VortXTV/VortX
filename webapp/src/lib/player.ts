@@ -196,6 +196,15 @@ async function mountAndLoad(
   // the source now playing. See sourceGen.
   const myGen = ++sourceGen;
   const isCurrentSource = () => myToken === playToken && myGen === sourceGen;
+  let subtitleSelectionMade = false;
+  const selectSubtitle = (selected: TextTrack | null) => {
+    if (!isCurrentSource()) return;
+    subtitleSelectionMade = true;
+    for (const track of selectableSubtitleTracks(vid)) {
+      track.mode = track === selected ? "showing" : "disabled";
+    }
+    controller?.refreshSubtitles();
+  };
   const hasNext = sessionIndex < sessionFallbacks.length - 1;
   controller = mountControls(host, vid, {
     title,
@@ -204,10 +213,11 @@ async function mountAndLoad(
     hasNextEpisode: !!opts.onNextEpisode,
     onNextEpisode: opts.onNextEpisode,
     onTryNextSource: hasNext ? () => advanceSource(host, "manual") : undefined,
+    onSelectSubtitle: selectSubtitle,
   });
 
   if (opts.item) wireProgress(vid, opts.item);
-  wireKeyboard(vid);
+  wireKeyboard(host, vid, selectSubtitle, isCurrentSource);
   wireMobileAudio(vid);
   wireAudioFailure(host, vid, myGen);
   // Surface a clear message when the element fails to load or decode (an expired debrid link, a 404, an
@@ -218,16 +228,13 @@ async function mountAndLoad(
     if (!advanceSource(host, "decode"))
       showError(host, "This source could not be played. It may be offline or an unsupported format. Try another source.");
   });
-  // Subtitles: non-blocking, gated on the session token so a list that resolves after close / a new source
-  // does not attach tracks to a dead session.
+  // Add-on tracks must attach to this source and respect an explicit CC or keyboard selection.
   if (opts.subtitles) {
     void opts.subtitles
-      .then((subs) => {
-        if (myToken !== playToken) return;
-        return addSubtitleTracks(vid, subs);
-      })
-      .then(() => {
-        if (myToken === playToken) controller?.refreshSubtitles();
+      .then(async (subs) => {
+        if (!isCurrentSource()) return;
+        await addSubtitleTracks(vid, subs, isCurrentSource, () => !subtitleSelectionMade);
+        if (isCurrentSource()) controller?.refreshSubtitles();
       })
       .catch(() => undefined);
   }
@@ -443,18 +450,88 @@ function wireProgress(video: HTMLVideoElement, item: CWItem, admitted = sessionP
   });
 }
 
+function isTypingTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement &&
+    (target.isContentEditable || (typeof target.matches === "function" && target.matches("textarea, select, input:not([type=range]), [role=textbox]")));
+}
+
+function isPlayerControlTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement && typeof target.matches === "function" &&
+    target.matches("button, a, [role=button], [role^=menuitem], input[type=range]");
+}
+
+function changeVolume(video: HTMLVideoElement, delta: number): void {
+  const current = Number.isFinite(video.volume) ? video.volume : 1;
+  const next = Math.min(1, Math.max(0, current + delta));
+  video.volume = next;
+  if (delta > 0 && video.muted) video.muted = false;
+  if (next === 0) video.muted = true;
+}
+
+const KEYBOARD_SEEK_SECONDS = 10;
+
+function keyboardShortcutKey(e: KeyboardEvent): string {
+  if (e.key === " ") return "Space";
+  if (typeof e.key === "string" && e.key.length === 1) return e.key.toLowerCase();
+  return e.code;
+}
+
+function playerPopupOpen(host: HTMLElement): boolean {
+  return !!host.querySelector<HTMLElement>(".pl-menu:not([hidden])");
+}
+
 /** Global keyboard shortcuts while the player overlay is open (the native <video> controls only respond
- *  when the element is focused): Space play/pause, Left/Right seek by the Skip-step setting, Up/Down volume,
- *  [ / ] playback speed, M mute, F fullscreen.
- *  Removed on close so keys don't leak to the surfaces underneath. */
-function wireKeyboard(video: HTMLVideoElement): void {
+ *  when the element is focused): Space/K play-pause, J/L fixed ten-second seek, Left/Right seek by the
+ *  Skip-step setting, Up/Down volume, [ / ] playback speed, M mute, F fullscreen, P picture-in-picture,
+ *  C toggle preferred subtitles, T subtitles menu, S skip the active segment, I playback settings, and N
+ *  next episode when the current session supplies one. Escape is reserved for the control chrome's menu
+ *  dismissal and the app-level player close handler. Playback shortcuts are suspended while a player menu
+ *  is open. Removed on close so keys don't leak to surfaces below. */
+function wireKeyboard(
+  host: HTMLElement,
+  video: HTMLVideoElement,
+  selectSubtitle: (track: TextTrack | null) => void,
+  isCurrentSource: () => boolean,
+): void {
   if (keyHandler) document.removeEventListener("keydown", keyHandler);
+  const clickControl = (id: string): boolean => {
+    const button = host.querySelector<HTMLElement>(`#${id}`);
+    if (!button) return false;
+    button.click();
+    return true;
+  };
+  const clickVisibleControl = (id: string): boolean => {
+    const button = host.querySelector<HTMLElement>(`#${id}`);
+    if (!button || button.hidden) return false;
+    button.click();
+    return true;
+  };
+  const discreteKeys = new Set(["Space", "k", "KeyK", "c", "KeyC", "m", "KeyM", "f", "KeyF", "p", "KeyP", "n", "KeyN", "s", "KeyS", "t", "KeyT", "i", "KeyI"]);
   keyHandler = (e: KeyboardEvent) => {
+    const isEscape = e.code === "Escape" || e.key === "Escape";
+    const shortcut = keyboardShortcutKey(e);
+    // Do not steal browser/app shortcuts, text editing, or native control activation. A focused seek
+    // slider is a div role=slider, so its arrows intentionally continue to use the player shortcut.
+    if (!isCurrentSource() || e.defaultPrevented || e.isComposing || e.altKey || e.ctrlKey || e.metaKey ||
+        e.shiftKey || isTypingTarget(e.target) || (!isEscape && playerPopupOpen(host)) ||
+        (!isEscape && isPlayerControlTarget(e.target)) || (e.repeat && discreteKeys.has(shortcut))) return;
     let handled = true;
-    switch (e.code) {
+    switch (shortcut) {
       case "Space":
-        if (video.paused) void video.play().catch(() => undefined);
-        else video.pause();
+      case "k":
+      case "KeyK":
+        if (!clickControl("pl-play")) {
+          if (video.paused) void video.play().catch(() => undefined);
+          else video.pause();
+        }
+        break;
+      case "j":
+      case "KeyJ":
+        video.currentTime = Math.max(0, video.currentTime - KEYBOARD_SEEK_SECONDS);
+        break;
+      case "l":
+      case "KeyL":
+        video.currentTime = Math.min(video.duration || Infinity, video.currentTime + KEYBOARD_SEEK_SECONDS);
         break;
       case "ArrowLeft":
         video.currentTime = Math.max(0, video.currentTime - getSettings().skipStep);
@@ -463,32 +540,63 @@ function wireKeyboard(video: HTMLVideoElement): void {
         video.currentTime = Math.min(video.duration || Infinity, video.currentTime + getSettings().skipStep);
         break;
       case "ArrowUp":
-        video.volume = Math.min(1, video.volume + 0.1);
+        changeVolume(video, 0.1);
         break;
       case "ArrowDown":
-        video.volume = Math.max(0, video.volume - 0.1);
+        changeVolume(video, -0.1);
         break;
       case "BracketRight":
+      case "]":
         stepSpeed(video, 1);
         break;
       case "BracketLeft":
+      case "[":
         stepSpeed(video, -1);
         break;
+      case "KeyC":
+      case "c":
+        handled = togglePreferredSubtitle(video, selectSubtitle);
+        break;
       case "KeyM":
-        video.muted = !video.muted;
+      case "m":
+        if (!clickControl("pl-mute")) video.muted = !video.muted;
         break;
       case "KeyF":
-        if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
-        else void video.requestFullscreen().catch(() => undefined);
+      case "f":
+        if (!clickControl("pl-fs")) {
+          if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+          else if (typeof video.requestFullscreen === "function") void video.requestFullscreen().catch(() => undefined);
+          else handled = false;
+        }
         break;
       case "KeyP":
-        if (document.pictureInPictureElement) void document.exitPictureInPicture().catch(() => undefined);
-        else if (document.pictureInPictureEnabled) void video.requestPictureInPicture().catch(() => undefined);
+      case "p":
+        if (!clickControl("pl-pip")) {
+          if (document.pictureInPictureElement) void document.exitPictureInPicture().catch(() => undefined);
+          else if (document.pictureInPictureEnabled && typeof video.requestPictureInPicture === "function") {
+            void video.requestPictureInPicture().catch(() => undefined);
+          } else handled = false;
+        }
         break;
       case "KeyN":
+      case "n":
         // Next episode (series only; a no-op for movies / the last episode).
-        if (sessionOptions.onNextEpisode) sessionOptions.onNextEpisode();
+        if (sessionOptions.onNextEpisode) {
+          if (!clickControl("pl-next")) sessionOptions.onNextEpisode();
+        }
         else handled = false;
+        break;
+      case "KeyS":
+      case "s":
+        handled = clickVisibleControl("pl-skipseg");
+        break;
+      case "KeyT":
+      case "t":
+        handled = clickControl("pl-subs-btn");
+        break;
+      case "KeyI":
+      case "i":
+        handled = clickControl("pl-settings-btn");
         break;
       default:
         handled = false;
@@ -500,8 +608,48 @@ function wireKeyboard(video: HTMLVideoElement): void {
 
 type SelectableSubtitleTrack = Pick<TextTrack, "language" | "mode">;
 
-function primaryLanguage(value: string): string {
-  return value.trim().toLowerCase().split(/[-_]/, 1)[0] ?? "";
+// ISO 639-2 spellings of the subtitle languages offered in web Settings. Older TV
+// browser locale data can leave three-letter spellings as-is.
+const subtitleLanguageAliases = new Map([
+  ["eng", "en"], ["spa", "es"], ["fra", "fr"], ["fre", "fr"], ["deu", "de"], ["ger", "de"],
+  ["ita", "it"], ["por", "pt"], ["rus", "ru"], ["jpn", "ja"], ["kor", "ko"],
+  ["zho", "zh"], ["chi", "zh"], ["hin", "hi"], ["ara", "ar"],
+]);
+
+function subtitleLanguage(value: string): string {
+  const [base, ...region] = value.trim().toLowerCase().replace(/_/g, "-").split("-");
+  if (!base) return "";
+  const tag = [subtitleLanguageAliases.get(base) ?? base, ...region].join("-");
+  try { return Intl.getCanonicalLocales(tag)[0]?.toLowerCase() ?? ""; }
+  catch { return tag; }
+}
+
+function primaryLanguage(tag: string): string {
+  return tag.split("-", 1)[0] ?? "";
+}
+
+function preferredSubtitleTrack<T extends SelectableSubtitleTrack>(tracks: T[], language: string): T | undefined {
+  const preferred = subtitleLanguage(language);
+  const primary = primaryLanguage(preferred);
+  if (!primary) return undefined;
+  const candidates = tracks.map((track) => ({ track, tag: subtitleLanguage(track.language) }));
+  return (candidates.find(({ tag }) => tag === preferred) ??
+    candidates.find(({ tag }) => primaryLanguage(tag) === primary))?.track;
+}
+
+function selectableSubtitleTracks(video: HTMLVideoElement): TextTrack[] {
+  return Array.from(video.textTracks).filter((track) => track.kind === "subtitles" || track.kind === "captions");
+}
+
+function togglePreferredSubtitle(video: HTMLVideoElement, selectSubtitle: (track: TextTrack | null) => void): boolean {
+  const tracks = selectableSubtitleTracks(video);
+  const preferred = preferredSubtitleTrack(tracks, getSettings().subtitleLang);
+  if (!preferred) return false;
+  const language = primaryLanguage(subtitleLanguage(preferred.language));
+  const alreadyShowing = tracks.some((track) =>
+    track.mode === "showing" && primaryLanguage(subtitleLanguage(track.language)) === language);
+  selectSubtitle(alreadyShowing ? null : preferred);
+  return true;
 }
 
 /** Apply the persisted subtitle policy after tracks have been attached to the video. */
@@ -514,19 +662,21 @@ function applySubtitlePreference(
   for (const track of available) track.mode = "disabled";
   if (mode !== "always") return;
 
-  const preferred = primaryLanguage(preferredLanguage);
-  const selected =
-    (preferred
-      ? available.find((track) => primaryLanguage(track.language) === preferred)
-      : undefined) ?? available[0];
+  const selected = preferredSubtitleTrack(available, preferredLanguage) ?? available[0];
   if (selected) selected.mode = "showing";
 }
 
 /** Add subtitle <track>s to the video; the player's CC menu then exposes them to pick one. */
-async function addSubtitleTracks(video: HTMLVideoElement, subs: SubtitleTrack[]): Promise<void> {
+async function addSubtitleTracks(
+  video: HTMLVideoElement,
+  subs: SubtitleTrack[],
+  isCurrentSource: () => boolean = () => true,
+  shouldApplyPreference: () => boolean = () => true,
+): Promise<void> {
   // Convert all in parallel so one slow source does not hold up the rest (sequential awaits could take
   // up to ~12s x N before the user's language appears). Promise.all preserves the original order.
   const resolved = await Promise.all(subs.map(async (sub) => ({ sub, url: await toVttUrl(sub) })));
+  if (!isCurrentSource()) return;
   const appended: TextTrack[] = [];
   for (const { sub, url } of resolved) {
     if (!url) continue;
@@ -538,8 +688,12 @@ async function addSubtitleTracks(video: HTMLVideoElement, subs: SubtitleTrack[])
     video.appendChild(track);
     appended.push(track.track);
   }
-  const settings = getSettings();
-  applySubtitlePreference(appended, settings.subtitlesMode, settings.subtitleLang);
+  if (shouldApplyPreference()) {
+    const settings = getSettings();
+    applySubtitlePreference(appended, settings.subtitlesMode, settings.subtitleLang);
+  } else {
+    for (const track of appended) track.mode = "disabled";
+  }
 }
 
 export const __playerTestHooks = { addSubtitleTracks, applySubtitlePreference, wireProgress };
@@ -549,11 +703,14 @@ async function toVttUrl(sub: SubtitleTrack): Promise<string | null> {
   const abortCtrl = new AbortController();
   const timer = setTimeout(() => abortCtrl.abort(), 12_000);
   // Also abort if the player session ends while this fetch is in flight, so it can't push a stale blob URL.
-  subAbort?.signal.addEventListener("abort", () => abortCtrl.abort(), { once: true });
+  const sourceSignal = subAbort?.signal;
+  const abort = () => abortCtrl.abort();
+  sourceSignal?.addEventListener("abort", abort, { once: true });
   try {
     const res = await fetch(sub.url, { signal: abortCtrl.signal });
     if (!res.ok) return null;
     const text = await res.text();
+    if (abortCtrl.signal.aborted) return null;
     const isVtt = /\.vtt(\?|$)/i.test(sub.url) || /^﻿?\s*WEBVTT/.test(text);
     const blobUrl = URL.createObjectURL(new Blob([isVtt ? text : srtToVtt(text)], { type: "text/vtt" }));
     subtitleBlobs.push(blobUrl);
@@ -562,6 +719,7 @@ async function toVttUrl(sub: SubtitleTrack): Promise<string | null> {
     return null;
   } finally {
     clearTimeout(timer);
+    sourceSignal?.removeEventListener("abort", abort);
   }
 }
 

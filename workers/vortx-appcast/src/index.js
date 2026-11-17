@@ -20,6 +20,13 @@ const REPOSITORY = "VortXTV/VortX";
 const CANONICAL_ALTSTORE = "https://vortx.tv/altstore.json";
 const ANDROID_SIGNER_SHA256 = "FC22B87ECD9E4FA26930A1C3E227D8F7D918C646B216032B5DA820EF1AC218CA";
 const MAX_ANDROID_PREDECESSOR_HOPS = 32;
+// The split feed must fit the installed Android client's UpdatePolicy.kt.
+const ANDROID_MAX_VERSION_CODE = 2_147_483_647;
+const ANDROID_MAX_APK_BYTES = 1_073_741_824;
+const ANDROID_MAX_APPCAST_BYTES = 512 * 1024;
+const ANDROID_MAX_VERSION_CHARS = 64;
+const ANDROID_MAX_NAME_CHARS = 200;
+const ANDROID_MAX_NOTES_CHARS = 20_000;
 
 function jsonText(value) {
   return `${JSON.stringify(value, null, 2)}\n`;
@@ -156,15 +163,17 @@ function validateSource(source, manifest) {
   }
 }
 
-function validateChecksum(checksumText, assets) {
+function validateChecksum(checksumText, assets, exact = false) {
   const records = new Map();
   for (const rawLine of checksumText.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
-    const match = line.match(/^([0-9a-f]{64})\s+\*?(?:out\/)?([^\s]+)$/i);
+    const match = line.match(exact ? /^([0-9a-f]{64})\s+\*?([^\s]+)$/i : /^([0-9a-f]{64})\s+\*?(?:out\/)?([^\s]+)$/i);
     if (!match) throw new Error("checksum file contains an invalid line");
+    if (exact && records.has(match[2])) throw new Error("checksum file repeats a package");
     records.set(match[2], match[1].toLowerCase());
   }
+  if (exact && records.size !== Object.keys(assets).length) throw new Error("checksum file does not bind the exact package roster");
   for (const asset of Object.values(assets)) {
     if (records.get(asset.checksumName) !== asset.sha256) throw new Error(`checksum does not match ${asset.name}`);
   }
@@ -192,7 +201,28 @@ function provenanceBindsAPK(provenanceText, name) {
   return section.split(/\r?\n/).some((line) => line.trim().toUpperCase() === `SIGNER SHA-256: ${fingerprint}`);
 }
 
-async function findInheritedAndroid(current, storage) {
+function androidFeedEntry(manifest, versionCode, flavor, engine, asset) {
+  return {
+    tag: manifest.tag,
+    version: manifest.version,
+    build: versionCode,
+    versionCode,
+    name: manifest.name,
+    notes: manifest.notes,
+    prerelease: Boolean(manifest.prerelease),
+    flavor,
+    applicationId: "com.vortx.android",
+    engine,
+    artifactType: "apk",
+    signed: true,
+    url: asset.url,
+    size: Number(asset.size),
+    sha256: asset.sha256,
+    signer: ANDROID_SIGNER_SHA256,
+  };
+}
+
+async function findAndroidPredecessor(current, storage) {
   const seen = new Set([current.manifest.generation]);
   let candidate = current;
   for (let hop = 0; hop < MAX_ANDROID_PREDECESSOR_HOPS; hop += 1) {
@@ -204,7 +234,7 @@ async function findInheritedAndroid(current, storage) {
     const predecessor = await storage.get(`${ROLLBACK_PREFIX}${generation}`);
     if (!predecessor) {
       if (promotion?.previousGeneration) throw new Error("Android predecessor snapshot is missing");
-      return { state: "none", android: null };
+      return null;
     }
     const predecessorGeneration = predecessor.manifest?.generation;
     if (typeof predecessorGeneration !== "string" || seen.has(predecessorGeneration)) {
@@ -215,11 +245,18 @@ async function findInheritedAndroid(current, storage) {
     }
     seen.add(predecessorGeneration);
     if (predecessor.manifest?.android != null) {
-      return { state: "valid", android: inheritedAndroid(predecessor.appcastText, predecessor.manifest) };
+      return predecessor;
     }
     candidate = predecessor;
   }
   throw new Error("Android predecessor chain exceeds the supported history");
+}
+
+async function findInheritedAndroid(current, storage) {
+  const predecessor = await findAndroidPredecessor(current, storage);
+  return predecessor
+    ? { state: "valid", android: inheritedAndroid(predecessor.appcastText, predecessor.manifest) }
+    : { state: "none", android: null };
 }
 
 async function buildAndroidAugmentation(payload, current, storage) {
@@ -280,27 +317,9 @@ async function buildAndroidAugmentation(payload, current, storage) {
     !provenanceText.includes(`source commit: ${current.manifest.sourceCommit}`)
   ) throw new Error("Android signing provenance does not bind both APKs, release identity, and production signer");
 
-  const androidEntry = (flavor, engine, asset) => ({
-    tag,
-    version,
-    build: versionCode,
-    versionCode,
-    name: current.manifest.name,
-    notes: current.manifest.notes,
-    prerelease: Boolean(current.manifest.prerelease),
-    flavor,
-    applicationId: "com.vortx.android",
-    engine,
-    artifactType: "apk",
-    signed: true,
-    url: asset.url,
-    size: Number(asset.size),
-    sha256: asset.sha256,
-    signer: ANDROID_SIGNER_SHA256,
-  });
   const android = {
-    full: androidEntry("full", "mpv", fullAsset),
-    play: androidEntry("play", "media3", playAsset),
+    full: androidFeedEntry(current.manifest, versionCode, "full", "mpv", fullAsset),
+    play: androidFeedEntry(current.manifest, versionCode, "play", "media3", playAsset),
   };
   const appcastText = jsonText({ ...currentAppcast, android });
   const sourceText = current.sourceText;
@@ -373,6 +392,85 @@ function inheritedAndroid(appcastText, manifest) {
   return android;
 }
 
+function hasSplitAndroid(android) {
+  return android != null && (Object.hasOwn(android, "full") || Object.hasOwn(android, "play"));
+}
+
+function validatePublishedAsset(asset, tag, expectedName) {
+  if (!asset || asset.name !== expectedName || asset.checksumName !== expectedName || asset.url !== releaseAssetURL(tag, expectedName) || asset.state !== "uploaded") {
+    throw new Error(`published asset ${expectedName} does not match its immutable release identity`);
+  }
+  if (!Number.isSafeInteger(asset.assetId) || asset.assetId <= 0 || !Number.isSafeInteger(asset.size) || asset.size <= 0 || asset.sha256 !== digest(asset.sha256, `${expectedName} sha256`)) {
+    throw new Error(`published asset ${expectedName} metadata is invalid`);
+  }
+}
+
+async function validatePublishedAndroid(manifest, checksumText) {
+  const { tag, version, assets, checksumAsset, android } = manifest;
+  if (version !== tag.slice(1).split("-")[0]) throw new Error("published package version does not match the release tag");
+  if (version.length > ANDROID_MAX_VERSION_CHARS || manifest.name.length > ANDROID_MAX_NAME_CHARS || manifest.notes.length > ANDROID_MAX_NOTES_CHARS) {
+    throw new Error("published Android release text exceeds client limits");
+  }
+  const expectedNames = {
+    ios: `VortX-iOS-${tag}-ci.ipa`,
+    tvos: `VortX-tvOS-${tag}-ci.ipa`,
+    tvosLite: `VortX-tvOS-lite-${tag}-ci.ipa`,
+    mac: `VortX-macOS-${tag}-ci.dmg`,
+    androidFull: `VortX-${version}-full-mpv-universal.apk`,
+    androidPlay: `VortX-${version}-play-media3-universal.apk`,
+    androidBundle: `VortX-${version}-play-media3.aab`,
+  };
+  if (Object.keys(assets).length !== Object.keys(expectedNames).length) throw new Error("published receipt requires the exact package roster");
+  for (const [key, name] of Object.entries(expectedNames)) validatePublishedAsset(assets[key], tag, name);
+  validatePublishedAsset(checksumAsset, tag, "SHA256SUMS.txt");
+  const assetIds = [...Object.values(assets), checksumAsset].map((asset) => asset.assetId);
+  if (new Set(assetIds).size !== assetIds.length) throw new Error("published package and checksum asset IDs must be distinct");
+  if (checksumAsset.size !== new TextEncoder().encode(checksumText).byteLength || checksumAsset.sha256 !== await sha256(checksumText)) {
+    throw new Error("published checksum evidence bytes do not match the release asset");
+  }
+  validateChecksum(checksumText, assets, true);
+  if (assets.androidFull.size > ANDROID_MAX_APK_BYTES || assets.androidPlay.size > ANDROID_MAX_APK_BYTES) {
+    throw new Error("published Android APK size exceeds the client limit");
+  }
+
+  const versionCode = android.full?.versionCode;
+  if (!Number.isInteger(versionCode) || versionCode <= 0 || versionCode > ANDROID_MAX_VERSION_CODE) {
+    throw new Error("published Android versionCode is outside the client integer range");
+  }
+  // The HMAC-authenticated publisher checks the actual package bytes and signer.
+  // Bind its attestation to exactly these public APKs, metadata and release identity.
+  const expectedAndroid = {
+    full: androidFeedEntry(manifest, versionCode, "full", "mpv", assets.androidFull),
+    play: androidFeedEntry(manifest, versionCode, "play", "media3", assets.androidPlay),
+  };
+  if (JSON.stringify(canonicalValue(android)) !== JSON.stringify(canonicalValue(expectedAndroid))) {
+    throw new Error("published Android metadata does not match both signed APK assets");
+  }
+}
+
+async function splitAndroidAdvanceFailure(manifest, predecessor, storage) {
+  if (!hasSplitAndroid(manifest.android) || !predecessor) return null;
+  try {
+    const prior = predecessor.manifest.android != null ? predecessor : await findAndroidPredecessor(predecessor, storage);
+    if (!prior) return null;
+    let priorBuild;
+    if (hasSplitAndroid(prior.manifest.android)) {
+      const android = inheritedAndroid(prior.appcastText, prior.manifest);
+      priorBuild = Math.max(Number(android.full.build), Number(android.play.build));
+    } else {
+      validateAppcast(parseJSON(prior.appcastText, "predecessor appcast"), structuredClone(prior.manifest));
+      priorBuild = Number(prior.manifest.android.build);
+      if (!Number.isSafeInteger(priorBuild)) throw new Error("invalid flat Android build");
+    }
+    if (manifest.android.full.versionCode <= priorBuild) {
+      return failure(409, "android-build-order", "published Android versionCode must exceed the previous verified Android build");
+    }
+  } catch {
+    return failure(409, "android-predecessor-invalid", "the previous Android build could not be verified");
+  }
+  return null;
+}
+
 function validateAppcast(appcast, manifest) {
   if (!appcast || Number(appcast.schemaVersion) !== ARTIFACT_SCHEMA || appcast._generatedFromTag !== manifest.tag || appcast._generatedFromCommit !== manifest.sourceCommit) {
     throw new Error("appcast identity does not match the staged receipt");
@@ -390,6 +488,12 @@ function validateAppcast(appcast, manifest) {
   }
   if (manifest.android === null) {
     if (appcast.android !== null) throw new Error("Android must be null until a signed artifact is recorded");
+    return;
+  }
+  if (hasSplitAndroid(manifest.android)) {
+    if (JSON.stringify(canonicalValue(appcast.android)) !== JSON.stringify(canonicalValue(manifest.android))) {
+      throw new Error("Android appcast metadata differs from the published APK records");
+    }
     return;
   }
   const android = validateAndroidArtifact(manifest.android, manifest);
@@ -420,25 +524,34 @@ async function validateStage(payload) {
   if (!COMMIT_RE.test(manifest.sourceCommit)) throw new Error("manifest sourceCommit is not immutable");
   if (manifest.releaseId === null || manifest.releaseId === undefined) throw new Error("manifest releaseId is required for an immutable release receipt");
   positiveInteger(Number(manifest.releaseId), "manifest releaseId");
-  if (manifest.android !== null) validateAndroidArtifact(manifest.android, manifest);
+  const splitAndroid = hasSplitAndroid(manifest.android);
+  if (splitAndroid && (payload.action !== "stage" || manifest.prerelease)) throw new Error("split Android requires a published Latest release stage");
+  if (manifest.android !== null && !splitAndroid) validateAndroidArtifact(manifest.android, manifest);
   const sourceText = text(payload.source, "source");
   const appcastText = text(payload.appcast, "appcast");
   const checksumText = text(payload.checksum, "checksum");
+  if (splitAndroid && new TextEncoder().encode(appcastText).byteLength > ANDROID_MAX_APPCAST_BYTES) {
+    throw new Error("published appcast exceeds the Android client byte limit");
+  }
   const source = parseJSON(sourceText, "source");
   const appcast = parseJSON(appcastText, "appcast");
   if (jsonText(source) !== sourceText || jsonText(appcast) !== appcastText) throw new Error("feed JSON bytes are not canonical artifact bytes");
   const assets = manifest.assets;
   if (!assets || !assets.ios || !assets.tvos || !assets.tvosLite || !assets.mac) throw new Error("manifest must include all Apple artifacts");
-  for (const asset of Object.values(assets)) {
-    text(asset.name, "asset name");
-    text(asset.checksumName, "checksum name");
-    asset.url = expectedAssetURL(asset.url, asset.name);
-    if (asset.url !== releaseAssetURL(manifest.tag, asset.name) || asset.state !== "uploaded") throw new Error(`asset ${asset.name} is not bound to the release`);
-    positiveInteger(asset.size, `asset ${asset.name} size`);
-    asset.sha256 = digest(asset.sha256, `asset ${asset.name} sha256`);
-    positiveInteger(Number(asset.assetId), `asset ${asset.name} assetId`);
+  if (splitAndroid) {
+    await validatePublishedAndroid(manifest, checksumText);
+  } else {
+    for (const asset of Object.values(assets)) {
+      text(asset.name, "asset name");
+      text(asset.checksumName, "checksum name");
+      asset.url = expectedAssetURL(asset.url, asset.name);
+      if (asset.url !== releaseAssetURL(manifest.tag, asset.name) || asset.state !== "uploaded") throw new Error(`asset ${asset.name} is not bound to the release`);
+      positiveInteger(asset.size, `asset ${asset.name} size`);
+      asset.sha256 = digest(asset.sha256, `asset ${asset.name} sha256`);
+      positiveInteger(Number(asset.assetId), `asset ${asset.name} assetId`);
+    }
+    validateChecksum(checksumText, manifest.android === null ? assets : { ...assets, android: manifest.android });
   }
-  validateChecksum(checksumText, manifest.android === null ? assets : { ...assets, android: manifest.android });
   validateSource(source, manifest);
   validateAppcast(appcast, manifest);
   const sourceSha = await sha256(sourceText);
@@ -557,6 +670,8 @@ export class FeedCoordinator {
         if (current && Number(payload.manifest.build) < Number(current.manifest.build)) return failure(409, "build-order", "a staged release cannot be older than the active generation");
         if (current && Number(payload.manifest.build) === Number(current.manifest.build) && payload.manifest.tag !== current.manifest.tag) return failure(409, "build-tag-conflict", "a build is permanently bound to one release tag");
         if (current && payload.manifest.tag === current.manifest.tag && Number(payload.manifest.build) !== Number(current.manifest.build)) return failure(409, "tag-build-conflict", "a release tag is permanently bound to one build");
+        const androidFailure = await splitAndroidAdvanceFailure(payload.manifest, predecessor, storage);
+        if (androidFailure) return androidFailure;
         await storage.put(releaseKey, payload);
         await storage.put(generationKey, payload);
         await storage.put(tagKey, payload);
@@ -616,6 +731,8 @@ export class FeedCoordinator {
         if (predecessor && Number(staged.manifest.build) < Number(predecessor.manifest.build)) return failure(409, "promote-build-order", "a staged generation cannot downgrade a newer active build");
         if (predecessor && Number(staged.manifest.build) === Number(predecessor.manifest.build) && staged.manifest.tag !== predecessor.manifest.tag) return failure(409, "promote-build-tag-conflict", "a build is permanently bound to one active release tag");
         if (predecessor && staged.manifest.tag === predecessor.manifest.tag && Number(staged.manifest.build) !== Number(predecessor.manifest.build)) return failure(409, "promote-tag-build-conflict", "an active release tag is permanently bound to one build");
+        const androidFailure = await splitAndroidAdvanceFailure(staged.manifest, predecessor, storage);
+        if (androidFailure) return androidFailure;
         if (predecessor) await storage.put(`${ROLLBACK_PREFIX}${payload.generation}`, predecessor);
         await storage.put(ACTIVE_KEY, staged);
         await storage.put(`${OPERATION_PREFIX}${payload.operationId}`, { action: "promote", operationId: payload.operationId, generation: payload.generation, releaseId: payload.releaseId, receiptSha256: staged.receiptSha256 });

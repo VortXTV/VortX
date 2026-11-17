@@ -4,7 +4,9 @@ import com.vortx.android.net.VortXEdgeAuth
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -28,30 +30,50 @@ internal object CatalogTmdbEdge {
     const val IMAGE_BASE = "https://image.tmdb.org/t/p"
 
     private const val TIMEOUT_MS = 20_000
+    private const val BOUNDED_TIMEOUT_MS = 5_000
 
     /// GET [path] off the keyless edge and decode a JSON object. Signs the request via [VortXEdgeAuth]
     /// (stamped after the method + URL are set, before the connection opens, per the signer's contract).
     /// Runs on [Dispatchers.IO]; a non-200 or any transport error resolves to null so every caller stays
     /// fail-soft. [path] is a leading-slash TMDB path (`/movie/123/recommendations`), appended to `/3`.
-    suspend fun getJson(path: String): JSONObject? = withContext(Dispatchers.IO) {
+    suspend fun getJson(path: String, maxBodyBytes: Int? = null): JSONObject? = withContext(Dispatchers.IO) {
+        val timeout = if (maxBodyBytes == null) TIMEOUT_MS else BOUNDED_TIMEOUT_MS
+        val deadline = System.nanoTime() + timeout * 1_000_000L
         var connection: HttpURLConnection? = null
         try {
             val url = URL(EDGE_BASE + path)
             connection = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
-                connectTimeout = TIMEOUT_MS
-                readTimeout = TIMEOUT_MS
+                connectTimeout = timeout
+                readTimeout = timeout
                 useCaches = false
+                if (maxBodyBytes != null) instanceFollowRedirects = false
             }
             VortXEdgeAuth.sign(connection)
             if (connection.responseCode != 200) return@withContext null
-            val text = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val text = if (maxBodyBytes == null) {
+                connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            } else {
+                connection.inputStream.use { boundedText(it, maxBodyBytes, deadline) } ?: return@withContext null
+            }
             runCatching { JSONObject(text) }.getOrNull()
         } catch (_: IOException) {
             null
         } finally {
             connection?.disconnect()
         }
+    }
+
+    private fun boundedText(input: InputStream, limit: Int, deadline: Long): String? {
+        val out = ByteArrayOutputStream()
+        val buffer = ByteArray(8192)
+        while (System.nanoTime() - deadline < 0L) {
+            val size = input.read(buffer)
+            if (size < 0) return if (System.nanoTime() - deadline < 0L) out.toString(Charsets.UTF_8.name()) else null
+            if (size > limit - out.size()) return null
+            out.write(buffer, 0, size)
+        }
+        return null
     }
 }
 

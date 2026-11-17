@@ -42,6 +42,7 @@ import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.profile.AdmittedPickerRoster
 import com.vortx.android.profile.ProfileSelectionRequest
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.ui.profilepicker.ProfilePickerCinematicBackdrop
@@ -74,16 +75,19 @@ import kotlinx.coroutines.CancellationException
 ///
 /// Add and Edit use the same native capture/commit admission and editor as TV Settings.
 @Composable
-fun TvWhosWatching(
+internal fun TvWhosWatching(
+    admittedRoster: AdmittedPickerRoster,
     onDone: () -> Unit,
     onSelected: (ProfileSelectionRequest) -> Unit,
     accountControl: ProfilePickerAccountControl?,
     modifier: Modifier = Modifier,
 ) {
-    val (gateway, loading) = rememberTvProfileGateway()
-    if (gateway == null) {
+    val (gateway, loading) = rememberTvProfileGateway(admittedRoster)
+    val snapshot = gateway?.read()
+    val matching = snapshot != null && snapshot.profiles == admittedRoster.profiles && snapshot.activeID == admittedRoster.activeID
+    if (gateway == null || !matching) {
         val backFocus = remember { FocusRequester() }
-        BackHandler(onBack = onDone)
+        BackHandler(enabled = !admittedRoster.needsSelection, onBack = onDone)
         Column(modifier.fillMaxSize().padding(TvDimens.edge),
             verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
             horizontalAlignment = Alignment.CenterHorizontally) {
@@ -92,13 +96,14 @@ fun TvWhosWatching(
             accountControl?.let { control ->
                 TvProfileButton(control.label, modifier = Modifier.width(320.dp), onClick = control.onClick)
             }
-            TvProfileButton("Back", modifier = Modifier.width(320.dp).focusRequester(backFocus), onClick = onDone)
+            if (!admittedRoster.needsSelection)
+                TvProfileButton("Back", modifier = Modifier.width(320.dp).focusRequester(backFocus), onClick = onDone)
         }
-        LaunchedEffect(backFocus) { withFrameNanos { }; runCatching { backFocus.requestFocus() } }
+        if (!admittedRoster.needsSelection)
+            LaunchedEffect(backFocus) { withFrameNanos { }; runCatching { backFocus.requestFocus() } }
         return
     }
-    val snapshot = gateway.read()
-    if (snapshot.profiles.size <= 1 && !snapshot.selectionPending) {
+    if (admittedRoster.profiles.size <= 1 && !admittedRoster.selectionPending) {
         LaunchedEffect(Unit) { onDone() }
         return
     }

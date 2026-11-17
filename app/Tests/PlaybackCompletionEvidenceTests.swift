@@ -79,6 +79,45 @@ private enum PlaybackCompletionEvidenceTests {
                    "known premature end outside tolerance is rejected at duration \(duration)")
         }
 
+        func canWrite(_ duration: Double?, expected: Double? = nil, online: Bool = true) -> Bool {
+            ShortTitlePlaybackPolicy.allowsAutomaticHistory(
+                durationSeconds: duration, expectedRuntimeSeconds: expected, isOnlineTitle: online
+            )
+        }
+        let errorClipDuration = 30.016
+        expect(!canWrite(errorClipDuration), "unverified 30-second online file cannot change title history")
+        expect(!canWrite(errorClipDuration, expected: 5_400),
+               "a feature's catalog runtime cannot corroborate the short source")
+        expect(!canWrite(errorClipDuration, expected: 1), "a much shorter catalog runtime is not matching evidence")
+        expect(canWrite(errorClipDuration, expected: 30), "matching genuine online short can be watched")
+        expect(canWrite(errorClipDuration, expected: 60), "minute-rounded short metadata remains usable")
+        expect(!canWrite(errorClipDuration, expected: .nan), "nonfinite catalog runtime is not evidence")
+        expect(canWrite(5_400), "ordinary title history can use settled decoder duration")
+        expect(canWrite(errorClipDuration, online: false), "a local short remains eligible")
+        for duration in [nil, 0, -1, .infinity, .nan] as [Double?] {
+            expect(!canWrite(duration), "online source history waits for a valid observed duration")
+        }
+
+        var shortSource = Evidence()
+        shortSource.begin(owner: 1, mountGeneration: 0)
+        shortSource.recordDuration(5_400, owner: 1)
+        shortSource.begin(owner: 2, mountGeneration: 0)
+        shortSource.recordDuration(5_400, owner: 1)
+        expect(!canWrite(shortSource.observedDuration(owner: 2)), "a source swap cannot inherit an old runtime")
+        shortSource.recordDuration(errorClipDuration, owner: 2)
+        shortSource.recordPosition(29.9, owner: 2)
+        expect(shortSource.consumeEOF(owner: 2, isLive: false, isTrailer: false) == .allowCompletion,
+               "the MP4 ends normally at the decoder")
+        expect(!canWrite(shortSource.observedDuration(owner: 2)),
+               "both 90% progress and clean EOF must use separate title-history admission")
+        expect(shortSource.observedDuration(owner: 1) == nil, "stale callbacks cannot read the new source's duration")
+        expect(shortSource.observedDuration(owner: 2, mountGeneration: 1) == nil,
+               "an active replacement cannot read advertised runtime before its first callback")
+        shortSource.begin(owner: 2, mountGeneration: 1)
+        expect(shortSource.observedDuration(owner: 2) == nil, "a replaced AV item clears the predecessor duration")
+        shortSource.recordDuration(5_400, owner: 2)
+        expect(canWrite(shortSource.observedDuration(owner: 2)), "a replacement full stream regains title history")
+
         let root = FileManager.default.currentDirectoryPath
         for path in ["app/Sources/PlayerScreen.swift", "app/SourcesTV/TVPlayerView.swift"] {
             let source = try String(contentsOfFile: root + "/" + path, encoding: .utf8)

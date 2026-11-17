@@ -41,6 +41,10 @@ final class ConnectivityMonitor: ObservableObject {
     /// re-confirms the path is still down (see `apply`).
     @Published private(set) var launchOffline: Bool?
 
+    /// Safe for switching an ordinary resume to a local copy. An unknown launch path or
+    /// a fresh online callback cannot authorize the switch while the banner settles.
+    var hasConfirmedOfflinePath: Bool { launchOffline != nil && isOffline && lastRawOffline }
+
     /// Fires on the main thread when the debounced state transitions from offline to online.
     let didBecomeOnline = PassthroughSubject<Void, Never>()
 

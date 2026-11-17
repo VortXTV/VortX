@@ -27,12 +27,22 @@ export=(root/'app/SourcesShared/DiagnosticLogExportButton.swift').read_text()
 assert '.fileImporter(isPresented:' in view and 'allowsMultipleSelection: false' in view
 assert '[.folder] : [.json, .data]' in view and 'completion(request, result)' in view
 assert 'ProfilePickerToolsFilePicker(request: request)' in view and '.id(request.id)' in view
+assert 'onCancellation: { completion(request, .success([])) }' in view
+assert 'func documentPickerWasCancelled' in view
+assert 'scroll.scrollTo("profile-tools-feedback", anchor: .center)' in view
+for focus in ('retryInput', 'retryOutput', 'verify', 'finish'):
+    assert f'focused = .{focus}' in view
+ios = (root/'app/SourcesiOS/iOSRootView.swift').read_text()
+tv = (root/'app/SourcesTV/RootTabView.swift').read_text()
+assert ios.count('.modifier(ProfilePickerRecoveryOffer(profiles: profiles,') == 2
+assert tv.count('.modifier(ProfilePickerRecoveryOffer(profiles: profiles,') == 1
+assert 'offeredFor != original' in profiles and 'if !profiles.needsPicker { profiles.requestPicker() }' in profiles
 assert 'Button("Back") { close() }' in view and '.interactiveDismissDisabled(true)' in view
 assert '.onDisappear { controller.cancel() }' not in view
 assert 'profileAction.cancel(preservingFailure: toolsRoute != nil || accountHelpNeeded)' in profiles
 assert 'accountHelpDiagnosticGrant = diagnosticGrant()' in profiles
-assert settings.count('DiagnosticLogExportButton(grant: exportGrant)') == 2
-assert 'ShareLink(item: PreProfileDiagnosticLogTransfer(grant: grant)' in export
+assert settings.count('DiagnosticLogExportButton(grant: exportGrant, recoveryOnly: recoveryDiagnosticsOnly)') == 2
+assert 'ShareLink(item: PreProfileDiagnosticLogTransfer(grant: grant, recoveryOnly: sharesRecoveryOnly)' in export
 staging=export[export.index('FileRepresentation(exportedContentType: .plainText)'):export.index('\n#else\n@MainActor',export.index('FileRepresentation(exportedContentType: .plainText)'))]
 assert staging.count('try await require(transfer.grant)') == 3
 assert staging.index('try await require(transfer.grant)') < staging.index('VXDiagExport.exportBody()')

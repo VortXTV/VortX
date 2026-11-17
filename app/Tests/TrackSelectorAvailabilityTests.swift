@@ -257,6 +257,25 @@ enum TrackSelectorAvailabilityTests {
               TrackSelector.preferredSubtitle(in: candidates, languages: ["tr", "en"], language: { $0 }) == "tr-TR")
         check("external candidate: no match stays nil",
               TrackSelector.preferredSubtitle(in: candidates, languages: ["ja"], language: { $0 }) == nil)
+        let shortcutPrimary = track(30, type: "sub", lang: "tur", selected: true)
+        let shortcutSecondary = track(31, type: "sub", lang: "en", selected: true)
+        let shortcutRejected = track(32, type: "sub", lang: "tr", title: "Commentary")
+        let shortcutPreferred = track(33, type: "sub", lang: "tr-TR")
+        check("subtitle shortcut: dual-track state reads the primary, independent of row order",
+              TrackSelector.primarySubtitleLanguage(in: [shortcutSecondary, shortcutPrimary], primaryID: 30) == "tur")
+        check("subtitle shortcut: Off primary never falls through to the selected secondary",
+              TrackSelector.primarySubtitleLanguage(in: [shortcutSecondary], primaryID: -1) == nil)
+        check("subtitle shortcut: single-track state uses the selected row",
+              TrackSelector.primarySubtitleLanguage(in: [shortcutPreferred, shortcutPrimary], primaryID: nil) == "tur")
+        check("subtitle shortcut: language matching skips unavailable and rejected rows",
+              TrackSelector.preferredSelectableSubtitle(
+                in: [track(34, type: "sub", lang: "tr", unavailable: "Unavailable"),
+                     shortcutRejected, shortcutPreferred],
+                language: "tr", rejectTerms: ["commentary"])?.id == 33)
+        check("subtitle shortcut: absent preference leaves selection unchanged",
+              TrackSelector.preferredSelectableSubtitle(
+                in: [shortcutPrimary, shortcutSecondary], language: "ja", rejectTerms: []) == nil)
+
         let forcedBitmap = track(
             22,
             type: "sub",

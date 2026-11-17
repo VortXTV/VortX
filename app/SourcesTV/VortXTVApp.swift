@@ -40,10 +40,9 @@ enum SelftestSource {
 
 @main
 struct VortXTVApp: App {
-    @StateObject private var account = StremioAccount()
-    @StateObject private var core = CoreBridge.shared
-    @StateObject private var sync = VortXSyncManager.shared
-    @StateObject private var presenter = PlayerPresenter()
+    private static let runsPlayerSelftest = ProcessInfo.processInfo.arguments.contains("-tv-selftest")
+    @State private var splashFinished = false
+    @State private var shellReady = VortXTVApp.runsPlayerSelftest
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -67,11 +66,6 @@ struct VortXTVApp: App {
         // its FIRST verdict (launchOffline) is ready to land an offline launch on the Library tab (where
         // Downloads live) and the shell's "You're offline" chip tracks the live (debounced) state.
         ConnectivityMonitor.shared.start()
-        // Bring DownloadManager up at launch so its "auto-delete watched downloads" subscription (it
-        // observes WatchedIndex and prunes finished downloads when the opt-in setting is ON) is live from
-        // the start on tvOS. Without touching the singleton here, nothing on tvOS instantiates it at launch,
-        // so the subscription would only arm once a Downloads screen happened to be opened.
-        _ = DownloadManager.shared
         // Embed Stremio's streaming server on :11470 (nodejs-mobile retargeted to tvOS), so
         // torrent / non-web-ready streams the server must fetch & remux can play on Apple TV.
         // On by default; -stremiox-no-server disables it for isolation testing.
@@ -96,16 +90,72 @@ struct VortXTVApp: App {
         // Publish whether the user has their own usenet provider configured, so bare-NZB rows are tappable
         // from launch (before the Settings screen is ever opened). One Keychain read; no-op if unset.
         UsenetProviderStore.refreshAvailability()
+        if Self.runsPlayerSelftest { Self.startCore() }
+    }
+
+    private static func startCore() {
+        // Arm auto-delete of watched downloads before the shell opens, even if Downloads is never shown.
+        _ = DownloadManager.shared
         // Boot the native stremio-core engine (hydrates library/profile from storage, starts the
         // event loop). The schema-version log is an end-to-end smoke check of the Rust⇄Swift FFI.
         CoreBridge.shared.start()
         NSLog("%@", "[StremioX] stremio-core schema version = \(CoreBridge.shared.schemaVersion)")
     }
 
+    private func startShellIfReady(_ phase: ScenePhase) {
+        guard splashFinished, !shellReady, phase == .active else { return }
+        Self.startCore()
+        shellReady = true
+    }
+
     var body: some Scene {
         WindowGroup {
             Group {
-                if ProcessInfo.processInfo.arguments.contains("-tv-selftest") {
+                if shellReady {
+                    WindowShell(scenePhase: scenePhase, runsPlayerSelftest: Self.runsPlayerSelftest)
+                } else if splashFinished {
+                    SplashView.canvas.ignoresSafeArea()
+                } else {
+                    SplashView {
+                        splashFinished = true
+                    }
+                }
+            }
+            .preferredColorScheme(.dark)
+            .visualEffectsRoot()
+            // Keep parking Top Shelf destinations during cold launch. Infuse progress is saved
+            // here too, then applied when the account-backed shell appears.
+            .onOpenURL { DeepLinkRouter.shared.handle($0, applyInfuseImmediately: shellReady) }
+            .onChange(of: splashFinished) { _, _ in startShellIfReady(scenePhase) }
+            .onChange(of: scenePhase) { _, phase in
+                DiagnosticsLog.log("app", "scenePhase → \(String(describing: phase))")
+                switch phase {
+                case .active: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseActive)
+                case .inactive: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseInactive)
+                case .background: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseBackground)
+                @unknown default: break
+                }
+                #if !VORTX_NO_EMBEDDED_SERVER
+                // The in-process server starts before the shell, so handle suspension here as well.
+                if phase == .active { VortxNativeServer.startIfNeeded() }
+                if phase == .background { VortxNativeServer.stopOnBackground() }
+                #endif
+                startShellIfReady(phase)
+            }
+        }
+    }
+
+    private struct WindowShell: View {
+        let scenePhase: ScenePhase
+        let runsPlayerSelftest: Bool
+        @StateObject private var account = StremioAccount()
+        @StateObject private var core = CoreBridge.shared
+        @StateObject private var sync = VortXSyncManager.shared
+        @StateObject private var presenter = PlayerPresenter()
+
+        var body: some View {
+            Group {
+                if runsPlayerSelftest {
                     TVPlayerView(url: SelftestSource.url, title: "Player Test, Oceans")
                 } else {
                     RootView()   // player OR shell, never both, the only reliable tvOS focus isolation
@@ -117,33 +167,7 @@ struct VortXTVApp: App {
             .environmentObject(ThemeManager.shared)
             .environmentObject(ProfileStore.shared)
             .environmentObject(VortXSyncManager.shared)
-            .preferredColorScheme(.dark)
-            // Settings > Effects and performance > Animations, read once here for every view below.
-            .visualEffectsRoot()
-            // The app's own `vortx://` scheme. Its only minter today is the Top Shelf extension handing
-            // back a tap from the tvOS Home screen; the router parks the destination and RootView
-            // presents it, so a link that arrives during the splash / profile picker still lands.
-            //
-            // Both Top Shelf actions (select AND play/pause) route here as "open the detail page",
-            // where the primary button already reads "Resume <time>" and runs the real resume: the
-            // exact stored source, a fresh debrid link, the episode-moved gate. A one-press resume
-            // straight from the shelf wants that logic (today private to the Continue Watching rail's
-            // `directResume`) lifted into a shared helper. That is a refactor of the app's most
-            // bug-historied path and does not belong inside a new feature's diff, so it is left as a
-            // deliberate follow-up rather than duplicated out here where the two copies would drift.
-            .onOpenURL { DeepLinkRouter.shared.handle($0) }
             .onChange(of: scenePhase) { _, phase in
-                // Distinguishes "the system suspended us" (an unhandled menu press)
-                // from "we crashed" when a device report says the app vanished.
-                DiagnosticsLog.log("app", "scenePhase → \(String(describing: phase))")
-                // Termination evidence: keep the receipt's last-known phase current so the next
-                // launch can distinguish a backgrounded jetsam kill from a foreground kill.
-                switch phase {
-                case .active: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseActive)
-                case .inactive: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseInactive)
-                case .background: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseBackground)
-                @unknown default: break
-                }
                 if phase == .active {
                     InfuseReturnCoordinator.applyReturned()   // a position Infuse reported before VortX was ready
                     UpdateChecker.shared.checkIfStale()
@@ -155,11 +179,6 @@ struct VortXTVApp: App {
                     // once per 30 minutes inside the actor, detached so it cannot delay this hook, and
                     // fail-soft by construction (refresh never throws and keeps last-good on any error).
                     Task.detached(priority: .utility) { await RemoteConfig.shared.refreshIfForegroundDue() }
-                    #if !VORTX_NO_EMBEDDED_SERVER
-                    // The in-process engine server stops on background (below), so foreground restarts it
-                    // on a fresh ephemeral port; the player follows via StremioServer.embeddedPort.
-                    VortxNativeServer.startIfNeeded()
-                    #endif
                     Task {
                         await VortXSyncManager.shared.syncDown()      // pull other devices' changes on foreground
                         // Account-owns-everything: if the engine is degraded (no stream add-on), hydrate the
@@ -183,11 +202,6 @@ struct VortXTVApp: App {
                     // callback may not run. Publish the latest acknowledged queue before suspension;
                     // this does not invent a final progress ACK or bypass the writer's owner gates.
                     TopShelfSnapshotWriter.publishCurrent()
-                    #if !VORTX_NO_EMBEDDED_SERVER
-                    // Phase 8: stop the flag-gated in-process engine server on background (graceful
-                    // rqbit shutdown off-main); .active above restarts it. No-op while the flag is off.
-                    VortxNativeServer.stopOnBackground()
-                    #endif
                     // Drop the memoized YouTube-trailer range-proxy listener: tvOS can reclaim its bound
                     // loopback port across a suspension, and the proxy caches the port once, so every Home
                     // hero-preview trailer fails after a resume until it rebinds. proxied() rebinds lazily on
@@ -221,6 +235,7 @@ struct VortXTVApp: App {
                 // Keychain-restored session pulls the account's real profile immediately. Idempotent (guards
                 // isSignedIn + !realtimeActive) and it already performs an immediate syncDown().
                 VortXSyncManager.shared.startRealtime()
+                InfuseReturnCoordinator.applyReturned()
                 // Profile housekeeping (the library repair scan + sync probe) is background work;
                 // delay it so it never competes with the engine boot and the node server's
                 // cold start for the first seconds on device.

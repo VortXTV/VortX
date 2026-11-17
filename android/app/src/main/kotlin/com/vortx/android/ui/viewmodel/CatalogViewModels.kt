@@ -38,6 +38,7 @@ import com.vortx.android.home.ContinueWatchingSource
 import com.vortx.android.home.ContinueWatchingPermit
 import com.vortx.android.home.SimklContinueWatchingModel
 import com.vortx.android.home.continueWatchingOwnerIsKnown
+import com.vortx.android.home.matchesContinueWatchingResume
 import com.vortx.android.home.withSelectedContinueWatchingRail
 import com.vortx.android.home.importedCatalogRails
 import com.vortx.android.home.upcomingMetaBases
@@ -687,6 +688,20 @@ class HomeViewModel internal constructor(
         }
     }
 
+    internal fun localContinueWatchingResume(item: MetaItem, renderedDownloadId: String? = null): MetaItem? {
+        val ownerToken = com.vortx.android.player.PlaybackOwnerEpoch.capture() ?: return null
+        val original = currentContinueWatchingPermit()
+        val admission = com.vortx.android.home.ContinueWatchingAdmission(ownerToken, renderedDownloadId) {
+            val row = (_state.value as? UiState.Success)?.data?.firstOrNull {
+                it.id == HomeRail.CONTINUE_CATALOG_ID && !it.readOnly
+            }
+            original.selection.source == ContinueWatchingSource.LOCAL &&
+                original == currentContinueWatchingPermit() && isContinueWatchingTapCurrent(item) &&
+                row?.items?.any { it.matchesContinueWatchingResume(item) } == true
+        }
+        return item.copy(continueWatchingAdmission = admission).takeIf { admission.isCurrent() }
+    }
+
     /** Explicit Home choice: use loaded rows only, then re-admit that one title at the native boundary.
      * This opens ordinary Detail; it cannot resolve a source or start playback. Runs on the UI caller.
      */
@@ -1305,6 +1320,17 @@ class LibraryLandingViewModel(private val repo: CatalogRepository) : ViewModel()
     }
 
     fun retry() = load(showLoading = true)
+
+    internal fun localContinueWatchingResume(owner: ContinueWatchingOwner, item: MetaItem): MetaItem? {
+        val ownerToken = com.vortx.android.player.PlaybackOwnerEpoch.capture() ?: return null
+        if (!continueWatchingOwnerIsKnown(owner, owner.profileId)) return null
+        val admission = com.vortx.android.home.ContinueWatchingAdmission(downloadedResumeOwner = ownerToken) {
+            val current = (_state.value as? UiState.Success)?.data
+            current != null && current.owner == owner && repo.continueWatchingOwner() == owner &&
+                current.continueWatching.any { it.matchesContinueWatchingResume(item) }
+        }
+        return item.copy(continueWatchingAdmission = admission).takeIf { admission.isCurrent() }
+    }
 
     /** Keep the Library-local Continue Watching rail's long-press removal functional without creating Home. */
     fun removeFromContinueWatching(item: MetaItem) {

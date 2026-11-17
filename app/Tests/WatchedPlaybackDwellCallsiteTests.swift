@@ -54,6 +54,21 @@ private class State {
     var currentTime = 0.0
     var persistenceBlockedForExit = false
     var terminalRewindGate = Gate()
+    var onlineTitle = false
+    var expectedRuntimeSeconds: Double?
+    var exits = 0
+    var completionOnly = false
+    var armsTerminalDeadline = false
+
+    func automaticHistoryDuration(owner: PlayerLoadToken?, castDurationSeconds: Double? = nil) -> Double? {
+        let observedDuration = castDurationSeconds ?? duration
+        return ShortTitlePlaybackPolicy.allowsAutomaticHistory(
+            durationSeconds: observedDuration, expectedRuntimeSeconds: expectedRuntimeSeconds, isOnlineTitle: onlineTitle
+        ) ? observedDuration : nil
+    }
+
+    func leavePlayback() { exits += 1 }
+    func armTerminalAdvanceDeadline(reason: String) {}
     func sample(_ seconds: Double, at now: Double, settled: Bool = true, owner: PlayerLoadToken? = nil,
                 evidence: MPVSeekSettlementEvidence? = nil) {
         clock = now
@@ -65,6 +80,8 @@ private class State {
     func eof() { fatalError("abstract") }
     func exit() {
         let assetSanityAccepted = assetSanityAttempt.accepted
+        let historyDuration = automaticHistoryDuration(owner: coordinator.player?.activeLoadToken)
+        let exitPosition: Double? = currentTime
         // EXIT_MARK
     }
 }
@@ -143,6 +160,17 @@ private final class TV: State {
             let eof = make(); eof.duration = 2; eof.currentTime = 2; eof.eof()
             if eof is IOS { eof.exit(); expect(eof.core.finishes == 1, "\(name) true EOF film exit removes CW") }
             expect(eof.core.marks == 1, "\(name) true EOF still completes short film")
+            let errorClip = make(); errorClip.onlineTitle = true
+            errorClip.duration = 30.016; errorClip.currentTime = 29.9; errorClip.eof()
+            expect(errorClip.core.marks == 0 && errorClip.exits == 1, "\(name) short online error clip exits without a watched mark")
+            if errorClip is IOS {
+                errorClip.exit()
+                expect(errorClip.core.finishes == 0, "\(name) short online error clip preserves the resume entry")
+            }
+            let genuineShort = make(); genuineShort.onlineTitle = true
+            genuineShort.expectedRuntimeSeconds = 30; genuineShort.duration = 30.016
+            genuineShort.currentTime = 29.9; genuineShort.eof()
+            expect(genuineShort.core.marks == 1, "\(name) confirmed short title still marks watched")
             let series = make(); series.curMeta?.usesSeriesLifecycle = true; flowing(series); series.exit()
             expect(series.core.finishes == 0, "\(name) series exit does not dismiss series CW")
             let reenter = make(); flowing(reenter, count: 3); reenter.sample(800, at: 4); reenter.sample(900, at: 5); reenter.sample(901, at: 6)

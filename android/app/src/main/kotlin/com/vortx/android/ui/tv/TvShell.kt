@@ -115,6 +115,7 @@ fun TvShell(
     importedFromHome: Boolean = true,
     importedReturnSignal: Int = 0,
     onOpenProfilePickerTools: (() -> Unit)? = null,
+    onLocalResume: (MetaItem) -> Unit = onItem,
 ) {
     val appContext = LocalContext.current.applicationContext
     // Bumped when the active tab is re-selected on the rail. A depth-aware destination (Add-ons) pops its own
@@ -126,6 +127,7 @@ fun TvShell(
     var libraryRoute by remember { mutableStateOf(TvLibraryRoute.LANDING) }
     var libraryReturnRoute by remember { mutableStateOf(TvLibraryRoute.DOWNLOADS) }
     var libraryRestoreFocusSignal by remember { mutableStateOf(0) }
+    var downloadRouteGeneration by remember { mutableStateOf(0L) }
     val libraryEntryFocus = remember {
         listOf(TvLibraryRoute.DOWNLOADS, TvLibraryRoute.WATCHLIST, TvLibraryRoute.HISTORY, TvLibraryRoute.SMART_COLLECTIONS,
             TvLibraryRoute.NETWORK_SHARES)
@@ -135,11 +137,21 @@ fun TvShell(
     val debridKeys = remember(appContext) { DebridKeys(appContext) }
     val debridLibraryFocus = remember { FocusRequester() }
     val modalVisible = showPlayLinkSheet || showDebridLibrary || importedCollectionsOpen
+    val capturedDownloadRoute = downloadRouteGeneration
+    val onPlayDownloaded: (Playable) -> Unit = { playable ->
+        if (downloadRouteGeneration == capturedDownloadRoute) onPlayLocal(playable)
+    }
+    fun changeDestination(next: TvDestination) {
+        downloadRouteGeneration += 1
+        onDestinationChange(next)
+    }
     fun openLibraryRoute(route: TvLibraryRoute) {
+        downloadRouteGeneration += 1
         libraryReturnRoute = route
         libraryRoute = route
     }
     fun closeLibraryRoute() {
+        downloadRouteGeneration += 1
         libraryRoute = TvLibraryRoute.LANDING
         libraryRestoreFocusSignal++
     }
@@ -187,7 +199,7 @@ fun TvShell(
             homeBrowseSelected = !hiddenTabs.hideDiscover
         }
         if (!mergeHomeDiscover || hiddenTabs.hideDiscover) homeBrowseSelected = false
-        if (destination !in destinations) onDestinationChange(TvDestination.HOME)
+        if (destination !in destinations) changeDestination(TvDestination.HOME)
     }
 
     // SD-8: Discover and Search gate on a sign-in. On TV the available signal is the engine's Stremio
@@ -201,7 +213,7 @@ fun TvShell(
     // system default (leave the app) still applies there. When a detail/player overlay is up it is composed
     // ABOVE this shell with its own BackHandler, so this one is inert underneath it -- the existing
     // Home -> Detail -> Play back stack is unchanged.
-    BackHandler(enabled = destination != TvDestination.HOME) { onDestinationChange(TvDestination.HOME) }
+    BackHandler(enabled = destination != TvDestination.HOME) { changeDestination(TvDestination.HOME) }
     BackHandler(enabled = destination == TvDestination.HOME && homeBrowseSelected) { homeBrowseSelected = false }
     BackHandler(enabled = destination == TvDestination.LIBRARY && libraryRoute != TvLibraryRoute.LANDING, onBack = ::closeLibraryRoute)
 
@@ -226,7 +238,7 @@ fun TvShell(
             // Re-selecting the active tab pops that tab's own stack to root (Add-ons); switching tabs moves.
             onSelect = { dest ->
                 if (dest == TvDestination.LIBRARY && libraryRoute != TvLibraryRoute.LANDING) closeLibraryRoute()
-                if (dest == destination) reselectSignal++ else onDestinationChange(dest)
+                if (dest == destination) reselectSignal++ else changeDestination(dest)
             },
             )
             Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
@@ -249,7 +261,8 @@ fun TvShell(
                     } else {
                         TvHomeScreen(viewModel<HomeViewModel>(factory = factory), onItem, modifier = Modifier.weight(1f), reselectSignal = reselectSignal,
                             onImportedCollections = onImportedCollections?.let { open -> { open(true) } },
-                            importedReturnSignal = if (importedFromHome) importedReturnSignal else 0)
+                            importedReturnSignal = if (importedFromHome) importedReturnSignal else 0,
+                            onLocalResume = onLocalResume)
                     }
                 }
                 TvDestination.DISCOVER ->
@@ -270,6 +283,7 @@ fun TvShell(
                             landingViewModel = landingViewModel,
                             onItem = onItem,
                             onDirectResume = onDirectResume,
+                            onLocalResume = onLocalResume,
                             pickerActive = libraryRoute == TvLibraryRoute.LANDING,
                             onDownloads = { openLibraryRoute(TvLibraryRoute.DOWNLOADS) },
                             onWatchlist = { openLibraryRoute(TvLibraryRoute.WATCHLIST) },
@@ -285,7 +299,7 @@ fun TvShell(
                         TvLibraryRoute.LANDING -> Unit
                         TvLibraryRoute.DOWNLOADS -> Column(modifier = Modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
                             TvLibraryRouteHeader("Downloads", onBack = ::closeLibraryRoute)
-                            TvDownloadsScreen(onPlay = onPlayLocal, modifier = Modifier.weight(1f))
+                            TvDownloadsScreen(onPlay = onPlayDownloaded, modifier = Modifier.weight(1f))
                         }
                         TvLibraryRoute.WATCHLIST -> TvWatchlistScreen(
                             store = WatchlistStore.shared(appContext),
@@ -303,7 +317,7 @@ fun TvShell(
                     }
                 }
                 TvDestination.DOWNLOADS ->
-                    TvDownloadsScreen(onPlay = onPlayLocal)
+                    TvDownloadsScreen(onPlay = onPlayDownloaded)
                 TvDestination.SEARCH ->
                     TvSearchScreen(
                         viewModel = viewModel<SearchViewModel>(factory = factory),
@@ -318,8 +332,10 @@ fun TvShell(
                 TvDestination.ADDONS ->
                     TvAddonsDestination(
                         repo = repo,
+                        auth = auth,
+                        syncManager = syncManager,
                         reselectSignal = reselectSignal,
-                        onExit = { onDestinationChange(TvDestination.HOME) },
+                        onExit = { changeDestination(TvDestination.HOME) },
                     )
                 TvDestination.SETTINGS ->
                     TvSettingsScreen(repo = repo, auth = auth, syncManager = syncManager, onItem = onItem, onProfileSelected = onProfileSelected,
@@ -457,6 +473,8 @@ private fun TvNavItem(destination: TvDestination, selected: Boolean, onClick: ()
 @Composable
 private fun TvAddonsDestination(
     repo: CatalogRepository,
+    auth: AuthRepository,
+    syncManager: VortXSyncManager?,
     reselectSignal: Int,
     onExit: () -> Unit,
     modifier: Modifier = Modifier,
@@ -474,6 +492,10 @@ private fun TvAddonsDestination(
             val pairingVm: AddonPairingViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo))
             TvAddonPairingScreen(viewModel = pairingVm, onBack = { route = TvAddonsRoute.ROOT }, modifier = modifier)
         }
+        TvAddonsRoute.ACCOUNT -> {
+            BackHandler { route = TvAddonsRoute.ROOT }
+            TvAccountRoute(repo, auth, syncManager, onBack = { route = TvAddonsRoute.ROOT }, modifier = modifier)
+        }
         TvAddonsRoute.ROOT -> {
             val addonsVm: AddonsViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo))
             TvAddonsScreen(
@@ -481,10 +503,11 @@ private fun TvAddonsDestination(
                 onBack = onExit,
                 onDiscover = { route = TvAddonsRoute.STORE },
                 onInstallByQr = { route = TvAddonsRoute.PAIRING },
+                onOpenAccount = if (syncManager != null) ({ route = TvAddonsRoute.ACCOUNT }) else null,
                 modifier = modifier,
             )
         }
     }
 }
 
-private enum class TvAddonsRoute { ROOT, STORE, PAIRING }
+private enum class TvAddonsRoute { ROOT, STORE, PAIRING, ACCOUNT }

@@ -346,6 +346,7 @@ struct iOSDetailView: View {
     @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source floats to top + badges/menu (#15)
     @ObservedObject private var debridKeys = DebridKeys.shared
     @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized detail title/logo override
+    @ObservedObject private var playbackGate = FullscreenPlaybackGate.shared
     /// Observed so the episode ticks repaint when an async Trakt shadow pull lands while this page is open.
     /// The Trakt episode mirror is read synchronously from a non-observable cache, so without this the page
     /// would show the pre-pull state until some unrelated event happened to re-evaluate it. WatchedIndex
@@ -639,6 +640,7 @@ struct iOSDetailView: View {
     @StateObject private var mediaServers = MediaServerSource()
     #if !os(tvOS)
     @ObservedObject private var downloads = DownloadStore.shared   // offline-download state for the hero "Download" affordance (#30)
+    @State private var downloadLaunchID: UUID?
     // Batch episode downloads (#119): the coordinator publishes the walk's status/summary; the two
     // selection vars drive the episode multi-select mode (chosen over a from/to range sheet because it
     // reuses the existing chip + row idiom, covers arbitrary picks AND ranges, and "whole season" is one
@@ -776,6 +778,14 @@ struct iOSDetailView: View {
         var wasExplicitPick: Bool = false
         /// Frozen at the ordinary source-admission handoff, never re-read from a later Detail intent.
         var playbackQueueToken: PlaybackTitleQueue.Token? = nil
+        var downloadedPlayback: AppleDownloadedPlayback? = nil
+
+        static func downloaded(_ playback: AppleDownloadedPlayback, resume: Double) -> Self {
+            .init(url: playback.url, title: playback.record.displayTitle, headers: nil,
+                  resume: resume, meta: playback.record.playbackMeta,
+                  qualityText: playback.record.qualityText, isTorrent: false, wasExplicitPick: true,
+                  downloadedPlayback: playback)
+        }
     }
 
     /// A resolved TRAILER row ready to hand to PlayerScreen with `isTrailer: true` (Identifiable so the
@@ -1088,6 +1098,8 @@ struct iOSDetailView: View {
             sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex,
                             mediaServers: mediaServers, debridCache: debridCache)
             if effectiveType == "series" {
+                downloads.refreshSeasonBoundaries(libraryID: meta?.id ?? id, type: effectiveType,
+                                                    owner: PlaybackMutationTarget.capture(core: core))
                 torboxSearch.clearResults(); sourceIndex.clearResults(); mediaServers.clearResults()
                 // A series detail loads meta only; streams load per-episode from iOSEpisodeStreams.
                 if meta == nil { core.loadMeta(type: effectiveType, id: metaRequestID) }
@@ -1142,6 +1154,16 @@ struct iOSDetailView: View {
         }
         .onValueChange(of: meta?.videos?.count) { _ in requestAutoPlayIfReady() }
         .onValueChange(of: movieReady) { _ in requestAutoPlayIfReady() }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if meta == nil, !LiveTypes.contains(type) {
+                let copies = downloads.playableDownloads(libraryID: id, type: type)
+                if !copies.isEmpty {
+                    DownloadedTitleChoices(copies: copies, onPlay: playDownloadedCopy)
+                        .padding(Theme.Space.md)
+                        .background(Theme.Palette.canvas)
+                }
+            }
+        }
         // Do NOT unloadMeta here. On iOS, pushing the per-episode page (iOSEpisodeStreams) fires THIS
         // detail page's onDisappear AFTER the episode page has already loaded its streams, so calling
         // unloadMeta would wipe `metaDetails` out from under the episode page (~0.3s later), leaving its
@@ -1149,6 +1171,7 @@ struct iOSDetailView: View {
         // iOS while MOVIES (no child push) and macOS (different onDisappear timing) worked. The next
         // detail's loadMeta replaces the resident meta anyway, so leaving it loaded is harmless.
         .onDisappear {
+            downloadLaunchID = nil
             ratingsGeneration = nil
             ratingsTask?.cancel(); ratingsTask = nil
             // Forward the same pending grant to a series' accepted episode page.
@@ -1232,7 +1255,24 @@ struct iOSDetailView: View {
                     // save to the LAUNCH episode across in-player binge advances (wrong-episode CW attribution).
                     onProgress: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
                     onSeek: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
+                    downloadedPlayback: launch.downloadedPlayback,
+                    ownsDownloadedPresentation: { presentation?.id == item.id },
+                    onDownloadedAdvance: { candidate, onFailure in
+                        guard presentation?.id == item.id else { return }
+                        core.unloadEnginePlayer()
+                        Task { @MainActor in
+                            let prepared = await candidate.prepareForPlayback(core: core, refreshSeasonBoundary: false)
+                            guard presentation?.id == item.id else { return }
+                            guard let prepared else {
+                                onFailure()
+                                presentation = nil
+                                return
+                            }
+                            presentation = .player(.downloaded(prepared.copy, resume: prepared.resume))
+                        }
+                    },
                     onClose: {
+                        guard presentation?.id == item.id else { return }
                         core.unloadEnginePlayer()
                         presentation = nil
                     }
@@ -1906,20 +1946,24 @@ struct iOSDetailView: View {
     /// a missing / slow / blocked trailer never blanks the band, and no error is ever surfaced.
     /// Re-logged when the title or its trailer resolution changes, never per render.
     private var detailTrailerGateKey: String {
-        "\(id)|\(detailNativeTrailerURL != nil)|\(detailTrailerYouTubeID != nil)|\(detailTrailerClipURL != nil)"
+        "\(id)|\(detailNativeTrailerURL != nil)|\(detailTrailerYouTubeID != nil)|\(detailTrailerClipURL != nil)|\(detailTrailerBlockReason ?? "allowed")"
     }
-    /// One diagnostics line per detail title: whether the muted hero trailer could mount, and if not which gate
-    /// stopped it. No title identity is logged.
+    private var detailTrailerBlockReason: String? {
+        if playbackGate.playerActive || presentation != nil { return "playback_active" }
+        if !autoplayTrailers { return "autoplay_off" }
+        if reduceMotion { return "reduce_motion" }
+        return LiveTypes.contains(type) ? "live" : nil
+    }
+
+    /// Log trailer eligibility without claiming that a decoder started. No title identity is logged.
     private func logDetailTrailerGate() {
-        let reason = !autoplayTrailers ? "autoplay_off"
-            : reduceMotion ? "reduce_motion"
-            : LiveTypes.contains(type) ? "live"
-            : (detailNativeTrailerURL == nil && detailTrailerYouTubeID == nil && detailTrailerClipURL == nil) ? "no_trailer" : nil
-        DiagnosticsLog.log("trailer", "hero surface=detail result=" + (reason.map { "skip reason=\($0)" } ?? "mount"))
+        let reason = detailTrailerBlockReason
+            ?? ((detailNativeTrailerURL == nil && detailTrailerYouTubeID == nil && detailTrailerClipURL == nil) ? "no_trailer" : nil)
+        DiagnosticsLog.log("trailer", "hero surface=detail result=" + (reason.map { "skip reason=\($0)" } ?? "eligible"))
     }
 
     @ViewBuilder private func heroTrailerClip(height: CGFloat) -> some View {
-        if autoplayTrailers, !reduceMotion, !LiveTypes.contains(type) {
+        if detailTrailerBlockReason == nil {
             if let native = detailNativeTrailerURL {
                 // FULL trailer (direct stream OR the /yt resolver) muted + looping in libmpv (window nil = whole
                 // trailer, looped). This is the owner's FINAL detail-hero path - same native route as the button.
@@ -1982,8 +2026,10 @@ struct iOSDetailView: View {
     /// yt-direct: one attempt per ambient YouTube id at resolving the detail-hero clip on the user's own IP.
     /// Fail-soft: any miss records `url = nil`, which mounts the existing /yt worker URL unchanged.
     private func resolveDetailAmbientDirect() async {
-        guard let yt = detailAmbientYouTubeID, detailAmbientDirect?.ytID != yt else { return }
+        guard !Task.isCancelled, detailTrailerBlockReason == nil,
+              let yt = detailAmbientYouTubeID, detailAmbientDirect?.ytID != yt else { return }
         let resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080)
+        guard !Task.isCancelled, detailTrailerBlockReason == nil, detailAmbientYouTubeID == yt else { return }
         NSLog("[yt-direct] detail ambient: %@",
               resolved.map { $0.isMuxed ? "direct-muxed" : "direct-pair" } ?? "fallback-worker")
         detailAmbientDirect = (yt, resolved?.videoURL)
@@ -2357,6 +2403,10 @@ struct iOSDetailView: View {
             return $0.isResume ? primaryEpisodeResumeSeconds($0.video) : nil
         }
         return AnyView(VStack(alignment: .leading, spacing: Theme.Space.md) {
+            if let meta {
+                let copies = downloads.playableDownloads(libraryID: meta.id, type: meta.type)
+                if !copies.isEmpty { DownloadedTitleChoices(copies: copies, onPlay: playDownloadedCopy) }
+            }
             // Full-width primary episode CTA on its own line (matches the movie Play button), with the
             // resume stripe just beneath it.
             if let m = meta, let primary {
@@ -2715,6 +2765,18 @@ struct iOSDetailView: View {
         #endif
     }
 
+    private func playDownloadedCopy(_ candidate: AppleDownloadedPlayback) {
+        guard presentation == nil else { return }
+        cancelPendingQuickWatch()
+        let launchID = UUID()
+        downloadLaunchID = launchID
+        Task { @MainActor in
+            let prepared = await candidate.prepareForPlayback(core: core)
+            guard presentation == nil, downloadLaunchID == launchID, let prepared else { return }
+            presentation = .player(.downloaded(prepared.copy, resume: prepared.resume))
+        }
+    }
+
     // MARK: Movie Watch Now + sources
 
     /// The movie hero action row, the touch/Mac twin of the tvOS detail action set: a **Watch**
@@ -2727,6 +2789,12 @@ struct iOSDetailView: View {
         // FlowLayout so the action chips wrap to a new line on a narrow phone instead of compressing into
         // vertical slivers ("Sou / rce") under the hero's hard width cap.
         return AnyView(VStack(alignment: .leading, spacing: Theme.Space.md) {
+            if let copy = downloads.playableDownload(for: moviePlaybackMeta) {
+                Button { playDownloadedCopy(copy) } label: {
+                    Label("Play downloaded", systemImage: "play.fill")
+                }
+                .buttonStyle(ChipButtonStyle())
+            }
             // The primary CTA is a big, high-contrast rounded Play button on its own line, the
             // cinematic-media-app hero action, no longer one small chip lost in a wrapping row.
             // Width-capped per platform (heroCtaMaxWidth) so it doesn't span the whole Mac window (#6).
@@ -3717,6 +3785,7 @@ struct iOSDetailView: View {
         // Movies only (a series episode resumes via its own path); skipped when it is a torrent while torrents
         // are off.
         if let entry = LastStreamStore.entry(for: moviePlaybackMeta.libraryId, profileID: ProfileStore.shared.activeID),
+           URL(string: entry.url)?.isFileURL != true,
            let service = entry.debridService.flatMap(DebridService.init(rawValue:)),
            let hash = entry.infoHash, !hash.isEmpty,
            !(PlaybackSettings.torrentsDisabled && entry.torrent == true) {
@@ -3724,7 +3793,7 @@ struct iOSDetailView: View {
             if let quickWatchScope {
                 guard quickWatchScopeIsCurrent(quickWatchScope) else { return }
             }
-            if refreshed {
+            if refreshed, !url.isFileURL {
                 core.loadEnginePlayer(for: stream)
                 let pm = moviePlaybackMeta
                 let resumeProposal = await proposedResume(
@@ -5557,6 +5626,8 @@ struct iOSEpisodeStreams: View {
     // and two sheets attached to the same view shadow each other, so a #95 trailer cover added ALONGSIDE the
     // player cover could stop Watch from presenting. One enum-typed slot guarantees exactly one cover.
     @State private var presentation: Presentation?
+    @ObservedObject private var episodeDownloads = DownloadStore.shared
+    @State private var downloadLaunchID: UUID?
     @State private var playbackReturnReceipt = EpisodeReturnReceiptState<UUID, PlaybackMeta>()
     @State private var playbackReturnTarget: PlaybackNavigationOwner?
     @State private var preparation = PlaybackPreparationState()
@@ -5718,6 +5789,7 @@ struct iOSEpisodeStreams: View {
             }
         }
         .onDisappear {
+            downloadLaunchID = nil
             if initialTraktNextEpisodeOffer != nil { episodeTargetGeneration &+= 1 }
             cancelPendingAutoPick()
             torrentPrime?.cancel(); sourceRefreshDebounce?.cancel()
@@ -5801,19 +5873,21 @@ struct iOSEpisodeStreams: View {
                     initialEnginePreference: launch.enginePreference,
                     playbackQueueToken: launch.playbackQueueToken,
                     startedFromExplicitPick: launch.wasExplicitPick,
-                    episodes: seasonEpisodes.map {
+                    episodes: launch.downloadedPlayback == nil ? seasonEpisodes.map {
                         PlayerEpisodeRef(id: $0.id,
                                          label: "S\($0.season ?? 1)E\($0.episodeNumber) · \($0.episodeTitle)",
                                          season: $0.season,
                                          episode: $0.episode)
-                    },
+                    } : [],
                     // Detail metadata is a launch/current-season view, not proof of a settled full-title
                     // CoreMetaDetails aggregation. Terminal refresh may upgrade this only from its exact
                     // request-owned appleCWTerminalFullMeta receipt.
                     seriesInventoryAuthority: .launch,
-                    loadEpisode: { await loadEpisodeStream($0) },
-                    loadEpisodeWithMetadata: { await loadEpisodeStream($0.id, refreshedVideo: $0) },
-                    warmNextEpisode: { await nextEpisodePreparer.warm($0, context: nextEpisodePreparationContext()) },
+                    loadEpisode: launch.downloadedPlayback == nil ? { await loadEpisodeStream($0) } : nil,
+                    loadEpisodeWithMetadata: launch.downloadedPlayback == nil
+                        ? { await loadEpisodeStream($0.id, refreshedVideo: $0) } : nil,
+                    warmNextEpisode: launch.downloadedPlayback == nil
+                        ? { await nextEpisodePreparer.warm($0, context: nextEpisodePreparationContext()) } : nil,
                     // Engine feed only: the ACCOUNT write lives in PlayerScreen.saveAccountProgress, keyed on
                     // curMeta, so a binge advance attributes progress to the CURRENT episode (capturing
                     // launch.meta here saved every advance's progress against the launch episode).
@@ -5824,6 +5898,24 @@ struct iOSEpisodeStreams: View {
                         beginPlaybackReturn(launch)
                         guard playbackReturnTarget?.isCurrent(core: core, account: account) == true else { return }
                         _ = playbackReturnReceipt.record(committed, requestID: launch.id)
+                    },
+                    downloadedPlayback: launch.downloadedPlayback,
+                    ownsDownloadedPresentation: { presentation?.id == item.id },
+                    onDownloadedAdvance: { candidate, onFailure in
+                        guard presentation?.id == item.id else { return }
+                        beginPlaybackReturn(launch)
+                        _ = playbackReturnReceipt.close(requestID: launch.id)
+                        core.unloadEnginePlayer()
+                        Task { @MainActor in
+                            let prepared = await candidate.prepareForPlayback(core: core, refreshSeasonBoundary: false)
+                            guard presentation?.id == item.id else { return }
+                            guard let prepared else {
+                                onFailure()
+                                presentation = nil
+                                return
+                            }
+                            presentation = .player(.downloaded(prepared.copy, resume: prepared.resume))
+                        }
                     },
                     onClose: {
                         guard presentation?.id == item.id else { return }
@@ -6105,7 +6197,29 @@ struct iOSEpisodeStreams: View {
     /// + isSuspended) so this hidden episode list stops re-rendering behind the video; it restores on close.
     private func sourceListView(width: CGFloat, heroOwnsPrimaryPlay: Bool = false) -> some View {
         let suspended = presentation != nil
-        return iOSSourceList(
+        let target = PlaybackMeta(libraryId: meta.id, videoId: shownVideo.id, type: "series",
+                                  name: meta.name, poster: shownVideo.thumbnail ?? meta.poster,
+                                  season: shownVideo.season, episode: shownVideo.episode)
+        return VStack(alignment: .leading, spacing: Theme.Space.md) {
+        if !suspended, let copy = episodeDownloads.playableDownload(for: target) {
+            Button {
+                let launchID = UUID()
+                let generation = episodeTargetGeneration
+                downloadLaunchID = launchID
+                cancelPendingAutoPick()
+                Task { @MainActor in
+                    let prepared = await copy.prepareForPlayback(core: core)
+                    guard presentation == nil, downloadLaunchID == launchID,
+                          episodeTargetIsCurrent(shownVideo, generation: generation),
+                          let prepared, prepared.copy.record.matchesPlayback(target) else { return }
+                    presentation = .player(.downloaded(prepared.copy, resume: prepared.resume))
+                }
+            } label: {
+                Label("Play downloaded", systemImage: "play.fill")
+            }
+            .buttonStyle(ChipButtonStyle())
+        }
+        iOSSourceList(
             groups: suspended ? [] : rankedEpisode(),
             sourceRows: suspended ? [] : sourceList.quickFilterGroups,
             progress: core.streamLoadProgress(forStreamId: shownVideo.id),
@@ -6153,6 +6267,7 @@ struct iOSEpisodeStreams: View {
         // Equatable gate: unrelated episode re-renders skip re-diffing the ranked list (the
         // groups compare is a buffer-identity fast path until the model republishes).
         .equatable()
+        }
         .padding(.horizontal, Theme.Space.md)
         // #9: cap the source list to a readable column, centered, on wide iPad/Mac windows.
         .frame(maxWidth: width > Theme.Space.wideLayoutMinWidth ? Theme.Space.contentColumn : .infinity)

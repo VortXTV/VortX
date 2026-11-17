@@ -12,10 +12,11 @@ import androidx.activity.compose.LocalActivityResultRegistryOwner
 import androidx.activity.result.ActivityResultRegistry
 import androidx.activity.result.ActivityResultRegistryOwner
 import androidx.activity.result.contract.ActivityResultContract
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.Text
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.ui.test.assertDoesNotExist
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsFocused
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -23,6 +24,9 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.click
 import androidx.core.app.ActivityOptionsCompat
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -44,8 +48,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import java.util.UUID
 
-/** Production host/controller with synthetic download/preparation. No provider, account or network I/O.
- * System Back/focus and absent-SAF UI are bounded instrumentation coverage only, authored but unrun. */
+/** Production host/controller with synthetic download/preparation. No provider, account or network I/O. */
 @RunWith(AndroidJUnit4::class)
 class ProfilePickerToolsHostTest {
     @get:Rule val compose = createComposeRule()
@@ -110,54 +113,129 @@ class ProfilePickerToolsHostTest {
         }
     }
 
+    private class UnavailableTreeRegistry : ActivityResultRegistry(), ActivityResultRegistryOwner {
+        override val activityResultRegistry: ActivityResultRegistry get() = this
+        var launches = 0
+        override fun <I, O> onLaunch(requestCode: Int, contract: ActivityResultContract<I, O>, input: I,
+            options: ActivityOptionsCompat?) {
+            assertTrue(contract is ActivityResultContracts.OpenDocumentTree)
+            launches++
+            throw ActivityNotFoundException("synthetic absent folder chooser")
+        }
+    }
+
+    private fun openToolsWithRemote(controller: ProfilePickerToolsController) {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        instrumentation.setInTouchMode(false)
+        compose.onNodeWithTag("profile-picker-tools").performSemanticsAction(SemanticsActions.RequestFocus).assertIsFocused()
+        instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_DPAD_CENTER)
+        compose.waitUntil { controller.state.value.open }
+        compose.waitForIdle()
+    }
+
     @Test fun televisionToolsIsAvailableOverBusyPickerAndSystemBackReturnsFocusWithoutOpeningProfile() {
         val f = Fixture(); var pickerCompositions = 0
         try {
             compose.setContent { VortXTheme {
-                ProfilePickerToolsHost(f.model, isTv = true, diagnosticAdmission = { f.policy.value }, canOpenTree = { false }) {
+                ProfilePickerToolsHost(f.model, isTv = true, diagnosticAdmission = { f.policy.value }) {
                     pickerCompositions++; Text("Opening profiles…")
                 }
             } }
             compose.onNodeWithText("Opening profiles…").assertIsDisplayed()
-            compose.onNodeWithTag("profile-picker-tools").performClick()
+            openToolsWithRemote(f.controller)
             compose.onNodeWithTag("picker-tools-back").assertIsDisplayed()
             compose.onNodeWithTag("picker-tools-diagnostics").assertDoesNotExist()
+            compose.onNodeWithTag("picker-tools-recovery-diagnostics").assertExists()
             compose.onNodeWithText("Repair backup").assertDoesNotExist(); compose.onNodeWithText("Restore backup").assertDoesNotExist()
             InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
             compose.waitForIdle()
             compose.onNodeWithTag("profile-picker-tools").assertIsDisplayed().assertIsFocused()
             compose.onNodeWithText("Opening profiles…").assertIsDisplayed()
             assertEquals(0, f.accounts.gets); assertTrue(pickerCompositions > 0)
-        } finally { f.close() }
+        } finally {
+            InstrumentationRegistry.getInstrumentation().resetInTouchMode()
+            f.close()
+        }
     }
     @Test fun unavailableSafActivityUsesFixedExplanationAndDoesNotAttemptAnotherDownload() {
         val f = Fixture()
+        val registry = UnavailableTreeRegistry()
         try {
-            compose.setContent { VortXTheme {
-                ProfilePickerToolsHost(f.model, isTv = true, diagnosticAdmission = { f.policy.value }, canOpenTree = { false }) {}
+            compose.setContent { CompositionLocalProvider(LocalActivityResultRegistryOwner provides registry) {
+                VortXTheme { ProfilePickerToolsHost(f.model, isTv = false, diagnosticAdmission = { f.policy.value }) {} }
             } }
-            compose.onNodeWithTag("profile-picker-tools").performClick()
-            compose.onNodeWithTag("picker-tools-download").performClick()
+            compose.onNodeWithTag("profile-picker-tools").performTouchInput { click() }
+            compose.onNodeWithTag("picker-tools-download").performTouchInput { click() }
             compose.waitUntil { f.controller.state.value.phase == PickerToolsPhase.AWAITING_DESTINATION }
-            compose.onNodeWithTag("picker-tools-destination").performScrollTo().performClick()
+            compose.onNodeWithTag("picker-tools-destination").assertIsDisplayed().performTouchInput { click() }
             compose.waitUntil { f.controller.state.value.phase == PickerToolsPhase.IDLE }
-            compose.onNodeWithText(PickerToolsFailure.NO_FILE_PROVIDER.message).performScrollTo().assertIsDisplayed()
+            compose.onNodeWithText(PickerToolsFailure.NO_FILE_PROVIDER.message).assertIsDisplayed()
+            assertEquals(1, registry.launches)
             assertEquals(1, f.accounts.gets)
         } finally { f.close() }
     }
-    @Test fun protectedOrUnavailableRosterNeverShowsDiagnosticExportInPhoneTools() {
+
+    @Test fun televisionDpadFocusMovesToFolderChoiceAfterDownloadAndReturnsToToolsOnBack() {
+        val f = Fixture()
+        val registry = UnavailableTreeRegistry()
+        val input = InstrumentationRegistry.getInstrumentation()
+        try {
+            compose.setContent { CompositionLocalProvider(LocalActivityResultRegistryOwner provides registry) {
+                VortXTheme { ProfilePickerToolsHost(f.model, isTv = true, diagnosticAdmission = { false }) {} }
+            } }
+            openToolsWithRemote(f.controller)
+            compose.onNodeWithTag("picker-tools-back").assertIsFocused()
+            input.sendKeyDownUpSync(KeyEvent.KEYCODE_DPAD_DOWN)
+            compose.onNodeWithTag("picker-tools-download").assertIsFocused()
+            input.sendKeyDownUpSync(KeyEvent.KEYCODE_DPAD_CENTER)
+            compose.waitUntil { f.controller.state.value.phase == PickerToolsPhase.AWAITING_DESTINATION }
+            compose.onNodeWithTag("picker-tools-destination").assertIsFocused()
+            input.sendKeyDownUpSync(KeyEvent.KEYCODE_DPAD_CENTER)
+            compose.waitUntil { f.controller.state.value.phase == PickerToolsPhase.IDLE }
+            compose.onNodeWithText(PickerToolsFailure.NO_FILE_PROVIDER.message).assertIsDisplayed()
+            assertEquals(1, registry.launches)
+            input.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
+            compose.onNodeWithTag("profile-picker-tools").assertIsFocused()
+        } finally {
+            input.resetInTouchMode()
+            f.close()
+        }
+    }
+    @Test fun protectedOrUnavailableRosterOffersOnlyLimitedDiagnosticsInPhoneTools() {
         val f = Fixture()
         try {
             compose.setContent { VortXTheme {
-                ProfilePickerToolsHost(f.model, isTv = false, diagnosticAdmission = { f.policy.value }, canOpenTree = { false }) {}
+                ProfilePickerToolsHost(f.model, isTv = false, diagnosticAdmission = { f.policy.value }) {}
             } }
             compose.onNodeWithTag("profile-picker-tools").performClick()
             compose.onNodeWithTag("picker-tools-diagnostics").assertDoesNotExist()
+            compose.onNodeWithTag("picker-tools-recovery-diagnostics").assertExists()
             compose.runOnIdle { f.policy.value = true }
             compose.onNodeWithTag("picker-tools-diagnostics").assertExists()
+            compose.onNodeWithTag("picker-tools-recovery-diagnostics").assertDoesNotExist()
             compose.runOnIdle { f.policy.value = false }
             compose.onNodeWithTag("picker-tools-diagnostics").assertDoesNotExist()
+            compose.onNodeWithTag("picker-tools-recovery-diagnostics").assertExists()
             assertEquals(0, f.accounts.gets)
+        } finally { f.close() }
+    }
+
+    @Test fun profilesUnavailableHasInlineToolsAndSeparateAccountCheck() {
+        val f = Fixture()
+        var accountChecks = 0
+        try {
+            compose.setContent { VortXTheme {
+                ProfilePickerToolsHost(f.model, isTv = false, diagnosticAdmission = { false }, entryInPicker = true) { toolsEntry ->
+                    PickerProfilesUnavailable(isTv = false, toolsEntry = toolsEntry,
+                        accountControl = ProfilePickerAccountControl("Sign out", onCheckAccount = { accountChecks++ }) {
+                            error("check account must not sign out")
+                        })
+                }
+            } }
+            compose.onNodeWithTag("picker-check-account").assertIsDisplayed().performTouchInput { click() }
+            assertEquals(1, accountChecks)
+            compose.onNodeWithTag("profile-picker-tools").assertIsDisplayed().performTouchInput { click() }
+            compose.onNodeWithTag("picker-tools-back").assertIsDisplayed()
         } finally { f.close() }
     }
 

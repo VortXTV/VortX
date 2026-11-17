@@ -70,6 +70,31 @@ object TrackSelector {
         return preferAddonSubtitles || firstMatch(subtitles, preferences.subtitleLanguages, preferences.rejectTerms) == null
     }
 
+    /**
+     * An explicit C press uses the saved language order independently of automatic Off/Forced policy.
+     * Return [SUBTITLE_OFF] if the first available preferred language is already on the primary
+     * slot, an id to select, or null to keep the current selection. mpv identifies the primary
+     * slot separately because its secondary track is also marked selected.
+     */
+    internal fun preferredSubtitleShortcut(
+        subtitles: List<PlayerTrack>,
+        preferences: TrackPreferences,
+        primarySubtitleId: Int?,
+        secondarySubtitleId: Int,
+    ): Int? {
+        val primary = if (primarySubtitleId == null) {
+            subtitles.singleOrNull { it.selected }
+        } else {
+            subtitles.firstOrNull { it.id == primarySubtitleId }
+        }
+        val selectable = subtitles.filterNot { it.id == secondarySubtitleId }
+        for (language in preferences.subtitleLanguages) {
+            if (matches(primary?.lang, language)) return SUBTITLE_OFF
+            firstMatch(selectable, listOf(language), preferences.rejectTerms)?.let { return it.id }
+        }
+        return null
+    }
+
     /** First track whose language matches the priority list and whose title isn't rejected. */
     private fun firstMatch(tracks: List<PlayerTrack>, languages: List<String>, reject: List<String>): PlayerTrack? {
         for (lang in languages) {

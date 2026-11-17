@@ -63,7 +63,7 @@ def main():
                    b'vortx_get_state_json', b'vortx_engine_free', b'vortx_owner_history_canonicalize_evidence_json']:
         if symbol not in header_bytes:
             raise SystemExit('The current production C ABI requires a missing header declaration')
-    subprocess.run(['/usr/bin/lipo', '-verify_arch', 'arm64', str(library)], check=True)
+    subprocess.run(['/usr/bin/lipo', str(library), '-verify_arch', 'arm64'], check=True)
     build = ROOT / 'app/build'
     build.mkdir(parents=True, exist_ok=True)
     if ROOT not in build.resolve().parents:

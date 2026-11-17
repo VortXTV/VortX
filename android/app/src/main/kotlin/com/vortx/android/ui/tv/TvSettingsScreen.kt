@@ -67,6 +67,7 @@ import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.skip.SkipConfig
 import com.vortx.android.sync.VortXSyncManager
+import com.vortx.android.sync.presentationKey
 import com.vortx.android.ui.prefs.TabBarPrefs
 import com.vortx.android.ui.prefs.VisualEffects
 import com.vortx.android.ui.screens.AccountContent
@@ -103,7 +104,6 @@ import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.ProfileSelectionRequest
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.tv.TopShelfSettings
-import com.vortx.android.tv.WatchNextPublisher
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -196,16 +196,11 @@ fun TvSettingsScreen(
     var settingsQuery by remember { mutableStateOf("") }
 
     val store = ProfileStore.sharedOrNull()
-    // Re-read the debrid account after returning from profile management.
-    var refresh by remember { mutableStateOf(0) }
-    val debridAccountIdentity = remember(refresh) {
-        store?.activeKeychainAccount ?: ProfileStore.PRIMARY_TOKEN_ACCOUNT
-    }
     val activeProfile by (store?.activeProfile?.collectAsStateWithLifecycle()
         ?: remember { mutableStateOf(null) })
 
     if (route == TvSettingsRoute.PROFILES) {
-        TvProfilesScreen(onBack = { route = TvSettingsRoute.ROOT; refresh++; restoreProfilesFocus = true }, onSelected = onProfileSelected, modifier = modifier)
+        TvProfilesScreen(onBack = { route = TvSettingsRoute.ROOT; restoreProfilesFocus = true }, onSelected = onProfileSelected, modifier = modifier)
         return
     }
 
@@ -256,6 +251,7 @@ fun TvSettingsScreen(
             onBack = ::returnFromAddons,
             onDiscover = { route = TvSettingsRoute.ADDON_STORE },
             onInstallByQr = { route = TvSettingsRoute.ADDON_PAIRING },
+            onOpenAccount = if (syncManager != null) ({ route = TvSettingsRoute.ADDON_ACCOUNT }) else null,
             modifier = modifier,
         )
         return
@@ -263,6 +259,8 @@ fun TvSettingsScreen(
 
     if (route == TvSettingsRoute.DEBRID) {
         BackHandler { returnToSettingsRoot() }
+        val debridAccountIdentity = syncManager?.sessionOwnerPresentation?.collectAsStateWithLifecycle()
+            ?.value?.presentationKey ?: "unavailable"
         TvDebridKeysScreen(
             keys = debridKeys,
             accountIdentity = debridAccountIdentity,
@@ -286,13 +284,14 @@ fun TvSettingsScreen(
         return
     }
 
-    if (route == TvSettingsRoute.ACCOUNT) {
-        BackHandler { route = TvSettingsRoute.ROOT }
+    if (route == TvSettingsRoute.ACCOUNT || route == TvSettingsRoute.ADDON_ACCOUNT) {
+        val returnRoute = route.back()
+        BackHandler { route = returnRoute }
         TvAccountRoute(
             repo = repo,
             auth = auth,
             syncManager = syncManager,
-            onBack = { route = TvSettingsRoute.ROOT },
+            onBack = { route = returnRoute },
             modifier = modifier,
         )
         return
@@ -542,8 +541,6 @@ fun TvSettingsScreen(
                             val next = !showCwOnHome
                             showCwOnHome = next
                             TopShelfSettings.setShowContinueWatching(appContext, next)
-                            // Turning it off clears the rows now; turning it on lets the next CW update publish.
-                            if (!next) WatchNextPublisher.clearOwnedRows(appContext)
                         },
                     )
                 }
@@ -1003,6 +1000,7 @@ internal enum class TvSettingsRoute {
     ADDONS,
     ADDON_STORE,
     ADDON_PAIRING,
+    ADDON_ACCOUNT,
     DEBRID,
     WHATS_NEW,
     CUSTOMIZE_HOME,
@@ -1024,8 +1022,8 @@ internal enum class TvSettingsRoute {
     DIAGNOSTICS;
 
     internal fun back(): TvSettingsRoute = when (this) {
-        // The store + pairing screens are nested under Add-ons; Back returns there, not to the root.
-        ADDON_STORE, ADDON_PAIRING -> ADDONS
+        // Routes opened by Add-ons return there.
+        ADDON_STORE, ADDON_PAIRING, ADDON_ACCOUNT -> ADDONS
         else -> ROOT
     }
 }
@@ -1306,7 +1304,7 @@ private val tvSkipProviderOptions: List<Pair<String, Pair<String, String>>> = li
 /// rows drive. The VortX side ([VortXAccountViewModel]) needs the app-process [VortXSyncManager] and is only
 /// built when one is available; the Stremio side ([AccountViewModel]) rides the shared [AuthRepository].
 @Composable
-private fun TvAccountRoute(
+internal fun TvAccountRoute(
     repo: CatalogRepository,
     auth: AuthRepository,
     syncManager: VortXSyncManager?,

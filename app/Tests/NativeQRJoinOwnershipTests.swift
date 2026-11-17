@@ -45,10 +45,17 @@ private enum PairingCrypto {
     func isCurrent(_ capture: Capture) -> Bool { capture.generation == generation }
 }
 
+private struct VortXAuthenticationReceipt: Equatable {
+    let accountID: String
+    let credential: CredentialScopeRegistry.Capture
+}
+
 @MainActor private final class VortXSyncManager {
+    private struct Account { let id: String }
     private let credentialAuthority = CredentialScopeRegistry()
     private var authOperationGeneration: UInt64 = 0
     private var qrOperation: QrJoinOperation?
+    private var account: Account?
     /* PRODUCTION_AUTH_CAPTURE */
     /* PRODUCTION_AUTH_GENERATION */
     /* PRODUCTION_QR */
@@ -95,15 +102,18 @@ private enum PairingCrypto {
     // deliberately changes the credential capture BEFORE suspending at bindGate,
     // reproducing the cancellation aperture without touching any account store.
     private func adopt(token: String, account: [String: Any], dataKey: Data,
-                       expectedOperation: AuthOperationCapture? = nil) async -> Bool {
+                       expectedOperation: AuthOperationCapture? = nil,
+                       onAuthenticated: (@MainActor (VortXAuthenticationReceipt) -> Void)? = nil) async -> Bool {
         guard let operation = expectedOperation, isCurrent(operation), !Task.isCancelled else { return false }
-        guard !token.isEmpty, account["id"] as? String == "fixture-only-id",
+        guard !token.isEmpty, let id = account["id"] as? String, id == "fixture-only-id",
               account["email"] is String, account["username"] is String,
               dataKey.count == 32 else { return false }
         credentialAuthority.generation += 1
         if let bindGate { await bindGate.wait() }
         guard operation.generation == authOperationGeneration, !Task.isCancelled else { return false }
         adoptions.append(token)
+        self.account = Account(id: id)
+        onAuthenticated?(.init(accountID: id, credential: credentialAuthority.capture()))
         return true
     }
 }
@@ -189,10 +199,23 @@ private enum PairingCrypto {
         do {
             let manager = VortXSyncManager(), gate = Gate(); manager.bindGate = gate
             let session = await manager.qrStart()!
-            let poll = Task { @MainActor in await manager.qrPoll(session) }
+            var receipts: [VortXAuthenticationReceipt] = []
+            let poll = Task { @MainActor in await manager.qrPoll(session) { receipts.append($0) } }
             await entered(gate); manager.qrCancel(session); gate.release()
             check(await poll.value == .failed && manager.adoptions.isEmpty,
                   "cancel after credential bind still revokes original auth generation")
+            check(receipts.isEmpty, "a cancelled QR adoption delivers no decision owner")
+        }
+        do {
+            let manager = VortXSyncManager()
+            let session = await manager.qrStart()!
+            var receipts: [VortXAuthenticationReceipt] = []
+            check(await manager.qrPoll(session) { receipts.append($0) } == .signedIn(email: "fixture.invalid"),
+                  "the approved QR adoption succeeds")
+            check(receipts == [.init(accountID: "fixture-only-id", credential: .init(generation: 2))],
+                  "the TV receives the credential generation published by adoption")
+            check(await manager.qrPoll(session) { receipts.append($0) } == .failed && receipts.count == 1,
+                  "an already consumed QR cannot regain ownership of a backup decision")
         }
         do {
             let manager = VortXSyncManager(), gate = Gate(); manager.meGate = gate

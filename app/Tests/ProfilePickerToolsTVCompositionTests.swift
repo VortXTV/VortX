@@ -198,7 +198,7 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
         let originalServiceOwner = owner
         var result = Model.Services(owner: {
             self.ownerReads += 1
-            return self.actionAdmitted ? self.owner : nil
+            return originalServiceOwner
         }, isCurrent: { expected in
             self.actionAdmitted && self.owner == expected
                 && CredentialScopeRegistry.shared.isCurrent(expected.credential)
@@ -324,6 +324,69 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
             check(channel.retireRequests == 1 && !channel.freshGrant() && h.model.isBusy,
                   "the original active route background event retires only its owned transfer")
             channel.acknowledgeFullDrain(); await settle { !h.model.isBusy }
+        }
+        do {
+            let h = TVHarness()
+            let grant = ProfilePickerToolsRouteAdmission(isForeground: false)
+            h.actionAdmitted = grant.permits
+            let owner = h.owner!, operationID = UUID()
+            h.records = [(owner, [.init(operationID: operationID, state: .needsVerification)])]
+            let route = h.present()
+            h.model.begin(.download, route: route)
+            check(!h.model.accountActionsAvailable && h.discoveries == 0 && h.downloads == 0,
+                  "inactive Tools appearance captures the owner without admitting status or files")
+            grant.setForeground(true)
+            h.actionAdmitted = grant.permits
+            check(!h.model.canRestore, "Restore waits for the original route's first admitted journal read")
+            h.model.admissionDidChange(route: route)
+            await settle { h.discoveries == 1 && !h.model.isBusy }
+            check(h.model.accountActionsAvailable && h.model.restoreNeedsVerification && !h.model.canRestore
+                    && h.model.canVerifyRestore && h.ownerReads == 1,
+                  "foreground return discovers the original account's retained restore without recapturing its owner")
+            h.model.begin(.download, route: route)
+            await settle { h.channels.count == 1 && h.channel.installed.count == 1 }
+            check(h.downloads == 1, "the same foreground route can download while a prior Restore remains guarded")
+            await h.cancelAndDrain()
+        }
+        do {
+            let h = TVHarness(), gate = TVGate<ProfilePickerToolsRestoreAction.StoredStatus>()
+            h.statusGate = gate
+            let route = h.present()
+            await gate.waitForEntry()
+            check(h.model.isBusy && !h.model.canCancelFileAction && !h.model.canRestore,
+                  "the automatic inventory does not expose a cancellable file action")
+            gate.returnValue(.accountChanged)
+            await settle { !h.model.isBusy }
+            check(h.model.accountActionsAvailable && !h.model.canRestore && !h.model.canVerifyRestore,
+                  "an unavailable account journal keeps Restore closed even while file actions are admitted")
+            h.model.begin(.restore, route: route)
+            check(h.channels.isEmpty, "the remote cannot open a restore transfer after inventory refusal")
+        }
+        do {
+            let h = TVHarness(), gate = TVGate<ProfilePickerToolsRestoreAction.StoredStatus>()
+            h.statusGate = gate
+            let route = h.present()
+            await gate.waitForEntry()
+            h.model.cancel()
+            gate.returnValue(.available([]))
+            await settle { !h.model.isBusy }
+            check(!h.model.canRestore && h.model.accountActionsAvailable,
+                  "cancelling the automatic inventory cannot enable Restore from an unverified status")
+            h.model.dismiss(route)
+            h.statusGate = nil
+            _ = await h.presentReady()
+            check(h.model.canRestore, "a freshly opened route can enable Restore after an authenticated empty inventory")
+        }
+        do {
+            let h = TVHarness()
+            h.actionAdmitted = false
+            let route = h.present()
+            h.replaceAccount("synthetic-account-A")
+            h.actionAdmitted = true
+            h.model.admissionDidChange(route: route)
+            h.model.begin(.download, route: route)
+            check(!h.model.accountActionsAvailable && h.discoveries == 0 && h.downloads == 0 && h.ownerReads == 1,
+                  "foreground return cannot regain authority after replacement of the same account epoch")
         }
         do {
             let h = TVHarness(), route = await h.presentReady()

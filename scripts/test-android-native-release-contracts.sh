@@ -95,6 +95,15 @@ for hosted_init in owner-history-hosted.init.gradle native-sync-hosted.init.grad
     require_literal "$hosted_init binds real JNI receipts to the reviewed native source" \
         "receipt.engineSource != \"$REVIEWED_NATIVE_SHA\"" "$REPO_ROOT/android/$hosted_init"
 done
+compatibility_count() {
+    awk '/^ *"com\.vortx\.android\.engine\.NativeOwnerHistoryCompatibilityTest":/ { rows++; count = $2 }
+        END { if (rows != 1 || count !~ /^[1-9][0-9]*L,$/) exit 1; print count }' "$1"
+}
+sync_count="$(compatibility_count "$REPO_ROOT/android/native-sync-hosted.init.gradle")" \
+    || fail "the native sync gate must declare one exact compatibility test count"
+owner_count="$(compatibility_count "$REPO_ROOT/android/owner-history-hosted.init.gradle")" \
+    || fail "the owner-history gate must declare one exact compatibility test count"
+[ "$sync_count" = "$owner_count" ] || fail "both hosted gates must require the same compatibility test count"
 
 candidate_artifact_gate="$(awk '/name: Verify signed release artifacts against the pinned production signer/{active=1; next}
     active && /^[[:space:]]+- name:/{exit} active{print}' "$ANDROID_CI_WF")"

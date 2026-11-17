@@ -1,7 +1,13 @@
 package com.vortx.android.tv
 
 import android.content.Context
+import android.content.SharedPreferences
+import com.vortx.android.VortXApplication
 import com.vortx.android.profile.ProfileStore
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 
 /**
  * The one preference behind the Android TV "Play Next" Continue Watching row (TV-2). Persisted under Apple's
@@ -17,11 +23,27 @@ object TopShelfSettings {
     const val SHOW_CONTINUE_WATCHING_KEY = "vortx.topShelf.showContinueWatching"
 
     fun showContinueWatching(context: Context): Boolean =
-        prefs(context).getBoolean(SHOW_CONTINUE_WATCHING_KEY, true)
+        showContinueWatching(prefs(context))
 
     fun setShowContinueWatching(context: Context, value: Boolean) {
         prefs(context).edit().putBoolean(SHOW_CONTINUE_WATCHING_KEY, value).apply()
+        if (!value) (context.applicationContext as? VortXApplication)?.clearWatchNextIfDisabled()
     }
+
+    internal fun observeShowContinueWatching(context: Context): Flow<Boolean> = callbackFlow {
+        val store = prefs(context)
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == null || key == SHOW_CONTINUE_WATCHING_KEY) {
+                trySend(showContinueWatching(store))
+            }
+        }
+        store.registerOnSharedPreferenceChangeListener(listener)
+        trySend(showContinueWatching(store))
+        awaitClose { store.unregisterOnSharedPreferenceChangeListener(listener) }
+    }.distinctUntilChanged()
+
+    private fun showContinueWatching(store: SharedPreferences): Boolean =
+        runCatching { store.getBoolean(SHOW_CONTINUE_WATCHING_KEY, true) }.getOrDefault(false)
 
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(ProfileStore.PREFS_FILE, Context.MODE_PRIVATE)

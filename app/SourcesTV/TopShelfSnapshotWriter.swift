@@ -33,7 +33,8 @@ enum TopShelfSnapshotWriter {
     @MainActor private static var lastPrivateArtworkInputs: [WarmCandidate]?
     @MainActor private static var lastPrivatePublished: [TopShelfSnapshot.Item]?
     @MainActor private static var lastPublishedSelectionSource: TraktPlaybackShadow.ContinueWatchingSource?
-    // At most five added lines per app process. Existing successful-publication logging remains.
+    @MainActor private static var contentNotification = TopShelfSnapshot.ContentNotification()
+    // Record each write status and the resolved group class once per process.
     @MainActor private static var reportedWriteResults: Set<TopShelfSnapshot.WriteResult> = []
     @MainActor private static var reportedGroupSource = false
 
@@ -93,8 +94,8 @@ enum TopShelfSnapshotWriter {
     /// Rebuild and publish the shelf from the CURRENT engine + profile state.
     ///
     /// Main-actor because it reads `@Published` state off `CoreBridge` / `ProfileStore`. Cheap and
-    /// idempotent: it caps at 8 items, and the store's own content diff means an unchanged Home
-    /// refresh writes nothing and wakes nothing. Safe to call from every Home re-seed.
+    /// idempotent: it caps at 8 items, and unchanged Home refreshes keep the retained bytes.
+    /// Only the first publication may ask tvOS to reload those bytes. Safe on every Home re-seed.
     @MainActor
     static func publishCurrent() {
         installAuthBoundaryObserver()
@@ -108,32 +109,21 @@ enum TopShelfSnapshotWriter {
         }
 
         let profiles = ProfileStore.shared
-        let snapshot = HomeContinueWatchingSelection.current(core: CoreBridge.shared, profiles: profiles)
+        let snapshot = publicationSnapshot(core: .shared, profiles: profiles)
         let selection = snapshot.selection
         let context = snapshot.context
-        let pending = items(from: selection.items, source: selection.source, displayProgress: selection.displayProgress)
         guard snapshot.intent.isCurrent() else {
             cancelWarm(clearArtwork: true); publish([]); return
         }
-        // A signing service's generic group can be shared by other apps it signs for this viewer. Trakt and
-        // SIMKL history, and Trakt's warmed artwork, never go there: such a queue leaves the static shelf
-        // image. VortX's own group, and a signer's copy of it (`.dedicated`), carry them like local rows (#229).
+        // A generic signing-service group can be shared by other apps. Publish only the current
+        // profile's VortX history there. Keep this write guard even when the selector uses local-only.
         guard selection.source == .local || TopShelfSnapshot.appGroupSource != .signer else {
             cancelWarm(clearArtwork: true); publish([]); return
         }
-        // Keep the warm identity exactly aligned with the queue above. Raw Trakt state can still carry
-        // finished, removed, or temporary seeds; those rows never render and must not consume one of the
-        // bounded eight private-image requests.
-        let sourceItems = Array(selection.items.lazy
-            .filter {
-                EpisodePlaybackIdentity.usesSeriesLifecycle(type: $0.type) || !$0.isFinished
-            }
-            .filter { $0.removed != true && $0.temp != true }
-            // Every system shelf item is actionable. Unsupported SIMKL cards remain visible in
-            // Home with an explicit unavailable action, never as a broken generic deep link.
-            .filter { selection.source != .simkl || SIMKLContinueWatchingFold.unavailableReason(id: $0.id, type: $0.type, videoID: $0.state.videoId) == nil }
-            .prefix(TopShelfSnapshot.maxItems)
-            .map { WarmCandidate(id: $0.id, type: $0.type, poster: $0.poster) })
+        let selectedRows = shelfCandidates(from: selection.items, source: selection.source)
+        let pending = snapshotItems(from: selectedRows, source: selection.source, displayProgress: selection.displayProgress)
+        // Warm artwork for exactly the rows that qualified for publication.
+        let sourceItems = selectedRows.map { WarmCandidate(id: $0.id, type: $0.type, poster: $0.poster) }
 
         // A private Trakt row is published immediately with nil artwork. The only later replacement is
         // a local file URL produced by the bounded first-party warm pass; joined third-party artwork is
@@ -205,6 +195,19 @@ enum TopShelfSnapshotWriter {
         let items: [TopShelfSnapshot.Item]
     }
 
+    @MainActor
+    static func publicationSnapshot(
+        core: CoreBridge,
+        profiles: ProfileStore,
+        renderedHome: HomeContinueWatchingSelection.Snapshot? = nil
+    ) -> HomeContinueWatchingSelection.Snapshot {
+        let localOnly = TopShelfSnapshot.appGroupSource == .signer
+        if let renderedHome, !localOnly || renderedHome.context.preferences.source == .local {
+            return renderedHome
+        }
+        return HomeContinueWatchingSelection.current(core: core, profiles: profiles, localOnly: localOnly)
+    }
+
     static func publicationKey(for snapshot: HomeContinueWatchingSelection.Snapshot) -> PublicationKey {
         .init(intent: snapshot.intent, items: items(from: snapshot.selection.items,
             source: snapshot.selection.source, displayProgress: snapshot.selection.displayProgress))
@@ -224,7 +227,14 @@ enum TopShelfSnapshotWriter {
         source: TraktPlaybackShadow.ContinueWatchingSource,
         displayProgress: [String: Double] = [:]
     ) -> [TopShelfSnapshot.Item] {
-        cw.lazy
+        snapshotItems(from: shelfCandidates(from: cw, source: source), source: source, displayProgress: displayProgress)
+    }
+
+    private static func shelfCandidates(
+        from cw: [CoreCWItem],
+        source: TraktPlaybackShadow.ContinueWatchingSource
+    ) -> [CoreCWItem] {
+        Array(cw.lazy
             // The rail's own prune rule. `CoreBridge` already applies `isFinished` before publishing
             // the rail, but the shelf re-applies it rather than trusting that, because a shelf is
             // rendered from a FILE that can outlive the process that wrote it: a title finished on
@@ -236,16 +246,25 @@ enum TopShelfSnapshotWriter {
             // business on the Home screen even while the engine still carries them in the bucket.
             .filter { $0.removed != true && $0.temp != true }
             .filter { source != .simkl || SIMKLContinueWatchingFold.unavailableReason(id: $0.id, type: $0.type, videoID: $0.state.videoId) == nil }
-            .prefix(TopShelfSnapshot.maxItems)
-            .map {
-                TopShelfSnapshot.Item(
-                    id: $0.id,
-                    type: $0.type,
-                    title: $0.name,
-                    poster: shelfPoster($0.poster, source: source),
-                    progress: shelfProgress(displayProgress[$0.id] ?? $0.progress)
-                )
-            }
+            // Apply the extension's link rule before the cap so a bad row cannot displace a good one.
+            .filter { TopShelfSnapshot.hasValidAction(type: $0.type, id: $0.id) }
+            .prefix(TopShelfSnapshot.maxItems))
+    }
+
+    private static func snapshotItems(
+        from rows: [CoreCWItem],
+        source: TraktPlaybackShadow.ContinueWatchingSource,
+        displayProgress: [String: Double]
+    ) -> [TopShelfSnapshot.Item] {
+        rows.map {
+            TopShelfSnapshot.Item(
+                id: $0.id,
+                type: $0.type,
+                title: $0.name,
+                poster: shelfPoster($0.poster, source: source),
+                progress: shelfProgress(displayProgress[$0.id] ?? $0.progress)
+            )
+        }
     }
 
     /// Watch progress, guaranteed finite and inside 0…1.
@@ -476,12 +495,14 @@ enum TopShelfSnapshotWriter {
         }
         if !reportedGroupSource {
             reportedGroupSource = true
-            DiagnosticsLog.log("topshelf", "group=\(TopShelfSnapshot.appGroupSource.rawValue)")
+            DiagnosticsLog.log("topshelf", "group=\(TopShelfSnapshot.appGroupSource.rawValue) source=\(TopShelfSnapshot.appGroupResolutionSource) decision=\(TopShelfSnapshot.appGroupResolutionDecision)")
         }
-        guard result == .written else { return }
-        // Only nudge the system when the content actually moved: this wakes the extension, so firing
-        // it on every unchanged Home re-seed would be pure churn.
+        guard contentNotification.shouldNotify(after: result) else { return }
         TVTopShelfContentProvider.topShelfContentDidChange()
+        if result == .unchanged {
+            DiagnosticsLog.log("topshelf", "refresh requested for retained snapshot")
+            return
+        }
         // Overflow may compact/drop unrepresentable cache rows. Do not report the input count
         // as the number actually written, and do not re-read the file just for logging.
         DiagnosticsLog.log("topshelf", "published snapshot")

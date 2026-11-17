@@ -20,7 +20,6 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -31,7 +30,6 @@ import androidx.compose.ui.unit.dp
 import com.vortx.android.usenet.UsenetProviderRead
 import com.vortx.android.usenet.UsenetProviderServer
 import com.vortx.android.usenet.UsenetProviderStore
-import com.vortx.android.debrid.DebridOwnerToken
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 
@@ -47,9 +45,10 @@ internal fun UsenetServersSettingsScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var servers by remember { mutableStateOf<List<UsenetProviderServer>>(emptyList()) }
-    var revision by remember { mutableLongStateOf(0L) }
-    var capturedOwner by remember { mutableStateOf<DebridOwnerToken?>(null) }
+    var read by remember { mutableStateOf<UsenetProviderRead>(UsenetProviderRead.UnavailableOrCorrupt(null, 0)) }
+    val renderedRead = read
+    val renderedOwner = renderedRead.owner.takeUnless { renderedRead is UsenetProviderRead.UnavailableOrCorrupt }
+    val renderedServers = (renderedRead as? UsenetProviderRead.Available)?.servers?.servers.orEmpty()
     var message by remember { mutableStateOf<String?>(null) }
     var editingId by remember { mutableStateOf<String?>(null) }
     var name by remember { mutableStateOf("") }
@@ -64,42 +63,23 @@ internal fun UsenetServersSettingsScreen(
     }
 
     fun refresh(clearMessage: Boolean = true) {
-        when (val current = store.snapshot()) {
-            is UsenetProviderRead.Available -> {
-                if (current.owner != capturedOwner) {
-                    servers = emptyList(); clearEditor(); capturedOwner = current.owner; message = null
-                }
-                servers = current.servers.servers
-                revision = current.revision
-                if (clearMessage) message = null
-            }
-            is UsenetProviderRead.Missing -> {
-                if (current.owner != capturedOwner) {
-                    servers = emptyList(); clearEditor(); capturedOwner = current.owner; message = null
-                }
-                servers = emptyList()
-                revision = current.revision
-                if (clearMessage) message = null
-            }
-            is UsenetProviderRead.UnavailableOrCorrupt -> {
-                if (current.owner != capturedOwner) {
-                    servers = emptyList(); clearEditor(); capturedOwner = current.owner
-                }
-                servers = emptyList()
-                revision = current.revision
-                message = "Saved Usenet settings could not be read. Nothing was changed."
-            }
+        val current = store.snapshot()
+        if (read != current) {
+            clearEditor()
+            if (read.owner != current.owner) message = null
+            read = current
         }
+        if (clearMessage) message = null
+        if (current is UsenetProviderRead.UnavailableOrCorrupt)
+            message = "Saved Usenet settings could not be read. Nothing was changed."
     }
+    // Polling can replace the read before Compose replaces a queued button or keyboard callback.
+    fun isRenderedCurrent(): Boolean = renderedOwner != null && read === renderedRead
+
     fun persist(next: List<UsenetProviderServer>) {
-        val owner = capturedOwner
-        if (owner == null) {
-            message = "Usenet settings are unavailable for the current account. Nothing was changed."
-            return
-        }
-        // Passing the snapshot owner explicitly makes an A->B switch reject this exact stale draft even
-        // when both process-local document revisions happen to be zero.
-        if (store.saveServers(next, revision, owner)) {
+        val owner = renderedOwner ?: return
+        if (!isRenderedCurrent()) return
+        if (store.saveServers(next, renderedRead.revision, owner)) {
             clearEditor(); refresh()
         } else {
             message = "Could not safely save Usenet servers. Refresh and try again."
@@ -107,6 +87,7 @@ internal fun UsenetServersSettingsScreen(
         }
     }
     fun edit(server: UsenetProviderServer) {
+        if (!isRenderedCurrent()) return
         editingId = server.id
         name = server.name; host = server.host; port = server.port.toString(); connections = server.maxConnections.toString()
         // Do not re-render either credential. Blank retains the encrypted value on save.
@@ -114,7 +95,8 @@ internal fun UsenetServersSettingsScreen(
         message = null
     }
     fun saveEditor() {
-        val existing = servers.firstOrNull { it.id == editingId }
+        if (!isRenderedCurrent()) return
+        val existing = renderedServers.firstOrNull { it.id == editingId }
         val candidate = UsenetProviderServer(
             id = existing?.id ?: java.util.UUID.randomUUID().toString(),
             name = name.trim(), host = host.trim(), port = port.toIntOrNull() ?: 0,
@@ -132,7 +114,7 @@ internal fun UsenetServersSettingsScreen(
             }
             return
         }
-        persist(if (existing == null) servers + candidate else servers.map { if (it.id == existing.id) candidate else it })
+        persist(if (existing == null) renderedServers + candidate else renderedServers.map { if (it.id == existing.id) candidate else it })
     }
 
     LaunchedEffect(store) {
@@ -159,35 +141,35 @@ internal fun UsenetServersSettingsScreen(
         ) {
             Text("Servers are tried from top to bottom. TLS credentials stay encrypted on this device and are never displayed.")
             message?.let { Text(it) }
-            servers.forEachIndexed { index, server ->
+            renderedServers.forEachIndexed { index, server ->
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Column(Modifier.weight(1f)) {
                         Text(server.redactedSummary)
                         Text("Priority ${index + 1}")
                     }
                     Switch(checked = server.enabled, onCheckedChange = { enabled ->
-                        persist(servers.map { if (it.id == server.id) it.copy(enabled = enabled) else it })
+                        persist(renderedServers.map { if (it.id == server.id) it.copy(enabled = enabled) else it })
                     })
                     TextButton(onClick = { edit(server) }) { Text("Edit") }
                     TextButton(enabled = index > 0, onClick = {
-                        persist(servers.toMutableList().also { list -> val moved = list.removeAt(index); list.add(index - 1, moved) })
+                        persist(renderedServers.toMutableList().also { list -> val moved = list.removeAt(index); list.add(index - 1, moved) })
                     }) { Text("Up") }
-                    TextButton(enabled = index < servers.lastIndex, onClick = {
-                        persist(servers.toMutableList().also { list -> val moved = list.removeAt(index); list.add(index + 1, moved) })
+                    TextButton(enabled = index < renderedServers.lastIndex, onClick = {
+                        persist(renderedServers.toMutableList().also { list -> val moved = list.removeAt(index); list.add(index + 1, moved) })
                     }) { Text("Down") }
-                    TextButton(onClick = { persist(servers.filterNot { it.id == server.id }) }) { Text("Delete") }
+                    TextButton(onClick = { persist(renderedServers.filterNot { it.id == server.id }) }) { Text("Delete") }
                 }
             }
             Text(if (editingId == null) "Add server" else "Edit server")
-            OutlinedTextField(name, { name = it }, label = { Text("Name") }, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(host, { host = it }, label = { Text("Host") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(port, { port = it }, label = { Text("Port") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(username, { username = it }, label = { Text(if (editingId == null) "Username" else "Username (blank keeps saved)") }, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(password, { password = it }, label = { Text(if (editingId == null) "Password" else "Password (blank keeps saved)") }, visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password), modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(connections, { connections = it }, label = { Text("Connections") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(name, { if (isRenderedCurrent()) name = it }, label = { Text("Name") }, modifier = Modifier.fillMaxWidth(), enabled = renderedOwner != null)
+            OutlinedTextField(host, { if (isRenderedCurrent()) host = it }, label = { Text("Host") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.fillMaxWidth(), enabled = renderedOwner != null)
+            OutlinedTextField(port, { if (isRenderedCurrent()) port = it }, label = { Text("Port") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth(), enabled = renderedOwner != null)
+            OutlinedTextField(username, { if (isRenderedCurrent()) username = it }, label = { Text(if (editingId == null) "Username" else "Username (blank keeps saved)") }, modifier = Modifier.fillMaxWidth(), enabled = renderedOwner != null)
+            OutlinedTextField(password, { if (isRenderedCurrent()) password = it }, label = { Text(if (editingId == null) "Password" else "Password (blank keeps saved)") }, visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password), modifier = Modifier.fillMaxWidth(), enabled = renderedOwner != null)
+            OutlinedTextField(connections, { if (isRenderedCurrent()) connections = it }, label = { Text("Connections") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth(), enabled = renderedOwner != null)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = ::saveEditor) { Text(if (editingId == null) "Add server" else "Save changes") }
-                if (editingId != null) TextButton(onClick = ::clearEditor) { Text("Cancel") }
+                Button(onClick = ::saveEditor, enabled = renderedOwner != null) { Text(if (editingId == null) "Add server" else "Save changes") }
+                if (editingId != null) TextButton(onClick = { if (isRenderedCurrent()) clearEditor() }) { Text("Cancel") }
             }
         }
     }

@@ -7,6 +7,7 @@
 //     app/Tests/KeychainFileAdapterTests.swift && /private/tmp/keychain-file-adapter
 
 import Foundation
+import Darwin
 
 private enum InjectedAtomicWriteFailure: Error {
     case beforeRename
@@ -31,7 +32,8 @@ struct KeychainFileAdapterTests {
                 isLegacyInvalidated: { [self] account in legacyMarkers.contains(account) },
                 clearLegacyInvalidated: { [self] account in legacyMarkers.remove(account) },
                 purgeAllLegacy: {},
-                purgeLegacy: { _ in }
+                purgeLegacy: { _ in },
+                mutationTransaction: { operation in adapter.withMutationTransaction(operation) }
             )
         }
     }
@@ -59,6 +61,7 @@ struct KeychainFileAdapterTests {
         testPersistThenPermissionFailureIsUncertain()
         testCredentialAndTombstoneShareOneFileMap()
         testLegacyDescriptorReadHardening()
+        testPreexistingApplicationSupportDirectory()
         testRealFilesystemAtomicPersistence()
 
         print("\n----------------------------------------")
@@ -261,6 +264,94 @@ struct KeychainFileAdapterTests {
               corruptResult != .value("old-secret"))
     }
 
+    static func testPreexistingApplicationSupportDirectory() {
+        print("\n=== credential writes protect the existing streaming-server parent ===")
+        let manager = FileManager.default
+        let fixture = manager.temporaryDirectory
+            .appendingPathComponent("vortx-keychain-parent-\(UUID().uuidString)", isDirectory: true)
+        defer { try? manager.removeItem(at: fixture) }
+
+        func mode(of url: URL) -> Int? {
+            ((try? manager.attributesOfItem(atPath: url.path)[.posixPermissions]) as? NSNumber)?.intValue
+        }
+
+        do {
+            try manager.createDirectory(at: fixture, withIntermediateDirectories: true,
+                                        attributes: [.posixPermissions: 0o700])
+            for existingCredential in [false, true] {
+                let root = fixture.appendingPathComponent(existingCredential ? "existing" : "fresh", isDirectory: true)
+                let serverData = root.appendingPathComponent("stremio-server", isDirectory: true)
+                let fileURL = root.appendingPathComponent("credentials.plist")
+                try manager.createDirectory(at: serverData, withIntermediateDirectories: true)
+                try manager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: root.path)
+                if existingCredential {
+                    let old = try PropertyListSerialization.data(
+                        fromPropertyList: ["other": "existing-synthetic"], format: .binary, options: 0)
+                    try old.write(to: fileURL)
+                    try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+                }
+                let adapter = KeychainFileAdapter(fileURL: fileURL, fileManager: manager)
+                let store = MarkerStore().makeStore(adapter: adapter)
+                check("existing 0755 parent permits certified credential write (existing=\(existingCredential))",
+                      store.set("new-synthetic", for: "account") == .success)
+                check("certified read returns the newly stored value", store.confirmedString("account") == .value("new-synthetic"))
+                check("other entries remain intact", adapter.read("other") ==
+                      (existingCredential ? .value("existing-synthetic") : .missing))
+                check("credential parent is 0700", mode(of: root) == 0o700)
+                check("credential and lock files are 0600", mode(of: fileURL) == 0o600
+                      && mode(of: root.appendingPathComponent("credentials.plist.lock")) == 0o600)
+                check("streaming-server directory is retained", manager.fileExists(atPath: serverData.path))
+            }
+
+            let writable = fixture.appendingPathComponent("writable", isDirectory: true)
+            try manager.createDirectory(at: writable, withIntermediateDirectories: false)
+            try manager.setAttributes([.posixPermissions: 0o777], ofItemAtPath: writable.path)
+            let rejectedFile = writable.appendingPathComponent("credentials.plist")
+            let rejected = KeychainFileAdapter(fileURL: rejectedFile, fileManager: manager)
+            check("world-writable parent cannot adopt credentials", rejected.write("synthetic", for: "account") == .failure)
+            check("world-writable parent is left intact", mode(of: writable) == 0o777
+                  && !manager.fileExists(atPath: rejectedFile.path))
+
+            let aclParent = fixture.appendingPathComponent("extended-acl", isDirectory: true)
+            try manager.createDirectory(at: aclParent, withIntermediateDirectories: false)
+            try manager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: aclParent.path)
+            let grant = Process()
+            grant.executableURL = URL(fileURLWithPath: "/bin/chmod")
+            grant.arguments = ["+a", "everyone allow add_file,search", aclParent.path]
+            try grant.run()
+            grant.waitUntilExit()
+            check("ACL fixture grants write access outside mode bits", grant.terminationStatus == 0)
+            if grant.terminationStatus == 0 {
+                let file = aclParent.appendingPathComponent("credentials.plist")
+                let aclAdapter = KeychainFileAdapter(fileURL: file, fileManager: manager)
+                check("ACL parent cannot adopt credentials", aclAdapter.write("synthetic", for: "account") == .failure)
+                check("ACL parent mode and files stay untouched", mode(of: aclParent) == 0o755
+                      && (try? manager.contentsOfDirectory(atPath: aclParent.path)) == [])
+                let descriptor = aclParent.path.withCString { Darwin.open($0, O_RDONLY | O_NOFOLLOW | O_DIRECTORY) }
+                if descriptor >= 0 {
+                    let acl = Darwin.acl_get_fd(descriptor)
+                    check("existing ACL is retained", acl != nil)
+                    if let acl { _ = Darwin.acl_free(UnsafeMutableRawPointer(acl)) }
+                    _ = Darwin.close(descriptor)
+                } else {
+                    check("open rejected ACL parent for fixture readback", false)
+                }
+            }
+
+            let target = fixture.appendingPathComponent("target", isDirectory: true)
+            try manager.createDirectory(at: target, withIntermediateDirectories: false)
+            try manager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: target.path)
+            let link = fixture.appendingPathComponent("link", isDirectory: true)
+            try manager.createSymbolicLink(at: link, withDestinationURL: target)
+            let linked = KeychainFileAdapter(fileURL: link.appendingPathComponent("credentials.plist"), fileManager: manager)
+            check("symlinked parent cannot adopt credentials", linked.write("synthetic", for: "account") == .failure)
+            check("symlink target permissions and files are untouched", mode(of: target) == 0o755
+                  && (try? manager.contentsOfDirectory(atPath: target.path)) == [])
+        } catch {
+            check("preexisting-parent fixture setup", false, "\(error)")
+        }
+    }
+
     static func testRealFilesystemAtomicPersistence() {
         print("\n=== real file persistence is owner-only and atomic ===")
         let fileManager = FileManager.default
@@ -281,6 +372,7 @@ struct KeychainFileAdapterTests {
               "mode \(directoryMode)")
 
         let oldBytes = try? Data(contentsOf: fileURL)
+        let originalEntries = (try? fileManager.contentsOfDirectory(atPath: root.path)) ?? []
         let replacement: [String: String] = ["account": "new-secret", "other": "other-secret"]
         let replacementBytes = try? PropertyListSerialization.data(
             fromPropertyList: replacement, format: .binary, options: 0)
@@ -294,7 +386,7 @@ struct KeychainFileAdapterTests {
               (try? Data(contentsOf: fileURL)) == oldBytes)
         let residues = (try? fileManager.contentsOfDirectory(atPath: root.path)) ?? []
         check("pre-rename failure removes its private temporary file",
-              residues == [fileURL.lastPathComponent], "entries \(residues)")
+              Set(residues) == Set(originalEntries), "entries \(residues)")
 
         let replaced = replacementBytes.map {
             KeychainAtomicFileWriter.persist($0, to: fileURL, fileManager: fileManager)

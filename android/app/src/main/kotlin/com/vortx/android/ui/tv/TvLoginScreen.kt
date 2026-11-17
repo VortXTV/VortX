@@ -108,6 +108,7 @@ internal fun TvPickerVortXAccountScreen(
         Text("VortX Account", style = VortXTheme.type.sectionTitle)
         dismissalNotice?.let { Text(it, style = VortXTheme.type.label) }
         VortXAccountContent(model, onSignOutRequest = onSignOutRequest)
-        if (diagnosticAdmission()) com.vortx.android.ui.screens.DiagnosticLogAction(mayShare = diagnosticAdmission)
+        if (diagnosticAdmission()) com.vortx.android.ui.screens.DiagnosticLogAction(isTv = true, mayShare = diagnosticAdmission)
+        else com.vortx.android.ui.screens.DiagnosticLogAction(isTv = true, recoveryOnly = true)
     }
 }

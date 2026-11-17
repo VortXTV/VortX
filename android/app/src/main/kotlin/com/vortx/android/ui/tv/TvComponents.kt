@@ -40,7 +40,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.toArgb
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.contentDescription
@@ -57,8 +56,9 @@ import androidx.tv.material3.Border
 import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
-import coil3.compose.AsyncImage
+import com.vortx.android.ui.components.ArtworkOverFallback
 import com.vortx.android.ui.components.FallbackArtwork
+import com.vortx.android.ui.components.preferredArtworkCandidates
 import com.vortx.android.R
 import com.vortx.android.VortXApplication
 import com.vortx.android.model.MetaItem
@@ -316,7 +316,7 @@ fun TvPlayButton(
     }
 }
 
-/// Full-bleed cinematic backdrop for the hero band and the detail page. A Coil [AsyncImage] when [url] is
+/// Full-bleed cinematic backdrop for the hero band and the detail page. A Coil image when [url] is
 /// present, otherwise a deterministic brand-tinted gradient keyed by [seed] so an art-less title (an
 /// unloaded preview, a still-hydrating engine row) still reads as an intentional panel rather than a black
 /// bar. The caller layers scrims + content over it.
@@ -515,34 +515,30 @@ fun TvPosterGrid(
 /** Uses a supplied wide backdrop in landscape mode, falling back to a safe crop of poster art. */
 @Composable
 internal fun androidx.compose.foundation.layout.BoxScope.TvPosterArt(item: MetaItem, landscape: Boolean) {
-    val rawBackdrop = if (landscape) PosterArtwork.backdrop(item.id, item.background) else null
-    var backdropFailed by remember(rawBackdrop) { mutableStateOf(false) }
-    val backdrop = tvLandscapeBackdropUrl(rawBackdrop, backdropFailed)
-    if (backdrop.isNullOrBlank()) {
+    if (!landscape) {
         PosterArt(item.poster, item.name, id = item.id, type = item.type.id)
-    } else {
-        AsyncImage(
-            model = backdrop,
-            contentDescription = item.name,
-            contentScale = ContentScale.Crop,
-            onError = { backdropFailed = true },
-            modifier = Modifier.fillMaxSize(),
-        )
-        if (item.id.startsWith("tt")) {
-            com.vortx.android.ui.components.CardRatingBadge(
-                id = item.id,
-                type = item.type.id,
-                active = PosterArtwork.badgesBackdrops,
-                textSize = 15,
-                modifier = Modifier.align(Alignment.TopStart).padding(10.dp).padding(end = 48.dp),
-            )
-        }
+        return
     }
+    val backdrops = preferredArtworkCandidates(
+        listOf(PosterArtwork.backdrop(item.id, item.background), item.background), item.poster,
+    )
+    ArtworkOverFallback(
+        preferred = backdrops,
+        contentDescription = item.name,
+        fallback = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
+        preferredOverlay = {
+            if (item.id.startsWith("tt")) {
+                com.vortx.android.ui.components.CardRatingBadge(
+                    id = item.id,
+                    type = item.type.id,
+                    active = PosterArtwork.badgesBackdrops,
+                    textSize = 15,
+                    modifier = Modifier.align(Alignment.TopStart).padding(10.dp).padding(end = 48.dp),
+                )
+            }
+        },
+    )
 }
-
-/** A failed wide-art request falls through once to the existing poster renderer, never retried in a loop. */
-internal fun tvLandscapeBackdropUrl(rawBackdrop: String?, failed: Boolean): String? =
-    rawBackdrop?.trim()?.takeIf { it.isNotEmpty() && !failed }
 
 /// Centered idle/empty message for a browse surface (an empty catalog, an untyped Search). Non-focusable
 /// text, so a screen with nothing to show is a calm hint rather than a dead black panel.

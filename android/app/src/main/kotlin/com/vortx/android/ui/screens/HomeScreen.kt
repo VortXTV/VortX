@@ -66,11 +66,14 @@ import com.vortx.android.ui.homeRowKey
 import com.vortx.android.ui.homeRowsWithHub
 import com.vortx.android.ui.normalizeHomeCatalogs
 import com.vortx.android.ui.components.EmptyState
+import com.vortx.android.ui.components.ArtworkOverFallback
+import com.vortx.android.ui.components.FallbackArtwork
 import com.vortx.android.ui.components.ErrorState
 import com.vortx.android.ui.components.CollectionsBrowseScreen
 import com.vortx.android.ui.components.CollectionsHub
 import com.vortx.android.ui.components.LoadingRail
 import com.vortx.android.ui.components.PosterRail
+import com.vortx.android.ui.components.preferredArtworkCandidates
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.theme.rememberReducedMotion
 import com.vortx.android.ui.viewmodel.HomeViewModel
@@ -171,12 +174,16 @@ private fun HomeContent(
     val heroCandidates = remember(heroCatalogs) { PhoneHeroPolicy.candidates(heroCatalogs) }
     val initialHero = heroCandidates.firstOrNull()
     val savedStream = initialHero?.let { lastStreamStore.load() }
+    val downloadRecords by com.vortx.android.downloads.DownloadStore.records.collectAsStateWithLifecycle()
+    val renderedHeroDownload = initialHero?.let { com.vortx.android.downloads.continueWatchingDownloadTarget(it) }
+        ?.let { target -> downloadRecords.singleOrNull(target::matches)?.id }
     // WHY audit R01: direct resume belongs only to the first Continue Watching hero, never ordinary cards.
     // An up-next hero names a finished episode: it opens Detail on the next one, never replays the old link.
     val heroCanDirectResume = heroCatalog?.id == "continue" && !heroCatalog.readOnly && initialHero != null &&
-        initialHero.preferredEpisode?.upNext != true && savedStream?.let {
-        it.mediaId == initialHero.id && it.mediaType == initialHero.type && it.positionMs > 0L
-    } == true
+        initialHero.preferredEpisode?.upNext != true && (renderedHeroDownload != null || savedStream?.let {
+        it.mediaId == initialHero.id && it.mediaType == initialHero.type && it.positionMs > 0L &&
+            !it.url.startsWith("file:", ignoreCase = true)
+    } == true)
     val hubShown = collections.isVisible && !hubHidden
     val forYouUi by viewModel.forYouUi.collectAsStateWithLifecycle()
     // Capture the rendered load at opening; recomposition must not replace its authority.
@@ -238,9 +245,9 @@ private fun HomeContent(
                         if (item.continueWatchingPermit == null || viewModel.isContinueWatchingTapCurrent(item)) onItem(item)
                     },
                     // Direct resume remains an affordance only for the leading Continue Watching title.
-                    onDirectResume = ({ item: MetaItem ->
-                        if (viewModel.isContinueWatchingTapCurrent(item)) onDirectResume(item)
-                    }).takeIf { heroCanDirectResume },
+                    onDirectResume = if (heroCanDirectResume) { item ->
+                        viewModel.localContinueWatchingResume(item, renderedHeroDownload)?.let(onDirectResume)
+                    } else null,
                     directResumeIdentity = initialHero.let(PhoneHeroPolicy::identity).takeIf { heroCanDirectResume },
                 )
             }
@@ -274,7 +281,7 @@ private fun HomeContent(
                             when {
                                 catalog.id == "continue" && !viewModel.isContinueWatchingTapCurrent(item) -> Unit
                                 catalog.id == "continue" && catalog.readOnly -> onItem(item)
-                                catalog.id == "continue" -> onDirectResume(item)
+                                catalog.id == "continue" -> viewModel.localContinueWatchingResume(item)?.let(onDirectResume)
                                 onCatalogItem != null -> onCatalogItem(item)
                                 else -> onItem(item)
                             }
@@ -359,13 +366,7 @@ private fun PhoneHeroHeader(
     val currentChoose by rememberUpdatedState(choose)
     val swipeThresholdPx = with(LocalDensity.current) { PhoneHeroPolicy.SWIPE_DISTANCE_DP.dp.toPx() }
     val colors = VortXTheme.colors
-    // The featured title's real artwork, drawn from the SAME catalog data the rails use: prefer the
-    // wide featured backdrop ([MetaItem.background], what browse pages lead with and what the engine's
-    // `parseMetaPreview` fills for add-on catalog items), fall back to the poster (Continue Watching
-    // items carry only that). Both go through the one app-wide Coil loader, exactly like [PosterArt].
-    // Null/blank on both (the offline preview, or a still-hydrating first item) keeps the plain
-    // gradient so the panel stays intentional rather than empty -- the sensible fallback.
-    val backdropUrl = item.background?.takeUnless { it.isBlank() } ?: item.poster?.takeUnless { it.isBlank() }
+    val backdrops = preferredArtworkCandidates(listOf(item.background), item.poster)
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -411,12 +412,17 @@ private fun PhoneHeroHeader(
             // Placeholder fill for when there is no artwork yet; hidden behind the image when there is.
             .background(Brush.verticalGradient(listOf(colors.surface2, colors.canvas))),
     ) {
-        if (backdropUrl != null) {
-            AsyncImage(
-                model = backdropUrl,
+        if (backdrops.isNotEmpty() || !item.poster.isNullOrBlank()) {
+            ArtworkOverFallback(
+                preferred = backdrops,
                 contentDescription = item.name,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
+                fallback = {
+                    FallbackArtwork(
+                        urls = listOf(item.poster),
+                        contentDescription = item.name,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                },
             )
             // Bottom-anchored scrim so the eyebrow/title/meta stay legible over any artwork: the
             // DESIGN-SYSTEM hero's fade to canvas, without dimming the top of the image.

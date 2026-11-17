@@ -347,12 +347,13 @@ internal object NativeProviderAccess {
         null
     }
 
-    fun read(keys: Set<String>): Read? = runCatching { access { selected, owner, value ->
+    fun read(keys: Set<String>, expected: SessionOwnerSnapshot.Account? = null): Read? = runCatching { access(expected) { selected, owner, value ->
         Read(keys.associateWith(value::value), selected.vault.revision(owner, value), owner)
     } }.getOrNull()
 
-    fun edit(values: Map<String, String?>, auxiliary: Map<String, String?> = emptyMap()): Boolean {
-        val success = runCatching { access { binding, owner, candidate ->
+    fun edit(values: Map<String, String?>, auxiliary: Map<String, String?> = emptyMap(),
+             expected: SessionOwnerSnapshot.Account? = null): Boolean {
+        val success = runCatching { access(expected) { binding, owner, candidate ->
             candidate.edit(values, auxiliary)
             commit(binding, owner, candidate)
             // Admission is still held: a switch cannot redirect this exact account's dirty event.

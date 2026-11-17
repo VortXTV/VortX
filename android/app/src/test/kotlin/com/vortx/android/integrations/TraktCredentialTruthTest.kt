@@ -1,5 +1,6 @@
 package com.vortx.android.integrations
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -221,6 +222,116 @@ class TraktCredentialTruthTest {
         assertFalse(clearCalled)
         assertEquals(NEWER_TOKEN, persistence.load())
         assertEquals(NEWER_TOKEN, TraktAuth.TokenPersistence(store.reopen()) { NOW }.load())
+    }
+
+    @Test
+    fun delayedSiblingRotationPreservesTheNewTupleWithoutGivingItToTheOldRequest() = runBlocking {
+        val store = FakeCredentialStore(oldTokenValues())
+        val persistence = TraktAuth.TokenPersistence(store) { NOW }
+        val spentToken = requireNotNull(persistence.loadStored())
+        val waits = mutableListOf<Long>()
+        var requests = 0
+
+        val outcome = runCatching {
+            TraktAuth.performRefresh(
+                operation = CredentialMutationCoordinator().operation(),
+                spentToken = spentToken,
+                persistence = persistence,
+                clearCurrent = { error("The synced replacement must be preserved") },
+                awaitSiblingRotation = { wait ->
+                    waits.add(wait)
+                    if (wait == 6_000L) persistence.save(NEW_TOKEN)
+                },
+                request = { requests++; IntegrationsHttp.Response(401, "") },
+            )
+        }
+
+        assertSame(TraktAuthException.SessionChanged, outcome.exceptionOrNull())
+        assertEquals(listOf(3_000L, 6_000L), waits)
+        assertEquals(1, requests)
+        assertEquals(NEW_TOKEN, TraktAuth.TokenPersistence(store.reopen()) { NOW }.load())
+    }
+
+    @Test
+    fun rejectedRefreshWithNoRotationClearsOnlyAfterTheBoundedWaits() = runBlocking {
+        val persistence = TraktAuth.TokenPersistence(FakeCredentialStore(oldTokenValues())) { NOW }
+        val spentToken = requireNotNull(persistence.loadStored())
+        val coordinator = CredentialMutationCoordinator()
+        val operation = coordinator.operation()
+        val waits = mutableListOf<Long>()
+
+        val outcome = runCatching {
+            TraktAuth.performRefresh(
+                operation = operation,
+                spentToken = spentToken,
+                persistence = persistence,
+                clearCurrent = { coordinator.invalidate(persistence::clear) },
+                awaitSiblingRotation = { wait ->
+                    assertEquals(OLD_TOKEN, persistence.load())
+                    waits.add(wait)
+                },
+                request = { IntegrationsHttp.Response(401, "") },
+            )
+        }
+
+        assertEquals(TraktAuthException.Server(401), outcome.exceptionOrNull())
+        assertEquals(listOf(3_000L, 6_000L, 12_000L), waits)
+        assertNull(persistence.load())
+        assertSame(CredentialMutationResult.Stale, operation.mutate { Unit })
+    }
+
+    @Test
+    fun rejectedRefreshCannotClearANewGenerationAfterWaiting() = runBlocking {
+        val persistence = TraktAuth.TokenPersistence(FakeCredentialStore(oldTokenValues())) { NOW }
+        val spentToken = requireNotNull(persistence.loadStored())
+        val coordinator = CredentialMutationCoordinator()
+        val operation = coordinator.operation()
+
+        val outcome = runCatching {
+            TraktAuth.performRefresh(
+                operation = operation,
+                spentToken = spentToken,
+                persistence = persistence,
+                clearCurrent = { error("The old request cannot clear the new sign-in") },
+                awaitSiblingRotation = { wait ->
+                    assertEquals(3_000L, wait)
+                    coordinator.invalidate { persistence.save(NEWER_TOKEN) }
+                },
+                request = { IntegrationsHttp.Response(401, "") },
+            )
+        }
+
+        assertSame(TraktAuthException.SessionChanged, outcome.exceptionOrNull())
+        assertEquals(NEWER_TOKEN, persistence.load())
+    }
+
+    @Test
+    fun cancelledAndTransientRefreshesKeepTheOriginalTuple() = runBlocking {
+        val persistence = TraktAuth.TokenPersistence(FakeCredentialStore(oldTokenValues())) { NOW }
+        val spentToken = requireNotNull(persistence.loadStored())
+        val operation = CredentialMutationCoordinator().operation()
+        val cancelled = CancellationException("test cancellation")
+
+        val cancellation = runCatching {
+            TraktAuth.performRefresh(
+                operation, spentToken, persistence,
+                clearCurrent = { error("Cancellation must preserve the existing tuple") },
+                awaitSiblingRotation = { throw cancelled },
+                request = { IntegrationsHttp.Response(401, "") },
+            )
+        }
+        val transient = runCatching {
+            TraktAuth.performRefresh(
+                operation, spentToken, persistence,
+                clearCurrent = { error("Temporary failures must preserve the existing tuple") },
+                awaitSiblingRotation = { error("Only an unauthorized refresh waits for a rotation") },
+                request = { IntegrationsHttp.Response(503, "") },
+            )
+        }
+
+        assertSame(cancelled, cancellation.exceptionOrNull())
+        assertEquals(TraktAuthException.Server(503), transient.exceptionOrNull())
+        assertEquals(OLD_TOKEN, persistence.load())
     }
 
     @Test

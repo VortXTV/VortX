@@ -43,7 +43,7 @@ struct LoginView: View {
                         }
 
                         secondaryActions
-                        DiagnosticLogExportButton()
+                        DiagnosticLogExportButton(recoveryOnly: true)
                     }
                     .padding(Theme.Space.screenEdge)
                     .frame(maxWidth: .infinity)

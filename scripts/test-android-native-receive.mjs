@@ -22,15 +22,16 @@ function method(name, prefix) {
     return match[0];
 }
 const down = method("syncDown", "private suspend ");
-const use = method("useAccountData", "suspend ");
+const use = method("useAccountData", "private suspend ");
 const mark = method("markNativeAccountUnavailable", "private ");
 const clear = method("clearNativeAccountUnavailable", "private ");
 const notice = source.match(/        private const val NATIVE_ACCOUNT_UNAVAILABLE =\n            "[^"\n]+"/)?.[0];
 assert(notice, "Fixed compatibility notice must be extracted from actual source");
 assert(!down.includes("BuildConfig") && !use.includes("onComparisonReceiveCompleted"),
     "This lane requires the native-only receive and choice boundary");
-assert(down.includes("nativeSyncDown(lease, gateway, force, routineReceive)") &&
-       down.includes("nativeSyncMutex.withLock"), "Actual gateway-bound worker/mutex required");
+assert(down.includes("nativeSyncDown(lease, gateway, force, routineReceive, publicationCurrent)") &&
+       down.includes("nativeSyncMutex.withLock") && down.includes("!publicationCurrent()"),
+       "Actual gateway-bound worker/mutex and publication guard required");
 const helper = join(repo, "android/app/src/main/kotlin/com/vortx/android/sync/NativeAccountAttempt.kt");
 const helperSource = await readFile(helper, "utf8");
 console.log("Native receive manager SHA-256:", createHash("sha256").update(source).digest("hex"));
@@ -77,10 +78,15 @@ internal class FixtureReceiveManager {
         action(); return true
     }
     private fun requiresUpgrade(lease: SyncSessionLease) = upgrade && isSyncLeaseCurrent(lease)
+    private fun routineSyncAllowed(lease: SyncSessionLease) = isSyncLeaseCurrent(lease)
+    private fun coldOwnerStillConfirmed(lease: SyncSessionLease) = isSyncLeaseCurrent(lease)
+    private inline fun <T> accountFileManagedWriter(refused: T, work: () -> T): T = work()
+    suspend fun useAccountData(): Boolean = useAccountData(captureSyncLease())
     private suspend fun nativeSyncDown(lease: SyncSessionLease, gateway: NativeAccountGateway,
-                                      force: Boolean, routineReceive: Boolean): Boolean {
+                                      force: Boolean, routineReceive: Boolean,
+                                      publicationCurrent: () -> Boolean): Boolean {
         calls++; forceSeen = force
-        check(!routineReceive)
+        check(!routineReceive && publicationCurrent())
         beforeResult?.invoke()
         failure?.let { throw it }
         return nativeReceived && isSyncLeaseCurrent(lease)

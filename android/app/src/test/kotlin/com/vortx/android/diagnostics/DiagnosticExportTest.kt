@@ -31,6 +31,20 @@ class DiagnosticExportTest {
         assertTrue(body.contains("always-on diagnostics log is empty"))
     }
 
+    @Test fun `recovery export uses mapped event codes without copying retained details`() {
+        val always = "account-secret [native-profiles] restore result=failed stage=legacy_preparation detail=profile_secret\n" +
+            "timestamp [native-account] restore result=failed stage=checkpoint_open\n" +
+            "timestamp [native-account] restore result=failed stage=backup_read path=key\n" +
+            "timestamp [playback] media=family-private-token\n"
+        val recovery = DiagnosticsLog.accountRecoveryExportBody("device and build", always)
+        assertEquals(
+            "Account recovery diagnostics\ndevice and build\n" +
+                "Legacy profile restore failed during preparation\n" +
+                "The local account checkpoint could not be opened\n",
+            recovery,
+        )
+    }
+
     @Test fun `stored crash reports become readable scrubbed lines`() {
         val crash = JSONObject().put("timestampMs", 0).put("thread", "main").put("type", "java.lang.IllegalStateException")
             .put("message", "failed for https://user:hunter2@host.example/tt0903747")

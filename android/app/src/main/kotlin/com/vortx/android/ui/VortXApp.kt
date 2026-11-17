@@ -51,7 +51,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -97,6 +96,12 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
+import com.vortx.android.downloads.isDownloadedPlaybackOwnerCurrent
+import com.vortx.android.downloads.isDownloadedPlaybackAdmissionCurrent
+import com.vortx.android.downloads.nextDownloadedPlayback
+import com.vortx.android.downloads.DownloadedContinueWatchingRequest
+import com.vortx.android.downloads.DownloadedContinueWatchingResult
+import com.vortx.android.downloads.refreshDownloadedPlaybackAdmission
 import com.vortx.android.model.PreferredEpisode
 import com.vortx.android.model.StreamSource
 import com.vortx.android.player.AutoAddLibrarySetting
@@ -119,7 +124,13 @@ import com.vortx.android.player.PlayerEpisodeHandoffRequest
 import com.vortx.android.player.advancePlayerEpisodeHistory
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.BuildConfig
+import com.vortx.android.VortXApplication
 import com.vortx.android.profile.ProfileSelectionHandoff
+import com.vortx.android.profile.ProfilePickerEntry
+import com.vortx.android.profile.profilePickerEntry
+import com.vortx.android.ui.profilepicker.PickerProfilesUnavailable
+import com.vortx.android.ui.profilepicker.isPickerRosterCurrent
+import com.vortx.android.ui.profilepicker.rememberAdmittedPickerRoster
 import com.vortx.android.ui.profilepicker.ProfileSelectionSurface
 import com.vortx.android.ui.profilepicker.PickerFileRecoveryLanding
 import com.vortx.android.ui.profilepicker.PickerRestoreStatusLanding
@@ -191,6 +202,7 @@ import com.vortx.android.ui.screens.WhosWatchingScreen
 import com.vortx.android.ui.screens.WatchlistScreen
 import com.vortx.android.sync.AccountLibrarySync
 import com.vortx.android.sync.VortXSyncManager
+import com.vortx.android.sync.presentationKey
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.theme.vortxGlassPanel
@@ -213,10 +225,10 @@ import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.launch
@@ -226,7 +238,13 @@ import kotlinx.coroutines.launch
 private const val AUTO_ADD_AFTER_MS = 60_000L
 
 /** One-shot resume intent; type + id prevent an old card tap from arming a colliding later Detail route. */
-private data class DirectResumeTarget(val type: MediaType, val id: String)
+private data class DirectResumeTarget(
+    val type: MediaType,
+    val id: String,
+    val generation: Long,
+    val local: DownloadedContinueWatchingRequest?,
+    val localChecked: Boolean = false,
+)
 
 internal fun detailViewModelKey(
     prefix: String,
@@ -271,26 +289,29 @@ fun VortXApp(
     // hidden and everything else is unchanged -- sync is off the critical path by design.
     syncManager: VortXSyncManager? = null,
     deepLinkEvent: VortXDeepLinkEvent? = null,
+    onDeepLinkHandled: (VortXDeepLinkEvent) -> Unit = {},
 ) {
     val liveFileRecoveryPause = syncManager?.pickerFileRecoveryPaused
     val fileRecoveryPausedNow = rememberPickerFileRecoveryPause(liveFileRecoveryPause)
     val appContext = LocalContext.current.applicationContext
-    // VortXApplication binds the persistence-backed owner before either the phone or TV launcher creates
-    // consumers. Compose only reads the shared binding; it must never redefine process ownership.
-    val debridKeys = remember(appContext) { DebridKeys(appContext) }
     val vortxSessionUi by (
         syncManager?.sessionUiState?.collectAsStateWithLifecycle()
             ?: remember { mutableStateOf<VortXSyncManager.SessionUiState?>(null) }
     )
     val profileStore = ProfileStore.sharedOrNull()
+    val app = appContext as? VortXApplication
+    val nativePickerHost = app != null && repo !is PreviewCatalogRepository
+    val pickerRoster = rememberAdmittedPickerRoster(app, profileStore, syncManager, vortxSessionUi)
+    val pickerEntry = profilePickerEntry(nativePickerHost,
+        vortxSessionUi == VortXSyncManager.SessionUiState.SignedOut, pickerRoster)
     val activeProfile by (
         profileStore?.activeProfile?.collectAsStateWithLifecycle()
             ?: remember { mutableStateOf(null) }
     )
-    // Reading the bound identity after collecting account makes Compose reset the debrid editor at the same
-    // account transition that every resolver/coordinator/view-model DebridKeys instance observes.
-    val debridAccountIdentity = debridKeys.ownerIdentity()
-    val debridOwnerEpoch = debridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
+    // The manager publishes the exact owner generation with session changes. Detail only uses it
+    // as a screen key; playback and credentials still perform their own owner admission.
+    val debridOwnerEpoch = syncManager?.sessionOwnerPresentation?.collectAsStateWithLifecycle()
+        ?.value?.presentationKey ?: "unknown"
     val debridCredentialRevision by DebridKeys.credentialRevision.collectAsStateWithLifecycle()
     val sourceSettingsRevision by SourceSettingsRevision.observe(appContext).collectAsStateWithLifecycle()
     val detailSourceEpoch = "$debridOwnerEpoch:$debridCredentialRevision:$sourceSettingsRevision"
@@ -408,6 +429,14 @@ fun VortXApp(
         }
         var detailGeneration by remember { mutableStateOf(0L) }
         var playing by remember { mutableStateOf<Playable?>(null) }
+        val openDirectResume: (MetaItem) -> Unit = resume@{ item ->
+            if (!openDetail(item)) return@resume
+            detailGeneration += 1
+            val local = DownloadedContinueWatchingRequest.capture(item, detailGeneration)
+            // Up Next and sparse episode cards stay in Detail; their prior source is not a resume target.
+            if (local == null && item.continueWatchingAdmission?.downloadedResumeOwner != null) return@resume
+            pendingDirectResumeTarget = DirectResumeTarget(item.type, item.id, detailGeneration, local)
+        }
         // Session-only route chosen on Detail. It rides source retries and episode advances inside the same
         // player, but every non-detail launch below explicitly resets it to Automatic. No preference store is
         // mutated, so one title's choice cannot become the next title's global default.
@@ -488,10 +517,9 @@ fun VortXApp(
         var showWhatsNew by remember { mutableStateOf(false) }
         // SD-1: the "Play a link / magnet" sheet, reachable from the top of Search.
         var showPlayLink by remember { mutableStateOf(false) }
-        // Cold-launch "Who's watching?" picker (ACC-3): shown once per launch only when there is a real
-        // choice (more than one profile, not yet picked). Seeded from ProfileStore.needsPicker at first
-        // composition so it never re-appears after the user has picked (select() sets pickedThisLaunch).
-        var showWhosWatching by remember { mutableStateOf(profileStore?.needsPicker == true) }
+        var showWhosWatching by remember(pickerRoster?.mount) { mutableStateOf(false) }
+        val showAdmittedPicker = pickerEntry == ProfilePickerEntry.CHOOSE || (showWhosWatching && pickerRoster != null)
+        val pickerUnavailable = pickerEntry == ProfilePickerEntry.UNAVAILABLE
         // SD-2: re-read "Combine Discover & Search" whenever the Home & Discover settings screen closes (the
         // only place it is toggled) so the combined surface flips without a relaunch, matching Apple's
         // reactive @AppStorage. When it turns ON while the (now-dropped) Search tab is selected, heal
@@ -503,65 +531,6 @@ fun VortXApp(
         var discoverReselect by remember { mutableStateOf(0) }
         var handledDeepLinkSequence by remember { mutableStateOf(Long.MIN_VALUE) }
         val latestDeepLinkEvent by rememberUpdatedState(deepLinkEvent)
-        LaunchedEffect(deepLinkEvent, fileRecoveryPausedNow) {
-            val event = deepLinkEvent ?: return@LaunchedEffect
-            if (event.sequence <= handledDeepLinkSequence) return@LaunchedEffect
-            // Intent targets have no profile admission or unavailable-message branch. A false
-            // openDetail result here means the live recovery pause won the final route check.
-            val target = event.target.toMetaItem()
-            while (true) {
-                if (fileRecoveryPausedNow()) {
-                    val livePause = liveFileRecoveryPause ?: return@LaunchedEffect
-                    // Either source can wake the wait. Re-read the combined predicate at delivery.
-                    combine(livePause, snapshotFlow(fileRecoveryPausedNow)) { _, _ -> fileRecoveryPausedNow() }
-                        .first { !it }
-                }
-                ensureActive()
-                if (latestDeepLinkEvent != event || event.sequence <= handledDeepLinkSequence) return@LaunchedEffect
-                if (openDetail(target)) break
-            }
-            handledDeepLinkSequence = event.sequence
-            playing = null
-            playingMeta = null
-            showGallery = false
-            showAccount = false
-            showVortxAccount = false
-            showAddons = false
-            showAddonStore = false
-            showAddonPairing = false
-            showIntegrations = false
-            showMediaServers = false
-            showDownloads = false
-            showWatchlist = false
-            showPreviouslyWatched = false
-            catalogBrowseTarget = null
-            quickViewItem = null
-            quickWatchIdentity = null
-            showDownloadQueue = false
-            showPlayback = false
-            showSources = false
-            showUsenetServers = false
-            showNzbIndexers = false
-            showMetadataKeys = false
-            showPosterStyle = false
-            showHomeDiscover = false
-            showDebridKeys = false
-            showDebridLibrary = false
-            restoreDebridServicesFocus = false
-            showLiveTv = false
-            showLibraryTransfer = false
-            importedCollectionsEntry = null
-            showBackup = false
-            showDiagnostics = false
-            showProfiles = false
-            showAppearance = false
-            showCustomizeHome = false
-            showWatchStats = false
-            showWhatsNew = false
-            showTabBar = false
-            showPlayLink = false
-            detailGeneration += 1
-        }
         val onItem: (MetaItem) -> Unit = {
             detailGeneration += 1
             openDetail(it)
@@ -618,6 +587,7 @@ fun VortXApp(
             showPlaybackQueue = false
             savedPlaylistOwner = null
             savedPlaylistStore = null
+            pendingDirectResumeTarget = null
             pendingRandomTitlePlayRequest = null
             pendingQueueToken = null
             pendingQueueAccepted = false
@@ -630,7 +600,8 @@ fun VortXApp(
         val showFileRecoveryEntry = !dismissedFileRecoveryEntry && !showWhosWatching &&
             pickerToolsModel.controller.restoreAvailable && vortxSessionUi == VortXSyncManager.SessionUiState.SignedOut
         LaunchedEffect(syncManager, vortxSessionUi) {
-            if (vortxSessionUi is VortXSyncManager.SessionUiState.SignedIn) dismissedFileRecoveryEntry = true
+            // The landing is hidden while signed in. Offer it again after a confirmed sign-out.
+            if (vortxSessionUi is VortXSyncManager.SessionUiState.SignedIn) dismissedFileRecoveryEntry = false
         }
         val restoreStatusOwner by pickerToolsModel.restoreStatusOwner.collectAsStateWithLifecycle()
         restoreStatusOwner?.let { original ->
@@ -651,7 +622,7 @@ fun VortXApp(
             }
             return@VortXTheme
         }
-        var profileSelection by remember(pickerFileRecoveryPaused) { mutableStateOf<ProfileSelectionPresentation?>(null) }
+        var profileSelection by remember(pickerFileRecoveryPaused, pickerRoster?.mount) { mutableStateOf<ProfileSelectionPresentation?>(null) }
         if (!pickerFileRecoveryPaused) profileSelection?.let { presentation ->
             val request = presentation.request
             val handoff = remember(request, auth) { ProfileSelectionHandoff(auth, native = true) }
@@ -662,7 +633,7 @@ fun VortXApp(
                 onReturnToProfiles = { showProfiles = true })
             return@VortXTheme
         }
-        if (showWhosWatching || pickerAccountOpen || (pickerToolsState.open && pickerToolsModel.state.value.open) ||
+        if (showAdmittedPicker || pickerUnavailable || pickerAccountOpen || (pickerToolsState.open && pickerToolsModel.state.value.open) ||
             pickerFileRecoveryPaused || showFileRecoveryEntry) {
             ProfilePickerAccountHost(syncManager, pickerAccountModel, diagnosticAdmission = ::currentPickerDiagnosticExportAllowed, retirePickerUi = { profileSelection = null },
                 fileRecoveryPaused = pickerFileRecoveryPaused,
@@ -675,11 +646,14 @@ fun VortXApp(
                     recoveryPaused = pickerFileRecoveryPaused,
                     recoveryLanding = pickerFileRecoveryPaused || showFileRecoveryEntry,
                     openRecoverySignIn = pickerAccountModel?.let { it::openPickerFileRecoverySignIn },
-                    resumeRecoverySync = syncManager?.let { it::resumePickerFileRecovery }) {
+                    resumeRecoverySync = syncManager?.let { it::resumePickerFileRecovery },
+                    entryInPicker = pickerFileRecoveryPaused || showFileRecoveryEntry || pickerUnavailable || pickerRoster == null) { toolsEntry ->
                     if (pickerFileRecoveryPaused || showFileRecoveryEntry) {
-                        PickerFileRecoveryLanding(isTv = false, accountControl = control,
+                        PickerFileRecoveryLanding(isTv = false, accountControl = control, toolsEntry = toolsEntry,
                             onContinue = if (pickerFileRecoveryPaused) null else ({ dismissedFileRecoveryEntry = true }))
-                    } else WhosWatchingScreen(onDone = { showWhosWatching = false }, onSelected = {
+                    } else if (pickerUnavailable || pickerRoster == null) {
+                        PickerProfilesUnavailable(isTv = false, accountControl = control, toolsEntry = toolsEntry)
+                    } else WhosWatchingScreen(pickerRoster, onDone = { showWhosWatching = false }, onSelected = {
                         profileSelection = ProfileSelectionPresentation(it,
                             if (showProfiles) ProfileSelectionOrigin.PROFILE_MANAGEMENT else ProfileSelectionOrigin.PICKER)
                     }, accountControl = control)
@@ -688,6 +662,55 @@ fun VortXApp(
             return@VortXTheme
         }
 
+        LaunchedEffect(deepLinkEvent, pickerRoster, fileRecoveryPausedNow) {
+            val event = deepLinkEvent ?: return@LaunchedEffect
+            if (event.sequence <= handledDeepLinkSequence || latestDeepLinkEvent != event || fileRecoveryPausedNow()) return@LaunchedEffect
+            if (nativePickerHost && (pickerRoster == null || app?.isPickerRosterCurrent(syncManager, pickerRoster) != true ||
+                    pickerRoster.needsSelection)) return@LaunchedEffect
+            if (!openDetail(event.target.toMetaItem())) return@LaunchedEffect
+            handledDeepLinkSequence = event.sequence
+            playing = null
+            playingMeta = null
+            showGallery = false
+            showAccount = false
+            showVortxAccount = false
+            showAddons = false
+            showAddonStore = false
+            showAddonPairing = false
+            showIntegrations = false
+            showMediaServers = false
+            showDownloads = false
+            showWatchlist = false
+            showPreviouslyWatched = false
+            catalogBrowseTarget = null
+            quickViewItem = null
+            quickWatchIdentity = null
+            showDownloadQueue = false
+            showPlayback = false
+            showSources = false
+            showUsenetServers = false
+            showNzbIndexers = false
+            showMetadataKeys = false
+            showPosterStyle = false
+            showHomeDiscover = false
+            showDebridKeys = false
+            showDebridLibrary = false
+            restoreDebridServicesFocus = false
+            showLiveTv = false
+            showLibraryTransfer = false
+            importedCollectionsEntry = null
+            showBackup = false
+            showDiagnostics = false
+            showProfiles = false
+            showAppearance = false
+            showCustomizeHome = false
+            showWatchStats = false
+            showWhatsNew = false
+            showTabBar = false
+            showPlayLink = false
+            detailGeneration += 1
+            onDeepLinkHandled(event)
+        }
         LaunchedEffect(activeProfile, fileRecoveryPausedNow) {
             if (fileRecoveryPausedNow()) return@LaunchedEffect
             appearancePrefs.applyProfile(activeProfile)
@@ -1040,7 +1063,7 @@ fun VortXApp(
             // player overlay is up).
             val showForNext = detail
             val advanceVm: DetailViewModel? =
-                if (showForNext != null && !playable.isTrailer) {
+                if (showForNext != null && !playable.isTrailer && playable.downloadedPlaybackAdmission == null) {
                     viewModel(
                         viewModelStoreOwner = detailVmOwner,
                         key = detailViewModelKey(
@@ -1109,6 +1132,11 @@ fun VortXApp(
             // The next episode being offered, set by onEnded. Keyed per playable so advancing into the
             // next episode (a NEW playable) clears the offer automatically.
             var upNext by remember(playable) { mutableStateOf<Episode?>(null) }
+            var downloadedUpNext by remember(playable) {
+                mutableStateOf<Pair<Playable, CompletableDeferred<Boolean?>>?>(null)
+            }
+            fun downloadHandoffCurrent(): Boolean = playing === playable &&
+                repo.continueWatchingOwner() == historyOwnerToken && isDownloadedPlaybackOwnerCurrent(playable)
             var episodeHandoffSequence by remember(playable) { mutableStateOf(0L) }
             var episodeHandoffRequest by remember(playable) { mutableStateOf<PlayerEpisodeHandoffRequest?>(null) }
             // Bad-source ladder surfaces, keyed per playable DELIBERATELY: a successful retry swaps
@@ -1131,11 +1159,13 @@ fun VortXApp(
                 // token is captured SYNCHRONOUSLY here, at play launch, and the repository verifies it
                 // under the owner fence when the async begin runs -- any profile/account/principal/
                 // revision change in between fails closed instead of retargeting the session.
-                if (!historyPlayable.isTrailer) {
+                val beginHistory = !historyPlayable.isTrailer &&
+                    (historyPlayable.downloadedPlaybackAdmission == null || isDownloadedPlaybackAdmissionCurrent(historyPlayable))
+                if (beginHistory) {
                     playbackSessions.begin(playbackSession, historyPlayable.playbackContext, historyOwnerToken)
                 }
                 onDispose {
-                    if (!historyPlayable.isTrailer) {
+                    if (beginHistory) {
                         lastProgress.end { receipt ->
                             onDurableWatchReceipt(receipt)
                         }
@@ -1145,6 +1175,33 @@ fun VortXApp(
             Box {
                 PlayerScreen(
                     playable = playable,
+                    onDownloadedNaturalEnd = downloadedEnd@{ ended, admission ->
+                        fun isCurrent() = admission.isCurrent() && downloadHandoffCurrent()
+                        if (ended !== playable || !isCurrent()) return@downloadedEnd false
+                        val next = nextDownloadedPlayback(appContext, ended) ?: return@downloadedEnd false
+                        if (!isCurrent()) return@downloadedEnd false
+                        val choice = CompletableDeferred<Boolean?>()
+                        val offer = next to choice
+                        downloadedUpNext = offer
+                        try {
+                            val automatic = choice.await()
+                            if (!isCurrent()) return@downloadedEnd false
+                            if (automatic == null) {
+                                autoAdvanceStreak[0] = 0
+                                return@downloadedEnd false
+                            }
+                            val admittedNext = refreshDownloadedPlaybackAdmission(appContext, next) ?: return@downloadedEnd false
+                            if (!isCurrent() || !isDownloadedPlaybackAdmissionCurrent(admittedNext)) return@downloadedEnd false
+                            autoAdvanceStreak[0] = if (automatic) autoAdvanceStreak[0] + 1 else 0
+                            playingEngineOverride = automaticEngineFor(admittedNext)
+                            playingMeta = null
+                            playing = admittedNext
+                            true
+                        } finally {
+                            choice.cancel()
+                            if (downloadedUpNext === offer) downloadedUpNext = null
+                        }
+                    },
                     engineOverride = playingEngineOverride,
                     onResourcesReleased = onWatchedDownloadResourcesReleased,
                     queueCount = visibleQueueState?.entries?.size ?: 0,
@@ -1328,8 +1385,22 @@ fun VortXApp(
                         }
                     },
                 )
-                // Countdown and Play now enter the mounted player's acknowledged episode handoff.
-                // A failure keeps its outgoing revision/history and exposes the exact-target retry.
+                // The player owns this download's terminal job. The overlay only answers its one offer.
+                downloadedUpNext?.let { (next, choice) ->
+                    val nextContext = requireNotNull(next.playbackContext)
+                    UpNextOverlay(
+                        episode = Episode(
+                            id = nextContext.videoId,
+                            title = next.episodeTitle ?: nextContext.title,
+                            season = requireNotNull(nextContext.season),
+                            episode = requireNotNull(nextContext.episode),
+                        ),
+                        resolving = false,
+                        onPlayNow = { choice.complete(false) },
+                        onAutoAdvance = { choice.complete(true) },
+                        onCancel = { choice.complete(null) },
+                    )
+                }
                 val nextEp = upNext
                 if (nextEp != null && advanceVm != null) {
                     fun requestNext(automatic: Boolean) {
@@ -1462,6 +1533,7 @@ fun VortXApp(
                 onBack = { showAddons = false },
                 onDiscover = { showAddonStore = true },
                 onInstallByQr = { showAddonPairing = true },
+                onOpenAccount = if (syncManager != null) ({ showVortxAccount = true }) else null,
             )
             return@VortXTheme
         }
@@ -1506,10 +1578,12 @@ fun VortXApp(
                 // identity: clear the binding rather than let the previous play's meta ride along. Auto-add
                 // then skips this play (Apple's `let m = curMeta` skip).
                 onPlay = {
-                    playingEngineOverride = automaticEngineFor(it)
-                    playing = it
-                    playingMeta = null
-                    autoAdvanceStreak[0] = 0
+                    if (showDownloads && !showDownloadQueue && playing == null && isDownloadedPlaybackAdmissionCurrent(it)) {
+                        playingEngineOverride = automaticEngineFor(it)
+                        playingMeta = null
+                        autoAdvanceStreak[0] = 0
+                        playing = it
+                    }
                 },
                 onManageQueue = { showDownloadQueue = true },
             )
@@ -1650,9 +1724,10 @@ fun VortXApp(
 
         if (showDebridKeys) {
             BackHandler(onBack = closeDebridKeys)
+            val keys = remember(appContext) { DebridKeys(appContext) }
             DebridKeysScreen(
-                keys = debridKeys,
-                accountIdentity = debridAccountIdentity,
+                keys = keys,
+                accountIdentity = debridOwnerEpoch,
                 onBack = closeDebridKeys,
             )
             return@VortXTheme
@@ -1661,11 +1736,12 @@ fun VortXApp(
         if (showDebridLibrary) {
             // Settings > Debrid > Your cloud: browse + play what is already in the user's debrid accounts.
             // Self-contained like the other settings overlays: it builds its own DebridCoordinator off the
-            // shared [debridKeys] and hands a resolved DIRECT url up to the same `playing` slot the Downloads
+            // account's keys and hands a resolved DIRECT url up to the same `playing` slot the Downloads
             // screen uses, so a chosen cloud item covers everything with the standard player.
             BackHandler { showDebridLibrary = false }
+            val keys = remember(appContext) { DebridKeys(appContext) }
             DebridLibraryScreen(
-                keys = debridKeys,
+                keys = keys,
                 onPlay = {
                     playingEngineOverride = automaticEngineFor(it)
                     playing = it
@@ -1773,6 +1849,10 @@ fun VortXApp(
                     target = target,
                     onBack = { catalogBrowseTarget = null },
                     onItem = onBrowseItem,
+                    onLocalResume = { item ->
+                        catalogBrowseTarget = null
+                        openDirectResume(item)
+                    },
                 )
                 return@VortXTheme
             }
@@ -1791,6 +1871,37 @@ fun VortXApp(
 
         val current = detail
         if (current != null) {
+            val resume = pendingDirectResumeTarget
+            val local = resume?.local
+            if (resume != null && local != null && !resume.localChecked && resume.generation == detailGeneration &&
+                current.type == resume.type && current.id == resume.id) {
+                LaunchedEffect(local) {
+                    fun ownsRoute() = pendingDirectResumeTarget === resume && detailGeneration == local.detailGeneration &&
+                        savedDetailId == local.item.id && savedDetailType == local.item.type.id
+                    fun canPlay() = ownsRoute() && playing == null && !fileRecoveryPausedNow() &&
+                        !showWhosWatching && profileStore?.needsPicker == false && local.isCurrent()
+                    val result = if (canPlay()) local.open(appContext) else DownloadedContinueWatchingResult.Unavailable
+                    if (!ownsRoute()) return@LaunchedEffect
+                    if (!canPlay()) {
+                        pendingDirectResumeTarget = null
+                        return@LaunchedEffect
+                    }
+                    pendingDirectResumeTarget = if (result == DownloadedContinueWatchingResult.Missing)
+                        resume.copy(localChecked = true) else null
+                    if (result is DownloadedContinueWatchingResult.Ready &&
+                        isDownloadedPlaybackAdmissionCurrent(result.playable)) {
+                        autoAdvanceStreak[0] = 0
+                        playingEngineOverride = automaticEngineFor(result.playable)
+                        playingMeta = null
+                        playing = result.playable
+                    }
+                }
+                BackHandler { openDetail(null) }
+                Box(Modifier.fillMaxSize(), contentAlignment = androidx.compose.ui.Alignment.Center) {
+                    androidx.compose.material3.CircularProgressIndicator()
+                }
+                return@VortXTheme
+            }
             // The generation boundary deliberately tears down DetailScreen's local person/nested-title
             // navigation when a new deep-link event targets the same media id again.
             key(current.type, current.id, detailGeneration) {
@@ -1820,10 +1931,14 @@ fun VortXApp(
                 )
                 LaunchedEffect(detailVm, pendingDirectResumeTarget) {
                     val target = pendingDirectResumeTarget
-                    if (target?.type == current.type && target.id == current.id) {
-                        // One attempt only. Cross-device history frequently has no local exact source;
-                        // that case remains a normal Detail screen and must never arm a later visit.
-                        detailVm.playLastStream()
+                    if (target?.type == current.type && target.id == current.id &&
+                        target.generation == detailGeneration) {
+                        val localStillCurrent = target.local?.let { target.localChecked && it.isCurrent() } ?: true
+                        if (localStillCurrent && !fileRecoveryPausedNow() && profileStore?.needsPicker == false &&
+                            current.continueWatchingAdmission?.isCurrent() != false) {
+                            // One attempt only. Cross-device history can lack a remembered source.
+                            detailVm.playLastStream(current.preferredEpisode.takeIf { target.local != null })
+                        }
                         pendingDirectResumeTarget = null
                     }
                 }
@@ -1902,6 +2017,24 @@ fun VortXApp(
                             playing = playable
                             autoAdvanceStreak[0] = if (firstQueueAcceptance && pendingQueueAutomatic) autoAdvanceStreak[0] + 1 else 0
                         } else playable.playbackLease?.close()
+                    },
+                    onPlayDownloaded = { local, requestedEngine ->
+                        if (playing == null && randomDetailRouteIsCurrent() && isDownloadedPlaybackAdmissionCurrent(local)) {
+                            pendingDirectResumeTarget = null
+                            pendingRandomTitlePlayRequest = null
+                            pendingQueueToken = null
+                            pendingQueueAccepted = false
+                            pendingQueueAutomatic = false
+                            quickWatchIdentity = null
+                            playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
+                                requested = requestedEngine,
+                                playable = local,
+                                mpvAvailable = MpvEngineFactory.isBundled,
+                            )
+                            playingMeta = null
+                            autoAdvanceStreak[0] = 0
+                            playing = local
+                        }
                     },
                     queueCount = visibleQueueState?.entries?.size ?: 0,
                     queueAvailable = playbackQueue != null && visibleQueueState?.ready == true &&
@@ -2101,11 +2234,7 @@ fun VortXApp(
                             viewModel = viewModel<HomeViewModel>(factory = factory),
                             onItem = onItem,
                             modifier = Modifier.weight(1f),
-                            onDirectResume = { item ->
-                                openDetail(item)
-                                pendingDirectResumeTarget = DirectResumeTarget(item.type, item.id)
-                                detailGeneration += 1
-                            },
+                            onDirectResume = openDirectResume,
                             onDiscover = if (hiddenTabs.hideDiscover) null else {
                                 {
                                     if (mergeHomeDiscover) savedHomeModeName = CinemaHomeMode.BROWSE.name
@@ -2129,11 +2258,7 @@ fun VortXApp(
                     landingViewModel = viewModel<LibraryLandingViewModel>(key = "library-history", factory = factory),
                     onItem = onCinemaItem,
                     modifier = content,
-                    onDirectResume = { item ->
-                        openDetail(item)
-                        pendingDirectResumeTarget = DirectResumeTarget(item.type, item.id)
-                        detailGeneration += 1
-                    },
+                    onDirectResume = openDirectResume,
                     onRandomPlay = onRandomLibraryPlay,
                     onDownloads = { showDownloads = true },
                     onWatchlist = { showWatchlist = true },
@@ -2165,6 +2290,7 @@ fun VortXApp(
                     modifier = content.consumeWindowInsets(padding),
                     onDiscover = { showAddonStore = true },
                     onInstallByQr = { showAddonPairing = true },
+                    onOpenAccount = if (syncManager != null) ({ showVortxAccount = true }) else null,
                 )
                 Tab.SETTINGS -> SettingsScreen(
                     authState = authState,

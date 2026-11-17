@@ -11,6 +11,7 @@ enum VortxLegacyBootstrapMaterialTests {
         try fixtureAndRoster()
         try ownAccountSources()
         try overlayWitnessContract()
+        try wholeAccountNodeBudget()
         try savedVersusPlayed()
         try durableHistoryAndClockPolicies()
         try ownerActorTies()
@@ -29,6 +30,27 @@ enum VortxLegacyBootstrapMaterialTests {
 
     static func check(_ condition: @autoclosure () -> Bool, _ message: String) {
         precondition(condition(), message)
+    }
+    static func wholeAccountNodeBudget() throws {
+        func nulls(_ count: Int) -> String { "[null" + String(repeating: ",null", count: count - 1) + "]" }
+        let largeAccount = Data(("{\"foreign\":" + nulls(110_000) + "}").utf8)
+        do { _ = try VortxProfileOverlayWitness.decodeObject(json: largeAccount); preconditionFailure("Standalone node cap changed") }
+        catch VortxProfileOverlayWitness.Failure.malformed {}
+        let projected = try VortxLegacyBootstrapMaterial.project(document: largeAccount,
+            roster: [owner, child], ownerProfileID: owner.id, rosterModifiedSeconds: nil, preparePendingMembership: false)
+        let retained = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(
+            document: largeAccount, roster: [owner, child], ownerProfileID: owner.id)
+        check(!projected.material.isEmpty && retained.isEmpty, "Cold bootstrap accepts a large whole account")
+
+        let profile = child.id.uuidString
+        let splitOverlay = "{\"vortx\":{\"byProfile\":{\"\(profile)\":{\"fixture\":\(nulls(60_000))}}},"
+            + "\"webProgress\":{\"removed\":{\"byProfile\":{\"\(profile)\":\(nulls(40_000))}}}}"
+        for json in [splitOverlay, "{\"foreign\":\(nulls(250_000))}", "{\"x\":9007199254740992}", "{\"x\":1,\"x\":2}"] {
+            do {
+                _ = try VortxProfileOverlayWitness.decodeAccountObject(json: Data(json.utf8))
+                preconditionFailure("Whole account decoder accepted an oversized overlay/account or invalid scalar/key")
+            } catch VortxProfileOverlayWitness.Failure.malformed {}
+        }
     }
     static func literalAddonManifestArchive() throws {
         // Exercise the actual account-preparation order, not just a handwritten material shape.

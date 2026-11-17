@@ -136,7 +136,7 @@ enum VortxLegacyWatchedMigration {
         try Task.checkCancellation()
         guard isCurrent() else { throw Evidence.Failure.admissionRevoked }
         var candidates = [Candidate]()
-        let root = try VortxProfileOverlayWitness.decodeObject(json: document)
+        let root = try VortxProfileOverlayWitness.decodeAccountObject(json: document)
         let profiles = Set(profileIDs)
         guard profiles.count == profileIDs.count, profiles.contains(ownerProfileID),
               Set(ownAccountSources.map(\.profileID)).count == ownAccountSources.count,

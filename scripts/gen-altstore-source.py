@@ -89,7 +89,8 @@ def release_detail(tag: str) -> dict:
 def project_build_from_yml_text(content: str) -> str:
     # Accept the tracked block-YAML structure, not arbitrary counts of build-like text.
     required = ("VortXiOSNative", "VortXMac", "VortXTV", "VortXTopShelf", "VortXTVLite")
-    allowed = {*required, "VortX", "CinemaUISmokeRenderer"}
+    optional_versioned = ("VortX", "VortXAetherKit")
+    allowed = {*required, *optional_versioned, "CinemaUISmokeRenderer"}
     targets = {}
     path = []
     sections = 0
@@ -155,7 +156,7 @@ def project_build_from_yml_text(content: str) -> str:
     for name in required:
         if name not in targets:
             invalid(f"is missing required target {name}")
-    expected = (*required, *(("VortX",) if "VortX" in targets else ()))
+    expected = (*required, *(name for name in optional_versioned if name in targets))
     builds = []
     for name in expected:
         if targets[name]["build"] is None:

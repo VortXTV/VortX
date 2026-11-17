@@ -17,7 +17,8 @@ internal class ProfileSelectionHandoff(private val auth: AuthRepository, private
         check(active === request && mutableState.value == State.COMPLETE)
         request.complete()
         true
-    } catch (_: Exception) { mutableState.value = State.FAILED; false }
+    } catch (cancel: CancellationException) { throw cancel }
+    catch (_: Exception) { mutableState.value = State.FAILED; false }
 
     suspend fun select(request: ProfileSelectionRequest) {
         active = request

@@ -1321,6 +1321,75 @@ enum TMDBClient {
         return ranked.sorted { $0.1 > $1.1 }.prefix(limit).map(\.0)
     }
 
+    private struct DownloadSeasonIMDbMatch: Decodable {
+        struct Show: Decodable { let id: Int }
+        let tvResults: [Show]
+    }
+
+    private static func decodeDownloadSeasonResponse<T: Decodable>(_ payload: [String: Any]) -> T? {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try? decoder.decode(T.self, from: data)
+    }
+
+    private static func downloadSeasonEpisodes(seriesID: Int, season: DownloadSeasonSeries.Season?,
+                                               key: String) async -> [DownloadSeasonDetails.Episode]? {
+        guard let season,
+              let raw = await get("/tv/\(seriesID)/season/\(season.seasonNumber)?api_key=\(key)"),
+              let details: DownloadSeasonDetails = decodeDownloadSeasonResponse(raw) else { return nil }
+        return details.completeEpisodes(seriesID: seriesID, season: season)
+    }
+
+    /// Uses the existing TMDB transport. Run only from download enqueue or an explicit local entry.
+    static func downloadSeasonBoundary(
+        libraryID: String, season: Int, episode: Int, replacing saved: DownloadSeasonBoundary?,
+        stillCurrent: @MainActor @Sendable () -> Bool
+    ) async -> DownloadSeasonBoundary.Refresh {
+        guard season > 0, season < Int.max, episode > 0,
+              let title = DownloadSeasonBoundary.SeriesID(libraryID), await stillCurrent() else { return .unavailable }
+        let key = ApiKeys.effectiveTMDBKey()
+        let tvID: Int
+        let tvQuery: String
+        switch title {
+        case let .tmdb(id):
+            tvID = id
+            tvQuery = ""
+        case let .imdb(id):
+            guard let found = await get("/find/\(id)?external_source=imdb_id&api_key=\(key)"),
+                  let match: DownloadSeasonIMDbMatch = decodeDownloadSeasonResponse(found),
+                  match.tvResults.count == 1, let show = match.tvResults.first,
+                  show.id > 0, show.id <= Int(Int32.max) else { return .unavailable }
+            tvID = show.id
+            tvQuery = "&append_to_response=external_ids"
+        }
+        guard await stillCurrent() else { return .unavailable }
+        var observations = DownloadSeasonBoundary.RefreshObservations(saved: saved)
+        observations.observe(seriesID: tvID)
+        let response = await get("/tv/\(tvID)?api_key=\(key)\(tvQuery)")
+        guard await stillCurrent() else { return .unavailable }
+        guard let response, let series: DownloadSeasonSeries = decodeDownloadSeasonResponse(response),
+              series.matches(title, requestedID: tvID) else { return observations.incompleteResult }
+        let from = series.season(season)
+        observations.observe(finaleEpisode: from?.episodeCount)
+        if let from, from.episodeCount != episode { return observations.incompleteResult }
+
+        let current = await downloadSeasonEpisodes(seriesID: tvID, season: from, key: key)?.last
+        guard await stillCurrent() else { return .unavailable }
+        observations.observe(finaleID: current?.id)
+        // The successor response can disprove a saved binding even without an outgoing season response.
+        guard current != nil || saved != nil else { return observations.incompleteResult }
+        let next = await downloadSeasonEpisodes(seriesID: tvID, season: series.season(season + 1), key: key)?.first
+        guard await stillCurrent() else { return .unavailable }
+        observations.observe(successorID: next?.id)
+        guard let current, current.episodeNumber == episode, let next, next.episodeNumber == 1,
+              current.id != next.id else { return observations.incompleteResult }
+        return .verified(DownloadSeasonBoundary(libraryID: libraryID,
+            finaleVideoID: "\(libraryID):\(season):\(episode)", successorVideoID: "\(libraryID):\(season + 1):1",
+            season: season, finaleEpisode: episode, tmdbSeriesID: tvID,
+            tmdbFinaleID: current.id, tmdbSuccessorID: next.id))
+    }
+
     /// Season poster art for a series, keyed by season number (0 = Specials), from /3/tv/{id}. Accepts the
     /// catalog id forms the detail page carries (`tt…` resolved through /find, or `tmdb:<id>`); any other id,
     /// a miss or an error returns [:] and the season selector falls back to the series poster.

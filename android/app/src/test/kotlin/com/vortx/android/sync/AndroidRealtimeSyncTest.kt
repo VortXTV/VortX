@@ -8,6 +8,8 @@ import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 import com.vortx.android.integrations.NativeProviderAccess
 import com.vortx.android.integrations.NativeProviderTestStore
 import com.vortx.android.profile.UserProfile
+import com.vortx.android.debrid.DebridOwnerScope
+import com.vortx.android.debrid.DebridOwnerToken
 import com.vortx.android.sync.VortXSyncManager.SessionUiState
 import java.lang.reflect.Proxy
 import kotlinx.coroutines.CompletableDeferred
@@ -162,9 +164,13 @@ class AndroidRealtimeSyncTest {
         override suspend fun prepareEmptyAccount(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean) = document()
     }
 
-    private inner class Fixture(scheduler: TestCoroutineScheduler, val context: MemoryContext = MemoryContext()) {
+    private inner class Fixture(
+        scheduler: TestCoroutineScheduler,
+        val context: MemoryContext = MemoryContext(),
+        startupActive: (VortXSyncManager) -> Boolean = { true },
+    ) {
         val work = CoroutineScope(SupervisorJob() + StandardTestDispatcher(scheduler))
-        val manager = VortXSyncManager(context, work)
+        val manager = VortXSyncManager(context, work, startupActive)
         val gateway = Gateway()
         val providers = NativeProviderTestStore()
         var cloud = document()
@@ -172,7 +178,9 @@ class AndroidRealtimeSyncTest {
         var gets = 0
         var puts = 0
         var putFails = false
+        var putFailureStatus = 500
         var getFails = false
+        var getFailureStatus = 500
         var beforePut: (() -> Unit)? = null
         var getGate: CompletableDeferred<Unit>? = null
         val tokens = mutableListOf<String?>()
@@ -188,25 +196,27 @@ class AndroidRealtimeSyncTest {
         init {
             manager.installSyncTestSeam(VortXSyncManager.Session("fixture-a", account, key), 10, transport = { method, _, body, token ->
                 tokens += token
-                if (method == "GET") {
-                    gets++; getGate?.await()
-                    if (getFails) 500 to null else 200 to JSONObject().put("version", version).put("document",
-                        VortXCrypto.sealDocument(key, cloud.toString().toByteArray(), account.id, version, true))
-                } else {
-                    puts++; beforePut?.invoke()
-                    if (putFails) 500 to null else {
-                        val sent = requireNotNull(body)
-                        version = sent.getLong("version")
-                        cloud = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key, sent.getString("document"), account.id, version))))
-                        200 to JSONObject().put("accepted", true)
-                    }
-                }
+                backupRequest(method, body)
             })
             manager.installSessionRestoreTestSeam(manager.currentSession())
             manager.installNativeGatewayTestSeam(gateway, providers)
             manager.installRealtimeTestSeam(realtime)
             manager.uploadClockMs = { scheduler.currentTime }
         }
+        suspend fun backupRequest(method: String, body: JSONObject?): Pair<Int, JSONObject?> =
+            if (method == "GET") {
+                gets++; getGate?.await()
+                if (getFails) getFailureStatus to null else 200 to JSONObject().put("version", version).put("document",
+                    VortXCrypto.sealDocument(key, cloud.toString().toByteArray(), account.id, version, true))
+            } else {
+                puts++; beforePut?.invoke()
+                if (putFails) putFailureStatus to null else {
+                    val sent = requireNotNull(body)
+                    version = sent.getLong("version")
+                    cloud = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key, sent.getString("document"), account.id, version))))
+                    200 to JSONObject().put("accepted", true)
+                }
+            }
         fun edit(name: String) {
             gateway.carrier.getJSONObject("facts").put(name, true)
             manager.onLocalNativeMutation(SessionOwnerSnapshot.Account(account.id, 1))
@@ -253,6 +263,20 @@ class AndroidRealtimeSyncTest {
             check(manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.UnknownOrUnavailable)
             check(manager.currentSession() == null)
         }
+        fun prepareStartup(
+            foreground: MutableStateFlow<AccountSyncForeground>,
+            confirmedOwner: SessionOwnerSnapshot = manager.sessionOwnerSnapshot(),
+        ): () -> Unit = requireNotNull(manager.prepareNativeGateway(gateway, foreground, confirmedOwner))
+
+        fun assertNoStartupDispatch() {
+            assertEquals(0, gateway.reopens)
+            assertEquals(0, gateway.applied)
+            assertEquals(0, gets)
+            assertEquals(0, puts)
+            assertTrue(tokens.isEmpty())
+            assertTrue(sockets.isEmpty())
+        }
+
         suspend fun close() { realtime.stop(); manager.cancelSyncTestWork(); gateway.retire(); NativeProviderAccess.unbindForTest() }
     }
 
@@ -307,14 +331,43 @@ class AndroidRealtimeSyncTest {
         } finally { model.viewModelScope.cancel(); f.close() }
     }
 
+    private suspend fun adoptInteractiveFixture(f: Fixture): PickerAccountSnapshot {
+        val password = "fixture-password"
+        val salt = ByteArray(16) { 23 }
+        val master = VortXCrypto.masterKey(password, salt, VortXCrypto.MIN_ITERS)
+        val wrapped = try { requireNotNull(VortXCrypto.seal(master, key)) } finally { master.fill(0) }
+        // Keep the real durable session transition. Substitute only its OS-backed persistence.
+        val durable = f.manager.javaClass.getDeclaredField("sessionState").apply { isAccessible = true }.get(f.manager)
+        val persist: (VortXSyncManager.Session, Long) -> Boolean = { session, epoch ->
+            f.manager.installSessionRestoreTestSeam(session, epoch)
+            true
+        }
+        durable.javaClass.getDeclaredField("persist").apply { isAccessible = true }.set(durable, persist)
+        f.manager.installSyncTestSeam(requireNotNull(f.manager.currentSession()), 10, transport = { method, path, body, _ ->
+            when (path) {
+                "/v1/auth/prelogin" -> 200 to JSONObject()
+                    .put("kdfSalt", VortXCrypto.b64(salt)).put("kdfIters", VortXCrypto.MIN_ITERS)
+                "/v1/auth/login" -> 200 to JSONObject().put("token", "fixture-b").put("wrappedKeyPassword", wrapped)
+                    .put("account", JSONObject().put("id", account.id).put("email", account.email).put("username", account.username))
+                "/v1/backup" -> f.backupRequest(method, body)
+                else -> error("Unexpected account path")
+            }
+        })
+        val completion = PickerAuthCompletion()
+        assertEquals(VortXSyncManager.AuthResult.Ok,
+            f.manager.signIn("fixture", password, totp = null, completion = completion))
+        return requireNotNull(completion.owner)
+    }
+
     @Test fun registrationBackBeforeRecoveryAcknowledgementKeepsOriginalCodeAndReconcile() = test {
         val f = Fixture(testScheduler)
         val model = VortXAccountViewModel(f.manager)
         try {
             f.cloud.put("vortx", JSONObject()) // Actual post-auth probe returns the pending account-data choice.
             model.openPickerPresentation()
-            model.completeRegistration(VortXSyncManager.RegisterResult(VortXSyncManager.AuthResult.Ok, "fixture recovery code"),
-                f.manager.capturePickerCompletionOwner(), f.manager.capturePickerCompletionOwner())
+            val owner = adoptInteractiveFixture(f)
+            model.completeRegistration(VortXSyncManager.RegisterResult(VortXSyncManager.AuthResult.Ok, "fixture recovery code"), owner, owner)
+            runCurrent()
             assertEquals("fixture recovery code", model.recoveryCode.value)
             assertTrue(model.showReconcile.value)
             assertFalse(model.requestClosePickerPresentation())
@@ -352,8 +405,9 @@ class AndroidRealtimeSyncTest {
         try {
             f.cloud.put("vortx", JSONObject())
             model.openPickerPresentation()
-            model.completeRegistration(VortXSyncManager.RegisterResult(VortXSyncManager.AuthResult.Ok, "fixture recovery code"),
-                f.manager.capturePickerCompletionOwner(), f.manager.capturePickerCompletionOwner())
+            val owner = adoptInteractiveFixture(f)
+            model.completeRegistration(VortXSyncManager.RegisterResult(VortXSyncManager.AuthResult.Ok, "fixture recovery code"), owner, owner)
+            runCurrent()
             val saved = f.manager.currentSession()
             f.manager.installSessionClearTestSeam { false }
             val captured = checkNotNull(f.manager.capturePickerAccountSnapshot())
@@ -1091,6 +1145,234 @@ class AndroidRealtimeSyncTest {
         model.requireAccountReconcile()
     }
 
+    @Test fun `authenticated native-only backup awaits a decision without publishing`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            f.cloud = document(native(JSONObject().put("cloud-library", true)))
+                .put("future", JSONObject().put("unknown", "keep"))
+            val original = f.cloud.toString()
+            assertEquals(VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA, f.manager.reconcileAfterSignIn())
+            runCurrent()
+            assertEquals(1, f.gets)
+            assertEquals(0, f.puts)
+            assertEquals(0, f.gateway.applied)
+            assertEquals(original, f.cloud.toString())
+        } finally { f.close() }
+    }
+
+    @Test fun `authenticated absence produces exactly one create-only seed`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val requests = mutableListOf<String>()
+            f.manager.installSyncTestSeam(requireNotNull(f.manager.currentSession()), 0, transport = { method, path, body, token ->
+                assertEquals("/v1/backup", path)
+                assertEquals("fixture-a", token)
+                requests += method
+                when (method) {
+                    "GET" -> if (requests.contains("PUT")) {
+                        200 to JSONObject().put("version", f.version).put("document",
+                            VortXCrypto.sealDocument(key, f.cloud.toString().toByteArray(), account.id, f.version, true))
+                    } else 404 to null
+                    "PUT" -> {
+                        val sent = requireNotNull(body)
+                        assertTrue(sent.has("baseRevision"))
+                        assertTrue(sent.isNull("baseRevision"))
+                        assertEquals(0L, sent.getLong("version"))
+                        f.version = 0L
+                        val plaintext = requireNotNull(VortXCrypto.openDocument(key, sent.getString("document"), account.id, f.version))
+                        f.cloud = JSONObject(plaintext.toString(Charsets.UTF_8))
+                        200 to JSONObject().put("accepted", true).put("version", f.version)
+                    }
+                    else -> error("Unexpected backup method")
+                }
+            })
+            assertEquals(VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE, f.manager.reconcileAfterSignIn())
+            assertEquals(listOf("GET", "GET", "PUT"), requests)
+            assertEquals(1, f.gateway.applied)
+            assertEquals(VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA, f.manager.reconcileAfterSignIn())
+            assertEquals(listOf("GET", "GET", "PUT", "GET"), requests)
+        } finally { f.close() }
+    }
+
+    @Test fun `keep device uses the native writer and retains local cloud and unknown data`() = test {
+        val f = Fixture(testScheduler)
+        val model = pendingReconcile(f.manager)
+        try {
+            f.gateway.carrier.getJSONObject("facts").put("local-library", true)
+            f.cloud.getJSONObject("nativeSync").getJSONObject("facts").put("cloud-library", true)
+            f.cloud.put("future", JSONObject().put("unknown", "keep"))
+
+            model.reconcileKeepDevice()
+            runCurrent()
+
+            assertFalse(model.showReconcile.value)
+            assertFalse(model.syncing.value)
+            assertNull(model.syncNotice.value)
+            assertEquals(1, f.puts)
+            assertEquals(11L, f.version)
+            assertTrue(f.cloud.getJSONObject("nativeSync").getJSONObject("facts").getBoolean("local-library"))
+            assertTrue(f.cloud.getJSONObject("nativeSync").getJSONObject("facts").getBoolean("cloud-library"))
+            assertEquals("keep", f.cloud.getJSONObject("future").getString("unknown"))
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun `real interactive sign in holds routine work until the owner chooses an account restore`() = test {
+        val f = Fixture(testScheduler)
+        val originalModel = VortXAccountViewModel(f.manager)
+        try {
+            f.cloud.getJSONObject("nativeSync").getJSONObject("facts").put("cloud-library", true)
+            val owner = adoptInteractiveFixture(f)
+            f.manager.setRealtimeForeground(true)
+            runCurrent()
+            assertEquals(0, f.gets)
+            assertEquals(0, f.gateway.applied)
+            assertTrue(f.sockets.isEmpty())
+
+            assertEquals(account, owner.account)
+            f.getGate = CompletableDeferred()
+            val interruptedProbe = async { f.manager.reconcileAfterSignIn(owner) }
+            runCurrent()
+            assertEquals(1, f.gets)
+            interruptedProbe.cancel()
+            runCurrent()
+            f.getGate = null
+            originalModel.syncNow()
+            runCurrent()
+            assertTrue(originalModel.showReconcile.value)
+            assertFalse(originalModel.postAuthCompleting.value)
+            assertNotNull(f.manager.interactiveReconcileOwner.value)
+            assertEquals(2, f.gets)
+            f.manager.setRealtimeForeground(false)
+            f.manager.setRealtimeForeground(true)
+            runCurrent()
+            assertEquals(2, f.gets)
+            assertEquals(0, f.gateway.applied)
+            assertTrue(f.sockets.isEmpty())
+
+            val reopenedModel = VortXAccountViewModel(f.manager)
+            try {
+                runCurrent()
+                assertTrue(originalModel.showReconcile.value)
+                assertTrue(reopenedModel.showReconcile.value)
+                assertSame(f.manager.interactiveReconcileOwner.value, f.manager.interactiveReconcileChoiceFor(owner))
+                f.manager.setRealtimeForeground(false)
+                f.getGate = CompletableDeferred()
+                reopenedModel.reconcileUseAccount()
+                runCurrent()
+                assertTrue(reopenedModel.syncing.value)
+                originalModel.reconcileKeepDevice()
+                runCurrent()
+                assertEquals(3, f.gets)
+                f.getGate?.complete(Unit)
+                runCurrent()
+
+                assertFalse(originalModel.showReconcile.value)
+                assertFalse(reopenedModel.showReconcile.value)
+                assertNull(f.manager.interactiveReconcileOwner.value)
+                assertEquals(3, f.gets)
+                assertEquals(1, f.gateway.applied)
+                assertEquals(VortXSyncManager.SignInReconcile.ALREADY_COMPLETED, f.manager.reconcileAfterSignIn(owner))
+                assertEquals(3, f.gets)
+                assertTrue(f.gateway.carrier.getJSONObject("facts").getBoolean("cloud-library"))
+            } finally { reopenedModel.viewModelScope.cancel() }
+        } finally { originalModel.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun `interactive merge opens the profile while the joined backup upload is queued`() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            val owner = adoptInteractiveFixture(f)
+            f.gateway.carrier.getJSONObject("facts").put("local-library", true)
+            f.cloud.getJSONObject("nativeSync").getJSONObject("facts").put("cloud-library", true)
+            assertEquals(VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA, f.manager.reconcileAfterSignIn(owner))
+            runCurrent()
+            assertTrue(model.showReconcile.value)
+
+            model.reconcileMergeBoth()
+            runCurrent()
+
+            assertFalse(model.showReconcile.value)
+            assertNull(model.syncNotice.value)
+            assertNull(f.manager.interactiveReconcileOwner.value)
+            assertEquals(1, f.gateway.applied)
+            assertTrue(f.dirty())
+            assertEquals(0, f.puts)
+
+            advanceTimeBy(2_500L)
+            runCurrent()
+            assertEquals(1, f.puts)
+            assertFalse(f.dirty())
+            val merged = f.cloud.getJSONObject("nativeSync").getJSONObject("facts")
+            assertTrue(merged.getBoolean("local-library"))
+            assertTrue(merged.getBoolean("cloud-library"))
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun `read only grace backup keeps local edits and stops rejected upload retries`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            assertTrue(f.manager.syncDown(force = true))
+            f.putFails = true
+            f.putFailureStatus = 401
+            f.edit("local-unsent")
+            advanceTimeBy(2_501L)
+            runCurrent()
+
+            assertEquals(1, f.puts)
+            assertEquals(account, f.manager.currentSession()?.account)
+            assertTrue(f.dirty())
+            assertTrue(f.gateway.carrier.getJSONObject("facts").getBoolean("local-unsent"))
+            assertTrue(f.manager.syncProblem.value.orEmpty().contains("Sign in to this VortX account again"))
+            advanceTimeBy(180_000L)
+            runCurrent()
+            assertEquals(1, f.puts)
+            assertTrue(f.dirty())
+        } finally { f.close() }
+    }
+
+    @Test fun `backup read rejects the expired login without clearing the signed in account`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            f.getFails = true
+            f.getFailureStatus = 401
+            assertFalse(f.manager.syncDown(force = true))
+            assertEquals(account, f.manager.currentSession()?.account)
+            assertTrue(f.manager.syncProblem.value.orEmpty().contains("Sign in to this VortX account again"))
+            assertEquals(0, f.puts)
+            assertEquals(0, f.gateway.applied)
+        } finally { f.close() }
+    }
+
+    @Test fun `interactive restore retries after its original pending edit uploads`() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            val owner = adoptInteractiveFixture(f)
+            f.gateway.carrier.getJSONObject("facts").put("saved-local-edit", true)
+            f.manager.requestSyncSoon()
+            assertTrue(f.dirty())
+            assertEquals(VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA, f.manager.reconcileAfterSignIn(owner))
+            runCurrent()
+            assertEquals(0, f.puts)
+
+            model.reconcileUseAccount()
+            runCurrent()
+            assertTrue(model.showReconcile.value)
+            assertTrue(model.syncing.value)
+            assertEquals(0, f.puts)
+
+            advanceTimeBy(2_500L)
+            runCurrent()
+            assertFalse(model.showReconcile.value)
+            assertFalse(model.syncing.value)
+            assertNull(model.syncNotice.value)
+            assertEquals(1, f.puts)
+            assertFalse(f.dirty())
+            assertTrue(f.cloud.getJSONObject("nativeSync").getJSONObject("facts").getBoolean("saved-local-edit"))
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
     @Test fun `failed reconcile choices remain visible and actionable until confirmed retry`() = test {
         val choices: List<(VortXAccountViewModel) -> Unit> = listOf(
             { it.reconcileUseAccount() }, { it.reconcileMergeBoth() }, { it.reconcileKeepDevice() })
@@ -1390,6 +1672,325 @@ class AndroidRealtimeSyncTest {
             f.manager.installSessionRestoreTestSeam(VortXSyncManager.Session("fixture-a", account, key), 2)
             f.manager.sessionOwnerSnapshot(); f.manager.onLocalNativeMutation(origin)
             assertFalse(f.dirty())
+        } finally { f.close() }
+    }
+
+    @Test fun `cold confirmed account waits for manager publication and forces one authenticated receive`() = test {
+        var published: VortXSyncManager? = null
+        val f = Fixture(testScheduler, startupActive = { it === published })
+        try {
+            val owner = f.manager.sessionOwnerSnapshot()
+            assertEquals(SessionOwnerSnapshot.Account(account.id, INITIAL_SESSION_OWNER_EPOCH), owner)
+            val start = f.prepareStartup(MutableStateFlow(AccountSyncForeground(active = false)), owner)
+            runCurrent()
+            f.assertNoStartupDispatch()
+            assertTrue(runCatching { start() }.exceptionOrNull() is IllegalStateException)
+            runCurrent()
+            f.assertNoStartupDispatch()
+
+            published = f.manager
+            start()
+            runCurrent()
+
+            assertEquals(1, f.gateway.reopens)
+            assertEquals(1, f.gateway.applied)
+            assertEquals(1, f.gets)
+            assertEquals(listOf("fixture-a"), f.tokens)
+            assertEquals(0, f.puts)
+            assertTrue(f.sockets.isEmpty())
+        } finally { f.close() }
+    }
+
+    @Test fun `owner presentation changes on confirmed same account recovery and clears on unavailable storage`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val manager = f.manager
+            val session = requireNotNull(manager.currentSession())
+            val original = SessionOwnerSnapshot.Account(account.id, INITIAL_SESSION_OWNER_EPOCH)
+            assertEquals(original, manager.sessionOwnerSnapshot())
+            assertEquals(original, manager.sessionOwnerPresentation.value)
+
+            manager.installUnavailableSessionRestoreTestSeam()
+            assertTrue(manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.UnknownOrUnavailable)
+            assertTrue(manager.sessionOwnerPresentation.value is SessionOwnerSnapshot.UnknownOrUnavailable)
+
+            val replacement = original.copy(generation = original.generation + 1)
+            manager.installSessionRestoreTestSeam(session, ownerEpoch = replacement.generation)
+            assertEquals(replacement, manager.sessionOwnerSnapshot())
+            assertEquals(SessionUiState.SignedIn(account), manager.sessionUiState.value)
+            assertEquals(replacement, manager.sessionOwnerPresentation.value)
+        } finally { f.close() }
+    }
+
+    @Test fun `usenet credential mutation requires the rendered owner and preserves the callback result`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val rendered = DebridOwnerToken(DebridOwnerScope.Account(account.id), INITIAL_SESSION_OWNER_EPOCH)
+            assertEquals(SessionOwnerSnapshot.Account(account.id, rendered.generation), f.manager.sessionOwnerSnapshot())
+            val callbacks = mutableListOf<String>()
+            val other = rendered.copy(scope = DebridOwnerScope.Account("00000000-0000-0000-0000-000000000999"))
+            assertFalse(f.manager.mutateCurrentUsenetOwner(other) { callbacks += "different account"; true })
+            assertFalse(f.manager.mutateCurrentUsenetOwner(rendered.copy(scope = DebridOwnerScope.SignedOutLocal)) {
+                callbacks += "signed-out scope"; true
+            })
+            assertTrue(f.manager.mutateCurrentUsenetOwner(rendered) { callbacks += "accepted"; true })
+            assertFalse(f.manager.mutateCurrentUsenetOwner(rendered) { callbacks += "declined"; false })
+            assertEquals(listOf("accepted", "declined"), callbacks)
+            f.assertNoStartupDispatch()
+        } finally { f.close() }
+    }
+
+    @Test fun `usenet rendered owner cannot adopt the same account with a new persisted epoch`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val manager = f.manager
+            val original = requireNotNull(manager.currentSession())
+            val rendered = DebridOwnerToken(DebridOwnerScope.Account(account.id), INITIAL_SESSION_OWNER_EPOCH)
+            assertEquals(SessionOwnerSnapshot.Account(account.id, rendered.generation), manager.sessionOwnerSnapshot())
+
+            // Recover the exact same Session and account under a new durable owner epoch.
+            manager.installUnavailableSessionRestoreTestSeam()
+            assertTrue(manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.UnknownOrUnavailable)
+            val replacement = rendered.copy(generation = rendered.generation + 1)
+            manager.installSessionRestoreTestSeam(original, ownerEpoch = replacement.generation)
+            assertEquals(SessionOwnerSnapshot.Account(account.id, replacement.generation), manager.sessionOwnerSnapshot())
+            assertSame(original, manager.currentSession())
+            assertEquals(SessionUiState.SignedIn(account), manager.sessionUiState.value)
+
+            val callbacks = mutableListOf<String>()
+            assertFalse(manager.mutateCurrentUsenetOwner(rendered) { callbacks += "stale rendered editor"; true })
+            assertTrue(callbacks.isEmpty())
+            assertTrue(manager.mutateCurrentUsenetOwner(replacement) { callbacks += "fresh rendered editor"; true })
+            assertEquals(listOf("fresh rendered editor"), callbacks)
+            f.assertNoStartupDispatch()
+        } finally { f.close() }
+    }
+
+    @Test fun `usenet mutation rereads unavailable persistence before invoking the rendered editor callback`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val manager = f.manager
+            val original = requireNotNull(manager.currentSession())
+            val rendered = DebridOwnerToken(DebridOwnerScope.Account(account.id), INITIAL_SESSION_OWNER_EPOCH)
+            assertEquals(SessionOwnerSnapshot.Account(account.id, rendered.generation), manager.sessionOwnerSnapshot())
+            manager.installUnavailableSessionRestoreTestSeam()
+            // Do not call sessionOwnerSnapshot here: the mutation boundary must detect unavailable
+            // persistence itself while the cached signed-in presentation still looks unchanged.
+            assertEquals(SessionUiState.SignedIn(account), manager.sessionUiState.value)
+            var callbacks = 0
+            assertFalse(manager.mutateCurrentUsenetOwner(rendered) { callbacks++; true })
+            assertEquals(0, callbacks)
+            assertSame(original, manager.currentSession())
+
+            manager.installSessionRestoreTestSeam(original, ownerEpoch = rendered.generation)
+            assertEquals(SessionOwnerSnapshot.Account(account.id, rendered.generation), manager.sessionOwnerSnapshot())
+            assertTrue(manager.mutateCurrentUsenetOwner(rendered) { callbacks++; true })
+            assertEquals(1, callbacks)
+            f.assertNoStartupDispatch()
+        } finally { f.close() }
+    }
+
+    @Test fun `usenet mutation rejects a different persisted bearer key or epoch without adopting it`() = test {
+        for (changedField in listOf("bearer", "data key", "owner epoch")) {
+            val f = Fixture(testScheduler)
+            try {
+                val manager = f.manager
+                val original = requireNotNull(manager.currentSession())
+                val rendered = DebridOwnerToken(DebridOwnerScope.Account(account.id), INITIAL_SESSION_OWNER_EPOCH)
+                assertEquals(SessionOwnerSnapshot.Account(account.id, rendered.generation), manager.sessionOwnerSnapshot())
+                val persisted = when (changedField) {
+                    "bearer" -> VortXSyncManager.Session("fixture-replacement", account, key)
+                    "data key" -> VortXSyncManager.Session("fixture-a", account, ByteArray(32) { 38 })
+                    else -> original
+                }
+                manager.installSessionRestoreTestSeam(persisted,
+                    ownerEpoch = rendered.generation + if (changedField == "owner epoch") 1 else 0)
+                // No prior owner refresh may reject this candidate on the tested method's behalf.
+                assertEquals(SessionUiState.SignedIn(account), manager.sessionUiState.value)
+                var callbacks = 0
+                assertFalse(changedField, manager.mutateCurrentUsenetOwner(rendered) { callbacks++; true })
+                assertEquals(changedField, 0, callbacks)
+                assertSame(changedField, original, manager.currentSession())
+                f.assertNoStartupDispatch()
+            } finally { f.close() }
+        }
+    }
+
+    @Test fun `cold signed-out and unavailable owners cannot open a checkpoint request or socket`() = test {
+        for (signedOut in listOf(true, false)) {
+            val f = Fixture(testScheduler)
+            try {
+                f.manager.installUnavailableSessionRestoreTestSeam()
+                assertTrue(f.manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.UnknownOrUnavailable)
+                if (signedOut) f.manager.installSessionRestoreTestSeam(null, ownerEpoch = 2)
+                val owner = f.manager.sessionOwnerSnapshot()
+                if (signedOut) {
+                    assertEquals(SessionOwnerSnapshot.SignedOutLocal(2), owner)
+                } else {
+                    assertTrue(owner is SessionOwnerSnapshot.UnknownOrUnavailable)
+                }
+
+                f.prepareStartup(MutableStateFlow(AccountSyncForeground(active = true)), owner)()
+                runCurrent()
+
+                f.assertNoStartupDispatch()
+                assertEquals(if (signedOut) SessionUiState.SignedOut else SessionUiState.UnknownOrUnavailable,
+                    f.manager.sessionUiState.value)
+            } finally { f.close() }
+        }
+    }
+
+    @Test fun `a live account and mismatched persisted tuple do not authorize cold receive`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val live = requireNotNull(f.manager.currentSession())
+            f.manager.installSessionRestoreTestSeam(
+                VortXSyncManager.Session("changed-fixture-token", live.account, ByteArray(32) { 38 }),
+                ownerEpoch = INITIAL_SESSION_OWNER_EPOCH,
+            )
+            val owner = f.manager.sessionOwnerSnapshot()
+            assertTrue(owner is SessionOwnerSnapshot.UnknownOrUnavailable)
+            assertSame(live, f.manager.currentSession())
+
+            // No foreground transition is present to independently recover the newer tuple.
+            f.prepareStartup(MutableStateFlow(AccountSyncForeground(active = false)), owner)()
+            runCurrent()
+
+            f.assertNoStartupDispatch()
+        } finally { f.close() }
+    }
+
+    @Test fun `cold startup rechecks unavailable or changed persistence after it waits for the native mutex`() = test {
+        for (unavailable in listOf(true, false)) {
+            val f = Fixture(testScheduler)
+            val release = CompletableDeferred<Unit>()
+            try {
+                val foreground = MutableStateFlow(AccountSyncForeground(active = false))
+                val start = f.prepareStartup(foreground)
+                f.getGate = release
+                val holder = async { f.manager.syncDown() }
+                runCurrent()
+                assertFalse(holder.isCompleted)
+                assertEquals(1, f.gets)
+                assertEquals(1, f.gateway.reopens)
+
+                start()
+                runCurrent()
+                assertEquals(1, f.gets)
+                if (unavailable) {
+                    f.manager.installUnavailableSessionRestoreTestSeam()
+                } else {
+                    f.manager.installSessionRestoreTestSeam(requireNotNull(f.manager.currentSession()), ownerEpoch = 2)
+                }
+                // Stop the holder at its existing transport response. It must not observe the changed
+                // persisted tuple on the way out and indirectly reject the queued cold lease for us.
+                f.getFails = true
+                f.getGate = null
+                release.complete(Unit)
+                runCurrent()
+                assertFalse(holder.await())
+
+                assertEquals("the rejected cold lease must not reopen the checkpoint", 1, f.gateway.reopens)
+                assertEquals(listOf("fixture-a"), f.tokens)
+                assertEquals(0, f.puts)
+                assertTrue(f.sockets.isEmpty())
+            } finally {
+                release.complete(Unit)
+                f.close()
+            }
+        }
+    }
+
+    @Test fun `background rejects an admitted realtime receive still waiting for native mutex`() = test {
+        val f = Fixture(testScheduler)
+        val release = CompletableDeferred<Unit>()
+        try {
+            val foreground = MutableStateFlow(AccountSyncForeground(active = true))
+            f.prepareStartup(foreground)()
+            runCurrent()
+            val socket = f.sockets.single()
+            val previousGets = f.gets
+            val previousReopens = f.gateway.reopens
+
+            f.getGate = release
+            val holder = async { f.manager.syncDown() }
+            runCurrent()
+            assertFalse(holder.isCompleted)
+            assertEquals(previousGets + 1, f.gets)
+            assertEquals(previousReopens + 1, f.gateway.reopens)
+
+            val oldLease = requireNotNull(f.manager.captureRealtimeLease())
+            // This call is not the socket worker, so stopping that worker cannot make the test pass by cancellation.
+            val queued = async { f.manager.syncDownForRealtime(oldLease) }
+            runCurrent()
+            assertFalse(queued.isCompleted)
+            foreground.value = AccountSyncForeground(active = false)
+            f.getGate = null
+            release.complete(Unit)
+            runCurrent()
+
+            assertTrue(holder.await())
+            assertFalse(queued.await())
+            assertTrue(socket.cancelled)
+            assertEquals(previousReopens + 1, f.gateway.reopens)
+            assertEquals(previousGets + 1, f.gets)
+            assertEquals(0, f.puts)
+        } finally {
+            release.complete(Unit)
+            f.close()
+        }
+    }
+
+    @Test fun `background after checkpoint preparation blocks the realtime transport request`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val foreground = MutableStateFlow(AccountSyncForeground(active = true))
+            f.prepareStartup(foreground)()
+            runCurrent()
+            val socket = f.sockets.single()
+            val previousGets = f.gets
+            val previousReopens = f.gateway.reopens
+            val oldLease = requireNotNull(f.manager.captureRealtimeLease())
+
+            // Invalidate the conditional receipt so this receive must use the real checkpoint/export path.
+            f.gateway.mountRevision++
+            var backgroundedBeforeRequest = false
+            f.gateway.afterExport = {
+                f.gateway.afterExport = null
+                backgroundedBeforeRequest = true
+                foreground.value = AccountSyncForeground(active = false)
+            }
+            val result = async { f.manager.syncDownForRealtime(oldLease) }
+            runCurrent()
+
+            assertTrue(backgroundedBeforeRequest)
+            assertFalse(result.await())
+            assertTrue(socket.cancelled)
+            assertEquals(previousReopens + 1, f.gateway.reopens)
+            assertEquals(previousGets, f.gets)
+            assertEquals(0, f.puts)
+        } finally { f.close() }
+    }
+
+    @Test fun `a conflated background and foreground retires the previous realtime socket`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val foreground = MutableStateFlow(AccountSyncForeground(active = true))
+            f.prepareStartup(foreground)()
+            runCurrent()
+            val old = f.sockets.single()
+            val previousGets = f.gets
+
+            foreground.value = AccountSyncForeground(active = false)
+            foreground.value = AccountSyncForeground(active = true)
+            runCurrent()
+
+            assertTrue(old.cancelled)
+            assertEquals(2, f.sockets.size)
+            assertEquals(previousGets + 1, f.gets)
+            old.updated(11)
+            runCurrent()
+            assertEquals(previousGets + 1, f.gets)
         } finally { f.close() }
     }
 

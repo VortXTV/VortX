@@ -6,7 +6,7 @@
 //   - an account-scoped journal of explicit edits, ACKed only after serialized successful writes.
 // vault.ts owns session persistence and encrypted transport. Journals carry no session/key/socket URL.
 
-import { clearSession, validateSession, migrateSession, sessionOwner, startSessionAuthority, onSessionAuthority, captureSessionOwnership, completeAuthAttempt, fetchSync, connectSyncSocket, mutateSyncDoc, SyncUpgradeRequiredError, type Session, type AuthAttempt, type AuthResult } from "./vault";
+import { clearSession, validateSession, migrateSession, sessionOwner, startSessionAuthority, onSessionAuthority, captureSessionOwnership, completeAuthAttempt, fetchSync, connectSyncSocket, mutateSyncDoc, SyncUpgradeRequiredError, SyncSessionExpiredError, type Session, type AuthAttempt, type AuthResult } from "./vault";
 import {
   mergeInstalledAddons,
   pruneInstalledAddons,
@@ -55,7 +55,7 @@ import { CINEMETA_URL, loadAddon } from "./addon";
 import type { MetaItem } from "./types";
 import { effectiveAddonRemovals, applyAddonIntents } from "./addonRemovals";
 import { projectNativeSync, type NativeSyncProjection } from "./nativeSyncProjection";
-import { applyHostIntent, createHostIntent, hostSettingField, watchlistField, watchlistValue, type HostIntent, type HostTarget } from "./nativeHostEdits";
+import { HOST_MAX_CLOCK, applyHostIntent, createHostIntent, hostSettingField, watchlistField, watchlistValue, type HostIntent, type HostTarget } from "./nativeHostEdits";
 import { applyProfileIntent, createProfileIntent, profileIntentAcknowledged, applyAddonEventIntent, addonEventAcknowledged, addonIdentity, type ProfileIntent, type AddonEventIntent } from "./nativeBrowserEvents";
 import { canonicalJSON } from "./nativeProfileEvents";
 let appliedNativeProjection: NativeSyncProjection | null = null;
@@ -73,6 +73,12 @@ const listeners = new Set<Listener>();
 function setSession(next: Session | null): void {
   cached = next;
   try { bindSettingsSyncState(next); } catch { /* retained intents remain; authority is not rolled back */ }
+  if (next && sessionOwner().mode === "blocked") {
+    appliedNativeProjection = null;
+    const scope = `account.${next.account.id.toLowerCase()}`;
+    blockNativeAccountProjection(scope);
+    blockNativeProfiles(scope);
+  }
   // A revision change invalidates the old receiver even when A's token/key bytes compare equal.
   if (receiveState) disposeReceiver(receiveState);
   receiveState = null;
@@ -216,28 +222,37 @@ function rosterFromDoc(vortx: Record<string, unknown>, doc: Record<string, unkno
 /** Apply a decrypted sync document to local state (READ-ONLY merge: add-ons, library, metadata keys).
  *  Pure (no network) so it is unit-testable; hydrateFromAccount fetches the doc then calls this. Tolerant
  *  of any missing/odd key - a partial or foreign doc never throws. */
+type ProjectionOutcome = "applied" | "partial" | "unavailable";
+
 export function applySyncDoc(doc: Record<string, unknown> | null | undefined): boolean {
-  if (!doc || typeof doc !== "object") return false;
+  return applySyncDocument(doc) === "applied";
+}
+
+function applySyncDocument(doc: Record<string, unknown> | null | undefined): ProjectionOutcome {
+  if (!doc || typeof doc !== "object") return "unavailable";
   discardTransferredIntents(settingsSyncState);
   if (Object.prototype.hasOwnProperty.call(doc, "nativeSync")) {
     try {
       const session = settingsSyncState.session;
-      if (!session) return false;
+      if (!session) return "unavailable";
       const view = projectNativeSync(doc, `account.${session.account.id.toLowerCase()}`)!;
       withSuppressedUp(() => applyNativeProjection(view, doc));
-      return !view.unsupported;
+      return view.unsupported ? "partial" : "applied";
     } catch {
-      const scope = `account.${settingsSyncState.session!.account.id.toLowerCase()}`;
-      blockNativeAccountProjection(scope); blockNativeProfiles(scope);
-      window.dispatchEvent(new Event("vortx:addons-changed"));
-      return false; // Present-invalid is not absence, nor permission to activate stale/unscoped data.
+      const session = settingsSyncState.session;
+      if (session) {
+        const scope = `account.${session.account.id.toLowerCase()}`;
+        blockNativeAccountProjection(scope); blockNativeProfiles(scope);
+        window.dispatchEvent(new Event("vortx:addons-changed"));
+      }
+      return "unavailable"; // Present-invalid is not absence, nor permission to activate stale/unscoped data.
     }
   }
   appliedNativeProjection = null;
   setNativeAccountProjection(null);
   setNativeProfiles("", null);
   withSuppressedUp(() => applySyncDocLocally(doc));
-  return true;
+  return "applied";
 }
 
 function nativeSettingsPatch(profile: NativeSyncProjection["profiles"][number]): Partial<Settings> {
@@ -479,9 +494,12 @@ interface ReceiveState {
   ownsStoredSession: () => boolean;
   receivedVersion?: number;
   appliedVersion?: number;
-  projectionPending?: boolean;
+  projection?: ProjectionOutcome;
+  readProblem?: "unavailable" | "reconnect";
+  empty?: true;
   pull: Promise<void> | null;
   pullAgain: boolean;
+  fullRead: boolean;
   abort: AbortController | null;
   socket: WebSocket | null;
   pollTimer?: ReturnType<typeof setTimeout>;
@@ -520,7 +538,7 @@ function bindReceiveSession(session: Session | null): void {
   receiveState = session ? {
     session: { ...session, account: { ...session.account }, dataKey: session.dataKey.slice() },
     ownsStoredSession: captureStoredSession(session),
-    pull: null, pullAgain: false, abort: null, socket: null, reconnectAttempt: 0,
+    pull: null, pullAgain: false, fullRead: false, abort: null, socket: null, reconnectAttempt: 0,
   } : null;
   if (receiveState) resumeReceiver(receiveState, true);
   notifyReceiveStatus();
@@ -536,7 +554,7 @@ function resumeReceiver(state: ReceiveState, flushWrites = false): void {
     scheduleIntentPush(settingsSyncState, 350);
   }
   for (const key of settingsSyncState.journalOwners) claimJournal(settingsSyncState, key);
-  void requestAccountPull(state);
+  void requestAccountPull(state, flushWrites && state.projection === "unavailable");
   connectReceiver(state);
   if (!state.pollTimer) state.pollTimer = setTimeout(() => {
     state.pollTimer = undefined;
@@ -590,8 +608,9 @@ function connectReceiver(state: ReceiveState): void {
   } catch { retry(); }
 }
 
-function requestAccountPull(state: ReceiveState): Promise<void> {
+function requestAccountPull(state: ReceiveState, fullRead = false): Promise<void> {
   if (!isCurrentReceiver(state) || !syncIsActive()) return Promise.resolve();
+  state.fullRead ||= fullRead;
   if (state.pull) {
     state.pullAgain = true;
     return state.pull;
@@ -599,25 +618,34 @@ function requestAccountPull(state: ReceiveState): Promise<void> {
   const run = async (): Promise<void> => {
     do {
       state.pullAgain = false;
+      const version = state.fullRead ? undefined : state.receivedVersion;
+      state.fullRead = false;
       const abort = new AbortController();
       state.abort = abort;
       const deadline = setTimeout(() => abort.abort(), 15_000);
       try {
-        const status = await fetchSync(state.session, { version: state.receivedVersion, signal: abort.signal,
+        const status = await fetchSync(state.session, { version, signal: abort.signal,
           isCurrent: () => isCurrentReceiver(state) && syncIsActive() });
         if (!isCurrentReceiver(state) || !syncIsActive() || abort.signal.aborted) return;
-        if (status.unchanged || status.decryptFailed) continue;
-        if (status.version !== undefined && state.receivedVersion !== undefined && status.version < state.receivedVersion) continue;
-        if (status.contents) {
-          const applied = applySyncDoc(status.contents);
-          // The legacy browser adapter cannot project native engine state yet. Retain its encrypted
-          // fields on every write, and expose received separately from fully applied in the UI.
-          state.projectionPending = !applied;
-          if (!state.projectionPending) state.appliedVersion = status.version;
+        if (status.decryptFailed) {
+          state.readProblem = "unavailable";
+        } else if (status.unchanged) {
+          state.readProblem = undefined;
+        } else if (status.contents && (state.receivedVersion === undefined || status.version! >= state.receivedVersion)) {
+          recordAccountProjection(state, status.contents, status.version);
+        } else if (!status.synced && state.receivedVersion === undefined) {
+          state.readProblem = undefined;
+          state.empty = true;
+        } else {
+          state.readProblem = "unavailable";
         }
-        state.receivedVersion = status.version;
         notifyReceiveStatus();
-      } catch { /* Socket hints, fallback polling, and foreground/online catch-up retry automatically. */ }
+      } catch (error) {
+        if (isCurrentReceiver(state) && syncIsActive()) {
+          state.readProblem = error instanceof SyncSessionExpiredError ? "reconnect" : "unavailable";
+          notifyReceiveStatus();
+        }
+      }
       finally {
         clearTimeout(deadline);
         if (state.abort === abort) state.abort = null;
@@ -626,6 +654,21 @@ function requestAccountPull(state: ReceiveState): Promise<void> {
   };
   state.pull = run().finally(() => { state.pull = null; });
   return state.pull;
+}
+
+function recordAccountProjection(state: ReceiveState, contents: Record<string, unknown>, version?: number): void {
+  const projection = applySyncDocument(contents);
+  state.readProblem = undefined;
+  state.empty = undefined;
+  state.projection = projection;
+  state.receivedVersion = version;
+  if (projection === "applied") state.appliedVersion = version;
+}
+
+/** A user-requested read retries projection even when the server revision has not changed. */
+export function retryAccountSync(): Promise<void> {
+  const state = receiveState;
+  return state ? requestAccountPull(state, true) : Promise.resolve();
 }
 
 /** One automatic receiving lifecycle for this page. Account/token changes retire old callbacks. */
@@ -660,10 +703,15 @@ export function startAccountSync(): () => void {
   };
 }
 
-export function accountSyncStatus(): { receivedVersion?: number; appliedVersion?: number; projectionPending: boolean; upgradeRequired?: true } {
-  return { receivedVersion: receiveState?.receivedVersion, appliedVersion: receiveState?.appliedVersion,
-    projectionPending: receiveState?.projectionPending ?? false,
-    ...(settingsSyncState.upgradeRequired ? { upgradeRequired: true as const } : {}) };
+export function accountSyncStatus(): { receivedVersion?: number; appliedVersion?: number; projectionPending: boolean;
+  upgradeRequired?: true; reconnectRequired?: true; unavailable?: true; empty?: true } {
+  const state = receiveState;
+  return { receivedVersion: state?.receivedVersion, appliedVersion: state?.appliedVersion,
+    projectionPending: state?.projection !== undefined && state.projection !== "applied",
+    ...(settingsSyncState.upgradeRequired ? { upgradeRequired: true as const } : {}),
+    ...(settingsSyncState.writeReconnectRequired || state?.readProblem === "reconnect" || sessionOwner().mode === "blocked" ? { reconnectRequired: true as const } : {}),
+    ...(state?.readProblem === "unavailable" || state?.projection === "unavailable" ? { unavailable: true as const } : {}),
+    ...(state?.empty ? { empty: true as const } : {}) };
 }
 
 function notifyReceiveStatus(): void {
@@ -732,6 +780,7 @@ interface SettingsSyncState {
   revision: number;
   retryAttempt: number;
   upgradeRequired: boolean;
+  writeReconnectRequired: boolean;
   journalSources: Map<string, string>;
   journalOwners: Set<string>;
 }
@@ -1128,7 +1177,7 @@ function createSettingsSyncState(session: Session | null, ownerSnapshot?: Settin
     writeQueued: false,
     profileAtLastChange: activeProfileId(),
     ownerSettingsSnapshot: copySettings(ownerSnapshot ?? initialOwnerSettings()),
-    addonIntents: Object.create(null), progressIntents: Object.create(null), hostIntents: Object.create(null), profileIntents: Object.create(null), addonEvents: Object.create(null), hostCounter: 0, revision: 0, retryAttempt: 0, upgradeRequired: false,
+    addonIntents: Object.create(null), progressIntents: Object.create(null), hostIntents: Object.create(null), profileIntents: Object.create(null), addonEvents: Object.create(null), hostCounter: 0, revision: 0, retryAttempt: 0, upgradeRequired: false, writeReconnectRequired: false,
     journalSources: new Map(),
     journalOwners: new Set(),
   };
@@ -1140,6 +1189,7 @@ settingsSyncState = createSettingsSyncState(null);
 
 function bindSettingsSyncState(session: Session | null): void {
   if (sameAccountScope(settingsSyncState.session, session)) {
+    if (!sameSession(settingsSyncState.session, session)) settingsSyncState.writeReconnectRequired = false;
     settingsSyncState.requiresStoredSession ||= !!session && hasSessionDescriptor();
     settingsSyncState.session = session;
     settingsSyncState.ownsStoredSession = session ? captureStoredSession(session, settingsSyncState.requiresStoredSession) : () => true;
@@ -1242,6 +1292,97 @@ function rosterForSettingsWrite(
   return order.map((id) => byId.get(id)!);
 }
 
+const PROVIDER_METADATA_FIELDS = new Set(["tmdb", "mdblist", "fanart"]);
+const PROVIDER_OAUTH_GROUPS = [["traktAccess", "traktRefresh", "traktExpiry"], ["simklAccess", "simklExpiry"]];
+const PROVIDER_REGISTER_FIELDS = new Set([
+  ...PROVIDER_METADATA_FIELDS, "realDebrid", "allDebrid", "premiumize", "torBox", ...PROVIDER_OAUTH_GROUPS.flat(),
+]);
+
+type ProviderRegister = { clock: number; actor: string; value: string | null };
+
+function providerRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function providerEditUnavailable(): never {
+  throw new Error("This account's provider keys cannot be edited safely here; the edit remains queued.");
+}
+
+function validProviderActor(value: unknown): value is string {
+  return typeof value === "string" && value.length === 36 && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value);
+}
+
+function validProviderValue(value: unknown): value is string | null {
+  return value === null || (typeof value === "string" && value.length > 0 && !/[\uD800-\uDFFF]/u.test(value));
+}
+
+function readProviderRegisters(value: unknown, scope: string): Record<string, ProviderRegister> {
+  const carrier = providerRecord(value) ?? providerEditUnavailable();
+  const fields = providerRecord(carrier.fields) ?? providerEditUnavailable();
+  if (Object.keys(carrier).length !== 3 || carrier.schemaVersion !== 1 || carrier.scope !== scope) {
+    providerEditUnavailable();
+  }
+  const registers: Record<string, ProviderRegister> = Object.create(null);
+  for (const [key, raw] of Object.entries(fields)) {
+    const register = providerRecord(raw) ?? providerEditUnavailable();
+    const { clock, actor, value } = register;
+    if (!PROVIDER_REGISTER_FIELDS.has(key) || Object.keys(register).length !== 3
+        || typeof clock !== "number" || !Number.isSafeInteger(clock) || clock < 0 || clock > HOST_MAX_CLOCK
+        || !validProviderActor(actor) || !validProviderValue(value)) {
+      providerEditUnavailable();
+    }
+    if (key.endsWith("Expiry") && value !== null) {
+      const seconds = Number(value);
+      if (!Number.isSafeInteger(seconds) || seconds < 0 || String(seconds) !== value) providerEditUnavailable();
+    }
+    registers[key] = { clock, actor, value };
+  }
+  for (const group of PROVIDER_OAUTH_GROUPS) {
+    const values = group.map((key) => registers[key]).filter(Boolean);
+    if (values.length > 0 && (values.length !== group.length || values.some(({ clock, actor, value }) =>
+      clock !== values[0].clock || actor !== values[0].actor || (value === null) !== (values[0].value === null)))) {
+      providerEditUnavailable();
+    }
+  }
+  return registers;
+}
+
+/** Write a browser-owned metadata key and its native register in one encrypted CAS mutation. */
+export function writeApiKeys(
+  doc: Record<string, unknown>, edits: Record<string, string | null>, scope: string, actor: string,
+): void {
+  const changes = Object.entries(edits);
+  if (!changes.length) return;
+  if (!validProviderActor(actor) || changes.some(([key, value]) =>
+    (key !== "tmdb" && key !== "mdblist") || !validProviderValue(value))) providerEditUnavailable();
+
+  // Only an absent carrier denotes a legacy account. Existing incompatible values are retained.
+  const registers = Object.prototype.hasOwnProperty.call(doc, "nativeProviderCredentials")
+    ? readProviderRegisters(doc.nativeProviderCredentials, scope) : undefined;
+  const clock = registers ? Math.max(0, ...Object.values(registers).map((entry) => entry.clock)) : 0;
+  if (registers && clock >= HOST_MAX_CLOCK) providerEditUnavailable();
+
+  const existingKeys = Object.prototype.hasOwnProperty.call(doc, "apiKeys")
+    ? providerRecord(doc.apiKeys) ?? providerEditUnavailable() : {};
+  const existingMetadata = Object.prototype.hasOwnProperty.call(existingKeys, "metadata")
+    ? providerRecord(existingKeys.metadata) ?? providerEditUnavailable() : undefined;
+  const apiKeys = { ...existingKeys };
+  const metadata = { ...existingMetadata };
+  for (const [key, value] of changes) {
+    if (value === null) {
+      delete apiKeys[key];
+      delete metadata[key];
+    } else {
+      apiKeys[key] = value;
+      if (registers || existingMetadata) metadata[key] = value;
+    }
+    if (registers) registers[key] = { clock: clock + 1, actor, value };
+  }
+  if (existingMetadata || Object.keys(metadata).length > 0) apiKeys.metadata = metadata;
+  if (registers) doc.nativeProviderCredentials = { schemaVersion: 1, scope, fields: registers };
+  doc.apiKeys = apiKeys;
+}
+
 /** Push the changed webapp settings up to the MAIN profile via doc.profileEdits (dashboard-compatible shape).
  *  Delta-merges the main settings onto the latest effective app plus web roster, preserving unrelated
  *  profile edits and settings. Profile settings no-op when there is no synced main profile, while
@@ -1279,19 +1420,10 @@ async function pushSettings(
     }
 
     if (changed.has("tmdbKey") || changed.has("mdblistKey")) {
-      const apiKeys =
-        doc.apiKeys && typeof doc.apiKeys === "object"
-          ? { ...(doc.apiKeys as Record<string, unknown>) }
-          : {};
-      if (changed.has("tmdbKey")) {
-        if (s.tmdbKey) apiKeys.tmdb = s.tmdbKey;
-        else delete apiKeys.tmdb;
-      }
-      if (changed.has("mdblistKey")) {
-        if (s.mdblistKey) apiKeys.mdblist = s.mdblistKey;
-        else delete apiKeys.mdblist;
-      }
-      doc.apiKeys = apiKeys;
+      const edits: Record<string, string | null> = {};
+      if (changed.has("tmdbKey")) edits.tmdb = s.tmdbKey || null;
+      if (changed.has("mdblistKey")) edits.mdblist = s.mdblistKey || null;
+      writeApiKeys(doc, edits, `account.${session.account.id.toLowerCase()}`, journalPageId);
     }
   }, isCurrent);
 }
@@ -1365,11 +1497,10 @@ function applyHostReadback(readback: { contents: Record<string, unknown>; versio
   // Apply this authenticated read after retiring its optimistic overlay. Delayed receive reads
   // below this revision are fenced, including a socket-triggered GET started before the PUT.
   if (!receiveState || readback.version === undefined || receiveState.receivedVersion === undefined || readback.version >= receiveState.receivedVersion) {
-    const applied = applySyncDoc(readback.contents);
     if (receiveState && sameSession(receiveState.session, session)) {
-      receiveState.receivedVersion = readback.version;
-      receiveState.projectionPending = !applied;
-      if (applied) receiveState.appliedVersion = readback.version;
+      recordAccountProjection(receiveState, readback.contents, readback.version);
+    } else {
+      applySyncDoc(readback.contents);
     }
   }
 }
@@ -1499,8 +1630,8 @@ registerAddonsSyncPusher((hint) => {
   const state = settingsSyncState;
   const profileId = activeProfileId();
   const binding = appliedNativeProjection?.profiles.find((profile) => profile.id === profileId)?.binding;
-  return () => state === settingsSyncState && sameAccountScope(state.session, session) && (!binding ||
-    (activeProfileId() === profileId && appliedNativeProjection?.profiles.find((profile) => profile.id === profileId)?.binding === binding));
+  return () => state === settingsSyncState && sameSession(state.session, session) && state.ownsStoredSession() &&
+    activeProfileId() === profileId && appliedNativeProjection?.profiles.find((profile) => profile.id === profileId)?.binding === binding;
 });
 
 // Push the ACTIVE profile's web watch-progress up to the bilateral doc.webProgress field. Owner progress
@@ -1651,22 +1782,20 @@ function syncableSettingsKeys(
 function queueSettingsPush(state: SettingsSyncState): void {
   state.pushTimer = undefined;
   discardTransferredIntents(state);
-  if (state !== settingsSyncState || !state.session || state.upgradeRequired || !hasPendingIntents(state) || state.writeQueued) return;
+  if (state !== settingsSyncState || !state.session || state.upgradeRequired || state.writeReconnectRequired || !hasPendingIntents(state) || state.writeQueued) return;
+  const session = state.session;
   state.writeQueued = true;
 
   const write = async (): Promise<void> => {
-    if (state !== settingsSyncState || !state.session || state.upgradeRequired) {
-      state.writeQueued = false;
-      return;
-    }
-    const session = state.session;
-    const isCurrent = () => state === settingsSyncState && !state.upgradeRequired && sameSession(state.session, session) && state.ownsStoredSession() && ownsJournals(state);
+    const isCurrent = () => state === settingsSyncState && !state.upgradeRequired && !state.writeReconnectRequired &&
+      sameSession(state.session, session) && state.ownsStoredSession() && ownsJournals(state);
     let failed = Object.keys(state.retainedNativeSettings).length > 0;
     const attempt = async (job: () => Promise<void>): Promise<void> => {
       try { if (isCurrent()) await job(); } catch (error) {
         failed = true;
-        if (error instanceof SyncUpgradeRequiredError) {
-          state.upgradeRequired = true;
+        if (isCurrent() && (error instanceof SyncUpgradeRequiredError || error instanceof SyncSessionExpiredError)) {
+          state.upgradeRequired = error instanceof SyncUpgradeRequiredError;
+          state.writeReconnectRequired = error instanceof SyncSessionExpiredError;
           persistIntents(state);
           notifyReceiveStatus();
         }
@@ -1779,7 +1908,7 @@ function queueSettingsPush(state: SettingsSyncState): void {
       failed = true; // Unacknowledged intent never leaves the journal, including across reload/sign-out.
     } finally {
       state.writeQueued = false;
-      if (state === settingsSyncState && state.session && !state.upgradeRequired && hasPendingIntents(state)) {
+      if (state === settingsSyncState && state.session && !state.upgradeRequired && !state.writeReconnectRequired && hasPendingIntents(state)) {
         scheduleIntentPush(state, failed
           ? Math.min(30_000, SETTINGS_RETRY_DELAY * 2 ** Math.min(state.retryAttempt++, 5))
           : 350);
@@ -1794,7 +1923,7 @@ function hasPendingIntents(state: SettingsSyncState): boolean {
 }
 
 function scheduleIntentPush(state: SettingsSyncState, delay: number): void {
-  if (state !== settingsSyncState || !state.session || state.upgradeRequired || !hasPendingIntents(state) || state.pushTimer) return;
+  if (state !== settingsSyncState || !state.session || state.upgradeRequired || state.writeReconnectRequired || !hasPendingIntents(state) || state.pushTimer) return;
   state.pushTimer = setTimeout(() => queueSettingsPush(state), delay);
 }
 
@@ -1826,7 +1955,7 @@ function scheduleSettingsPush(
   persistIntents(state);
   if (state.pushTimer) clearTimeout(state.pushTimer);
   state.pushTimer = undefined;
-  if (state.upgradeRequired) return;
+  if (state.upgradeRequired || state.writeReconnectRequired) return;
   state.pushTimer = setTimeout(() => queueSettingsPush(state), SETTINGS_PUSH_DELAY);
 }
 

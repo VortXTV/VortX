@@ -499,6 +499,26 @@ do {
           "valid empty is explicitly empty, never invalid or unavailable")
     check(TopShelfSnapshot.writeResult([], to: diagnosticFile) == .unchanged && !TopShelfSnapshot.write([], to: diagnosticFile),
           "repeated explicit empty preserves the original no-change Bool")
+
+    section("Top Shelf refreshes once when a process inherits its snapshot")
+    var notification = TopShelfSnapshot.ContentNotification()
+    for failure in [TopShelfSnapshot.WriteResult.noContainer, .invalidDestination, .encodingFailed, .writeFailed] {
+        check(!notification.shouldNotify(after: failure), "\(failure) does not notify tvOS")
+    }
+    check(TopShelfSnapshot.writeResult(eight, to: diagnosticFile) == .written, "seed a previous launch's snapshot")
+    let retainedBytes = try Data(contentsOf: diagnosticFile)
+    let retainedResult = TopShelfSnapshot.writeResult(eight, to: diagnosticFile)
+    check(retainedResult == .unchanged, "first publication sees the same valid rows")
+    check(notification.shouldNotify(after: retainedResult),
+          "a retained current snapshot refreshes the system on first publication")
+    check(try Data(contentsOf: diagnosticFile) == retainedBytes, "first refresh preserves the retained bytes")
+    check(!notification.shouldNotify(after: TopShelfSnapshot.writeResult(eight, to: diagnosticFile)),
+          "unchanged Home refreshes do not wake the extension repeatedly")
+    check(notification.shouldNotify(after: TopShelfSnapshot.writeResult([], to: diagnosticFile)),
+          "a later clear refreshes the system")
+    var coldNotification = TopShelfSnapshot.ContentNotification()
+    check(coldNotification.shouldNotify(after: .written), "a fresh successful write refreshes the system")
+    check(!coldNotification.shouldNotify(after: .unchanged), "a fresh write consumes the first-publication refresh")
 } catch {
     check(false, "disposable snapshot fixture failed: \(error)")
 }
@@ -545,25 +565,187 @@ check(TopShelfSnapshot.boundedSnapshotData { requested in Data(repeating: 0, cou
 section("the shared group follows what the signed copy was granted")
 
 let canonicalGroup = TopShelfSnapshot.canonicalAppGroupID
-let signerGroup = "group.b0eaaf9ad1ed3ea5.1"
-check(TopShelfSnapshot.selectAppGroup(granted: [signerGroup], canonical: canonicalGroup) { $0 == canonicalGroup } == canonicalGroup,
-      "the project's own group wins when this copy holds it")
-check(TopShelfSnapshot.selectAppGroup(granted: [signerGroup], canonical: canonicalGroup) { $0 == signerGroup } == signerGroup,
-      "a re-signed copy uses the group its signer granted instead of finding no container")
-let grantedA = ["group.zz.second", signerGroup], grantedB = [signerGroup, "group.zz.second"]
-let both = { (id: String) in id == signerGroup || id == "group.zz.second" }
-check(TopShelfSnapshot.selectAppGroup(granted: grantedA, canonical: canonicalGroup, hasContainer: both)
-      == TopShelfSnapshot.selectAppGroup(granted: grantedB, canonical: canonicalGroup, hasContainer: both),
-      "an app and its extension granted the same groups in any order settle on the same one")
-check(TopShelfSnapshot.selectAppGroup(granted: ["group.*", "com.example.notagroup"], canonical: canonicalGroup) { _ in true } == canonicalGroup,
-      "wildcards and non-group identifiers are never used")
-check(TopShelfSnapshot.selectAppGroup(granted: [signerGroup], canonical: canonicalGroup) { _ in false } == nil,
-      "no granted container leaves the feature off")
+let signerGroup = "group.example.signed.2"
+let unrelatedGroup = "group.example.signed.1"
+let team = "ABCDE12345"
+let teamCopy = canonicalGroup + "." + team
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [], profileGroups: [signerGroup, canonicalGroup]) { _ in true } == canonicalGroup,
+      "the explicitly listed canonical group wins")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [], profileGroups: [signerGroup]) { $0 == signerGroup } == signerGroup,
+      "one rewritten group is used when the process can access it")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: ["group.*", "group.", "com.example.notagroup"],
+                                     profileGroups: []) { _ in true } == canonicalGroup,
+      "missing usable hints permit the canonical group only")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [signerGroup], profileGroups: [unrelatedGroup]) { _ in true } == nil,
+      "disjoint signing hints cannot admit either group")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [signerGroup], profileGroups: [unrelatedGroup, signerGroup]) { _ in true } == signerGroup,
+      "a single group supported by both hints wins over the wider profile")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [], profileGroups: [unrelatedGroup, signerGroup]) { _ in true } == nil,
+      "ambiguous generic groups do not select an arbitrary container")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [signerGroup, teamCopy], profileGroups: [teamCopy, signerGroup],
+                                     teamIdentifiers: [team]) { _ in true } == teamCopy,
+      "an explicitly verified VortX-specific group wins over a generic group")
+var probedGroups: [String] = []
+let unavailable = TopShelfSnapshot.selectAppGroup(recordedGroups: [], profileGroups: [signerGroup, canonicalGroup]) { group in
+    probedGroups.append(group)
+    return group == signerGroup
+}
+check(unavailable == nil && probedGroups == [canonicalGroup],
+      "a denied shared choice does not probe a different group")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [canonicalGroup], profileGroups: [canonicalGroup],
+                                     signedGroups: [signerGroup]) { $0 == signerGroup } == signerGroup,
+      "a signed extension entitlement overrides asymmetric canonical metadata")
+check(TopShelfSnapshot.selectAppGroup(recordedGroups: [canonicalGroup], profileGroups: [canonicalGroup],
+                                     signedGroups: []) { _ in true } == nil,
+      "an explicit signed empty set never falls back to canonical metadata")
+check(TopShelfSnapshot.signedAppGroups(executable: nil) == .absent,
+      "an absent executable preserves the existing metadata route")
+
+section("the provider's signed executable is read within Mach-O and SuperBlob bounds")
+
+do {
+    let fixtureRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        .appendingPathComponent("top-shelf-signature-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: fixtureRoot, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: fixtureRoot) }
+    func le32(_ value: UInt32) -> Data { withUnsafeBytes(of: value.littleEndian) { Data($0) } }
+    func be32(_ value: UInt32) -> Data { withUnsafeBytes(of: value.bigEndian) { Data($0) } }
+    func entitlement(_ magic: UInt32, _ payload: Data) -> Data {
+        be32(magic) + be32(UInt32(8 + payload.count)) + payload
+    }
+    func signedFixture(_ entries: [(UInt32, Data)]?, signatureOffset: UInt32 = 48,
+                       slotOffsets: [Int: UInt32] = [:]) throws -> URL {
+        let url = fixtureRoot.appendingPathComponent(UUID().uuidString)
+        var header = le32(0xfeedfacf) + le32(0x0100000c) + le32(0) + le32(2)
+        guard let entries else {
+            header += le32(1) + le32(8) + le32(0) + le32(0)
+            header += le32(0x2a) + le32(8)
+            try header.write(to: url)
+            return url
+        }
+        let indexEnd = 12 + entries.count * 8
+        var index = Data()
+        var body = Data()
+        for (ordinal, entry) in entries.enumerated() {
+            let offset = slotOffsets[ordinal] ?? UInt32(indexEnd + body.count)
+            index += be32(entry.0) + be32(offset)
+            body += entry.1
+        }
+        let signature = be32(0xfade0cc0) + be32(UInt32(indexEnd + body.count)) + be32(UInt32(entries.count)) + index + body
+        header += le32(1) + le32(16) + le32(0) + le32(0)
+        header += le32(0x1d) + le32(16) + le32(signatureOffset) + le32(UInt32(signature.count))
+        try (header + signature).write(to: url)
+        return url
+    }
+    let xml = try PropertyListSerialization.data(fromPropertyList: [
+        "com.apple.security.application-groups": [signerGroup]
+    ], format: .xml, options: 0)
+    let empty = try PropertyListSerialization.data(fromPropertyList: [String: Any](), format: .xml, options: 0)
+    let signedGroup = (UInt32(5), entitlement(0xfade7171, xml))
+    let signedEmpty = (UInt32(5), entitlement(0xfade7171, empty))
+    let der = (UInt32(7), entitlement(0xfade7172, Data([0x30, 0])))
+    let badDER = (UInt32(7), entitlement(0xfade7171, Data([0x30, 0])))
+    let unknownBadLength = (UInt32(0), be32(0xfade0c02) + be32(999))
+    let unknown = (UInt32(0), entitlement(0xfade0c02, Data()))
+    let xmlExecutable = try signedFixture([signedGroup])
+    let universal = fixtureRoot.appendingPathComponent("universal")
+    try (be32(0xcafebabe) + Data(repeating: 0, count: 28)).write(to: universal)
+    let cases: [(URL, TopShelfSnapshot.SignedAppGroupState, String)] = try [
+        (signedFixture(nil), .absent, "a real unsigned Mach-O without LC_CODE_SIGNATURE preserves metadata fallback"),
+        (signedFixture([]), .absent, "a signature without entitlement slots preserves metadata fallback"),
+        (xmlExecutable, .xml([signerGroup]), "bounded XML yields only its signed group"),
+        (signedFixture([signedGroup, der]), .xml([signerGroup]), "a DER slot can coexist with the XML claim"),
+        (signedFixture([signedEmpty]), .emptyXML, "a signed XML dictionary without groups blocks metadata fallback"),
+        (signedFixture([der]), .derUnsupported, "DER-only signed entitlements are distinguished"),
+        (signedFixture([signedGroup, badDER]), .malformed, "bad DER slot structure does not hide behind XML"),
+        (signedFixture([signedGroup, signedGroup]), .malformed, "duplicate XML entitlement slots are refused"),
+        (signedFixture([signedGroup, der, der]), .malformed, "duplicate DER entitlement slots are refused"),
+        (signedFixture([signedGroup], signatureOffset: 9_999_999), .malformed, "out-of-range signature offset is refused"),
+        (signedFixture([signedGroup], signatureOffset: 32), .malformed, "signature cannot start inside load commands"),
+        (signedFixture([signedGroup], slotOffsets: [0: 12]), .malformed, "a slot cannot start inside the index"),
+        (signedFixture([unknownBadLength]), .malformed, "an unknown slot may not extend beyond the signature"),
+        (signedFixture([unknown, signedGroup], slotOffsets: [0: 36]), .malformed, "different slots may not alias one blob"),
+        (universal, .layoutUnsupported, "universal layout is left uninspected")
+    ]
+    for (url, expected, description) in cases {
+        check(TopShelfSnapshot.signedAppGroups(executable: url) == expected, description)
+    }
+
+    let host = fixtureRoot.appendingPathComponent("VortX.app", isDirectory: true)
+    let provider = host.appendingPathComponent("Contents/PlugIns/VortXTopShelf.appex", isDirectory: true)
+    let providerExecutables = provider.appendingPathComponent("Contents/MacOS", isDirectory: true)
+    try FileManager.default.createDirectory(at: providerExecutables, withIntermediateDirectories: true)
+    try FileManager.default.copyItem(at: xmlExecutable, to: providerExecutables.appendingPathComponent("Provider"))
+    let hostInfo = try PropertyListSerialization.data(fromPropertyList: [
+        "CFBundleIdentifier": "test.vortx.signing-host", "CFBundlePackageType": "APPL"
+    ], format: .xml, options: 0)
+    let providerInfo = try PropertyListSerialization.data(fromPropertyList: [
+        "CFBundleIdentifier": "test.vortx.signing-host.topshelf", "CFBundlePackageType": "XPC!",
+        "CFBundleExecutable": "Provider", "ALTAppGroups": [canonicalGroup],
+        "NSExtension": ["NSExtensionPointIdentifier": "com.apple.tv-top-shelf"]
+    ] as [String: Any], format: .xml, options: 0)
+    try hostInfo.write(to: host.appendingPathComponent("Contents/Info.plist"))
+    try providerInfo.write(to: provider.appendingPathComponent("Contents/Info.plist"))
+    if let hostBundle = Bundle(url: host), let providerBundle = Bundle(url: provider) {
+        check(TopShelfSnapshot.resolveAppGroupID(bundle: hostBundle) { $0 == signerGroup } == signerGroup,
+              "the host routes to the actual provider claim over the canonical metadata")
+        check(TopShelfSnapshot.resolveAppGroupID(bundle: providerBundle) { $0 == signerGroup } == signerGroup,
+              "the provider independently routes to the same signed claim")
+        check(TopShelfSnapshot.resolveAppGroupID(bundle: hostBundle) { $0 == canonicalGroup } == nil,
+              "host denial of the signed claim cannot fall back to its canonical container")
+    } else {
+        check(false, "open the signed-route fixture bundles")
+    }
+} catch {
+    check(false, "write and read the disposable Mach-O signature fixtures")
+}
+
+section("the app and provider use the same exact embedded extension")
+
+do {
+    let fixture = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        .appendingPathComponent("top-shelf-bundle-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: fixture) }
+    let host = fixture.appendingPathComponent("VortX.app", isDirectory: true)
+    let plugins = host.appendingPathComponent("Contents/PlugIns", isDirectory: true)
+    let provider = plugins.appendingPathComponent("VortXTopShelf.appex", isDirectory: true)
+    let other = plugins.appendingPathComponent("Other.appex", isDirectory: true)
+    func writeBundle(_ url: URL, id: String, groups: [String], provider: Bool) throws {
+        let contents = url.appendingPathComponent("Contents", isDirectory: true)
+        try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+        var info: [String: Any] = [
+            "CFBundleIdentifier": id, "CFBundlePackageType": provider ? "XPC!" : "APPL",
+            "ALTAppGroups": groups
+        ]
+        if provider { info["NSExtension"] = ["NSExtensionPointIdentifier": "com.apple.tv-top-shelf"] }
+        let plist = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        try plist.write(to: contents.appendingPathComponent("Info.plist"))
+    }
+    try writeBundle(host, id: "test.vortx.host", groups: [unrelatedGroup, signerGroup], provider: false)
+    try writeBundle(provider, id: "test.vortx.host.topshelf", groups: [signerGroup], provider: true)
+    try writeBundle(other, id: "test.vortx.host.other", groups: [unrelatedGroup], provider: true)
+    if let hostBundle = Bundle(url: host), let providerBundle = Bundle(url: provider), let otherBundle = Bundle(url: other) {
+        check(TopShelfSnapshot.resolveAppGroupID(bundle: hostBundle) { [unrelatedGroup, signerGroup].contains($0) } == signerGroup,
+              "a host with two grants selects the exact provider's group")
+        check(TopShelfSnapshot.resolveAppGroupID(bundle: providerBundle) { $0 == signerGroup } == signerGroup,
+              "the provider selects the same group from its own bundle")
+        check(TopShelfSnapshot.resolveAppGroupID(bundle: hostBundle) { $0 == unrelatedGroup } == nil,
+              "a host that lacks the selected grant cannot publish in another container")
+        check(TopShelfSnapshot.resolveAppGroupID(bundle: otherBundle) { _ in true } == nil,
+              "a differently named extension does not supply a group")
+        let lite = fixture.appendingPathComponent("VortXLite.app", isDirectory: true)
+        try writeBundle(lite, id: "test.vortx.lite", groups: [canonicalGroup], provider: false)
+        check(Bundle(url: lite).map { TopShelfSnapshot.resolveAppGroupID(bundle: $0) { _ in true } == nil } == true,
+              "a bundle without the exact embedded provider has no Top Shelf group")
+    } else {
+        check(false, "fixture bundles open")
+    }
+} catch {
+    check(false, "write disposable fixture bundles")
+}
 
 section("only a group no other app shares carries Trakt and SIMKL rows")
 
-let team = "ABCDE12345"
-let teamCopy = canonicalGroup + "." + team
 func dedicated(_ id: String, recorded: [String]? = nil, teams: [String] = [team]) -> Bool {
     TopShelfSnapshot.isDedicatedSignerGroup(id, recordedGroups: recorded ?? [id], teamIdentifiers: teams)
 }

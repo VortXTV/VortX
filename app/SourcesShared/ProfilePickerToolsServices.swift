@@ -7,7 +7,9 @@ extension ProfilePickerToolsController.Services {
         let sync = VortXSyncManager.shared
         #if os(tvOS)
         return Self(owner: {
-            guard let owner = accountGrant.owner, accountGrant.permits(owner),
+            // Freeze identity even if the presentation is briefly inactive. The live
+            // grant still fences status, file actions and every asynchronous callback.
+            guard let owner = accountGrant.owner, CredentialScopeRegistry.shared.isCurrent(owner.credential),
                   sync.isSignedIn, sync.account?.id == owner.accountID else { return nil }
             return owner
         }, isCurrent: { owner in
@@ -28,7 +30,9 @@ extension ProfilePickerToolsController.Services {
         })
         #else
         return Self(owner: {
-            guard let owner = accountGrant.owner, accountGrant.permits(owner),
+            // Freeze identity even if the presentation is briefly inactive. The live
+            // grant still fences status, file actions and every asynchronous callback.
+            guard let owner = accountGrant.owner, CredentialScopeRegistry.shared.isCurrent(owner.credential),
                   sync.isSignedIn, sync.account?.id == owner.accountID else { return nil }
             return owner
         }, isCurrent: { owner in

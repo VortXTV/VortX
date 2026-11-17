@@ -1,5 +1,5 @@
 import { actionOf, escapeHtml } from "../lib/dom";
-import { currentSession, signOut, accountSyncStatus } from "../lib/account";
+import { currentSession, signOut, accountSyncStatus, retryAccountSync } from "../lib/account";
 import { sessionOwner } from "../lib/vault";
 import { exportBackup, importBackup } from "../lib/store";
 import {
@@ -178,7 +178,10 @@ function accountSection(): string {
   if (acct) {
     const who = escapeHtml(acct.username || acct.email || "Signed in");
     const sub = acct.email && acct.username ? escapeHtml(acct.email) : undefined;
-    const body = row(who, `<button class="chip" data-action="account-signout">Sign out</button>`, sub) +
+    const body = row(who, `<div class="settings-actions">
+      <button class="chip" data-action="account-sync">Sync now</button>
+      <button class="chip" data-action="account-signout">Sign out</button>
+    </div>`, sub) +
       `<p class="settings-footer" data-account-sync-status aria-live="polite">${accountSyncMessage()}</p>`;
     return group("Account", body, "Your account data is end to end encrypted.");
   }
@@ -193,6 +196,9 @@ function accountSection(): string {
 function accountSyncMessage(): string {
   const status = accountSyncStatus();
   if (status.upgradeRequired) return "Update VortX to continue syncing. Your unsaved changes are retained on this browser.";
+  if (status.reconnectRequired) return "Sign out and sign in again to continue syncing. Changes queued on this browser are retained.";
+  if (status.unavailable) return "Account data couldn’t be loaded. Select Sync now to retry. Existing data is preserved.";
+  if (status.empty) return "This account doesn’t have an encrypted backup yet.";
   if (status.projectionPending) return "Account update received. Supported browser data updates automatically; some native data or profile protections still require VortX.";
   if (hasNativeProfiles()) return "Account updates apply automatically. Account Watchlist, trailer autoplay, direct-only links and performance settings sync with durable offline retries. Browser Save is local; other native profile-setting and playback edits stay queued pending compatible sync support. Metadata API keys sync independently.";
   return status.appliedVersion === undefined ? "Checking for account updates…" : "Account updates apply automatically while this page is active.";
@@ -401,13 +407,16 @@ function subtitleStyleSection(scale: number, font: SubtitleFont, color: Subtitle
 function backupSection(): string {
   const body = `
     <div class="settings-actions">
-      <button class="chip" data-action="export-backup">Export backup</button>
-      <label class="chip backup-import" role="button">Import backup<input type="file" accept="application/json,.json" data-import-backup hidden /></label>
-    </div>`;
+      <button class="chip" data-action="export-backup">Export local backup</button>
+      <button class="chip" data-action="select-backup">Import local backup</button>
+      <input type="file" accept="application/json,.json" data-import-backup hidden />
+      <a class="chip" href="https://vortx.tv/dashboard">Encrypted account backups</a>
+    </div>
+    <p class="settings-footer" data-backup-status role="status"></p>`;
   return group(
     "Backup & Restore",
     body,
-    "Export your add-ons, library, continue-watching, and settings to a file, or restore from one. Signed in, these also sync across your devices.",
+    "Local backups cover this browser. Keep the file private because its add-on URLs can contain service keys.",
   );
 }
 
@@ -543,6 +552,18 @@ export function handleSettingsClick(target: EventTarget | null): boolean {
       return commit({ subtitleScale: clampSub(Number(d.size) || 1) });
     case "sub-size":
       return commit({ subtitleScale: clampSub(getSettings().subtitleScale + (Number(d.dir) || 0) * SUB_STEP) });
+    case "account-sync": {
+      const button = hit.node as HTMLButtonElement;
+      const revision = sessionOwner().revision;
+      button.disabled = true;
+      button.textContent = "Checking…";
+      void retryAccountSync().finally(() => {
+        if (!button.isConnected || sessionOwner().revision !== revision) return;
+        button.disabled = false;
+        button.textContent = "Sync now";
+      });
+      return true;
+    }
     case "account-signout": {
       logoutNotice = "Signed out in this tab; checking saved session…";
       const completion = signOut(), revision = sessionOwner().revision;
@@ -582,7 +603,11 @@ export function handleSettingsClick(target: EventTarget | null): boolean {
       return true;
     }
     case "export-backup":
-      downloadBackup();
+      try { downloadBackup(); setBackupStatus("Local backup prepared."); }
+      catch { setBackupStatus("Could not save the local backup. Try again."); }
+      return true;
+    case "select-backup":
+      host?.querySelector<HTMLInputElement>("[data-import-backup]")?.click();
       return true;
     default:
       return false;
@@ -631,9 +656,9 @@ function downloadBackup(): void {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = "vortx-backup.json";
-  a.click();
-  URL.revokeObjectURL(url);
+  a.download = "vortx-web-local-backup.json";
+  try { a.click(); }
+  finally { setTimeout(() => URL.revokeObjectURL(url), 1_000); }
 }
 
 /** Attach change listeners for the native <select> controls (languages) + the text inputs (keys/filters). */
@@ -670,28 +695,31 @@ function wireSettings(target: HTMLElement): void {
   });
 
   const importInput = target.querySelector<HTMLInputElement>("input[data-import-backup]");
+  let importGeneration = 0;
   importInput?.addEventListener("change", () => {
     const file = importInput.files?.[0];
+    importInput.value = "";
+    const generation = ++importGeneration;
     if (!file) return;
+    if (file.size > 5_000_000) { setBackupStatus("Choose a local backup file of 5 MB or less."); return; }
+    const revision = sessionOwner().revision;
+    const isCurrent = () => generation === importGeneration && importInput.isConnected &&
+      host?.querySelector("[data-import-backup]") === importInput && sessionOwner().revision === revision;
     const reader = new FileReader();
     reader.onload = () => {
-      if (importBackup(String(reader.result))) location.reload();
-      else flashImportError(importInput);
+      if (!isCurrent()) return;
+      if (typeof reader.result === "string" && importBackup(reader.result)) location.reload();
+      else setBackupStatus("Could not import that local backup file.");
     };
+    reader.onerror = () => { if (isCurrent()) setBackupStatus("Could not read the backup file. Choose it again."); };
+    setBackupStatus("Reading local backup…");
     reader.readAsText(file);
   });
 }
 
-/** Inline "Invalid backup file" feedback on the Import control (no window.alert). */
-function flashImportError(input: HTMLInputElement): void {
-  const label = input.closest<HTMLElement>(".backup-import");
-  if (!label) return;
-  const prev = label.firstChild?.textContent ?? "Import backup";
-  if (label.firstChild) label.firstChild.textContent = "Invalid backup file";
-  input.value = "";
-  setTimeout(() => {
-    if (label.firstChild) label.firstChild.textContent = prev;
-  }, 2000);
+function setBackupStatus(message: string): void {
+  const status = host?.querySelector<HTMLElement>("[data-backup-status]");
+  if (status) status.textContent = message;
 }
 
 function rerender(): void {

@@ -4787,6 +4787,10 @@ enum PlayerLiveContractTests {
                   ".hopSource",
                   "hopToNextSource(reason: \"rapid cache starvation\"",
               ]))
+        let manualPrimarySubtitle = sourceSection(
+            tvPlayer,
+            from: "private func selectPrimarySubtitleTrack(_ id: Int, language: String)",
+            to: "private func selectPrimaryPooledSubtitle(")
         check("wiring: user seeks and track changes start a full rapid-buffer suppression window",
               tvPlayer?.contains("private func suppressRapidBufferingRecovery(reason: String)") == true
                   && tvPlayer?.contains("PlayerRapidBufferingRecoveryState.suppressionDeadline") == true
@@ -4794,8 +4798,10 @@ enum PlayerLiveContractTests {
                   && tvPlayer?.contains("suppressRapidBufferingRecovery(reason: \"user seek\")") == true
                   && tvPlayer?.contains("suppressRapidBufferingRecovery(reason: \"user relative seek\")") == true
                   && tvPlayer?.contains("suppressRapidBufferingRecovery(reason: \"user audio track\")") == true
-                  && tvPlayer?.contains("suppressRapidBufferingRecovery(reason: \"user subtitle off\")") == true
-                  && tvPlayer?.contains("suppressRapidBufferingRecovery(reason: \"user embedded subtitle\")") == true
+                  && sourceContainsInOrder(manualPrimarySubtitle, [
+                    "suppressRapidBufferingRecovery(reason: id < 0 ? \"user subtitle off\" : \"user embedded subtitle\")",
+                    "coordinator.player?.setSubtitleTrack(id)",
+                  ])
                   && tvPlayer?.contains("suppressRapidBufferingRecovery(reason: \"user external subtitle\")") == true
                   && tvPlayer?.contains("suppressRapidBufferingRecovery(reason: \"user pooled subtitle\")") == true)
         check("wiring: refused stall reload restores the still-live surface state",

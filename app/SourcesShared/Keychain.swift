@@ -788,8 +788,24 @@ final class KeychainFileMutationTransaction: @unchecked Sendable {
         var directoryStatus = stat()
         guard Darwin.fstat(directoryDescriptor, &directoryStatus) == 0,
               (directoryStatus.st_mode & S_IFMT) == S_IFDIR,
-              directoryStatus.st_uid == Darwin.geteuid(),
-              (directoryStatus.st_mode & 0o077) == 0 else { return nil }
+              directoryStatus.st_uid == Darwin.geteuid() else { return nil }
+        if (directoryStatus.st_mode & 0o077) != 0 {
+            // The streaming server can create the shared Application Support parent with 0755
+            // before the first credential write. Tighten only an owner-controlled directory.
+            // The already-open descriptor prevents chmod from following a substituted symlink.
+            guard (directoryStatus.st_mode & 0o7000) == 0,
+                  (directoryStatus.st_mode & 0o022) == 0,
+                  (directoryStatus.st_mode & 0o700) == 0o700,
+                  directoryPathMatches(directoryStatus),
+                  directoryHasNoAccessACL(directoryDescriptor),
+                  Darwin.fchmod(directoryDescriptor, mode_t(0o700)) == 0,
+                  Darwin.fstat(directoryDescriptor, &directoryStatus) == 0,
+                  (directoryStatus.st_mode & S_IFMT) == S_IFDIR,
+                  directoryStatus.st_uid == Darwin.geteuid(),
+                  (directoryStatus.st_mode & 0o777) == 0o700,
+                  directoryHasNoAccessACL(directoryDescriptor),
+                  directoryPathMatches(directoryStatus) else { return nil }
+        }
 
         let lockName = lockURL.lastPathComponent
         let lockFlags = O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_EXLOCK
@@ -824,6 +840,21 @@ final class KeychainFileMutationTransaction: @unchecked Sendable {
             return nil
         }
         return opened
+    }
+
+    private func directoryHasNoAccessACL(_ descriptor: Int32) -> Bool {
+        // Darwin reports ENOENT for no extended ACL. chmod does not clear an existing ACL.
+        guard let acl = Darwin.acl_get_fd(descriptor) else { return errno == ENOENT }
+        _ = Darwin.acl_free(UnsafeMutableRawPointer(acl))
+        return false
+    }
+
+    private func directoryPathMatches(_ descriptorStatus: stat) -> Bool {
+        var namedStatus = stat()
+        let result = directoryURL.path.withCString { Darwin.lstat($0, &namedStatus) }
+        return result == 0 && namedStatus.st_dev == descriptorStatus.st_dev
+            && namedStatus.st_ino == descriptorStatus.st_ino
+            && (namedStatus.st_mode & S_IFMT) == S_IFDIR
     }
 #endif
 }

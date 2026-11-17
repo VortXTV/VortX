@@ -37,7 +37,8 @@ if (process.argv[2] === '--extract') {
     return text.slice(start, end);
   };
   const hasCompletePull = source.includes('case doc(doc: [String: Any], version: Int, plaintext: Data, observation: UUID?)');
-  const reconnectMembers = ['accountReconnectRequired', 'clearAccountReconnectFailure']
+  const reconnectMembers = ['accountReconnectRequired', 'clearAccountReconnectFailure', 'backupUploadReconnectRequired',
+    'finishSyncWaiters', 'recoverInitialBackupWinner']
     .filter(name => source.includes(`${name}(`));
   const activeMembers = [...members, ...(hasCompleteReceiptFeature ? [...receiptMembers, ...receiptDependencies] : []), ...reconnectMembers];
   const selected = activeMembers.flatMap(name => {
@@ -56,6 +57,18 @@ if (process.argv[2] === '--extract') {
     block(source, '    private enum PushOutcome '));
   const observation = xperienceInputs.observationProperty(source);
   if (observation) selected.push(observation);
+  const usesWebsiteAdoption = selected.some(value => value.includes('authorizedWebsiteAccountAdoption('));
+  if (usesWebsiteAdoption) {
+    selected.push(block(source, '    private struct NativeWebsiteAccountAdoption {'));
+    selected.push(`    // Existing upload scenarios have no separately authenticated website-roster checkpoint.
+    private func authorizedWebsiteAccountAdoption(_ document: [String: Any], plaintext: Data, revision: Int,
+        capture: CredentialScopeRegistry.Capture, requiringCheckpoint: Bool) throws -> NativeWebsiteAccountAdoption? { nil }
+    private func prepareNativeLegacyMaterial(_ document: [String: Any], capture: CredentialScopeRegistry.Capture,
+        websiteAdoption: NativeWebsiteAccountAdoption?) async throws -> NativeLegacyPreparation {
+        precondition(websiteAdoption == nil)
+        return try await prepareNativeLegacyMaterial(document, capture: capture)
+    }`);
+  }
   const profiles = await readFile('app/SourcesShared/Profiles.swift', 'utf8');
   const preferenceFixture = await readFile('app/Tests/NativePreferenceAcknowledgementTests.swift', 'utf8');
   const exactDeclaration = (text, expression, label) => {
@@ -67,7 +80,8 @@ if (process.argv[2] === '--extract') {
   // A legitimate older baseline without that call does not acquire newer policy.
   const usesConversion = selected.some(value => value.includes('nativeLegacyConversionDecision('));
   let commitGeneration = '';
-  selected.push(block(source, '    private struct NativeLegacyPreparation {'));
+  const legacyPreparation = block(source, '    private struct NativeLegacyPreparation {');
+  selected.push(legacyPreparation);
   if (usesConversion) {
     commitGeneration = exactDeclaration(source, /^    private var nativeDocumentCommitGeneration: UInt64 = 0$/gm, 'conversion generation');
     selected.push(exactDeclaration(source, /^    private static let nativeExportKeys = \[[^\]]+\]/gm, 'native export keys'),
@@ -79,6 +93,13 @@ if (process.argv[2] === '--extract') {
   const backupDecoder = [exactDeclaration(backup, /^    static let formatTag = .*$/gm, 'backup format'),
     ...['    struct Envelope:', '    enum RestoreError:', '    static func decodeDomain('].map(marker => block(backup, marker))].join('\n');
   let peerSource = await readFile('app/Tests/AppleSyncManagerPeer.swift', 'utf8');
+  if (!legacyPreparation.includes('let archiveCapture: VortxNativeBootstrapArchive.LegacyCapture')) {
+    const currentFixture = '        let archiveCapture = try VortxNativeBootstrapArchive.captureLegacyDocument(doc)\n'
+      + '        return NativeLegacyPreparation(material: Data(), archiveCapture: archiveCapture, authority: nil, sourceArchive: nil)';
+    assert.equal(peerSource.split(currentFixture).length, 2, 'unique current legacy preparation fixture');
+    peerSource = peerSource.replace(currentFixture,
+      '        return NativeLegacyPreparation(material: Data(), authority: nil, sourceArchive: nil)');
+  }
   if (!hasCompletePull) {
     const currentPattern = 'if case .doc(let doc, let version, _, _) = await pullDocVersionedResult(credentialCapture: capture) {';
     assert.equal(peerSource.split(currentPattern).length, 2, 'unique fixture-only pull pattern');

@@ -25,6 +25,73 @@ class NativeHostDocumentTest {
         assertTrue("Expected '$phrase', got $error", error is IllegalArgumentException && error.message.orEmpty().contains(phrase))
     }
 
+    private fun addonSummary(name: String) = JSONObject()
+        .put("transportUrl", "https://addons.example/CaseSensitive/manifest.json")
+        .put("name", name)
+
+    private fun addonDescriptor(name: String, description: String) = addonSummary(name)
+        .put("manifest", JSONObject().put("id", "fixture.addon").put("name", name)
+            .put("version", "1.0.0").put("description", description))
+
+    @Test fun `native account source archive keeps tagged producer summaries and complete descriptors`() {
+        val summary = addonSummary("[4K] [HDR] Movies")
+        val descriptor = addonDescriptor("[TB⚡] Cinema", "{Community}: Film and TV")
+        val source = JSONObject()
+            .put("addons", JSONArray().put(summary))
+            .put("vortx", JSONObject().put("addons", JSONArray().put(descriptor).put(summary)))
+        val before = source.toString()
+        val archived = nativeLegacySourceArchive(source)
+
+        assertEquals(before, source.toString())
+        assertTrue(NativeHostPreferences.equal(source, archived.getJSONObject("document")))
+        assertTrue(paths(archived).isEmpty())
+        // Complete descriptor display fields also appear in typed import material and registers.
+        NativeHostDocument.requireCredentialFree(JSONObject().put("register", JSONObject().put("descriptor", descriptor)))
+    }
+
+    @Test fun `only owned summary arrays and qualified descriptor fields accept literal labels`() {
+        val name = "[4K] Movies"
+        val summary = addonSummary(name)
+        val invalid = listOf(
+            JSONObject().put("unknown", JSONObject().put("addons", JSONArray().put(summary))),
+            JSONObject().put("addons", JSONArray().put(addonSummary(name).put("manifest", JSONObject.NULL))),
+            JSONObject().put("addons", JSONArray().put(addonSummary(name).put("transportUrl", "file:///manifest.json"))),
+            JSONObject().put("addons", JSONArray().put(addonSummary(name).put("manifest", JSONObject().put("name", name)))),
+            JSONObject().put("addons", JSONArray().put(addonSummary("Fixture").put("future", name))),
+            JSONObject().put("addons", JSONArray().put(addonSummary(JSONObject.quote(name)))),
+        )
+        invalid.forEach { failure(it, "structured settings data") }
+    }
+
+    @Test fun `structured or encoded data cannot hide behind an add-on display label`() {
+        val secret = """{"token":"fixture-hidden","keep":true}"""
+        val encoded = Base64.getEncoder().encodeToString(secret.toByteArray())
+        val encodedWithBom = Base64.getEncoder().encodeToString(("\uFEFF" + secret).toByteArray())
+        val encodedUtf16 = Base64.getEncoder().encodeToString(secret.toByteArray(Charsets.UTF_16LE))
+        val tokenTag = "eyJ0b2tlbiI6InN5bnRoZXRpYyJ9"
+        val wrappedTokenTag = Base64.getEncoder().withoutPadding().encodeToString(tokenTag.toByteArray())
+        val malformed = listOf(
+            "[RD] - $secret", "[RD]: \uFEFF$encoded", "[RD] [4K] $encodedWithBom",
+            "[RD] $encodedUtf16", "[RD] bplist00broken", "[RD] - <?xml broken",
+            "[true] trailing", "[RD] [123]", "[RD] \"quoted\"", "[[RD]] Movies",
+            "[$tokenTag] Movies", "[RD] [$wrappedTokenTag] Movies", "[$tokenTag!] Movies", "[$secret] Movies",
+            "[\uFEFF$tokenTag] Movies", "[eyJ0b2tlbiI6Ij8+Pz8ifQ!_] Movies",
+        )
+        for (label in malformed) {
+            val source = JSONObject().put("addons", JSONArray().put(addonSummary(label)))
+            assertTrue(runCatching { nativeLegacySourceArchive(source) }.isFailure)
+        }
+        for (carrier in listOf(secret, encoded)) {
+            val descriptor = addonDescriptor("[4K] Movies", carrier).put("apiKey", "fixture-sibling")
+            val source = JSONObject().put("descriptor", descriptor)
+            val archive = NativeHostDocument.archive(source)
+            assertEquals(listOf("/descriptor/apiKey", "/descriptor/manifest/description/token"), paths(archive))
+            assertFalse(archive.toString().contains("fixture-hidden"))
+            assertFalse(archive.toString().contains("fixture-sibling"))
+            assertTrue(runCatching { NativeHostDocument.requireCredentialFree(source) }.isFailure)
+        }
+    }
+
     @Test fun `known credential carriers omitted with escaped deterministic paths no source mutation`() {
         val source = JSONObject().put("apiKeys", JSONObject().put("realdebrid", "hidden-value"))
             .put("nativeProviderCredentials", JSONObject().put("fields", JSONObject().put("tmdb", "hidden-register")))
@@ -99,6 +166,60 @@ class NativeHostDocumentTest {
         failure(JSONObject().put("settings", blob(mapOf("opaque" to byteArrayOf(1, 2, 3)))), "Opaque settings data")
         failure(JSONObject().put("settings", blob(mapOf("invalidUtf8" to byteArrayOf(0xc3.toByte(), 0x28)))), "UTF-8")
         failure(JSONObject().put("settings", blob(mapOf("safe" to "yes")) { it.put("schema", 99) }), "Unsupported settings schema")
+    }
+
+    @Test fun `account restore holds unreadable preferences in the inspected copy only`() {
+        val roster = """[{"id":"profile","name":"Viewer"}]""".toByteArray()
+        val brokenKey = "stremiox.seriesSourceSticky.fixture/~"
+        val sourceBlob = blob(mapOf(SettingsBackup.ROSTER_KEY to roster, "vortx.theme" to "dark",
+            brokenKey to mapOf("accessToken" to "fixture", "bingeGroup" to "["),
+            "opaque" to byteArrayOf(0xc3.toByte(), 0x28), "kcfallback.account" to "fixture")) {
+            it.put("futureHeader", JSONObject().put("version", 7))
+        }
+        val source = JSONObject().put("settings", sourceBlob)
+        val archive = nativeLegacySourceArchive(source, holdUnreadableSettings = true)
+        val inspected = archive.getJSONObject("document")
+        val clean = inspected.getString("settings")
+        val domain = rawDomain(clean)
+
+        assertEquals(sourceBlob, source.getString("settings"))
+        assertEquals(setOf(SettingsBackup.ROSTER_KEY, "vortx.theme"), domain.keys)
+        assertArrayEquals(roster, domain[SettingsBackup.ROSTER_KEY] as ByteArray)
+        assertEquals("dark", domain["vortx.theme"])
+        assertEquals(2, envelope(clean).getInt("keyCount"))
+        assertEquals(7, envelope(clean).getJSONObject("futureHeader").getInt("version"))
+        assertEquals(listOf("/settings/payloadBase64/kcfallback.account", "held:/settings/payloadBase64/opaque",
+            "held:/settings/payloadBase64/stremiox.seriesSourceSticky.fixture~1~0"), paths(archive))
+        NativeHostDocument.requireCredentialFree(inspected)
+        assertThrows(IllegalArgumentException::class.java) { nativeLegacySourceArchive(source) }
+        assertThrows(IllegalArgumentException::class.java) { NativeHostDocument.requireCredentialFree(source) }
+    }
+
+    @Test fun `account restore still rejects unreadable roster and settings envelope`() {
+        val unreadable = listOf(
+            JSONObject().put("settings", blob(mapOf(SettingsBackup.ROSTER_KEY to "[".toByteArray()))),
+            JSONObject().put("settings", blob(mapOf("broken" to "[")) { it.put("schema", 99) }),
+            JSONObject().put("settings", "not base64!"),
+            JSONObject().put("otherCarrier", envelope(blob(mapOf("broken" to "[")))),
+            JSONObject().put("unknown", "["),
+        )
+        for (source in unreadable) {
+            assertThrows(IllegalArgumentException::class.java) { NativeHostDocument.accountRestoreArchive(source) }
+        }
+    }
+
+    @Test fun `account restore still rejects ambiguous credentials and inspection limit failures`() {
+        var tooDeep: Any = "value"
+        repeat(68) { tooDeep = listOf(tooDeep) }
+        val invalid = listOf(
+            blob(mapOf("broken" to mapOf("ambiguousToken" to "fixture"))),
+            blob(mapOf("deep" to tooDeep)),
+        )
+        for (value in invalid) {
+            assertThrows(IllegalArgumentException::class.java) {
+                NativeHostDocument.accountRestoreArchive(JSONObject().put("settings", value))
+            }
+        }
     }
 
     @Test fun `ambiguous secret-like unmatched field fails rather than guessing`() {

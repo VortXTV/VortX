@@ -32,6 +32,21 @@ class ProfileSelectionHandoffTest {
         assertEquals(ProfileSelectionHandoff.State.FAILED, coordinator.state.value)
     }
 
+    @Test fun `final native admission cancellation leaves completion unacknowledged`() = runBlocking {
+        val cancelled = CancellationException("retired during completion")
+        val coordinator = ProfileSelectionHandoff(Transport(), native = true)
+        val selection = ProfileSelectionRequest(profile, ProfileStore.SwitchOutcome.SameAccount,
+            profile.email, 1L, { true }, completed = { throw cancelled })
+        coordinator.select(selection)
+        try {
+            coordinator.complete(selection)
+            fail("Cancellation was swallowed")
+        } catch (failure: CancellationException) {
+            assertSame(cancelled, failure)
+        }
+        assertEquals(ProfileSelectionHandoff.State.COMPLETE, coordinator.state.value)
+    }
+
     private class Transport : AuthRepository {
         override val authState = MutableStateFlow<AuthState>(AuthState.SignedOut)
         var selected: ProfileSelectionRequest? = null

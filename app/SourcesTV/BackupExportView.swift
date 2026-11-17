@@ -24,8 +24,11 @@ struct BackupExportView: View {
     @State private var poller: Task<Void, Never>?
     @State private var pollGeneration = UUID()
     @State private var showConflict = false
+    @State private var decisionOwner: VortXAuthenticationReceipt?
+    @State private var retryDecision: BackupDecision?
 
-    private enum Status: Equatable { case starting, waiting, saving, backedUp, pending, failed }
+    private enum Status: Equatable { case starting, waiting, decision, saving, backedUp, pending, failed }
+    private enum BackupDecision { case merge, useAccount }
 
     private static let qrSize: CGFloat = 320
     // A real page on the account site (vortx-site, src/pages/approve.astro), which reads `c` and `k` out of
@@ -67,6 +70,11 @@ struct BackupExportView: View {
                 Text("Saving to your VortX account…")
                     .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
 
+            case .decision:
+                Text("Choose how to combine or restore the profiles on this Apple TV.")
+                    .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                Button("Review backup choices") { showConflict = true }.buttonStyle(PrimaryActionStyle())
+
             case .backedUp:
                 Image(systemName: "checkmark.circle.fill")
                     .font(.system(size: 54)).foregroundStyle(Theme.Palette.accent)
@@ -77,12 +85,12 @@ struct BackupExportView: View {
             case .failed:
                 Text("That backup did not complete. Try again.")
                     .font(Theme.Typography.body).foregroundStyle(Theme.Palette.danger)
-                Button("Try again") { start() }.buttonStyle(ChipButtonStyle())
+                Button("Try again") { retry() }.buttonStyle(ChipButtonStyle())
 
             case .pending:
                 Text("Your changes are still waiting to sync. Try again shortly.")
                     .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
-                Button("Try again") { start() }.buttonStyle(ChipButtonStyle())
+                Button("Try again") { retry() }.buttonStyle(ChipButtonStyle())
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -91,8 +99,9 @@ struct BackupExportView: View {
         .onAppear { start() }
         .onDisappear { stop() }
         .alert("This account already has data", isPresented: $showConflict) {
-            Button("Merge both (keep all profiles)") { resolve { await $0.mergeBoth() ? .completed : .failed } }
-            Button("Use account's data") { resolve { await $0.useAccountData() } }
+            Button("Merge both (keep all profiles)") { resolve(.merge) }
+            Button("Use account's data") { resolve(.useAccount) }
+            Button("Not now", role: .cancel) {}
         } message: {
             Text("This VortX account already holds synced data. Merge both to keep every profile, or restore the account's data. Native backups do not overwrite an account with a legacy device snapshot.")
         }
@@ -123,13 +132,16 @@ struct BackupExportView: View {
         poller?.cancel(); poller = nil
         if let session { VortXSyncManager.shared.qrCancel(session) }
         session = nil; qrImage = nil
+        decisionOwner = nil; retryDecision = nil; showConflict = false
     }
 
     private func pollLoop(_ s: VortXSyncManager.QrJoinSession, generation: UUID) async {
         while !Task.isCancelled, pollGeneration == generation {
             try? await Task.sleep(nanoseconds: Self.pollInterval)
             if Task.isCancelled || pollGeneration != generation { return }
-            let result = await VortXSyncManager.shared.qrPoll(s)
+            let result = await VortXSyncManager.shared.qrPoll(s, onAuthenticated: { receipt in
+                if !Task.isCancelled, pollGeneration == generation { decisionOwner = receipt }
+            })
             if Task.isCancelled || pollGeneration != generation { return }
             switch result {
             case .pending, .transportError:
@@ -139,32 +151,60 @@ struct BackupExportView: View {
             case .failed:
                 status = .failed; return
             case .signedIn:
-                guard !Task.isCancelled else { return }
-                // BACKUP completion, NOT the joiner's blind useAccountData(): an empty account is already
-                // seeded from this device by reconcileAfterSignIn (.seededFromDevice), so we just confirm; a
-                // non-empty account asks which side to keep, defaulting to keeping THIS device.
-                let result = await VortXSyncManager.shared.reconcileAfterSignIn()
-                guard !Task.isCancelled else { return }
-                switch result {
-                case .hasAccountData: showConflict = true
-                case .seededFromDevice: status = .backedUp
-                case .unreachable: status = .failed
-                }
+                guard let owner = decisionOwner, isCurrent(owner) else { status = .failed; return }
+                await finishPairing(owner, generation: generation)
                 return
             }
         }
     }
 
-    /// Publish the actual conflict result; a failed or queued operation is not a completed backup.
-    private func resolve(_ op: @escaping (VortXSyncManager) async -> VortXSyncManager.ConflictResolutionOutcome) {
+    private func isCurrent(_ owner: VortXAuthenticationReceipt) -> Bool {
+        decisionOwner == owner && CredentialScopeRegistry.shared.isCurrent(owner.credential)
+            && VortXSyncManager.shared.isSignedIn && VortXSyncManager.shared.account?.id == owner.accountID
+    }
+
+    private func finishPairing(_ owner: VortXAuthenticationReceipt, generation: UUID) async {
+        guard !Task.isCancelled, pollGeneration == generation, isCurrent(owner) else { return }
+        status = .saving
+        let result = await VortXSyncManager.shared.reconcileAfterSignIn(credentialCapture: owner.credential)
+        guard !Task.isCancelled, pollGeneration == generation else { return }
+        guard isCurrent(owner) else { status = .failed; return }
+        switch result {
+        case .hasAccountData: status = .decision; showConflict = true
+        case .seededFromDevice: status = .backedUp
+        case .unreachable: status = .failed
+        }
+    }
+
+    private func retry() {
+        guard let owner = decisionOwner, isCurrent(owner), !VortXSyncManager.shared.accountSignInAgainRequired else {
+            start(); return
+        }
+        if let retryDecision { resolve(retryDecision); return }
         poller?.cancel()
+        let generation = pollGeneration
+        poller = Task { @MainActor in await finishPairing(owner, generation: generation) }
+    }
+
+    /// The decision and any retry belong to the exact account this QR adopted.
+    private func resolve(_ decision: BackupDecision) {
+        guard let owner = decisionOwner, isCurrent(owner) else { status = .failed; return }
+        poller?.cancel()
+        retryDecision = decision
+        let generation = pollGeneration
         status = .saving
         poller = Task { @MainActor in
-            guard !Task.isCancelled else { return }
-            let outcome = await op(VortXSyncManager.shared)
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, pollGeneration == generation, isCurrent(owner) else { return }
+            let manager = VortXSyncManager.shared
+            let outcome: VortXSyncManager.ConflictResolutionOutcome
+            switch decision {
+            case .merge: outcome = await manager.mergeBoth(credentialCapture: owner.credential)
+            case .useAccount: outcome = await manager.useAccountData(credentialCapture: owner.credential)
+            }
+            guard !Task.isCancelled, pollGeneration == generation else { return }
+            guard isCurrent(owner) else { status = .failed; return }
             switch outcome {
-            case .completed: status = .backedUp
+            case .completed: retryDecision = nil; status = .backedUp
             case .pending: status = .pending
             case .failed: status = .failed
             }

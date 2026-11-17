@@ -170,10 +170,11 @@ function readText(file) {
 }
 
 export function projectBuildFromYmlText(content) {
-  // This deliberately accepts the checked-in block-YAML layout only. Count named targets,
-  // not free-floating version lines: native ships five, historical projects also name VortX.
+  // Accept only the checked-in block-YAML layout. The current project also versions
+  // its Aether framework, while some historical projects include the legacy VortX app.
   const required = ["VortXiOSNative", "VortXMac", "VortXTV", "VortXTopShelf", "VortXTVLite"];
-  const allowed = new Set([...required, "VortX", "CinemaUISmokeRenderer"]);
+  const optionalVersioned = ["VortX", "VortXAetherKit"];
+  const allowed = new Set([...required, ...optionalVersioned, "CinemaUISmokeRenderer"]);
   const targets = new Map();
   const path = [];
   let sections = 0;
@@ -228,7 +229,7 @@ export function projectBuildFromYmlText(content) {
   }
   if (sections !== 1) invalid("must contain one targets section");
   for (const name of required) if (!targets.has(name)) invalid("is missing required target " + name);
-  const expected = [...required, ...(targets.has("VortX") ? ["VortX"] : [])];
+  const expected = [...required, ...optionalVersioned.filter(name => targets.has(name))];
   const builds = expected.map((name) => {
     const build = targets.get(name).build;
     if (build === null) invalid("is missing CURRENT_PROJECT_VERSION for " + name);

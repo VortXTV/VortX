@@ -366,7 +366,11 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         /// Full raw authenticated account base. Stored ONLY under the typed local format.
         var ownerHistoryAccountBase: Data? = nil
         var ownerHistoryReadUID: String? = nil
+        // Local witness that this checkpoint opened an authenticated rosterless website account.
+        // Cloud JSON has no way to set it. Existing checkpoints have no witness.
+        var websiteRosterAdoption: Data? = nil
     }
+    private let initialWebsiteRosterAdoption: (scope: VortxAccountScope, witness: Data)?
     private let directory: URL
     private let key: SymmetricKey
     private let installationKey: SymmetricKey?
@@ -388,6 +392,7 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         let bootstrap: Data?
         let hostPreferences: Data?
         let ownerHistoryLocal: Data?
+        let websiteRosterAdoption: Data?
     }
     private var installed: [VortxAccountScope: Installed] = [:]
     private let ownerHistoryStoreID = UUID()
@@ -593,8 +598,14 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         let bootstrap: Data
     }
     init(directory: URL, key: SymmetricKey, installationKey: SymmetricKey? = nil, bootstrap: Data? = nil, bootstrapScope: VortxAccountScope? = nil,
-         ownerHistoryAccountBase: Data? = nil) throws {
+         ownerHistoryAccountBase: Data? = nil, initialWebsiteRosterAdoption: Data? = nil) throws {
         guard key.bitCount == 256, installationKey == nil || installationKey?.bitCount == 256 else { throw VortxNativeError.invalidSnapshot }
+        if let witness = initialWebsiteRosterAdoption {
+            guard witness.count == SHA256.Digest.byteCount, let bootstrapScope, bootstrap != nil, ownerHistoryAccountBase == nil else {
+                throw VortxNativeError.invalidSnapshot
+            }
+            self.initialWebsiteRosterAdoption = (bootstrapScope, witness)
+        } else { self.initialWebsiteRosterAdoption = nil }
         if let bootstrap {
             guard let bootstrapScope else { throw VortxNativeError.invalidSnapshot }
             try bootstrapScope.validate(); try VortxNativeBootstrapArchive.validate(bootstrap)
@@ -902,10 +913,8 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         let checkpoint: OwnerHistoryRead
         let bootstrap: Data
     }
-    /// Authenticate the original locator, then return one original raw envelope/CAS. Generic
-    /// recovery remains unchanged and does not become a schema6/typed-format reader.
-    func ownerHistoryRecovery(account: String) throws -> OwnerHistoryRecovery? {
-        let scope: VortxAccountScope? = try lock.withLock {
+    private func authenticatedOwnerHistoryLocator(account: String) throws -> VortxAccountScope? {
+        try lock.withLock {
             let bytes: Data
             do { bytes = try Data(contentsOf: locatorURL(account)) }
             catch let error as NSError where error.domain == NSCocoaErrorDomain
@@ -918,8 +927,26 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
             try locator.scope.validate()
             return locator.scope
         }
-        guard let scope, let checkpoint = try readOwnerHistory(scope: scope) else { return nil }
-        guard checkpoint.format == "vortx-native-owner-history-checkpoint-v1" else { return nil }
+    }
+
+    /// Local/offline recovery requires the original authenticated account locator.
+    func ownerHistoryRecovery(account: String) throws -> OwnerHistoryRecovery? {
+        guard let scope = try authenticatedOwnerHistoryLocator(account: account) else { return nil }
+        return try readOwnerHistoryRecovery(scope: scope)
+    }
+
+    /// An authenticated typed peer can establish the exact scope after a first mount crashed
+    /// between state installation and locator publication. An existing locator still owns its scope.
+    func ownerHistoryRecovery(authenticatedPeerScope scope: VortxAccountScope) throws -> OwnerHistoryRecovery? {
+        if let locator = try authenticatedOwnerHistoryLocator(account: scope.account), locator != scope {
+            throw VortxNativeError.invalidSnapshot
+        }
+        return try readOwnerHistoryRecovery(scope: scope)
+    }
+
+    private func readOwnerHistoryRecovery(scope: VortxAccountScope) throws -> OwnerHistoryRecovery? {
+        guard let checkpoint = try readOwnerHistory(scope: scope),
+              checkpoint.format == "vortx-native-owner-history-checkpoint-v1" else { return nil }
         guard let bootstrap = checkpoint.bootstrap, checkpoint.ownerHistoryAccountBase != nil,
               let uid = checkpoint.preservedOwnerUID, !uid.isEmpty,
               !uid.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
@@ -943,6 +970,16 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         }
         return checkpoint
     }
+    /// Exact authenticated absence allows the first cold mount. Every retry or warm export
+    /// requires the same checkpoint's sealed witness, never an untrusted rosterless cloud field.
+    func permitsWebsiteRosterAdoption(scope: VortxAccountScope, witness: Data, requiringCheckpoint: Bool) throws -> Bool {
+        guard witness.count == SHA256.Digest.byteCount else { throw VortxNativeError.invalidSnapshot }
+        guard let checkpoint = try authenticatedCheckpoint(scope: scope) else { return !requiringCheckpoint }
+        return lock.withLock {
+            installed[scope]?.state == checkpoint && installed[scope]?.websiteRosterAdoption == witness
+        }
+    }
+
     /// The requested account's exact state/owner/draft paths must be absent. Existing installation
     /// indexes distinguish other accounts WITHOUT opening their account-key ciphertext. Unindexed
     /// or interrupted unattributed history remains unknown, never a positive absence receipt.
@@ -989,7 +1026,9 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         guard let snapshot = String(data: plain, encoding: .utf8) else { throw VortxNativeError.invalidSnapshot }
         if let object = try JSONSerialization.jsonObject(with: plain) as? [String: Any], object["format"] != nil {
             let envelope = try JSONDecoder().decode(Envelope.self, from: plain)
-            guard envelope.format == "vortx-native-checkpoint-v1" else { throw VortxNativeError.invalidSnapshot }
+            guard envelope.format == "vortx-native-checkpoint-v1",
+                  envelope.websiteRosterAdoption == nil || (envelope.websiteRosterAdoption?.count == SHA256.Digest.byteCount && envelope.bootstrap != nil)
+            else { throw VortxNativeError.invalidSnapshot }
             _ = try scope.validateSnapshot(envelope.state)
             if let bootstrap = envelope.bootstrap { try VortxNativeBootstrapArchive.validate(bootstrap) }
             if let host = envelope.hostPreferences { try VortxNativeHostPreferences.validateSealed(host, scope: scope) }
@@ -1042,8 +1081,16 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
     private func remember(_ bytes: Data, _ envelope: Envelope, scope: VortxAccountScope) {
         installed[scope] = Installed(format: envelope.format, accountBase: envelope.ownerHistoryAccountBase, digest: SHA256.hash(data: bytes), state: envelope.state,
                                      bootstrap: envelope.bootstrap, hostPreferences: envelope.hostPreferences,
-                                     ownerHistoryLocal: envelope.ownerHistoryLocal)
+                                     ownerHistoryLocal: envelope.ownerHistoryLocal, websiteRosterAdoption: envelope.websiteRosterAdoption)
     }
+    /// First website admission must never replace a checkpoint installed after the absence
+    /// check by another store or process. The staged and installed paths share a directory.
+    static func installFirstWebsiteCheckpoint(_ staged: URL, at destination: URL) throws {
+        guard Darwin.renamex_np(staged.path, destination.path, UInt32(RENAME_EXCL)) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+    }
+
     private func commitSnapshot(_ snapshot: String, scope: VortxAccountScope, hostPreferences: Data?) throws {
         lock.lock(); defer { lock.unlock() }
         var stage = VortxCheckpointDiagnostics.Stage.validate
@@ -1052,6 +1099,7 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
             var retainedHost = hostPreferences
             var retainedOwnerHistory: Data?
             var retainedAccountBase = accountBases[scope]
+            var websiteRosterAdoption = initialWebsiteRosterAdoption.flatMap { $0.scope == scope ? $0.witness : nil }
             stage = .retainExisting
             var existing: Data?
             do { existing = try Data(contentsOf: url(scope)) }
@@ -1063,6 +1111,8 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
                     if let bootstrap = known.bootstrap { bootstraps[scope] = bootstrap }
                     if retainedHost == nil { retainedHost = known.hostPreferences }
                     retainedOwnerHistory = known.ownerHistoryLocal
+                    if let witness = websiteRosterAdoption, known.websiteRosterAdoption != witness { throw VortxNativeError.invalidSnapshot }
+                    websiteRosterAdoption = known.websiteRosterAdoption
                     if retainedAccountBase == nil { retainedAccountBase = known.accountBase }
                     // An obsolete generic runtime must never overwrite a schema6 checkpoint.
                     // Even with a cached encrypted read, the dedicated coordinator owns it.
@@ -1079,6 +1129,8 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
                     if let bootstrap = retained.bootstrap { bootstraps[scope] = bootstrap }
                     if retainedHost == nil { retainedHost = retained.hostPreferences }
                     retainedOwnerHistory = retained.ownerHistoryLocal
+                    if let witness = websiteRosterAdoption, retained.websiteRosterAdoption != witness { throw VortxNativeError.invalidSnapshot }
+                    websiteRosterAdoption = retained.websiteRosterAdoption
                     if retainedAccountBase == nil { retainedAccountBase = retained.ownerHistoryAccountBase }
                 }
             }
@@ -1095,7 +1147,7 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
             }
             let envelope = Envelope(format: "vortx-native-checkpoint-v1", state: snapshot, bootstrap: bootstrap,
                 hostPreferences: retainedHost, ownerHistoryLocal: retainedOwnerHistory,
-                ownerHistoryAccountBase: retainedAccountBase)
+                ownerHistoryAccountBase: retainedAccountBase, websiteRosterAdoption: websiteRosterAdoption)
             stage = .seal
             let sealed = try AES.GCM.seal(JSONEncoder().encode(envelope), using: key, authenticating: scope.authenticatedData)
             guard let combined = sealed.combined else { throw VortxNativeError.invalidSnapshot }
@@ -1114,7 +1166,13 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
             stage = .stageReadback
             guard try Data(contentsOf: staged) == bytes else { throw VortxNativeError.invalidSnapshot }
             stage = .install
-            guard Darwin.rename(staged.path, url(scope).path) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+            if existing == nil, websiteRosterAdoption != nil {
+                try Self.installFirstWebsiteCheckpoint(staged, at: url(scope))
+            } else {
+                guard Darwin.rename(staged.path, url(scope).path) == 0 else {
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                }
+            }
             stage = .directorySync
             let directoryFD = Darwin.open(directory.path, O_RDONLY)
             guard directoryFD >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
@@ -1123,7 +1181,8 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
             stage = .installedReadback
             guard try Data(contentsOf: url(scope)) == bytes else { throw VortxNativeError.invalidSnapshot }
             installed[scope] = Installed(format: "vortx-native-checkpoint-v1", accountBase: retainedAccountBase, digest: SHA256.hash(data: bytes), state: snapshot, bootstrap: bootstrap,
-                                         hostPreferences: retainedHost, ownerHistoryLocal: retainedOwnerHistory)
+                                         hostPreferences: retainedHost, ownerHistoryLocal: retainedOwnerHistory,
+                                         websiteRosterAdoption: websiteRosterAdoption)
         } catch {
             // The file is uncertain now: the next commit opens it in full.
             installed[scope] = nil
@@ -1361,6 +1420,7 @@ actor VortxNativeSession {
     private(set) var legacyReconciliation: LegacyReconciliation?
     /// Host diagnostics sink. Only outcome transitions are reported, never material bytes.
     private let diagnostics: (@Sendable (String) -> Void)?
+    private var lastAccountMergeFailureStage: String?
     private var closed = false
     private var persistenceFailed = false
     // Playback position ticks are applied in memory at once but written to the sealed checkpoint at most
@@ -1407,11 +1467,14 @@ actor VortxNativeSession {
          ownerHistoryColdTarget: OwnerHistorySessionCoordinator.Target? = nil,
          ownerHistoryColdCheckpoint: VortxEncryptedCheckpointStore.OwnerHistoryRead? = nil,
          ownerHistoryReadOnly: Bool = false,
+         ownerHistoryColdRepairSource: Data? = nil,
          ownerHistoryColdPeer: OwnerHistoryColdPeer? = nil,
          ownerHistoryLocalCheckpointPreparation: OwnerHistoryLocalCheckpointPreparation? = nil) throws {
         try scope.validate()
         self.diagnostics = diagnostics
-        guard legacy == nil || legacy?.scope == scope else { throw VortxNativeError.invalidSnapshot }
+        guard legacy == nil || legacy?.scope == scope,
+              ownerHistoryColdRepairSource == nil || (ownerHistoryColdCheckpoint != nil && ownerHistoryColdPeer == nil)
+        else { throw VortxNativeError.invalidSnapshot }
         self.scope = scope; self.abi = abi; self.store = store; self.transport = transport
         self.ownerHistoryLocalCheckpointPreparation = ownerHistoryLocalCheckpointPreparation
         if let input = ownerHistoryColdPeer {
@@ -1504,12 +1567,26 @@ actor VortxNativeSession {
             runtime = nil
             self.ownerHistoryReadOnly = ownerHistoryReadOnly
             do {
+                var opening = checkpoint
+                if try OwnerHistorySessionCoordinator.missingColdOwnerLibrary(checkpoint.snapshot, scope: scope) {
+                    guard let ownerHistoryColdRepairSource else { throw VortxNativeError.unavailable }
+                    let candidate = try OwnerHistorySessionCoordinator.repairColdOwnerLibrary(checkpoint,
+                        scope: scope, peerPlaintext: ownerHistoryColdRepairSource, canonicalABI: abi,
+                        sessionABI: OwnerHistorySessionCABI(), sourceAuthority: sourceAuthority)
+                    let coldLease = lease
+                    var installed: VortxEncryptedCheckpointStore.OwnerHistoryRead?
+                    try coldLease.withActive { try sourceAuthority.withActive {
+                        installed = try encrypted.commitOwnerHistory(candidate, expected: checkpoint, scope: scope)
+                    } }
+                    guard let installed else { throw VortxNativeError.checkpointUncertain }
+                    opening = installed
+                }
                 ownerHistory = try OwnerHistorySessionCoordinator(scope: scope, target: target, store: encrypted,
                     abi: OwnerHistorySessionCABI(), canonicalABI: abi, sourceAuthority: sourceAuthority,
-                    originalRead: checkpoint)
+                    originalRead: opening)
                 try sourceAuthority.withActive {
-                    try encrypted.requireCurrentOwnerHistory(checkpoint, scope: scope)
-                    try encrypted.rememberAuthenticatedOwnerHistoryScope(scope, expected: checkpoint)
+                    try encrypted.requireCurrentOwnerHistory(opening, scope: scope)
+                    try encrypted.rememberAuthenticatedOwnerHistoryScope(scope, expected: opening)
                 }
             } catch {
                 let typedRetired = ownerHistory?.close() ?? true
@@ -1853,6 +1930,11 @@ actor VortxNativeSession {
     func usesOwnerHistory() -> Bool { ownerHistory != nil }
     /// Ownership and health are separate after an irreversible generic-to-typed transfer.
     /// Inspect only actor-owned state: task cancellation is not session corruption.
+    func requireCurrentOwnerHistoryCheckpoint() throws {
+        guard !closed, !persistenceFailed, let ownerHistory else { throw VortxNativeError.unavailable }
+        try lease.withActive { try ownerHistory.requireCurrentCheckpoint() }
+    }
+
     func ownerHistoryRouteStatus() -> (ownsHistory: Bool, requiresAuthenticatedReopen: Bool) {
         (ownerHistory != nil,
          closed || persistenceFailed || ownerHistoryRetirementPending || genericRetirementUnconfirmed
@@ -2110,6 +2192,17 @@ actor VortxNativeSession {
     private struct OwnerHistoryLeaseAuthority: VortxMutationAuthority {
         let lease: VortxSessionLease
         func withActive(_ operation: () throws -> Void) throws { try lease.withActive(operation) }
+    }
+
+    /// Hold the normal account writer while proving absence and publishing the first roster.
+    /// The detached operation must finish before ordinary restore acquires the writer to mount.
+    @MainActor static func withWebsiteRosterWriter<T>(scope: VortxAccountScope,
+        operation: @MainActor (any VortxMutationAuthority) async throws -> T) async throws -> T {
+        try scope.validate()
+        let lease = VortxSessionLease()
+        let writer = try VortxScopeWriter(scope: scope, lease: lease)
+        defer { lease.revoke(); writer.release() }
+        return try await operation(OwnerHistoryLeaseAuthority(lease: lease))
     }
     private struct OwnerHistoryAdditionalCheckpointAuthority: OwnerHistoryCompleteCheckpointAuthority {
         let raw: OwnerHistoryPreparedExport
@@ -2773,14 +2866,28 @@ actor VortxNativeSession {
                                     checkpointValidator: (any VortxProspectiveCheckpointValidator)? = nil,
                                     fifoAuthority: (any VortxMutationAuthority)? = nil,
                                     typedPeer: OwnerHistoryPeerPreparation? = nil,
-                                    hostRemoteRaw: Data? = nil) async throws -> [String] {
+                                    hostRemoteRaw: Data? = nil, reportAccountMergeFailure: Bool = false) async throws -> [String] {
+        var failureStage: String? = "route"
+        var hostFailure: VortxNativeHostPreferences.RawMergeFailure?
+        defer {
+            if reportAccountMergeFailure {
+                let detail = hostFailure.map { " reason=\($0.rawValue)" } ?? ""
+                let failure = failureStage.map { "stage=\($0)" + detail }
+                if failure != lastAccountMergeFailureStage {
+                    lastAccountMergeFailureStage = failure
+                    if let failure { diagnostics?("native_account_merge result=failed \(failure)") }
+                }
+            }
+        }
         try requireActiveRoute()
         // Retire at actual execution, not when a later FIFO member is merely enqueued.
         externalCWGeneration.retire()
+        failureStage = "snapshot_read"
         let old = try stateJSON()
         let typedCapture: OwnerHistorySessionCoordinator.Capture?
         let typedTransaction: (any OwnerHistoryCompleteCheckpointAuthority)?
         var candidate: NativeCandidate
+        failureStage = "candidate_hydrate"
         if let ownerHistory {
             // Account-native commands do not fetch/import Stremio data. The real original
             // account source, running FIFO member and complete-account CAS remain mandatory.
@@ -2820,6 +2927,7 @@ actor VortxNativeSession {
         var installed = false
         defer { if !installed { candidate.close() } }
         var results: [String] = []
+        failureStage = "kernel_actions"
         for action in actions {
             let result = try candidate.dispatch(action, now: now)
             let value = try JSONDecoder().decode(VortxJSON.self, from: Data(result.utf8))
@@ -2827,18 +2935,26 @@ actor VortxNativeSession {
             results.append(result)
         }
         if let legacyMaterial {
+            failureStage = "legacy_receipt"
             recordLegacyReconciliation(try Self.validateLegacyReceipt(candidate, scope: scope, material: legacyMaterial, baselineMaterial: legacyBaseline, abi: abi))
         }
+        failureStage = "merged_snapshot"
         var state = try candidate.state(scope: scope)
         if legacyMaterial != nil, let shrink = try? Self.libraryShrink(from: JSONDecoder().decode(VortxJSON.self, from: Data(old.utf8)),
                                                                        to: state, ownerProfileID: scope.ownerProfileID) {
             diagnostics?("library_shrink stage=sync removed=\(shrink)")
         }
+        failureStage = "source_archive"
         try Self.validateAuthenticatedSources(authenticatedSourceArchive, state: state)
         var candidateHost = hostPreferences
         try candidateHost.retainAuthenticatedSourceArchive(authenticatedSourceArchive)
-        if let hostRemoteRaw { try candidateHost.mergeRaw(hostRemoteRaw, scope: scope) }
-        else { try candidateHost.merge(hostRemote, scope: scope) }
+        failureStage = "host_carrier_merge"
+        if let hostRemoteRaw {
+            try candidateHost.mergeRaw(hostRemoteRaw, scope: scope) { hostFailure = $0 }
+        } else {
+            try candidateHost.merge(hostRemote, scope: scope) { hostFailure = $0 }
+        }
+        failureStage = "watchlist_seed"
         for (profile, entries) in legacyWatchlists {
             // The unchanged legacy roster may still carry a profile explicitly deleted by the
             // native peer. Preserve that old array in its source document, never resurrect the
@@ -2846,6 +2962,7 @@ actor VortxNativeSession {
             guard let record = state["roster"]?["profiles"]?[profile.uuidString], record["deleted"] != .bool(true) else { continue }
             try VortxNativeWatchlist.seed(entries, profileID: profile, into: &candidateHost)
         }
+        failureStage = "host_edits"
         if let hostFieldCAS {
             let matches: Bool
             if let raw = hostFieldCAS.raw {
@@ -2872,6 +2989,7 @@ actor VortxNativeSession {
                 }
             }
         }
+        failureStage = "profile_events"
         let pending = candidateHost.local.websitePending ?? []
         let hasWebsiteWork = !websiteEvents.isEmpty || !pending.isEmpty
         if hasWebsiteWork {
@@ -2925,6 +3043,7 @@ actor VortxNativeSession {
             candidateHost.local.websiteConflicts = conflicts
             state = try candidate.state(scope: scope)
         }
+        failureStage = "addon_events"
         let addonPending = candidateHost.local.websiteAddonPending ?? []
         let hasAddonWork = !websiteAddonEvents.isEmpty || !addonPending.isEmpty
         if hasAddonWork {
@@ -2972,9 +3091,11 @@ actor VortxNativeSession {
             candidateHost.local.websiteAddonConflicts = conflicts
             state = try candidate.state(scope: scope)
         }
+        failureStage = "checkpoint_encode"
         let updated = try candidate.stateJSON()
         let hasHostChanges = hostRemoteRaw != nil || hostRemote != nil || !hostEdits.isEmpty || !legacyWatchlists.isEmpty || hasWebsiteWork || hasAddonWork || authenticatedSourceArchive != nil
         let encodedHost = hasHostChanges ? try candidateHost.encoded() : nil
+        failureStage = "checkpoint_commit"
         if case .owner(let value) = candidate {
             guard let ownerHistory, let typedTransaction, typedCapture != nil else { throw VortxNativeError.superseded }
             do {
@@ -2990,6 +3111,7 @@ actor VortxNativeSession {
             if try JSONDecoder().decode(VortxJSON.self, from: Data(old.utf8))["activeProfileId"] != state["activeProfileId"] {
                 invalidateScreens()
             }
+            failureStage = nil
             return results
         }
         let uptime = ProcessInfo.processInfo.systemUptime
@@ -3038,6 +3160,7 @@ actor VortxNativeSession {
         guard case .generic(let generic) = candidate else { throw VortxNativeError.invalidSnapshot }
         let previous = runtime!; runtime = generic; hostPreferences = candidateHost; if hasHostChanges { hostPublicationCache = nil }; installed = true; previous.close()
         if try scope.validateSnapshot(old)["activeProfileId"] != state["activeProfileId"] { invalidateScreens() }
+        failureStage = nil
         return results
     }
     /// The witness came from the complete existing sync/export pipeline after Save confirmation.

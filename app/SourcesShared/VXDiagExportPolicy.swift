@@ -264,6 +264,26 @@ enum VXDiagExportPolicy {
         return Data((out + section).utf8)
     }
 
+    /// Before a profile opens, share fixed recovery events only. Omit original log text,
+    /// timestamps, source identifiers, values, server tails and playback details.
+    static func recoveryBody(appVersion: String, platform: String, diagnostics: String) -> Data {
+        let events = lines(in: diagnostics).compactMap { line -> String? in
+            guard let category = line.range(of: " [") else { return nil }
+            let event = line[category.upperBound...]
+            if event.hasPrefix("native-profiles] restore result=mounted") { return "Profile restore mounted." }
+            if event.hasPrefix("native-profiles] restore result=not_started reason=backoff") { return "Profile restore is waiting before retry." }
+            if event.hasPrefix("native-profiles] restore result=failed stage=legacy_preparation ") { return "An older backup could not be prepared." }
+            if event.hasPrefix("native-profiles] restore result=failed stage=typed_account ") { return "The saved account state could not be opened." }
+            if event.hasPrefix("native-profiles] restore result=failed stage=account_pull ") { return "The account backup could not be loaded." }
+            if event.hasPrefix("native-profiles] restore result=failed stage=offline_restore ") { return "The local saved account was unavailable." }
+            if event.hasPrefix("native-profiles] restore result=failed ") { return "Profile restore failed." }
+            if event.hasPrefix("sync] upload result=failed ") { return "The backup upload failed." }
+            return nil
+        }.suffix(40)
+        let status = events.isEmpty ? "No account recovery events were recorded." : events.joined(separator: "\n")
+        return Data("VortX account recovery diagnostics\nApp: \(appVersion)\nSystem: \(platform)\n\n\(status)\n".utf8)
+    }
+
     private static func lines(in contents: String) -> [String] {
         contents
             .split(separator: "\n", omittingEmptySubsequences: true)

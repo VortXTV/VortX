@@ -26,6 +26,6 @@ internal fun ConfiguredNzbIndexerSettingsScreen(onBack: () -> Unit, modifier: Mo
 internal fun ConfiguredUsenetServersSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
     val context = LocalContext.current.applicationContext
     val keys = remember(context) { DebridKeys(context) }
-    val store = remember(keys) { UsenetProviderStore(context, keys::ownerToken, keys::mutateCurrentOwner) }
+    val store = remember(keys) { UsenetProviderStore(context, keys::readDownloadOwner, keys::mutateCurrentUsenetOwner) }
     UsenetServersSettingsScreen(store = store, onBack = onBack, modifier = modifier)
 }

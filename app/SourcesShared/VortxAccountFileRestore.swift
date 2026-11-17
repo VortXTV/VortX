@@ -235,6 +235,34 @@ enum VortxAccountFileRestore {
 
 actor VortxAccountFileRestoreWorker {
     static let shared = VortxAccountFileRestoreWorker()
+
+    func validateWebsiteRoster(scope: VortxAccountScope, owner: UserProfile, rosterModified: Double?,
+        source: Data, candidate: Data, key: Data) throws {
+        try requireLocalAbsence(scope: scope, key: key)
+        let projected = try VortxProfileOverlayWitness.decodeAccountObject(json: candidate)
+        let roster = ProfileRosterSnapshot.resolve(settingsDomain: nil, vortx: projected["vortx"] as? [String: Any])
+        guard roster?.profiles == [owner], roster?.modified == rosterModified else {
+            throw VortxNativeError.invalidSnapshot
+        }
+        // Use the credential-free source and native import rules of the regular restore.
+        // No provider transport, migration draft or credential staging is available here.
+        let original = try VortxProfileOverlayWitness.decodeAccountObject(json: source)
+        // The website writes webProgress. A legacy library requires the ordinary watched
+        // migration, which can need metadata before it can admit an account.
+        let unsupportedCarriers = VortxNativeBootstrapArchive.managedRecoveryHostKeys.union([
+            "library",
+            "authenticatedOwnAccountSources", "nativeOwnAccountPending", "nativeOwnAccountCandidates",
+            "nativeWatchlistMigrationPending", "websiteAddonEditPending"
+        ])
+        guard unsupportedCarriers.isDisjoint(with: original.keys) else { throw VortxNativeError.invalidSnapshot }
+        let archive = try VortxNativeBootstrapArchive.captureLegacyDocument(original)
+        let material = try VortxLegacyBootstrapMaterial.prepare(document: archive.document, roster: [owner],
+            ownerProfileID: owner.id, rosterModifiedSeconds: rosterModified, deferProfileEdits: true,
+            accountID: scope.account).material
+        _ = try VortxNativeSession.detachedLegacySync(scope: scope, ownerName: owner.name, material: material, abi: VortxCABI())
+        try requireLocalAbsence(scope: scope, key: key)
+    }
+
     func prepare(file: Data, response: Data, input: VortxAccountFileRepairService.Input,
                  fence: VortxAccountFileRepairService.Fence) throws -> VortxAccountFileRestore.Prepared {
         try VortxAccountFileRestore.prepare(file: file, response: response, input: input, fence: fence, abi: VortxCABI())

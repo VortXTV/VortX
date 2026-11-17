@@ -93,10 +93,15 @@ struct DetailView: View {
     @State private var langChipsKey = ""
     @State private var langChipsDebounce: Task<Void, Never>? = nil
     private static let langChipsDebounceMs = 400   // settle window before the off-main name/regex parse, mirrors coalesceMs intent
-    /// yt-direct: the ambient hero trailer's ATTEMPTED device-direct resolve, keyed by meta id so a stale
-    /// resolve never paints over another title. `url == nil` = attempted, no direct stream (mount the /yt
-    /// worker URL). The layer waits for the attempt so the clip never remounts mid-play on a late resolve.
-    @State private var heroDirectTrailer: (metaID: String, url: URL?)?
+    private struct HeroTrailerTarget: Equatable {
+        let metaID: String
+        let fallbackURL: URL
+        let youTubeID: String?
+        let presentation: UUID
+    }
+    /// A completed resolution for this exact title, trailer and player generation. A nil direct URL
+    /// uses the fallback. The layer waits for the attempt before mounting a clip.
+    @State private var heroDirectTrailer: (target: HeroTrailerTarget, url: URL?)?
     /// Dynamic dominant-color backdrop: the page art's average color (PosterImageLoader.averageColor),
     /// washed into the page background below the hero so the detail page carries the title's palette
     /// instead of flat canvas. nil (no art / not computed) keeps today's canvas exactly.
@@ -155,6 +160,15 @@ struct DetailView: View {
         return initialVideoID
     }
 
+    @ObservedObject private var detailDownloads = DownloadStore.shared
+    @State private var downloadLaunchID: UUID?
+
+    private func playDownloadedCopy(_ candidate: AppleDownloadedPlayback) {
+        let launchID = UUID()
+        downloadLaunchID = launchID
+        presenter.presentDownloaded(candidate, core: core, stillCurrent: { downloadLaunchID == launchID })
+    }
+
     private var newerPlaybackVideoID: String? {
         let entry = LastStreamStore.entry(for: fencedMeta?.id ?? metaRequestID, profileID: profiles.activeID)
         return DetailEpisodeTargetPolicy.newerPlaybackID(
@@ -162,8 +176,17 @@ struct DetailView: View {
     }
 
     var body: some View {
+        let meta = fencedMeta
+        let needsEpisodeFallback = effectiveType == "series" && meta?.videos?.isEmpty != false
+        let offlineCopies = !LiveTypes.contains(type) && (meta == nil || needsEpisodeFallback)
+            ? detailDownloads.playableDownloads(libraryID: meta?.id ?? id, type: effectiveType) : []
         Group {
-            if let meta = fencedMeta {
+            if !offlineCopies.isEmpty {
+                // Reuse the offline surface for a partial series shell too. Its remote focus stays
+                // on playable buttons instead of the empty movie source list.
+                DownloadedTitleChoices(copies: offlineCopies, onPlay: playDownloadedCopy)
+                    .padding(Theme.Space.screenEdge)
+            } else if let meta {
                 // Live (tv / channel / events) gets its own stripped-down page BEFORE the movie
                 // fallback (today live falls through to moviePage): backdrop + name + a red LIVE
                 // badge + the channel source list, with NO VOD chrome: no trailer chip, no movie
@@ -240,7 +263,10 @@ struct DetailView: View {
         .onChange(of: effectiveType, initial: false) { _, _ in clearRandomEpisodePick() }
         // Page disappearance also happens when an accepted episode/player covers it.
         // Only dismiss an uncommitted preview here; route pop clears the full receipt.
-        .onDisappear { if randomEpisodeRoute == nil { clearRandomEpisodePick() } }
+        .onDisappear {
+            downloadLaunchID = nil
+            if randomEpisodeRoute == nil { clearRandomEpisodePick() }
+        }
         // END RANDOM PICK EPISODE LIFECYCLE
         // BEGIN TV RANDOM PLAY DETAIL LIFECYCLE
         .navigationDestination(isPresented: Binding(get: { randomSeriesPlayRoute != nil }, set: {
@@ -281,6 +307,8 @@ struct DetailView: View {
             // the meta loads, so load meta FIRST then dispatch streams on meta-ready (loadMovieStreamsIfNeeded).
             // Series load streams per-episode (CoreEpisodeStreams), so a series detail loads meta only.
             if effectiveType == "series" {
+                detailDownloads.refreshSeasonBoundaries(libraryID: fencedMeta?.id ?? id, type: effectiveType,
+                                                    owner: PlaybackMutationTarget.capture(core: core))
                 core.loadMeta(type: effectiveType, id: metaRequestID)
             } else if fencedMeta != nil {
                 loadMovieStreamsIfNeeded()
@@ -1260,6 +1288,7 @@ struct DetailView: View {
         // a 2000-video series meant one full sort per row per D-pad press. One array, computed here.
         let ordered = videos.orderedBySeasonEpisode
         let primary = seriesPrimaryEpisode(ordered: ordered, watched: watched, localWatched: localWatched, metaID: meta.id)
+        let offlineCopies = detailDownloads.playableDownloads(libraryID: meta.id, type: meta.type)
         let primaryProgress = primary.map { episodeProgress($0.video, metaID: meta.id) } ?? 0
         let primaryResumeSeconds = primary.flatMap {
             if $0.video.id == validInitialVideoID, let validInitialResumeSeconds {
@@ -1285,6 +1314,9 @@ struct DetailView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.xl) {
                         Color.clear.frame(height: 0).id(DetailFocusAnchor.top)
+                        if !offlineCopies.isEmpty {
+                            DownloadedTitleChoices(copies: offlineCopies, onPlay: playDownloadedCopy)
+                        }
                         hero(meta, primaryEpisode: primary?.video, primaryIsResume: primary?.isResume == true,
                              primaryResumeSeconds: primaryResumeSeconds,
                              primaryProgress: primaryProgress,
@@ -1765,8 +1797,7 @@ struct DetailView: View {
         // its looping 1080p trailer underneath the whole movie: micro stutter and audio crackle on every
         // stream started from this page. Unmounting tears the clip down the moment the player presents;
         // it remounts fresh when playback closes.
-        if autoplayTrailers, !reduceMotion, !LiveTypes.contains(type), presenter.request == nil,
-           let url = TrailerRequest.from(meta: m)?.playableURL {
+        if let target = heroTrailerTarget(m) {
             // Owner directive: play the WHOLE trailer muted + looping (window nil), the same full `/yt` trailer
             // as the Trailer button, not a 10s snippet (that only suited the retired short `/clip` mp4). For a
             // SERIES this `m` is the series meta, so a series-episode hero shows the SERIES trailer.
@@ -1777,28 +1808,39 @@ struct DetailView: View {
             // `.task` on an empty view, so with only the conditional clip inside, the attempt never ran.
             ZStack {
                 Color.clear
-                if let attempt = heroDirectTrailer, attempt.metaID == m.id {
-                    TVInHeroTrailerView(url: attempt.url ?? url, window: nil)
+                if let attempt = heroDirectTrailer, attempt.target == target {
+                    TVInHeroTrailerView(url: attempt.url ?? target.fallbackURL, window: nil)
                 }
             }
             .allowsHitTesting(false)
-            .task(id: m.id) { await resolveHeroDirectTrailer(m) }
+            .task(id: target) { await resolveHeroDirectTrailer(target) }
         }
     }
 
-    /// yt-direct: one attempt per meta id at resolving the ambient hero trailer on the user's own IP.
-    /// Fail-soft: any miss records `url = nil`, which mounts the existing /yt worker URL unchanged.
-    private func resolveHeroDirectTrailer(_ m: CoreMetaItem) async {
-        guard heroDirectTrailer?.metaID != m.id else { return }
-        var direct: URL? = nil
-        // A direct (non-YouTube) trailer stream needs no resolver; only a YouTube trailer is resolvable.
-        if directTrailerURL(m) == nil, let yt = m.trailerYouTubeID, !yt.isEmpty {
-            let resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080)
-            direct = resolved?.videoURL
+    private func heroTrailerTarget(_ m: CoreMetaItem) -> HeroTrailerTarget? {
+        guard autoplayTrailers, !reduceMotion, !LiveTypes.contains(type), presenter.request == nil,
+              let trailer = TrailerRequest.from(meta: m), let fallbackURL = trailer.playableURL else { return nil }
+        return HeroTrailerTarget(metaID: m.id, fallbackURL: fallbackURL,
+                                 youTubeID: trailer.directURL == nil ? trailer.youTubeID : nil,
+                                 presentation: presenter.requestGeneration)
+    }
+
+    /// An attempt under a previous playback or metadata generation cannot replace the current hero.
+    private func resolveHeroDirectTrailer(_ target: HeroTrailerTarget) async {
+        guard !Task.isCancelled, fencedMeta.flatMap(heroTrailerTarget) == target,
+              heroDirectTrailer?.target != target else { return }
+        let resolved: YouTubeDirectResolver.Resolved?
+        if let yt = target.youTubeID {
+            resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080)
+        } else {
+            resolved = nil
+        }
+        guard !Task.isCancelled, fencedMeta.flatMap(heroTrailerTarget) == target else { return }
+        if target.youTubeID != nil {
             NSLog("[yt-direct] tvOS detail ambient: %@",
                   resolved.map { $0.isMuxed ? "direct-muxed" : "direct-pair" } ?? "fallback-worker")
         }
-        heroDirectTrailer = (m.id, direct)
+        heroDirectTrailer = (target, resolved?.videoURL)
     }
 
     /// A direct (non-YouTube) trailer stream the meta carried, if any. Always preferred (needs no resolver).
@@ -3361,6 +3403,7 @@ struct CoreStreamList: View {
     // affordances (Download / Downloading / Downloaded) the same way iOS does. Device-local only; nothing
     // here syncs or touches the account library.
     @ObservedObject private var downloads = DownloadStore.shared
+    @State private var downloadLaunchID: UUID?
     /// Once the user has confirmed (and dismissed) the storage-eviction warning the first time, never show
     /// it again. Per device (a plain @AppStorage bool), not synced.
     @AppStorage("stremiox.downloadEvictionAck") private var downloadEvictionAck = false
@@ -3582,6 +3625,21 @@ struct CoreStreamList: View {
             // the source state changes from loading -> ready -> failed, so its focus target never disappears.
             TVDetailActionRow(accessibilityLabel: String(localized: "Playback and source actions"),
                               onMoveCommand: sourceMoveHandler(from: .primary, state: actionState)) {
+                if let meta, !isLive, let copy = downloads.playableDownload(for: meta) {
+                    Button {
+                        let launchID = UUID()
+                        let generation = episodeTargetGeneration
+                        let videoID = episodeStreamId
+                        downloadLaunchID = launchID
+                        randomPlayIntent?.revoke()
+                        presenter.presentDownloaded(copy, core: core, stillCurrent: {
+                            downloadLaunchID == launchID && targetIsCurrent(videoID: videoID, generation: generation)
+                        })
+                    } label: {
+                        Label("Play downloaded", systemImage: "play.fill")
+                    }
+                    .buttonStyle(ChipButtonStyle())
+                }
                 if let best {
                     // Restored 0.3.13 semantics (reverses the Beta 25 diag-6 experiment): the Watch button is
                     // gated on full add-on settlement again, so the single primary action can no longer be
@@ -3904,7 +3962,10 @@ struct CoreStreamList: View {
         .onChange(of: sourceFilter, initial: false) { _, _ in randomPlayIntent?.revoke() }
         .onChange(of: sourcePin, initial: false) { _, _ in randomPlayIntent?.revoke() }
         .onChange(of: sourceList.sessionAudioLanguages, initial: false) { _, _ in randomPlayIntent?.revoke() }
-        .onDisappear { randomPlayIntent?.revoke() }
+        .onDisappear {
+            downloadLaunchID = nil
+            randomPlayIntent?.revoke()
+        }
         // END TV RANDOM PLAY SOURCE LIFECYCLE
         // Smart Source Selection (Lane A): auto-pick my best source, scoped to a SERIES episode page (meta
         // type "series"), which is only ever reached by pushing CoreEpisodeStreams. The inline movie / live
@@ -4573,6 +4634,7 @@ struct CoreStreamList: View {
         // failure). Only when the stored source is genuinely gone do we drop to the auto-pick race below.
         if initialTraktNextEpisodeOffer == nil, let m = meta,
            let entry = LastStreamStore.entry(for: m.libraryId, profileID: ProfileStore.shared.activeID),
+           URL(string: entry.url)?.isFileURL != true,
            entry.debridService != nil, let hash = entry.infoHash, !hash.isEmpty,
            // Movie: always this title. Series: only when the stored episode is the one being played.
            (!isEpisodePlayback || entry.videoId == (episodeStreamId ?? m.videoId)),
@@ -4587,7 +4649,7 @@ struct CoreStreamList: View {
                 ) else { return }
             }
             let (url, refreshed) = resumeResult
-            if refreshed, let service = entry.debridService.flatMap(DebridService.init(rawValue:)) {
+            if refreshed, !url.isFileURL, let service = entry.debridService.flatMap(DebridService.init(rawValue:)) {
                 // A fresh link for the SAME source: play it as an EXPLICIT pick (no silent hop) so the resume
                 // honors the user's chosen source, exactly as a manual source-row tap would. Carry the debrid
                 // provenance so the play-record re-stores it and the NEXT resume can reresolve again.

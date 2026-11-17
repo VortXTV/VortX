@@ -160,9 +160,10 @@ struct VortxNativeHostPreferences: Sendable {
     }
     /// Compatibility entry point for callers whose source contract is already typed. It
     /// cannot recover original peer bytes. Authentic raw owner-history imports use mergeRaw.
-    mutating func merge(_ remote: VortxJSON?, scope: VortxAccountScope) throws {
+    mutating func merge(_ remote: VortxJSON?, scope: VortxAccountScope,
+                        onFailure: ((RawMergeFailure) -> Void)? = nil) throws {
         guard let remote else { return }
-        try mergeRaw(JSONEncoder().encode(remote), scope: scope)
+        try mergeRaw(JSONEncoder().encode(remote), scope: scope, onFailure: onFailure)
     }
     mutating func edit(profileID: String?, fields: [String: VortxJSON], scope: VortxAccountScope) throws {
         guard !fields.isEmpty else { return }
@@ -236,13 +237,14 @@ struct VortxNativeHostPreferences: Sendable {
     /// size); content is decoded leniently where it is read, so a newer app's value can never stop sync.
     static let forYouPrefix = "forYou."
     static let forYouMaxBytes = 16_384
+    private static func isForYouCollection(_ name: String) -> Bool {
+        let prefix = forYouPrefix + "collection."
+        guard name.hasPrefix(prefix) else { return false }
+        let id = String(name.dropFirst(prefix.count))
+        return UUID(uuidString: id)?.uuidString.lowercased() == id
+    }
     static func validateForYouField(_ name: String, value: VortxJSON) throws {
-        let collectionPrefix = forYouPrefix + "collection."
-        let isCollection = name.hasPrefix(collectionPrefix) && {
-            let id = String(name.dropFirst(collectionPrefix.count))
-            return UUID(uuidString: id)?.uuidString.lowercased() == id
-        }()
-        guard name == forYouPrefix + "interests" || isCollection else { throw VortxNativeError.invalidSnapshot }
+        guard name == forYouPrefix + "interests" || isForYouCollection(name) else { throw VortxNativeError.invalidSnapshot }
         if value == .null { return }
         guard case .object = value, try JSONEncoder().encode(value).count <= forYouMaxBytes else { throw VortxNativeError.invalidSnapshot }
     }
@@ -341,40 +343,63 @@ extension VortxNativeHostPreferences {
         for (canonical, originalKey) in keys { profiles.set(canonical, try original.required(originalKey)) }
         document.set("profiles", try profiles.encoded()); return try document.encoded()
     }
-    /// Merge complete raw registers. Equal clock+actor with different complete evidence is
-    /// contradictory; never choose a first match or reconcile unknown payload members.
-    mutating func mergeRaw(_ remote: Data?, scope: VortxAccountScope) throws {
+    enum RawMergeFailure: String, Error, Sendable {
+        case remoteAdmission = "remote_admission"
+        case localPreparation = "local_preparation"
+        case mergedAdmission = "merged_admission"
+        case unknownWrapper = "unknown_wrapper"
+        case equalEvent = "equal_event"
+        case equalEventEvidenceLimit = "equal_event_evidence_limit"
+        case equalEventMetadata = "equal_event_metadata"
+        case equalEventForYou = "equal_event_for_you"
+        case equalEventKnownPreference = "equal_event_known_preference"
+    }
+    /// Merge complete raw registers. Equal clock+actor must carry the same evidence, with
+    /// numeric spelling compatibility limited to already-owned fields shared with Android.
+    mutating func mergeRaw(_ remote: Data?, scope: VortxAccountScope,
+                           onFailure: ((RawMergeFailure) -> Void)? = nil) throws {
         guard let remote else { return }
-        let normalized = try Self.canonicalRawProfileKeys(remote)
-        try Self.validateRawCarrier(normalized)
-        let incoming = try Self.canonicalDocument(JSONDecoder().decode(Document.self, from: Self.typedDocumentData(normalized)), scope: scope)
-        var left = try OwnerHistoryExactJSON.Object(rawDocumentData())
-        let right = try OwnerHistoryExactJSON.Object(normalized)
-        try Self.retainUnknown(from: right, in: &left, owned: ["schemaVersion", "scope", "ownerProfileId", "profiles", "globals"])
-        left.set("globals", try Self.mergeRawFields(left.required("globals"), right.required("globals")))
-        var profiles = try OwnerHistoryExactJSON.Object(left.required("profiles"))
-        let remoteProfiles = try OwnerHistoryExactJSON.Object(right.required("profiles"))
-        for (id, group) in remoteProfiles.fields {
-            if let previous = profiles[id] { profiles.set(id, try Self.mergeRawFields(previous, group)) }
-            else { profiles.set(id, group) }
+        var stage = RawMergeFailure.remoteAdmission
+        do {
+            let normalized = try Self.canonicalRawProfileKeys(remote)
+            try Self.validateRawCarrier(normalized)
+            let incoming = try Self.canonicalDocument(JSONDecoder().decode(Document.self, from: Self.typedDocumentData(normalized)), scope: scope)
+            stage = .localPreparation
+            var left = try OwnerHistoryExactJSON.Object(rawDocumentData())
+            let right = try OwnerHistoryExactJSON.Object(normalized)
+            try Self.retainUnknown(from: right, in: &left, owned: ["schemaVersion", "scope", "ownerProfileId", "profiles", "globals"])
+            left.set("globals", try Self.mergeRawFields(left.required("globals"), right.required("globals"), global: true))
+            var profiles = try OwnerHistoryExactJSON.Object(left.required("profiles"))
+            let remoteProfiles = try OwnerHistoryExactJSON.Object(right.required("profiles"))
+            for (id, group) in remoteProfiles.fields {
+                if let previous = profiles[id] { profiles.set(id, try Self.mergeRawFields(previous, group, global: false)) }
+                else { profiles.set(id, group) }
+            }
+            stage = .mergedAdmission
+            left.set("profiles", try profiles.encoded())
+            let joined = try left.encoded()
+            local.document = try Self.canonicalDocument(JSONDecoder().decode(Document.self, from: Self.typedDocumentData(joined)), scope: scope)
+            local.counter = max(local.counter, max(Self.maximum(incoming), Self.maximum(local.document)))
+            rawDocumentBase = joined; rawDocumentBaseline = local.document
+        } catch let conflict as RawMergeFailure {
+            onFailure?(conflict)
+            throw VortxNativeError.invalidSnapshot
+        } catch {
+            onFailure?(stage)
+            throw error
         }
-        left.set("profiles", try profiles.encoded())
-        let joined = try left.encoded()
-        local.document = try Self.canonicalDocument(JSONDecoder().decode(Document.self, from: Self.typedDocumentData(joined)), scope: scope)
-        local.counter = max(local.counter, max(Self.maximum(incoming), Self.maximum(local.document)))
-        rawDocumentBase = joined; rawDocumentBaseline = local.document
     }
     private static func retainUnknown(from source: OwnerHistoryExactJSON.Object,
                                       in target: inout OwnerHistoryExactJSON.Object, owned: Set<String>) throws {
         for (key, value) in source.fields where !owned.contains(key) {
             if let old = target[key] {
                 guard VortxRawHostRegister.sameValue(old, value) else {
-                    throw VortxNativeError.invalidSnapshot
+                    throw RawMergeFailure.unknownWrapper
                 }
             } else { target.set(key, value) }
         }
     }
-    private static func mergeRawFields(_ previous: Data, _ incoming: Data) throws -> Data {
+    private static func mergeRawFields(_ previous: Data, _ incoming: Data, global: Bool) throws -> Data {
         var left = try OwnerHistoryExactJSON.Object(previous)
         let right = try OwnerHistoryExactJSON.Object(incoming)
         try retainUnknown(from: right, in: &left, owned: ["fields"])
@@ -385,8 +410,8 @@ extension VortxNativeHostPreferences {
             if let old = fields[name] {
                 let prior = try JSONDecoder().decode(Register.self, from: typedRegisterData(old, name: name))
                 if prior.clock == value.clock && prior.actor == value.actor {
-                    guard VortxRawHostRegister.sameValue(old, bytes) else {
-                        throw VortxNativeError.invalidSnapshot
+                    if let mismatch = rawEventMismatch(old, bytes, name: name, global: global) {
+                        throw mismatch
                     }
                 } else if value.clock > prior.clock || (value.clock == prior.clock && value.actor > prior.actor) {
                     fields.set(name, bytes)
@@ -394,6 +419,127 @@ extension VortxNativeHostPreferences {
             } else { fields.set(name, bytes) }
         }
         left.set("fields", try fields.encoded()); return try left.encoded()
+    }
+    private static func rawEventMismatch(_ first: Data, _ second: Data, name: String,
+                                         global: Bool) -> RawMergeFailure? {
+        if first == second { return nil }
+        guard let a = try? VortxRawHostRegister.boundedCanonical(first),
+              let b = try? VortxRawHostRegister.boundedCanonical(second) else { return .equalEventEvidenceLimit }
+        if a == b { return nil }
+        guard let firstEvent = try? OwnerHistoryExactJSON.Object(a),
+              let secondEvent = try? OwnerHistoryExactJSON.Object(b),
+              let firstValue = firstEvent["value"], let secondValue = secondEvent["value"] else { return .equalEvent }
+        guard sameMembers(firstEvent, secondEvent, { key, first, second in
+            if key == "clock" { return HostDecimal.same(first, second) }
+            return key == "value" || first == second
+        }) else { return .equalEventMetadata }
+        if (try? sameRawPreference(firstValue, secondValue, name: name, global: global, path: [])) == true {
+            return nil
+        }
+        // Fixed categories identify the guard without logging field names, IDs or values.
+        if !global && (name == forYouPrefix + "interests" || isForYouCollection(name)) { return .equalEventForYou }
+        if global ? globalIntegers.contains(name) :
+            (name == "playback" || name == "discovery" || name.hasPrefix(VortxNativeWatchlist.prefix)) {
+            return .equalEventKnownPreference
+        }
+        return .equalEvent
+    }
+    private static func sameMembers(_ a: OwnerHistoryExactJSON.Object, _ b: OwnerHistoryExactJSON.Object,
+                                    _ equal: (String, Data, Data) throws -> Bool) rethrows -> Bool {
+        guard Set(a.fields.keys.map { Data($0.utf8) }) == Set(b.fields.keys.map { Data($0.utf8) }) else { return false }
+        return try a.fields.allSatisfy { key, value in try equal(key, value, b.fields[key]!) }
+    }
+    private static func sameRawPreference(_ first: Data, _ second: Data, name: String, global: Bool,
+                                          path: [String]) throws -> Bool {
+        if first == second { return true }
+        if global {
+            return path.isEmpty && globalIntegers.contains(name) && HostDecimal.same(first, second)
+        }
+        if path.count == 1 {
+            let key = path[0]
+            if name.hasPrefix(VortxNativeWatchlist.prefix) && key == "addedAt" {
+                if HostDecimal.same(first, second) { return true }
+                // The watchlist schema owns this timestamp as binary64 epoch seconds.
+                // Encoders can emit different decimals for the same exact Double.
+                let decoder = JSONDecoder()
+                guard let a = try? decoder.decode(Double.self, from: first),
+                      let b = try? decoder.decode(Double.self, from: second),
+                      a.isFinite, a >= 0, a <= Double(maxClock) else { return false }
+                return a.bitPattern == b.bitPattern
+            }
+            if name == "playback", ["subSizeScale", "maxFileSizeGB", "maxResolution", "minResolution", "titleMatchThreshold"].contains(key) {
+                return HostDecimal.same(first, second)
+            }
+            if name == "discovery", key == "selectedProviders" || key == "providerOrder" {
+                guard first.first == 91, second.first == 91 else { return false }
+                let a = try OwnerHistoryExactJSON.array(first), b = try OwnerHistoryExactJSON.array(second)
+                return a.count == b.count && zip(a, b).allSatisfy { HostDecimal.same($0, $1) }
+            }
+        }
+        let collection = isForYouCollection(name)
+        let interests = name == forYouPrefix + "interests"
+        if (interests && path == ["people"]) || (collection && path == ["rules", "people"]) {
+            return try sameRawPeople(first, second)
+        }
+        if collection, path == ["createdAt"] ||
+            path.count == 2 && path[0] == "rules" && ["yearFrom", "yearTo", "minRating"].contains(path[1]) {
+            return HostDecimal.same(first, second)
+        }
+        // Descend only into owned shapes. Unknown members keep exact numeric evidence.
+        guard path.isEmpty && (name == "playback" || name == "discovery" ||
+                name.hasPrefix(VortxNativeWatchlist.prefix) || interests || collection) ||
+                collection && path == ["rules"], first.first == 123, second.first == 123 else { return false }
+        return try sameMembers(OwnerHistoryExactJSON.Object(first), OwnerHistoryExactJSON.Object(second)) { key, first, second in
+            try sameRawPreference(first, second, name: name, global: false, path: path + [key])
+        }
+    }
+    private static func sameRawPeople(_ first: Data, _ second: Data) throws -> Bool {
+        guard first.first == 91, second.first == 91 else { return false }
+        let left = try OwnerHistoryExactJSON.array(first), right = try OwnerHistoryExactJSON.array(second)
+        guard left.count == right.count else { return false }
+        let leftRows = try left.map(rawPersonObject), rightRows = try right.map(rawPersonObject)
+        let leftReservations = personReservations(leftRows), rightReservations = personReservations(rightRows)
+        for index in left.indices where left[index] != right[index] {
+            guard let a = leftRows[index], let b = rightRows[index],
+                  let id = exactPersonID(a), exactPersonID(b) == id,
+                  leftReservations[id] == 1, rightReservations[id] == 1,
+                  sameMembers(a, b, { key, first, second in
+                      key == "id" ? HostDecimal.same(first, second) : first == second
+                  }) else { return false }
+        }
+        return true
+    }
+    private static func rawPersonObject(_ bytes: Data) throws -> OwnerHistoryExactJSON.Object? {
+        guard bytes.first == 123 else { return nil }
+        return try OwnerHistoryExactJSON.Object(bytes)
+    }
+    private static func exactPersonID(_ row: OwnerHistoryExactJSON.Object) -> Int32? {
+        guard let bytes = row["id"],
+              let id = try? JSONDecoder().decode(Int32.self, from: bytes), id > 0,
+              HostDecimal.same(bytes, Data(String(id).utf8)),
+              let name = try? row.text("name"), !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        if let department = row["department"], department != Data("null".utf8),
+           (try? row.text("department")) == nil { return nil }
+        return id
+    }
+    private static func personReservations(_ rows: [OwnerHistoryExactJSON.Object?]) -> [Int32: Int] {
+        var reservations: [Int32: Int] = [:]
+        for row in rows {
+            guard let bytes = row?["id"] else { continue }
+            // A malformed or out-of-range row can still collide in another client's numeric
+            // projection. Reserve those IDs too, but only exact IDs can establish equality.
+            var ids = Set<Int32>()
+            if let value = try? JSONDecoder().decode(Double.self, from: bytes), value.isFinite, value >= 1 {
+                ids.insert(Int32(min(value.rounded(.towardZero), Double(Int32.max))))
+            }
+            if let value = try? JSONDecoder().decode(Int64.self, from: bytes) {
+                let truncated = Int32(truncatingIfNeeded: value)
+                if truncated > 0 { ids.insert(truncated) }
+            }
+            for id in ids { reservations[id, default: 0] += 1 }
+        }
+        return reservations
     }
     /// One new Xperience value with complete original-register metadata retained. The DTO is
     /// used only for existing reserved-name/credential/schema admission, never as saved bytes.
@@ -414,6 +560,33 @@ extension VortxNativeHostPreferences {
         fields.set(field, try register.encoded()); wrapper.set("fields", try fields.encoded())
         profiles.set(id, try wrapper.encoded()); document.set("profiles", try profiles.encoded())
         rawDocumentBase = try document.encoded(); rawDocumentBaseline = local.document
+    }
+}
+
+/// Compare already validated JSON number tokens without floating-point conversion.
+private enum HostDecimal {
+    static func same(_ first: Data, _ second: Data) -> Bool {
+        guard let a = normalized(first), let b = normalized(second) else { return false }
+        return a == b
+    }
+
+    private static func normalized(_ bytes: Data) -> String? {
+        // The raw JSON parser has already checked grammar. A nonnumeric JSON value cannot
+        // get here as an alias, even if its display form would look like a number.
+        let negative = bytes.first == 45
+        guard negative || bytes.first.map({ (48...57).contains($0) }) == true else { return nil }
+        let text = String(decoding: bytes, as: UTF8.self).dropFirst(negative ? 1 : 0)
+        let scientific = text.split(maxSplits: 1, omittingEmptySubsequences: false, whereSeparator: { $0 == "e" || $0 == "E" })
+        guard let mantissa = scientific.first else { return nil }
+        let parsedPower = scientific.count == 2 ? Int(scientific[1]) : 0
+        guard let exponent = parsedPower, (-100_000...100_000).contains(exponent) else { return nil }
+        let decimal = mantissa.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+        let digits = decimal.joined()
+        guard let first = digits.firstIndex(where: { $0 != "0" }),
+              let last = digits.lastIndex(where: { $0 != "0" }) else { return "0" }
+        let fraction = decimal.count == 2 ? decimal[1].utf8.count : 0
+        let trailingZeroes = digits[digits.index(after: last)...].utf8.count
+        return (negative ? "-" : "") + digits[first...last] + "e" + String(exponent - fraction + trailingZeroes)
     }
 }
 

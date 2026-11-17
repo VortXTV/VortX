@@ -244,13 +244,27 @@ enum SyncBackupUploadFailure { case upgradeRequired, other
     let providerRemoteApplyMaximumAttempts = 1
     enum ConflictResolutionOutcome { case completed, pending, failed }
     private func isCurrent(_ capture: CredentialScopeRegistry.Capture) -> Bool { credentialAuthority.isCurrent(capture) }
+    private var token: String? = "fixture-bearer"
+    private var backupUploadReconnectFailureCapture: CredentialScopeRegistry.Capture?
     private func accountReconnectRequired(for capture: CredentialScopeRegistry.Capture) -> Bool { false }
+    private func backupUploadReconnectRequired(for capture: CredentialScopeRegistry.Capture) -> Bool {
+        backupUploadReconnectFailureCapture == capture && isCurrent(capture)
+    }
+    private enum NativeBackupHistory { case seen, confirmedAbsent }
+    private func nativeBackupHistory(capture: CredentialScopeRegistry.Capture) -> NativeBackupHistory { .seen }
+    private func finishSyncDown(_ id: UUID) {
+        if activeSyncDown?.id == id { activeSyncDown = nil }
+    }
     // Actual pending admission methods are selected with the actual receive below.
     private func withRemoteApplySuppressed(_ body: () -> Void) {
         AdoptionWorld.current.suppressionDepth += 1
         defer { AdoptionWorld.current.suppressionDepth -= 1 }
         body()
     }
+    // These fixtures exercise ordinary receives for accounts with a roster.
+    private func promoteUnpublishedWebsiteRoster(_ pulled: VersionedPull, capture: CredentialScopeRegistry.Capture,
+        authority: ReceivedProviderCloudAuthority) async -> VersionedPull { pulled }
+
     private func pullDocVersionedRetrying(credentialCapture: CredentialScopeRegistry.Capture, ifNoneMatch: Int?) async -> VersionedPull {
         let w = AdoptionWorld.current; w.gets += 1
         let plain = w.plaintext, revision = w.revision, observation = w.observation
@@ -278,7 +292,7 @@ enum SyncBackupUploadFailure { case upgradeRequired, other
         }
         return mirrored
     }
-    private func commitNativePulledDocument(_ doc: [String: Any], originalPlaintext: Data, capture: CredentialScopeRegistry.Capture,
+    private func commitNativePulledDocument(_ doc: [String: Any], originalPlaintext: Data, revision: Int?, capture: CredentialScopeRegistry.Capture,
         cloudAuthority: ReceivedProviderCloudAuthority) async throws -> PlaybackMutationTarget {
         try cloudAuthority.withActive {}
         let originalTarget = CoreBridge.shared.captureNativePlaybackTarget()
@@ -335,6 +349,7 @@ enum SyncBackupUploadFailure { case upgradeRequired, other
     }
     private func rememberNativeBackup(capture: CredentialScopeRegistry.Capture) -> Bool { preconditionFailure("push acknowledgment entered") }
     private func acknowledgeNativeProviders(_ doc: [String: Any], capture: CredentialScopeRegistry.Capture) throws { preconditionFailure("push acknowledgment entered") }
+    private static func sawDocV2(_ account: String) -> Bool { false }
     private static func markSawDocV2(_ account: String) { preconditionFailure("push stamp entered") }
     private static func documentVersion(_ value: Any?) -> Int? { preconditionFailure("push rejection entered") }
     // @@ACTUAL_LOCAL_ADOPTION_MANAGER@@

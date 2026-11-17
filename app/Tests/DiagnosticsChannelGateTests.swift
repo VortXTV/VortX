@@ -181,17 +181,17 @@ let rules: [Rule] = [
                                     why: "a computed share URL rewrites the whole diagnostic log on every SwiftUI body pass")
             }
             if let entry = files["app/SourcesShared/DiagnosticLogExportButton.swift"] {
-                found += requiring(entry, "VXDiagExport.exportBody()",
-                                   why: "pre-profile sharing must export a sanitised copy")
+                found += requiring(entry, "transfer.recoveryOnly ? VXDiagExport.recoveryExportBody() : VXDiagExport.exportBody()",
+                                   why: "pre-profile sharing must prepare only the original permitted export scope")
                 found += requiring(entry, "FileRepresentation(exportedContentType: .plainText)",
                                    why: "pre-profile sharing must prepare the file lazily")
-                found += requiring(entry, "ShareLink(item: PreProfileDiagnosticLogTransfer(grant: grant)",
+                found += requiring(entry, "ShareLink(item: PreProfileDiagnosticLogTransfer(grant: grant, recoveryOnly: sharesRecoveryOnly)",
                                    why: "pre-profile sharing must use the sanitised transfer and captured grant")
                 found += requiring(entry, "try await require(transfer.grant)",
                                    why: "an async share must recheck its original diagnostic grant around staging")
                 found += requiring(entry, "try await grant.requireForExport()",
                                    why: "staging must check live PIN/failure admission and original credentials")
-                found += requiring(entry, "preview: SharePreview(\"VortX diagnostic log\")",
+                found += requiring(entry, "preview: SharePreview(title)",
                                    why: "pre-profile sharing must supply a SwiftUI preview")
                 found += forbidding(entry, "VXProbe.logFileURL",
                                     why: "pre-profile sharing must never expose the live cache")

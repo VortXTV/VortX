@@ -14,7 +14,7 @@ allprojects {
         if (task.path == ":app:testPlayDebugUnitTest") {
             def expected = [
                 "com.vortx.android.engine.NativeOwnerHistoryRuntimeTest": 7L,
-                "com.vortx.android.engine.NativeOwnerHistoryCompatibilityTest": 18L,
+                "com.vortx.android.engine.NativeOwnerHistoryCompatibilityTest": 25L,
                 "com.vortx.android.engine.NativeOwnerHistoryJniTest": 5L,
                 "com.vortx.android.engine.VortxNativeSessionTest": 2L,
                 "com.vortx.android.player.PlaybackMetadataTest": 5L,
@@ -77,11 +77,11 @@ allprojects {
                 if (descriptor.parent == null) {
                     requireExactLibrary()
                     def ownerCount = observed.findAll { key, value -> key != media3Class }.values().sum(0L)
-                    if (observed != expected || ownerCount != 37L || observed[media3Class] != 17L ||
-                            result.testCount != 54L || result.skippedTestCount != 0L ||
+                    if (observed != expected || ownerCount != 44L || observed[media3Class] != 17L ||
+                            result.testCount != 61L || result.skippedTestCount != 0L ||
                             result.failedTestCount != 0L)
-                        throw new GradleException("Require original owner-history37 plus Media3 17, zero skips/failures")
-                    logger.lifecycle("Executed owner-history37 and Media3 17 with unchanged real host JNI")
+                        throw new GradleException("Require original owner-history44 plus Media3 17, zero skips/failures")
+                    logger.lifecycle("Executed owner-history44 and Media3 17 with unchanged real host JNI")
                 }
             }
         }

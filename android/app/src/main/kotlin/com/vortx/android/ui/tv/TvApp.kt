@@ -8,6 +8,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -32,6 +33,11 @@ import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.Playable
+import com.vortx.android.downloads.isDownloadedPlaybackOwnerCurrent
+import com.vortx.android.downloads.isDownloadedPlaybackAdmissionCurrent
+import com.vortx.android.downloads.nextDownloadedPlayback
+import com.vortx.android.downloads.DownloadedContinueWatchingRequest
+import com.vortx.android.downloads.DownloadedContinueWatchingResult
 import com.vortx.android.model.PreferredEpisode
 import com.vortx.android.VortXApplication
 import com.vortx.android.player.queue.PlaybackQueueState
@@ -56,6 +62,11 @@ import com.vortx.android.profile.ProfileStore
 import com.vortx.android.BuildConfig
 import com.vortx.android.profile.ProfileSelectionRequest
 import com.vortx.android.profile.ProfileSelectionHandoff
+import com.vortx.android.profile.ProfilePickerEntry
+import com.vortx.android.profile.profilePickerEntry
+import com.vortx.android.ui.profilepicker.PickerProfilesUnavailable
+import com.vortx.android.ui.profilepicker.isPickerRosterCurrent
+import com.vortx.android.ui.profilepicker.rememberAdmittedPickerRoster
 import com.vortx.android.ui.profilepicker.ProfileSelectionSurface
 import com.vortx.android.ui.profilepicker.PickerFileRecoveryLanding
 import com.vortx.android.ui.profilepicker.PickerRestoreStatusLanding
@@ -69,6 +80,7 @@ import com.vortx.android.ui.profilepicker.ProfilePickerToolsHost
 import com.vortx.android.ui.viewmodel.rememberPickerToolsModel
 import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.sync.VortXSyncManager
+import com.vortx.android.sync.presentationKey
 import com.vortx.android.update.UpdatePromptHost
 import com.vortx.android.ui.detailViewModelKey
 import com.vortx.android.ui.detailEpisodeRouteKey
@@ -100,6 +112,7 @@ fun TvApp(
     auth: AuthRepository = PreviewAuthRepository(),
     syncManager: VortXSyncManager? = null,
     deepLinkEvent: VortXDeepLinkEvent? = null,
+    onDeepLinkHandled: (VortXDeepLinkEvent) -> Unit = {},
 ) {
     val fileRecoveryPausedNow = rememberPickerFileRecoveryPause(syncManager?.pickerFileRecoveryPaused)
     val profileStore = ProfileStore.sharedOrNull()
@@ -109,12 +122,8 @@ fun TvApp(
         accentId = activeProfile?.accentID ?: VortXAccents.default.id,
         oled = activeProfile?.oled ?: false,
     ) {
-        // WHO'S WATCHING launch gate (the 10-foot mirror of VortXApp's): with more than one profile and no
-        // pick yet this cold launch, cover everything with the picker until a profile settles, so no title's
-        // Home wall leaks before the viewer is known. Back keeps the current profile (re-selects it, which
-        // marks the launch picked) and dismisses. A single-profile install and a pick already made this launch
-        // skip it by construction, because ProfileStore.needsPicker is false in both cases.
-        var showPicker by remember { mutableStateOf(profileStore?.needsPicker == true) }
+        var handledDeepLinkSequence by remember { mutableStateOf(Long.MIN_VALUE) }
+        val latestDeepLinkEvent by rememberUpdatedState(deepLinkEvent)
         // Ordinary browse navigation is metadata and survives the pre-profile Tools return.
         var shellDestination by rememberSaveable { mutableStateOf(TvDestination.HOME) }
         val pickerAccountModel = rememberPickerAccountModel(syncManager)
@@ -126,6 +135,14 @@ fun TvApp(
             syncManager?.sessionUiState?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf<VortXSyncManager.SessionUiState?>(null) }
         )
+        val app = LocalContext.current.applicationContext as? VortXApplication
+        val nativePickerHost = app != null && repo !is PreviewCatalogRepository
+        val pickerRoster = rememberAdmittedPickerRoster(app, profileStore, syncManager, sessionUiState)
+        val pickerEntry = profilePickerEntry(nativePickerHost,
+            sessionUiState == VortXSyncManager.SessionUiState.SignedOut, pickerRoster)
+        var manualPicker by remember(pickerRoster?.mount) { mutableStateOf(false) }
+        val showPicker = pickerEntry == ProfilePickerEntry.CHOOSE || (manualPicker && pickerRoster != null)
+        val pickerUnavailable = pickerEntry == ProfilePickerEntry.UNAVAILABLE
         val pickerFileRecoveryPaused = fileRecoveryPausedNow()
         val pickerAccountOpen by (pickerAccountModel?.pickerPresentationOpen?.collectAsStateWithLifecycle()
             ?: remember { mutableStateOf(false) })
@@ -134,7 +151,8 @@ fun TvApp(
         val showFileRecoveryEntry = !dismissedFileRecoveryEntry && !showPicker &&
             pickerToolsModel.controller.restoreAvailable && sessionUiState == VortXSyncManager.SessionUiState.SignedOut
         LaunchedEffect(syncManager, sessionUiState) {
-            if (sessionUiState is VortXSyncManager.SessionUiState.SignedIn) dismissedFileRecoveryEntry = true
+            // The landing is hidden while signed in. Offer it again after a confirmed sign-out.
+            if (sessionUiState is VortXSyncManager.SessionUiState.SignedIn) dismissedFileRecoveryEntry = false
         }
         val restoreStatusOwner by pickerToolsModel.restoreStatusOwner.collectAsStateWithLifecycle()
         restoreStatusOwner?.let { original ->
@@ -155,15 +173,15 @@ fun TvApp(
             }
             return@VortXTheme
         }
-        var profileSelection by remember(pickerFileRecoveryPaused) { mutableStateOf<ProfileSelectionRequest?>(null) }
+        var profileSelection by remember(pickerFileRecoveryPaused, pickerRoster?.mount) { mutableStateOf<ProfileSelectionRequest?>(null) }
         if (!pickerFileRecoveryPaused) profileSelection?.let { request ->
             val handoff = remember(request, auth) { ProfileSelectionHandoff(auth, native = true) }
             ProfileSelectionSurface(request, handoff,
-                onComplete = { profileSelection = null; showPicker = false },
-                onChooseAgain = { profileSelection = null; showPicker = true })
+                onComplete = { profileSelection = null; manualPicker = false },
+                onChooseAgain = { profileSelection = null; manualPicker = true })
             return@VortXTheme
         }
-        if (showPicker || pickerAccountOpen || (pickerToolsState.open && pickerToolsModel.state.value.open) ||
+        if (showPicker || pickerUnavailable || pickerAccountOpen || (pickerToolsState.open && pickerToolsModel.state.value.open) ||
             pickerFileRecoveryPaused || showFileRecoveryEntry) {
             // The picker owns Back, its nested editor and exact native selection admission.
             ProfilePickerAccountHost(syncManager, pickerAccountModel, diagnosticAdmission = ::currentPickerDiagnosticExportAllowed, retirePickerUi = { profileSelection = null },
@@ -176,11 +194,15 @@ fun TvApp(
                     recoveryPaused = pickerFileRecoveryPaused,
                     recoveryLanding = pickerFileRecoveryPaused || showFileRecoveryEntry,
                     openRecoverySignIn = pickerAccountModel?.let { it::openPickerFileRecoverySignIn },
-                    resumeRecoverySync = syncManager?.let { it::resumePickerFileRecovery }) {
+                    resumeRecoverySync = syncManager?.let { it::resumePickerFileRecovery },
+                    entryInPicker = pickerFileRecoveryPaused || showFileRecoveryEntry || pickerUnavailable || pickerRoster == null) { toolsEntry ->
                     if (pickerFileRecoveryPaused || showFileRecoveryEntry) {
-                        PickerFileRecoveryLanding(isTv = true, accountControl = control,
+                        PickerFileRecoveryLanding(isTv = true, accountControl = control, toolsEntry = toolsEntry,
                             onContinue = if (pickerFileRecoveryPaused) null else ({ dismissedFileRecoveryEntry = true }))
-                    } else TvWhosWatching(onDone = { showPicker = false }, onSelected = { profileSelection = it }, accountControl = control)
+                    } else if (pickerUnavailable || pickerRoster == null) {
+                        PickerProfilesUnavailable(isTv = true, accountControl = control, toolsEntry = toolsEntry)
+                    } else TvWhosWatching(pickerRoster, onDone = { manualPicker = false },
+                        onSelected = { profileSelection = it }, accountControl = control)
                 }
             }
             return@VortXTheme
@@ -216,6 +238,7 @@ fun TvApp(
             importedCollectionsEntry = java.util.UUID.randomUUID().toString()
         }
         var pendingLibraryPlay by remember { mutableStateOf<RandomTitlePlayRequest?>(null) }
+        var pendingLocalResume by remember { mutableStateOf<DownloadedContinueWatchingRequest?>(null) }
         var pendingQueuePlay by remember { mutableStateOf<PlaybackQueueToken?>(null) }
         var pendingQueueAccepted by remember { mutableStateOf(false) }
         var pendingQueueAutomatic by remember { mutableStateOf(false) }
@@ -264,13 +287,27 @@ fun TvApp(
             pendingQueuePlay = null
             pendingQueueAccepted = false
             pendingQueueAutomatic = false
-            if (pendingLibraryPlay == null) return
+            if (pendingLibraryPlay == null && pendingLocalResume == null) return
             // Revoke callbacks synchronously, before the bounded ViewModel owner is forgotten.
             pendingLibraryPlay = null
+            pendingLocalResume = null
             detailGeneration += 1
             detail = null
             playing = null
             playingMeta = null
+        }
+        fun openDetail(item: MetaItem, tryLocalResume: Boolean = false) {
+            if (fileRecoveryPausedNow() || item.continueWatchingAdmission?.isCurrent() == false) return
+            retireLibraryPlayRoute()
+            item.continueWatchingUnavailableMessage?.let { message ->
+                unavailableContinueWatching = "${item.name}\n\n$message"
+                return
+            }
+            detailGeneration += 1
+            detail = item
+            if (tryLocalResume) {
+                pendingLocalResume = DownloadedContinueWatchingRequest.capture(item, detailGeneration)
+            }
         }
         fun openLibraryPlay(item: MetaItem) {
             if (fileRecoveryPausedNow()) return
@@ -318,9 +355,11 @@ fun TvApp(
             }
         }
 
-        LaunchedEffect(deepLinkEvent) {
+        LaunchedEffect(deepLinkEvent, pickerRoster) {
             val event = deepLinkEvent ?: return@LaunchedEffect
-            if (fileRecoveryPausedNow()) return@LaunchedEffect
+            if (event.sequence <= handledDeepLinkSequence || latestDeepLinkEvent != event || fileRecoveryPausedNow()) return@LaunchedEffect
+            if (nativePickerHost && (pickerRoster == null || app?.isPickerRosterCurrent(syncManager, pickerRoster) != true ||
+                    pickerRoster.needsSelection)) return@LaunchedEffect
             val target = event.target
             retireLibraryPlayRoute()
             importedCollectionsEntry = null
@@ -330,15 +369,15 @@ fun TvApp(
             autoAdvanceStreak[0] = 0
             detailGeneration += 1
             detail = target.toMetaItem()
+            handledDeepLinkSequence = event.sequence
+            onDeepLinkHandled(event)
         }
 
         val appContext = LocalContext.current.applicationContext
-        val debridKeys = remember(appContext) { DebridKeys(appContext) }
         // Collect session truth so an account-generation transition recreates the title ViewModel and drops
         // account-derived cache badges/resume refs on TV just as it does in the phone shell.
-        val debridOwnerEpoch = remember(sessionUiState) {
-            debridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
-        }
+        val debridOwnerEpoch = syncManager?.sessionOwnerPresentation?.collectAsStateWithLifecycle()
+            ?.value?.presentationKey ?: "unknown"
         val debridCredentialRevision by DebridKeys.credentialRevision.collectAsStateWithLifecycle()
         val sourceSettingsRevision by SourceSettingsRevision.observe(appContext).collectAsStateWithLifecycle()
         val detailSourceEpoch = "$debridOwnerEpoch:$debridCredentialRevision:$sourceSettingsRevision"
@@ -378,7 +417,9 @@ fun TvApp(
             }
         } }
         val playerDetail = detail
-        val playerVm: DetailViewModel? = if (playable != null && playerDetail != null && !playable.isTrailer) {
+        val playerVm: DetailViewModel? = if (
+            playable != null && playerDetail != null && !playable.isTrailer && playable.downloadedPlaybackAdmission == null
+        ) {
             viewModel(
                 viewModelStoreOwner = detailVmOwner,
                 key = detailViewModelKey(
@@ -552,8 +593,12 @@ fun TvApp(
             }
             // A warm task belongs to this accepted episode and complete profile/source owner.
             // Disposing or replacing either cancels real I/O, not just its eventual publication.
-            val playerOwnerKey = "${activeProfile?.id}:$detailSourceEpoch:${playerDetail?.type}:${playerDetail?.id}"
-            val currentPlayerPrincipal = activeProfile?.id to debridOwnerEpoch
+            val keys = remember(appContext) { DebridKeys(appContext) }
+            val playerDebridOwner = remember(sessionUiState, debridOwnerEpoch) {
+                keys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
+            }
+            val playerOwnerKey = "${activeProfile?.id}:$detailSourceEpoch:$playerDebridOwner:${playerDetail?.type}:${playerDetail?.id}"
+            val currentPlayerPrincipal = activeProfile?.id to playerDebridOwner
             val launchedPlayerPrincipal = remember(playable) { currentPlayerPrincipal }
             val launchedPlayerViewModel = remember(playable) { playerVm }
             val preloadPolicy = remember(historyIdentity, playerOwnerKey) { NextEpisodePreloadPolicy() }
@@ -624,13 +669,27 @@ fun TvApp(
             // D-pad Back pops the player back to the detail page rather than exiting the app.
             BackHandler(onBack = ::exitPlayer)
             DisposableEffect(historyIdentity) {
-                playbackHistory.begin()
+                val beginHistory = playable.downloadedPlaybackAdmission == null || isDownloadedPlaybackAdmissionCurrent(playable)
+                if (beginHistory) playbackHistory.begin()
                 onDispose {
-                    playbackHistory.end()
+                    if (beginHistory) playbackHistory.end()
                 }
             }
             PlayerScreen(
                 playable = playable,
+                onDownloadedNaturalEnd = downloadedEnd@{ ended, admission ->
+                    fun isCurrent() = admission.isCurrent() && ended === playable && playing === playable &&
+                        launchedPlayerPrincipal == currentPlayerPrincipal &&
+                        repo.continueWatchingOwner() == historyOwnerToken && isDownloadedPlaybackOwnerCurrent(ended)
+                    if (!isCurrent()) return@downloadedEnd false
+                    val next = nextDownloadedPlayback(appContext, ended) ?: return@downloadedEnd false
+                    if (!isCurrent() || !isDownloadedPlaybackAdmissionCurrent(next)) return@downloadedEnd false
+                    autoAdvanceStreak[0] += 1
+                    playingEngineOverride = automaticEngineFor(next)
+                    playingMeta = null
+                    playing = next
+                    true
+                },
                 queueCount = visibleQueueState?.entries?.size ?: 0,
                 onShowQueue = visibleQueueState?.let { {
                     if (queueOwnerIsSelected(currentQueueOwner)) showingPlaybackQueueFor = currentQueueOwner
@@ -771,6 +830,29 @@ fun TvApp(
             val current = detail
             if (current != null) {
                 val routeGeneration = detailGeneration
+                val local = pendingLocalResume
+                if (local != null && local.detailGeneration == routeGeneration && detail === local.item) {
+                    LaunchedEffect(local) {
+                        fun ownsRoute() = pendingLocalResume === local &&
+                            detailGeneration == local.detailGeneration && detail === local.item
+                        fun canPlay() = ownsRoute() && playing == null && !fileRecoveryPausedNow() &&
+                            profileStore?.needsPicker == false && local.isCurrent()
+                        val result = if (canPlay()) local.open(appContext) else DownloadedContinueWatchingResult.Unavailable
+                        if (!ownsRoute()) return@LaunchedEffect
+                        val accepted = canPlay() && result is DownloadedContinueWatchingResult.Ready &&
+                            isDownloadedPlaybackAdmissionCurrent(result.playable)
+                        pendingLocalResume = null
+                        if (accepted && result is DownloadedContinueWatchingResult.Ready) {
+                            autoAdvanceStreak[0] = 0
+                            playingEngineOverride = automaticEngineFor(result.playable)
+                            playingMeta = null
+                            playing = result.playable
+                        }
+                    }
+                    BackHandler { retireLibraryPlayRoute() }
+                    TvLoading()
+                    return@TvMaterialTheme
+                }
                 val libraryPlayRequest = pendingLibraryPlay
                 val queuePlayRequest = pendingQueuePlay
                 val queuePlayAutomatic = pendingQueueAutomatic
@@ -898,6 +980,20 @@ fun TvApp(
                             // A deliberate manual action owns the existing Detail; do not replace it.
                             admitted
                         },
+                        onPlayDownloaded = { local, requestedEngine ->
+                            if (playing == null && detailGeneration == routeGeneration &&
+                                detail?.id == current.id && detail?.type == current.type &&
+                                isDownloadedPlaybackAdmissionCurrent(local)) {
+                                playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
+                                    requested = requestedEngine,
+                                    playable = local,
+                                    mpvAvailable = MpvEngineFactory.isBundled,
+                                )
+                                playingMeta = null
+                                autoAdvanceStreak[0] = 0
+                                playing = local
+                            }
+                        },
                         onQueueInteraction = {
                             val request = libraryPlayRequest
                             val admitted = detailGeneration == routeGeneration &&
@@ -972,26 +1068,22 @@ fun TvApp(
                     importedCollectionsOpen = importedCollectionsEntry != null,
                     importedFromHome = importedFromHome,
                     importedReturnSignal = importedReturnSignal,
-                    onItem = {
-                        retireLibraryPlayRoute()
-                        if (it.continueWatchingAdmission?.isCurrent() != false) {
-                            if (it.continueWatchingUnavailableMessage != null) unavailableContinueWatching = "${it.name}\n\n${it.continueWatchingUnavailableMessage}"
-                            else {
-                                detailGeneration += 1
-                                detail = it
-                            }
-                        }
-                    },
+                    onItem = { openDetail(it) },
+                    onLocalResume = { openDetail(it, tryLocalResume = true) },
                     onDirectResume = ::openLibraryPlay,
                     // A finished download plays straight into the shared player slot (no detail page), the same
                     // slot a streamed source resolves into. Clears any stale detail meta so the player reads the
                     // local file, not a previous title's badges.
-                    onPlayLocal = {
-                        retireLibraryPlayRoute()
-                        autoAdvanceStreak[0] = 0
-                        playingEngineOverride = automaticEngineFor(it)
-                        playingMeta = null
-                        playing = it
+                    onPlayLocal = { local ->
+                        val downloaded = local.downloadedPlaybackAdmission != null
+                        if (!downloaded || (playing == null && detail == null && !fileRecoveryPausedNow() &&
+                                isDownloadedPlaybackAdmissionCurrent(local))) {
+                            retireLibraryPlayRoute()
+                            autoAdvanceStreak[0] = 0
+                            playingEngineOverride = automaticEngineFor(local)
+                            playingMeta = null
+                            playing = local
+                        }
                     },
                     syncManager = syncManager,
                 )

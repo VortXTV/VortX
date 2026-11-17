@@ -4,7 +4,6 @@ import androidx.compose.ui.unit.dp
 import com.vortx.android.ui.prefs.PosterStylePreferences
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -36,12 +35,6 @@ class TvPosterLayoutPolicyTest {
         assertEquals(16.dp, layout.cornerRadius)
         assertEquals(2f / 3f, layout.aspectRatio)
         assertTrue(layout.showLabels)
-    }
-
-    @Test
-    fun `failed nonblank landscape backdrop falls back to poster art`() {
-        assertEquals("https://art.example/backdrop.jpg", tvLandscapeBackdropUrl(" https://art.example/backdrop.jpg ", false))
-        assertNull(tvLandscapeBackdropUrl("https://art.example/backdrop.jpg", true))
     }
 
     @Test

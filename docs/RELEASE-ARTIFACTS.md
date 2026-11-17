@@ -2,6 +2,12 @@
 
 Use a named [official release](https://github.com/VortXTV/VortX/releases) as the package boundary. Do not mix files from different tags or assume an update feed/download redirect follows every beta.
 
+## Release notes and update discovery
+
+Use [0.5.5](https://github.com/VortXTV/VortX/releases/tag/v0.5.5) as the release-note reference. Open with a short summary of the build, group the user-visible changes under **Fixed**, **New** or **Changed**, and finish with **Please test** and **Install**. List the packages actually available in that release and call out platform-specific steps.
+
+Put the build number in the GitHub release title as `(Build 285)` and as plain `Build 285` near the top of the body, using the actual build number. Installed Apple updaters can read that spelling even when the appcast lags behind GitHub. Keep distribution and provenance markers intact when editing published notes. Verify the intended live feed separately for each platform when promoting a release to Latest.
+
 ## Apple packages
 
 | Package pattern | Device and contents |

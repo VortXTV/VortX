@@ -62,7 +62,7 @@ internal class AndroidNativePlaybackResolver(context: Context) : NativePlaybackR
     private val keys by lazy { DebridKeys(this.context) }
     private val resolver by lazy { DebridResolver(keys) }
     private val coordinator by lazy { DebridCoordinator(resolver = resolver, keys = keys, appContext = this.context,
-        usenetProviderStore = UsenetProviderStore(this.context, keys::ownerToken, keys::mutateCurrentOwner), nativeUsenetEnabled = true) }
+        usenetProviderStore = UsenetProviderStore(this.context, keys::readDownloadOwner, keys::mutateCurrentUsenetOwner), nativeUsenetEnabled = true) }
 
     override suspend fun resolve(source: StreamSource, episode: Episode?): Playable = resolve(source, episode, { true }, { true })
 

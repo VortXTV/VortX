@@ -42,7 +42,9 @@ import androidx.compose.ui.text.input.VisualTransformation
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridKeyStatus
 import com.vortx.android.debrid.DebridService
+import com.vortx.android.debrid.DebridOwnerToken
 import com.vortx.android.usenet.UsenetProviderCredentials
+import com.vortx.android.usenet.UsenetProviderRead
 import com.vortx.android.usenet.UsenetProviderStore
 import com.vortx.android.ui.components.PrimaryButton
 import com.vortx.android.ui.components.SurfaceCard
@@ -50,6 +52,12 @@ import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 
 internal const val DEBRID_STORAGE_UNAVAILABLE_STATUS = "Secure storage unavailable"
+
+internal fun UsenetProviderRead.editorStatus(): String = when (this) {
+    is UsenetProviderRead.Available -> if (servers.firstEnabledCredentials != null) "Configured (credentials redacted)" else "Not configured"
+    is UsenetProviderRead.Missing -> "Not configured"
+    is UsenetProviderRead.UnavailableOrCorrupt -> DEBRID_STORAGE_UNAVAILABLE_STATUS
+}
 
 internal data class DebridEditorStateKey(
     val service: DebridService,
@@ -129,7 +137,10 @@ fun DebridKeysScreen(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current.applicationContext
-    val usenetStore = remember(keys) { UsenetProviderStore(context, keys::ownerToken, keys::mutateCurrentOwner) }
+    val renderedOwner = keys.readDownloadOwner()
+    val renderedIdentity = renderedOwner?.let { "${it.identity}:${it.generation}" } ?: "unavailable:$accountIdentity"
+    val unavailable = DebridKeyStatus(false, false, true)
+    val usenetStore = remember(keys) { UsenetProviderStore(context, keys::readDownloadOwner, keys::mutateCurrentUsenetOwner) }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -155,28 +166,31 @@ fun DebridKeysScreen(
                 style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary),
             )
             DebridService.entries.forEach { service ->
-                val editorStateKey = debridEditorStateKey(service, accountIdentity)
+                val editorStateKey = debridEditorStateKey(service, renderedIdentity)
                 val initialState = remember(keys, editorStateKey) {
-                    DebridKeyEditorState.from(keys.status(service))
+                    DebridKeyEditorState.from(renderedOwner?.let { keys.status(service, it) } ?: unavailable)
                 }
                 DebridKeySection(
                     service = service,
                     editorStateKey = editorStateKey,
                     initialState = initialState,
                     onSave = { value ->
-                        val saved = keys.setKey(service, value)
-                        debridMutationStatus(saved, keys.status(service))
+                        if (renderedOwner == null) unavailable else {
+                            val saved = keys.setKey(service, value, renderedOwner)
+                            debridMutationStatus(saved, keys.status(service, renderedOwner))
+                        }
                     },
                     onClear = {
-                        val cleared = keys.setKey(service, "")
-                        debridMutationStatus(cleared, keys.status(service))
+                        if (renderedOwner == null) unavailable else {
+                            val cleared = keys.setKey(service, "", renderedOwner)
+                            debridMutationStatus(cleared, keys.status(service, renderedOwner))
+                        }
                     },
                 )
             }
             UsenetProviderSection(
                 store = usenetStore,
-                ownerKnown = keys.ownerToken() != null,
-                accountIdentity = accountIdentity,
+                owner = renderedOwner,
             )
         }
     }
@@ -185,20 +199,23 @@ fun DebridKeysScreen(
 @Composable
 private fun UsenetProviderSection(
     store: UsenetProviderStore,
-    ownerKnown: Boolean,
-    accountIdentity: String,
+    owner: DebridOwnerToken?,
 ) {
     // A settings host can switch profiles in place. Every transient credential field is keyed by the exact
     // account identity, so even unsaved text from A is discarded before B's editor becomes visible.
-    var host by remember(accountIdentity) { mutableStateOf("") }; var port by remember(accountIdentity) { mutableStateOf("563") }
-    var username by remember(accountIdentity) { mutableStateOf("") }; var password by remember(accountIdentity) { mutableStateOf("") }
-    var connections by remember(accountIdentity) { mutableStateOf("4") }; var status by remember(ownerKnown, accountIdentity) {
-        mutableStateOf(if (ownerKnown && store.isConfigured()) "Configured (credentials redacted)" else "Not configured")
+    var host by remember(owner) { mutableStateOf("") }; var port by remember(owner) { mutableStateOf("563") }
+    var username by remember(owner) { mutableStateOf("") }; var password by remember(owner) { mutableStateOf("") }
+    var connections by remember(owner) { mutableStateOf("4") }; var status by remember(store, owner) {
+        mutableStateOf(store.snapshot(owner).editorStatus())
     }
     fun save() {
         val credentials = UsenetProviderCredentials(host, port.toIntOrNull() ?: 0, username, password, connections.toIntOrNull() ?: 0, true)
-        status = if (ownerKnown && credentials.isValid && store.save(credentials)) "Configured (credentials redacted)" else "Unable to save secure Usenet provider"
-        if (status.startsWith("Configured")) { password = ""; username = "" }
+        if (owner != null && credentials.isValid && store.save(credentials, owner)) {
+            status = store.snapshot(owner).editorStatus()
+            password = ""; username = ""
+        } else {
+            status = "Unable to save secure Usenet provider"
+        }
     }
     SurfaceCard {
         Column(Modifier.padding(VortXTheme.spacing.md), verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
@@ -208,8 +225,11 @@ private fun UsenetProviderSection(
                 OutlinedTextField(value, { next -> when (label) { "Host" -> host=next; "Port" -> port=next; "Username" -> username=next; "Password" -> password=next; else -> connections=next } }, Modifier.fillMaxWidth(), label={Text(label)}, singleLine=true, visualTransformation=if(label=="Password") PasswordVisualTransformation() else VisualTransformation.None)
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
-                PrimaryButton("Save provider", { save() }, Modifier.weight(1f), enabled = ownerKnown)
-                TextButton(onClick = { if (ownerKnown && store.clear()) status="Not configured" }, enabled=ownerKnown) { Text("Clear", color=VortXTheme.colors.danger) }
+                PrimaryButton("Save provider", { save() }, Modifier.weight(1f), enabled = owner != null)
+                TextButton(onClick = {
+                    status = if (owner != null && store.clear(owner)) store.snapshot(owner).editorStatus()
+                    else "Unable to clear secure Usenet provider"
+                }, enabled = owner != null) { Text("Clear", color = VortXTheme.colors.danger) }
             }
         }
     }

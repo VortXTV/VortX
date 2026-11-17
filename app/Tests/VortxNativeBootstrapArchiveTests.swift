@@ -43,9 +43,21 @@ import CryptoKit
     }
     static func taggedDisplayCarrierControls() -> [String] {
         let secret = #"{"token":"fixture-hidden"}"#
+        let tag = Data(secret.utf8).base64EncodedString().trimmingCharacters(in: CharacterSet(charactersIn: "="))
+        let standard = Data(#"{"token":"ο࿿"}"#.utf8).base64EncodedString()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+        let urlSafe = standard.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "+", with: "-")
+        let mixed = standard.replacingOccurrences(of: "/", with: "_")
+        var corruptBytes = Data(secret.utf8)
+        corruptBytes.append(contentsOf: [0xff, 0xff])
+        let corrupt = corruptBytes.base64EncodedString().replacingOccurrences(of: "/", with: "_")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "="))
         return ["[RD] - " + secret, "[RD]: " + secret, "[RD] [4K] - " + secret,
                 "[RD] - " + Data(secret.utf8).base64EncodedString(),
                 "[RD]: \u{FEFF}" + Data(secret.utf8).base64EncodedString(),
+                "[\(tag)] Movies", "{\(tag)} Movies", "[RD] [\(tag)] Movies",
+                "[\(urlSafe)] Movies", "[\(mixed)] Movies", "[\(standard)!_] Movies", "[RD] \(standard)!_",
+                "[\(corrupt)] Movies",
                 "[RD] - \"quoted\"", "[RD]: bplist00broken", "[RD] - <?xml broken",
                 "[true] trailing", "[123]: trailing", "[null] trailing",
                 "[RD] [true]", "[RD] [123]", "[RD] [null]",
@@ -120,6 +132,7 @@ import CryptoKit
         try ownAccountSlotSourceHistory()
         try structuredCarrierAdmission()
         try archiveInspectionDiagnostics()
+        try heldSettingSurvivesColdBootstrap()
         do { try literalProfileDisplayFields() }
         catch { print("FAIL: producer-shaped literal profile text blocked account preparation: \(error)"); exit(1) }
         do { try taggedAccountRosterNames() }
@@ -859,7 +872,7 @@ import CryptoKit
             check(try data(document) == original)
         }
         let labels = ["[4K] Community catalog", "[Community]", "{Public} Catalog", " \n[EN] Films and shows.", "[日本語] アニメ", "[true]", "[123]",
-                      "[RD] [4K] Torrentio", "[TB⚡] Comet", "[Oshi no Ko]: The Movie"]
+                      "[RD] [4K] Torrentio", "[TB⚡] Comet", "[Oshi no Ko]: The Movie", "[Wyatt] Catalog", "[RD] Wyatt"]
         var journeys = 0
         for label in labels {
             let addon = descriptor(label, description: label)
@@ -1517,6 +1530,37 @@ import CryptoKit
         ]]]]]], field: "/nativeSync/accountSlots/*/slots/*/sourceHistory/*", carrier: "opaque_data")
         try rejected(["private-personal-field": ["sourceHistory": [sourceDigest: "e9" + String(repeating: "0", count: 62)]]],
                      field: "/*/sourceHistory/*", carrier: "base64_prefix")
+    }
+
+    static func heldSettingSurvivesColdBootstrap() throws {
+        let owner = "00000000-0000-0000-0000-00000000B22C"
+        let roster = [["id": owner, "name": "Main", "avatar": "🎬"]]
+        let preferences: [String: Any] = [
+            "future.unreadable": "[unfinished",
+            "future.readable": "Keep this",
+            "kcfallback.legacy": "fixture-credential"
+        ]
+        let plist = try PropertyListSerialization.data(fromPropertyList: preferences, format: .binary, options: 0)
+        let settings = try data(["format": "vortx-backup", "schema": 1, "payloadBase64": plist.base64EncodedString()])
+        let source: [String: Any] = ["vortx": ["roster": roster], "settings": settings.base64EncodedString()]
+        let original = try data(source)
+        let material = try data(["schemaVersion": 1, "roster": roster])
+        var messages: [String] = []
+        let capture = try VortxNativeBootstrapArchive.captureLegacyDocument(source, diagnostics: { messages.append($0) })
+        check(messages == ["archive_inspection result=held reason=opaque_preference field=/settings/payloadBase64/* carrier=plain_text_prefix"])
+        let archive = try VortxNativeBootstrapArchive.encode(capture: capture, material: material, authenticatedSourceArchive: nil)
+        try VortxNativeBootstrapArchive.validate(archive)
+        let archived = try JSONSerialization.jsonObject(with: archive) as! [String: Any]
+        let host = archived["hostDocument"] as! [String: Any]
+        let backup = try JSONSerialization.jsonObject(with: Data(base64Encoded: host["settings"] as! String)!) as! [String: Any]
+        let domain = try PropertyListSerialization.propertyList(from: Data(base64Encoded: backup["payloadBase64"] as! String)!,
+                                                               options: [], format: nil) as! [String: String]
+        check(domain == ["future.readable": "Keep this"])
+        check((host["vortx"] as? [String: Any])?["roster"] as? [[String: String]] == roster)
+        check(archived["excludedCredentialPaths"] as? [String] == ["/settings/payloadBase64/kcfallback.legacy"])
+        check(try data(archived["legacyImportMaterial"]!) == material)
+        check(try data(source) == original)
+        try strictOpaqueRefusal(source)
     }
 
     static func membershipReceiptRetention() throws {

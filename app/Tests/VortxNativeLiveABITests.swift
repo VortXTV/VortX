@@ -143,6 +143,10 @@ private final class NativeFieldNotifications: @unchecked Sendable {
     }
 
     static func main() async throws {
+        try VortxNativeProfileEditHostTests.numericHostEventInterop(
+            scope: .init(account: "account.fixture", ownerProfileID: "00000000-0000-0000-0000-00000000A11C"),
+            actor: "00000000-0000-0000-0000-000000000001")
+        print("Apple host preference equivalence and conflict diagnostics: verified")
         try shortUnwatchedEpisode()
         try OwnerHistorySwiftLiveABICases.run(checkpointDirectory: URL(fileURLWithPath: CommandLine.arguments[3]))
         let runtime = try VortxNativeRuntime(abi: VortxCABI(), ownerID: "fixture-owner", ownerName: "Fixture")

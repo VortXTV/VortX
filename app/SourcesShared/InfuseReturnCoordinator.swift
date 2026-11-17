@@ -47,7 +47,7 @@ enum InfuseReturnCoordinator {
 
     /// Handles an inbound URL if it is an Infuse callback. Returns false for any other link.
     @discardableResult
-    static func handle(_ url: URL) -> Bool {
+    static func handle(_ url: URL, applyImmediately: Bool = true) -> Bool {
         guard let callback = InfuseReturnPolicy.parse(url, scheme: TopShelfSnapshot.urlScheme) else { return false }
         var handoffs = InfuseReturnPolicy.pruned(load(), now: Date())
         guard let index = handoffs.firstIndex(where: { $0.token == callback.token }) else {
@@ -64,7 +64,7 @@ enum InfuseReturnCoordinator {
         }
         handoffs[index].returnedPositionSeconds = progress.position
         save(handoffs)
-        applyReturned()
+        if applyImmediately { applyReturned() }
         return true
     }
 

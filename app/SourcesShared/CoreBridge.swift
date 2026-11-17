@@ -491,7 +491,12 @@ final class CoreBridge: ObservableObject {
         try publicationSource?.withActive {}
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               let facade = nativeFacadeLock.withLock({ nativeCredentialCapture == capture ? nativeFacadeStorage : nil }) else { throw VortxNativeError.closed }
-        let baseline = try VortxNativeProfileEditHost.baselines(nativeProfileBaseline)
+        let baseline: VortxNativeProfileEditHost.Baselines
+        do { baseline = try VortxNativeProfileEditHost.baselines(nativeProfileBaseline) }
+        catch {
+            DiagnosticsLog.log("sync", "operation=native_account_merge result=failed stage=profile_baseline reason=\(VortxNativeError.diagnosticCode(error))")
+            throw error
+        }
         let cloudCommit = publicationSource.map { VortxNativeHostFieldCommitLatch(source: sourceAuthority ?? $0) }
         let commitSource: (any VortxMutationAuthority)? = cloudCommit.map { $0 as any VortxMutationAuthority } ?? sourceAuthority
         let document = try await withTaskCancellationHandler {
@@ -502,7 +507,11 @@ final class CoreBridge: ObservableObject {
         try publicationSource?.withActive {}
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeCredentialCapture == capture }) else { throw VortxNativeError.superseded }
-        try refreshNativeProfiles()
+        do { try refreshNativeProfiles() }
+        catch {
+            DiagnosticsLog.log("sync", "operation=native_account_merge result=failed stage=profile_projection reason=\(VortxNativeError.diagnosticCode(error))")
+            throw error
+        }
         return document
     }
     @MainActor
@@ -3011,12 +3020,13 @@ final class CoreBridge: ObservableObject {
     /// library is already loaded this returns immediately without re-dispatching.
     @MainActor
     func loadLibraryAndAwait(timeout: TimeInterval = 6) async {
+        guard !Task.isCancelled else { return }
         if library == nil { loadLibrary() }
         let deadlineNanos = UInt64(timeout * 1_000_000_000)
         let stepNanos: UInt64 = 200_000_000   // 0.2s poll cadence
         var elapsed: UInt64 = 0
         while library == nil, elapsed < deadlineNanos {
-            try? await Task.sleep(nanoseconds: stepNanos)
+            do { try await Task.sleep(nanoseconds: stepNanos) } catch { return }
             elapsed += stepNanos
         }
     }

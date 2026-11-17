@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Darwin
 
 private final class SessionABI: VortxRuntimeABI, @unchecked Sendable {
     private let lock = NSLock()
@@ -391,7 +392,9 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
 }
 
 @main enum VortxNativeSessionTests {
-    static func check(_ value: Bool, line: Int = #line) { precondition(value, "session assertion at line \(line)") }
+    static func check(_ value: Bool, _ message: String? = nil, line: Int = #line) {
+        precondition(value, message ?? "session assertion at line \(line)")
+    }
     @MainActor static func migrationProgressLeaseTests() async throws {
         let owner = UUID(uuidString: "90000000-0000-0000-0000-000000000009")!
         let scope = VortxAccountScope(account: "lease-draft.fixture", ownerProfileID: owner.uuidString)
@@ -1377,7 +1380,79 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         print("Native FIFO handoff: actual Facade membership, later profile ordering, revocation, flush, ABA and uncertainty passed")
     }
 
+    static func websiteRosterCheckpointTests() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "vortx-website-roster-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let scope = VortxAccountScope(account: "account-website-fixture", ownerProfileID: "owner")
+        let key = SymmetricKey(size: .bits256)
+        let session = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: SessionABI(),
+            store: SessionStore(), transport: SessionTransport(), allowNewAccount: true)
+        let before = try await session.stateJSON()
+        await session.close()
+        let archive = try VortxNativeBootstrapArchive.encode(document: Data(#"{"futurePreference":42}"#.utf8))
+        let existingDirectory = directory.appendingPathComponent("existing-roster", isDirectory: true)
+        let existing = try VortxEncryptedCheckpointStore(directory: existingDirectory, key: key,
+            bootstrap: archive, bootstrapScope: scope)
+        try existing.commit(before, scope: scope)
+        let coldStore = try VortxEncryptedCheckpointStore(directory: existingDirectory, key: key)
+        let actorA = "00000000-0000-4000-8000-000000000001"
+        let witness = Data(repeating: 0xa1, count: 32)
+        check(try !coldStore.permitsWebsiteRosterAdoption(scope: scope, witness: witness, requiringCheckpoint: false))
+        let websiteDirectory = directory.appendingPathComponent("website-roster-adoption", isDirectory: true)
+        let websiteProbe = try VortxEncryptedCheckpointStore(directory: websiteDirectory, key: key)
+        check(try websiteProbe.permitsWebsiteRosterAdoption(scope: scope, witness: witness, requiringCheckpoint: false))
+        check(try !websiteProbe.permitsWebsiteRosterAdoption(scope: scope, witness: witness, requiringCheckpoint: true))
+        // Simulate a second process creating the destination after the candidate was staged.
+        // The same atomic installation operation used by commitSnapshot must keep the winner.
+        try FileManager.default.createDirectory(at: websiteDirectory, withIntermediateDirectories: true)
+        let staged = websiteDirectory.appendingPathComponent("fixture-adoption.pending")
+        let destination = websiteDirectory.appendingPathComponent("fixture-winner.checkpoint")
+        let candidateBytes = Data("synthetic staged checkpoint".utf8)
+        let winnerBytes = Data("synthetic competing checkpoint".utf8)
+        try candidateBytes.write(to: staged)
+        try winnerBytes.write(to: destination)
+        do {
+            try VortxEncryptedCheckpointStore.installFirstWebsiteCheckpoint(staged, at: destination)
+            fatalError("first website checkpoint replaced a competing checkpoint")
+        } catch let error as NSError {
+            check(error.domain == NSPOSIXErrorDomain && error.code == Int(EEXIST))
+        }
+        check(try Data(contentsOf: destination) == winnerBytes)
+        check(try Data(contentsOf: staged) == candidateBytes)
+        try FileManager.default.removeItem(at: destination)
+        try VortxEncryptedCheckpointStore.installFirstWebsiteCheckpoint(staged, at: destination)
+        check(try Data(contentsOf: destination) == candidateBytes)
+        check(!FileManager.default.fileExists(atPath: staged.path))
+        try FileManager.default.removeItem(at: destination)
+        let websiteStore = try VortxEncryptedCheckpointStore(directory: websiteDirectory, key: key, bootstrap: archive,
+            bootstrapScope: scope, initialWebsiteRosterAdoption: witness)
+        try websiteStore.commit(before, scope: scope)
+        let websiteReopen = try VortxEncryptedCheckpointStore(directory: websiteDirectory, key: key)
+        check(try websiteReopen.recovery(account: scope.account) == nil)
+        check(try websiteReopen.permitsWebsiteRosterAdoption(scope: scope, witness: witness, requiringCheckpoint: true))
+        try websiteReopen.rememberAuthenticatedScope(scope)
+        check(try websiteReopen.permitsWebsiteRosterAdoption(scope: scope, witness: witness, requiringCheckpoint: true))
+        let websiteHost = try VortxNativeHostPreferences(scope: scope, actor: actorA).encoded()
+        try websiteReopen.commit(before, scope: scope, hostPreferences: websiteHost)
+        let websiteFresh = try VortxEncryptedCheckpointStore(directory: websiteDirectory, key: key)
+        check(try websiteFresh.readHostPreferences(scope: scope) == websiteHost)
+        check(try websiteFresh.permitsWebsiteRosterAdoption(scope: scope, witness: witness, requiringCheckpoint: true))
+        let impostor = try VortxEncryptedCheckpointStore(directory: existingDirectory, key: key, bootstrap: archive,
+            bootstrapScope: scope, initialWebsiteRosterAdoption: witness)
+        do { try impostor.commit(before, scope: scope); fatalError("existing roster checkpoint acquired website witness") } catch {}
+        check(try !coldStore.permitsWebsiteRosterAdoption(scope: scope, witness: witness, requiringCheckpoint: true))
+
+        let differentWitness = Data(repeating: 0xb2, count: 32)
+        check(try !websiteFresh.permitsWebsiteRosterAdoption(scope: scope, witness: differentWitness, requiringCheckpoint: true))
+        print("Website roster checkpoint: sealed exact witness, restart, wrong-witness refusal and exclusive first install passed")
+    }
+
     static func main() async throws {
+        if CommandLine.arguments.contains("--website-roster-checkpoint") {
+            try await websiteRosterCheckpointTests(); return
+        }
+        try await websiteRosterCheckpointTests()
         if CommandLine.arguments.contains("--external-cw-host") {
             try await checkExternalCWQueryReceipts(); return
         }
@@ -1505,17 +1580,23 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         store.failWrites()
         do { _ = try await session.dispatch(["{\"type\":\"edit\",\"value\":42}"], now: 2); fatalError("unacknowledged state published") }
         catch VortxNativeError.checkpointUncertain {}
-        check(try await session.stateJSON() == before)
+        do { _ = try await session.stateJSON(); fatalError("uncertain checkpoint exposed a live state read") }
+        catch VortxNativeError.checkpointUncertain {}
+        check(try store.read(scope: scope) == before)
         do { _ = try await session.dispatch(["{\"type\":\"edit\"}"], now: 3); fatalError("uncertain checkpoint overwritten") }
         catch VortxNativeError.checkpointUncertain {}
-        let slow = Task { try await session.loadMeta(request: .init(resource: .meta, type: "series", id: "slow"), stream: nil,
+        await session.close()
+        store.recover()
+        let resumedSession = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: store, transport: transport)
+        check(try await resumedSession.stateJSON() == before)
+        let slow = Task { try await resumedSession.loadMeta(request: .init(resource: .meta, type: "series", id: "slow"), stream: nil,
             addons: [.init(id: "slow", transportUrl: "https://slow.fixture/manifest.json", manifest: nil)]) }
         await withCheckedContinuation { done in DispatchQueue.global().async { precondition(transport.entered.wait(timeout: .now() + 5) == .success); done.resume() } }
-        _ = try await session.loadCatalog(.search, request: .init(resource: .catalog, type: "series", id: "popular"), addons: [])
-        if case .loading = await session.screen("meta_details") {} else { fatalError("search clobbered meta slot") }
-        await session.close(); transport.release.signal()
+        _ = try await resumedSession.loadCatalog(.search, request: .init(resource: .catalog, type: "series", id: "popular"), addons: [])
+        if case .loading = await resumedSession.screen("meta_details") {} else { fatalError("search clobbered meta slot") }
+        await resumedSession.close(); transport.release.signal()
         do { _ = try await slow.value; fatalError("closed owner published") } catch VortxNativeError.superseded {}
-        check(await session.screen("meta_details") == nil)
+        check(await resumedSession.screen("meta_details") == nil)
 
         let directory = URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent("sealed")
         let key = SymmetricKey(size: .bits256)
@@ -1718,10 +1799,12 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         precondition(legacy.documents[VortxLegacyImport.rosterID] == legacyJSON)
         let ambiguousStore = SessionStore()
         let ambiguous = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: ambiguousStore, transport: transport, allowNewAccount: true)
+        let priorPublication = try await ambiguous.stateJSON()
         ambiguousStore.failWrites(afterInstall: true)
         do { _ = try await ambiguous.dispatch(["{\"type\":\"edit\",\"value\":99}"], now: 4); fatalError("uncertain commit acknowledged") }
         catch VortxNativeError.checkpointUncertain {}
-        let priorPublication = try await ambiguous.stateJSON()
+        do { _ = try await ambiguous.stateJSON(); fatalError("uncertain checkpoint exposed a live state read") }
+        catch VortxNativeError.checkpointUncertain {}
         let uncertainDisk = try ambiguousStore.read(scope: scope)!
         precondition(priorPublication != uncertainDisk)
         await ambiguous.close(); ambiguousStore.recover()

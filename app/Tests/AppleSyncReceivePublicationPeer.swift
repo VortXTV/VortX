@@ -235,6 +235,11 @@ final class TraktNextEpisodeConsumer<Owner: Hashable & Sendable>: Sendable {}
     let directory: URL; let baseURL: URL
     let credentialAuthority = CredentialScopeRegistry.shared
     private var accountReconnectFailureCapture: CredentialScopeRegistry.Capture?
+    private var backupUploadReconnectFailureCapture: CredentialScopeRegistry.Capture?
+    private var token: String? = "fixture-bearer"
+    private var syncCompletionWaiters: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
+    private enum NativeBackupHistory { case seen, confirmedAbsent }
+    private func nativeBackupHistory(capture: CredentialScopeRegistry.Capture) -> NativeBackupHistory { .seen }
     var account: Account? = .init(id: AppleSyncReceivePublicationPeer.accountID.uuidString.lowercased())
     var dataKey: Data? = AppleSyncReceivePublicationPeer.key
     var isSignedIn = true; var hasAppliedAccountDoc = false; var hasPendingPush = false
@@ -279,7 +284,8 @@ final class TraktNextEpisodeConsumer<Owner: Hashable & Sendable>: Sendable {}
         // input imported at first creation. Never manufacture or reset an existing baseline.
         let material = try AppleSyncReceivePublicationPeer.legacyMaterial(document: doc)
         guard material == (try AppleSyncReceivePublicationPeer.legacyMaterial()) else { throw VortxNativeError.invalidSnapshot }
-        return NativeLegacyPreparation(material: material, authority: nil, sourceArchive: nil)
+        let archiveCapture = try VortxNativeBootstrapArchive.captureLegacyDocument(doc)
+        return NativeLegacyPreparation(material: material, archiveCapture: archiveCapture, authority: nil, sourceArchive: nil)
     }
     static func nativeWebsiteEvents(_ doc: [String: Any]) throws -> [VortxJSON] { [] }
     static func nativeWebsiteAddonEvents(_ doc: [String: Any]) throws -> [VortxJSON] { [] }

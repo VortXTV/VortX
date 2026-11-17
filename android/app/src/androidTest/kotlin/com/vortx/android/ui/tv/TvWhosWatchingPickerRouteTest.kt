@@ -7,7 +7,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.semantics.SemanticsActions
-import androidx.compose.ui.test.assertDoesNotExist
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsFocused
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -222,7 +221,7 @@ class TvWhosWatchingPickerRouteTest {
             if ((!selection && !adding && before.activeID != profile.id) ||
                 (if (adding) before.profiles.any { it.id == profile.id } else before.profiles.none { it == profile })
             ) return null
-            return TvProfileGateway.Admission {
+            return TvProfileGateway.Admission { action ->
                 runCatching {
                     check(admissionGeneration == beforeGeneration)
                     check(read().activeID == before.activeID)

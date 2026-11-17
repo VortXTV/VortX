@@ -12,16 +12,21 @@ private val knownAudioLanguageCodes: Set<String> = Locale.getISOLanguages().toSe
 
 internal fun isJunkPlayerDuration(durationMs: Long, playable: Playable): Boolean {
     if (playable.isTrailer || durationMs <= 0L) return false
-    val expected = playable.expectedDurationMs
-    return if (expected > 0L) durationMs < minOf(expected / 2, (expected - 600_000L).takeIf { it > 0L } ?: expected / 2)
-    else durationMs < 120_000L
+    return durationMs < minimumPlausibleRuntimeMs(playable)
 }
 
 internal fun isJunkPlayerEof(positionMs: Long, durationMs: Long, playable: Playable): Boolean {
     if (playable.isTrailer) return false
+    val minimum = minimumPlausibleRuntimeMs(playable)
+    return positionMs < minimum && (playable.expectedDurationMs > 0L || durationMs < minimum)
+}
+
+private fun minimumPlausibleRuntimeMs(playable: Playable): Long {
     val expected = playable.expectedDurationMs
-    return if (expected > 0L) positionMs < minOf(expected / 2, (expected - 600_000L).takeIf { it > 0L } ?: expected / 2)
-    else positionMs < 120_000L && durationMs < 120_000L
+    if (expected <= 0L) return 120_000L
+    // Allow shorter cuts and genuine shorts. The fallback floor also prevents the
+    // 10-minute tolerance from approving a tiny clip just above that boundary.
+    return minOf(expected / 2, maxOf(expected - 600_000L, 120_000L))
 }
 
 /** Local, cast, and exit writes use the same ratio-poisoning policy, even for a manually chosen file. */

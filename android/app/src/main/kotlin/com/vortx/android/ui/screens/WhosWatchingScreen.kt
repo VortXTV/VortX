@@ -28,7 +28,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,6 +49,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vortx.android.BuildConfig
 import com.vortx.android.VortXApplication
 import com.vortx.android.profile.ContinueWatchingOwnerGate
+import com.vortx.android.profile.AdmittedPickerRoster
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.ProfileSelectionRequest
 import com.vortx.android.profile.UserProfile
@@ -77,27 +77,21 @@ import kotlinx.coroutines.CancellationException
 /// CancellationException propagate to the caller. Every PIN-bearing profile, including the active profile,
 /// passes through the gate before selection or editing.
 @Composable
-fun WhosWatchingScreen(
+internal fun WhosWatchingScreen(
+    admittedRoster: AdmittedPickerRoster,
     onDone: () -> Unit,
     onSelected: (ProfileSelectionRequest) -> Unit,
     accountControl: ProfilePickerAccountControl?,
     modifier: Modifier = Modifier,
 ) {
-    val store = ProfileStore.sharedOrNull()
-    if (store == null) {
-        LaunchedEffect(store) { onDone() }
-        return
-    }
-    if (store.profiles.size <= 1 && !store.selectionPending) {
-        LaunchedEffect(store) { onDone() }
+    val store = ProfileStore.sharedOrNull() ?: return
+    val roster = admittedRoster.profiles
+    val activeId = admittedRoster.activeID
+    if (roster.size <= 1 && !admittedRoster.selectionPending) {
+        LaunchedEffect(admittedRoster) { onDone() }
         return
     }
 
-    // ProfileStore owns plain roster fields for the comparison path and publishes active-profile changes for
-    // native projection. Read the roster/active id on every recomposition; never freeze a launch-time copy.
-    val activeProjection by store.activeProfile.collectAsState()
-    val roster = store.profiles
-    val activeId = activeProjection?.id ?: store.activeID
     // The native picker is still a ProfileStore surface, but its selection request must carry a live native
     // admission witness. Keep this model scoped to the picker so the host can consume the request without
     // borrowing an optional owner/session from the Settings screen.
@@ -118,17 +112,6 @@ fun WhosWatchingScreen(
     var rosterRevision by remember { mutableStateOf(0) }
     @Suppress("UNUSED_VARIABLE") val rosterRedraw = rosterRevision
 
-    // Keep one owner for the launch route's system Back key. The PIN scrim and the editor are state in this
-    // route (rather than separate navigation destinations), so a nested handler would let Back finish the
-    // host activity or skip the PIN depending on which child happened to be composed last.
-    WhosWatchingBackHandler(
-        pinVisible = pinTarget != null,
-        editorVisible = editorRequest != null,
-        onCancelPin = { pinTarget = null },
-        onCancelEditor = { editorRequest = null },
-        onDone = onDone,
-    )
-
     fun requestPin(profile: UserProfile, purpose: PickerPinPurpose): PickerPinRequest =
         ContinueWatchingOwnerGate.serialized { revision ->
             PickerPinRequest(
@@ -140,11 +123,8 @@ fun WhosWatchingScreen(
         }
 
     fun choose(profile: UserProfile, expected: PickerPinRequest? = null) {
-        // A PIN gate may suspend this callback while sync/editor work replaces the live list. ProfileStore's
-        // selection is serialized under the same owner gate, so the delayed path carries and rechecks the
-        // exact list/profile witness before entering the store; an ABA replacement is a retry, never an
-        // implicit admission.
-        val outcome = try {
+        // PIN admission belongs to the exact rendered roster and the originally captured native mount.
+        val request = try {
             ContinueWatchingOwnerGate.serialized { revision ->
                 if (expected != null) {
                     check(revision == expected.ownerRevision)
@@ -156,36 +136,46 @@ fun WhosWatchingScreen(
                 }
                 val current = store.profiles.firstOrNull { it.id == profile.id }
                 check(current === profile && current == profile)
-                store.select(profile)
+                val model = checkNotNull(nativeModel)
+                val original = checkNotNull(model.captureSelection(profile))
+                check(original.target.runtime === admittedRoster.mount && original.account == admittedRoster.account)
+                var request: ProfileSelectionRequest? = null
+                check(model.commitEditor(original) {
+                    check(store.pickerRoster.value === admittedRoster)
+                    val outcome = store.select(profile)
+                    val selected = checkNotNull(store.active)
+                    // Capture the acknowledged successor before releasing the original Session, account and mount gates.
+                    val after = checkNotNull(model.captureSelection(selected))
+                    check(after.target.runtime === original.target.runtime && after.account == original.account)
+                    val nativeAdmission: (() -> Unit) -> Boolean = { action -> model.commitEditor(after, action) }
+                    request = captureProfileSelection(store, profile, outcome, nativeAdmission = nativeAdmission)
+                })
+                checkNotNull(request)
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
-            // Native publication/admission errors are not a successful selection. Leave the launch picker
-            // mounted so the viewer can retry or choose another profile.
             pickerError = "Couldn't open this profile. Tap it to try again."
-            return
-        }
-        // The host owns account-session handoff and dismissal. Always report the witness captured from the
-        // same selection transaction so a legacy SwitchAccount token or NeedsSignIn state cannot be replaced
-        // by a synthetic picker message or an ABA-prone roster re-read.
-        val request = try {
-            val nativeAdmission: (() -> Boolean)? = run {
-                val selected = checkNotNull(store.active) { "Choose the profile again." }
-                val captured = checkNotNull(nativeModel?.captureSelection(selected)) { "Choose the profile again." }
-                // A typed value: a bare lambda on the next line would bind as checkNotNull's trailing lambda.
-                val admission: () -> Boolean = { nativeModel.commitEditor(captured) {} }
-                admission
-            }
-            captureProfileSelection(store, profile, outcome, nativeAdmission = nativeAdmission)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Exception) {
-            pickerError = "This profile changed before its account session was ready. Try again."
             return
         }
         onSelected(request)
     }
+
+    fun chooseTile(profile: UserProfile) {
+        if (profile.hasPin) pinTarget = requestPin(profile, PickerPinPurpose.Select)
+        else choose(profile)
+    }
+
+    WhosWatchingBackHandler(
+        pinVisible = pinTarget != null,
+        editorVisible = editorRequest != null,
+        onCancelPin = { pinTarget = null },
+        onCancelEditor = { editorRequest = null },
+        onDone = {
+            if (admittedRoster.needsSelection) roster.firstOrNull { it.id == activeId }?.let(::chooseTile)
+            else onDone()
+        },
+    )
 
     fun openEditor(profile: UserProfile, isNew: Boolean) {
         pickerError = null
@@ -290,11 +280,7 @@ fun WhosWatchingScreen(
                                         profile = profile,
                                         isActive = profile.id == activeId,
                                         sideDp = layout.avatarSideDp,
-                                        onClick = {
-                                            if (profile.hasPin) {
-                                                pinTarget = requestPin(profile, PickerPinPurpose.Select)
-                                            } else choose(profile)
-                                        },
+                                        onClick = { chooseTile(profile) },
                                     )
                                 }
                                 is PhonePickerTile.Action -> ProfilePickerActionTile(

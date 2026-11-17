@@ -2,6 +2,8 @@
 import copy
 import hashlib
 import importlib.util
+import json
+import os
 import re
 from pathlib import Path
 import tempfile
@@ -401,10 +403,10 @@ class NativeBeta11Contract(NativeBeta7Contract):
 
     def test_builds_bind_to_the_candidate_tag_and_the_beta7_engine(self):
         self.assertEqual(MODULE.build_tag(self.tag), self.build_tag)
-        for tag in ("v0.5.6-beta.7", "v0.5.6-beta.6", "v0.5.6-beta.12"):
+        for tag in ("v0.5.6-beta.7", "v0.5.6-beta.6", "v0.5.6-beta.16"):
             self.assertEqual(MODULE.build_tag(tag), tag)
         self.assertEqual(MODULE.expected_engine(self.tag), MODULE.NATIVE_BETA7_ENGINE)
-        for tag in ("v0.5.6-beta.8", "v0.5.6-beta.9", "v0.5.6-beta.10", "v0.5.6-beta.12", self.build_tag):
+        for tag in ("v0.5.6-beta.8", "v0.5.6-beta.9", "v0.5.6-beta.10", "v0.5.6-beta.16", self.build_tag):
             with self.subTest(tag=tag), self.assertRaises(ValueError):
                 MODULE.expected_engine(tag)
         for lane in ("apple", "android"):
@@ -424,6 +426,305 @@ class NativeBeta11Contract(NativeBeta7Contract):
         evidence[0] = "release tag: " + self.tag
         with self.assertRaises(ValueError):
             MODULE.validate_android_evidence(evidence, {"runId": 5, "attempt": 1}, self.tag, self.source, "0.5.6", "281")
+
+
+class NativeBeta12Contract(unittest.TestCase):
+    tag = "v0.5.6-beta.12"
+    candidate = "v0.5.6-beta.12-candidate.3"
+    build = "283"
+    preflight_mode = "beta12-candidate-preflight"
+    rejected_candidates = ("1", "2")
+    source = "a" * 40
+    pointer = {"runId": 5, "attempt": 1, "artifactId": 8}
+
+    def test_only_exact_protected_tag_candidate_and_build_are_admitted(self):
+        self.assertEqual(MODULE.build_tag(self.tag), self.candidate)
+        self.assertEqual(MODULE.expected_engine(self.tag), "2ea2e0f27dd2e53b7b28228435ca35a70f92831f")
+        self.assertEqual(MODULE.source_versions(NativeBeta11Contract.project(build=self.build),
+            NativeBeta11Contract.gradle(build=self.build), "0.5.6", self.tag), self.build)
+        with self.assertRaisesRegex(ValueError, "exact cross-platform build"):
+            MODULE.source_versions(NativeBeta11Contract.project(build="282"),
+                NativeBeta11Contract.gradle(build="282"), "0.5.6", self.tag)
+        for tag in (self.candidate, "v0.5.6-beta.16",
+                    *(self.tag + "-candidate." + suffix for suffix in self.rejected_candidates)):
+            with self.subTest(tag=tag), self.assertRaises(ValueError):
+                MODULE.expected_engine(tag)
+
+    def test_candidate_requires_all_native_gates_and_skips_android_draft_write(self):
+        apple, _ = MODULE.job_contract("apple", self.tag)
+        android, skipped = MODULE.job_contract("android", self.tag)
+        for name in (MODULE.BETA12_LIVE_ABI, MODULE.BETA12_APPLE_GATE, MODULE.BETA12_APPLE_EVIDENCE,
+                     MODULE.BETA12_AETHER_RESOLVE, MODULE.BETA12_AETHER_VERIFY, MODULE.BETA12_AETHER_EVIDENCE):
+            self.assertIn(name, apple)
+        self.assertIn(MODULE.BETA12_ANDROID_GATE, android)
+        self.assertIn(MODULE.BETA12_ANDROID_EVIDENCE, android)
+        self.assertIn(MODULE.ANDROID_DRAFT_STEP, skipped)
+        self.assertNotIn(MODULE.ANDROID_DRAFT_STEP, android)
+        historical, _ = MODULE.job_contract("android", NativeBeta11Contract.tag)
+        self.assertIn(MODULE.ANDROID_DRAFT_STEP, historical)
+        original = NativeBeta7Contract.job(self, "android", self.tag)
+        MODULE.successful_job([original], "android", 5, 1, self.source, self.tag)
+        draft = next(step for step in original["steps"] if step["name"] == MODULE.ANDROID_DRAFT_STEP)
+        draft["conclusion"] = "success"
+        with self.assertRaisesRegex(ValueError, "forbidden publication"):
+            MODULE.successful_job([original], "android", 5, 1, self.source, self.tag)
+
+    def test_preflight_ref_absence_and_receipt_are_distinct_from_a_release(self):
+        with mock.patch.object(MODULE, "api", return_value=[{"ref": "refs/tags/" + self.candidate}]):
+            MODULE.require_uncreated_protected_tag(self.tag)
+        with mock.patch.object(MODULE, "api", return_value=[{"ref": "refs/tags/" + self.tag}]):
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                MODULE.require_uncreated_protected_tag(self.tag)
+        proof = {"tag": self.tag, "sourceCommit": self.source, "builds": {"apple": self.pointer}}
+        self.assertEqual(MODULE.candidate_receipt(proof)["mode"], self.preflight_mode)
+        self.assertEqual(MODULE.candidate_receipt(proof), MODULE.candidate_receipt({**proof, "releaseId": 17}))
+        self.assertNotEqual(MODULE.candidate_receipt(proof), MODULE.candidate_receipt({**proof, "sourceCommit": "b" * 40}))
+
+    def test_aether_sidecar_binds_every_original_native_receipt(self):
+        identity = {"schemaVersion": 1, "sourceCommit": self.source, "workflowCommit": self.source,
+                    "ref": "refs/tags/" + self.candidate, "runId": 5, "attempt": 1}
+        lock = "1" * 64
+        raw_resolution = MODULE.canonical({**identity, "packageResolvedSha256": lock, "packages": MODULE.BETA12_AETHER_PACKAGES})
+        contents = {"aether-resolved.json": raw_resolution}
+        with tempfile.TemporaryDirectory() as temporary:
+            handoff = Path(temporary)
+            for key, (platform, variant) in MODULE.BETA12_AETHER_APPS.items():
+                prefix = "Contents/Frameworks/" if key == "macos" else "Frameworks/"
+                binaries = {name: {"path": prefix + name + ".framework/" + name, "architectures": ["arm64"],
+                                   "rawSha256": "2" * 64, "normalizedSha256": "3" * 64}
+                            for name in MODULE.BETA12_AETHER_BINARIES}
+                native = MODULE.canonical({"bundlePayload": {item["path"]: {"sha256": item["normalizedSha256"]}
+                                                            for item in binaries.values()}})
+                (handoff / f"native-{key}.json").write_bytes(native)
+                contents[f"aether-{key}.json"] = MODULE.canonical({**identity, "key": key, "architecture": "arm64",
+                    "resolutionReceiptSha256": hashlib.sha256(raw_resolution).hexdigest(), "packageResolvedSha256": lock,
+                    "nativeAppReceiptSha256": hashlib.sha256(native).hexdigest(), "aetherLinkMapSha256": "4" * 64,
+                    "provider": {"platform": platform, "variant": variant, "libraryIdentifier": "fixture-arm64",
+                                 "upstreamSha256": "5" * 64, "processedSha256": "6" * 64, "arm64Sha256": "7" * 64},
+                    "binaries": binaries})
+            proof = MODULE.protected_aether_gate(contents, self.pointer, self.tag, self.source, handoff)
+            self.assertEqual(set(proof["apps"]), set(MODULE.BETA12_AETHER_APPS))
+            wrong_ref = MODULE.canonical({**json.loads(raw_resolution), "ref": "refs/tags/" + self.tag})
+            with self.assertRaisesRegex(ValueError, "resolution source or pins"):
+                MODULE.protected_aether_gate({**contents, "aether-resolved.json": wrong_ref},
+                                             self.pointer, self.tag, self.source, handoff)
+            changed = json.loads(contents["aether-tvos-lite.json"])
+            changed["binaries"]["VortXAetherKit"]["normalizedSha256"] = "8" * 64
+            with self.assertRaisesRegex(ValueError, "normalized bytes"):
+                MODULE.protected_aether_gate({**contents, "aether-tvos-lite.json": MODULE.canonical(changed)},
+                                             self.pointer, self.tag, self.source, handoff)
+
+
+class NativeBeta13Contract(NativeBeta12Contract):
+    tag = "v0.5.6-beta.13"
+    candidate = "v0.5.6-beta.13-candidate.1"
+    build = "285"
+    preflight_mode = "beta13-candidate-preflight"
+    rejected_candidates = ("2", "9")
+
+    def test_beta13_artifact_only_guard_is_part_of_the_original_apple_job(self):
+        required, _ = MODULE.job_contract("apple", self.tag)
+        historical, _ = MODULE.job_contract("apple", NativeBeta12Contract.tag)
+        guard = "Verify protected Beta 13 artifact-only dispatch"
+        self.assertIn(guard, required)
+        self.assertNotIn(guard, historical)
+        original = NativeBeta7Contract.job(self, "apple", self.tag)
+        MODULE.successful_job([original], "apple", 5, 1, self.source, self.tag)
+        original["steps"] = [step for step in original["steps"] if step["name"] != guard]
+        with self.assertRaisesRegex(ValueError, guard):
+            MODULE.successful_job([original], "apple", 5, 1, self.source, self.tag)
+
+    def test_beta13_requires_focused_android_backup_cas_step(self):
+        guard = MODULE.BETA13_ANDROID_BACKUP_CAS
+        historical, _ = MODULE.job_contract("android", NativeBeta12Contract.tag)
+        self.assertNotIn(guard, historical)
+        original = NativeBeta7Contract.job(self, "android", self.tag)
+        MODULE.successful_job([original], "android", 5, 1, self.source, self.tag)
+        original["steps"] = [step for step in original["steps"] if step["name"] != guard]
+        with self.assertRaisesRegex(ValueError, guard):
+            MODULE.successful_job([original], "android", 5, 1, self.source, self.tag)
+
+    def test_dispatch_receipt_rejects_final_previous_and_unapproved_candidate_refs(self):
+        receipt = {"schemaVersion": 1, "event": "workflow_dispatch", "ref": "refs/tags/" + self.candidate,
+                   "sourceCommit": self.source, "workflowCommit": self.source, "runId": 5, "attempt": 1,
+                   "inputs": MODULE.APPLE_INPUTS}
+        MODULE.validate_dispatch(receipt, self.pointer, self.tag, self.source)
+        for tag in (self.tag, NativeBeta12Contract.candidate, self.tag + "-candidate.2"):
+            with self.subTest(tag=tag), self.assertRaises(ValueError):
+                MODULE.validate_dispatch({**receipt, "ref": "refs/tags/" + tag}, self.pointer, self.tag, self.source)
+
+
+class NativeBeta14Contract(NativeBeta12Contract):
+    tag = "v0.5.6-beta.14"
+    candidate = "v0.5.6-beta.14-candidate.2"
+    build = "293"
+    preflight_mode = "beta14-candidate-preflight"
+    rejected_candidates = ("1", "9")
+
+    def test_beta14_requires_both_the_artifact_only_guard_and_android_regression_gate(self):
+        for lane, guard in (("apple", "Verify protected Beta 14 artifact-only dispatch"),
+                            ("android", MODULE.BETA14_ANDROID_REGRESSIONS)):
+            historical, _ = MODULE.job_contract(lane, NativeBeta13Contract.tag)
+            self.assertNotIn(guard, historical)
+            original = NativeBeta7Contract.job(self, lane, self.tag)
+            MODULE.successful_job([original], lane, 5, 1, self.source, self.tag)
+            original["steps"] = [step for step in original["steps"] if step["name"] != guard]
+            with self.assertRaisesRegex(ValueError, guard):
+                MODULE.successful_job([original], lane, 5, 1, self.source, self.tag)
+
+
+    def test_aether_evidence_accepts_the_same_exact_candidates_as_packaging(self):
+        release_script = Path(__file__).resolve().parents[1] / "verify-protected-apple-aether.py"
+        spec = importlib.util.spec_from_file_location("protected_apple_aether", release_script)
+        verifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verifier)
+        env = {
+            "BUILD_SOURCE_SHA": self.source, "GITHUB_SHA": self.source,
+            "GITHUB_REF": "refs/tags/" + MODULE.build_tag(self.tag),
+            "GITHUB_RUN_ID": "5", "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REPOSITORY": "VortXTV/VortX",
+        }
+        for tag in (self.tag, MODULE.NATIVE_BETA15_TAG):
+            candidate = MODULE.build_tag(tag)
+            env["GITHUB_REF"] = "refs/tags/" + candidate
+            with self.subTest(tag=tag), mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(verifier, "run", return_value=self.source):
+                identity = verifier.identity()
+                self.assertEqual(identity["ref"], "refs/tags/" + candidate)
+                self.assertEqual(identity["sourceCommit"], self.source)
+                for ref in (tag, tag + "-candidate.1", tag + "-candidate.5", tag + "-candidate.9"):
+                    with mock.patch.dict(os.environ, {"GITHUB_REF": "refs/tags/" + ref}):
+                        with self.assertRaisesRegex(ValueError, "exact candidate"):
+                            verifier.identity()
+                with mock.patch.dict(os.environ, {"GITHUB_SHA": "b" * 40}):
+                    with self.assertRaisesRegex(ValueError, "exact candidate"):
+                        verifier.identity()
+
+    def test_regression_receipt_requires_every_suite_and_matching_total(self):
+        beginning = "2026-11-15T00:00:00Z"
+        ending = "2026-11-15T00:00:02Z"
+        marker_time = "2026-11-15T00:00:01Z"
+        step = {"started_at": beginning, "completed_at": ending}
+        hashes = "d" * 64
+        for tag, suites in ((self.tag, MODULE.BETA14_ANDROID_SUITES),
+                            (MODULE.NATIVE_BETA15_TAG, MODULE.BETA15_ANDROID_SUITES)):
+            rows = [f"{marker_time} Verified protected Android regression: {suite} (2 cases); XML SHA256 {hashes}"
+                    for suite in suites]
+            total = f"{marker_time} Verified protected Android account setup and release regressions: {2 * len(suites)} cases"
+            with self.subTest(tag=tag), tempfile.TemporaryDirectory() as temporary:
+                log = Path(temporary) / "android.log"
+                log.write_text("\n".join([*rows, total]) + "\n")
+                self.assertEqual(MODULE.android_regression_proof(log, step, tag)["suites"],
+                                 {name: {"cases": 2, "xmlSha256": hashes} for name in suites})
+                for modified in ([*rows[:-1], total], [*rows, rows[0], total],
+                                 [*rows, total.replace(f": {2 * len(suites)} cases", ": 1 cases")]):
+                    log.write_text("\n".join(modified) + "\n")
+                    with self.assertRaisesRegex(ValueError, "log marker"):
+                        MODULE.android_regression_proof(log, step, tag)
+
+
+class NativeBeta15Contract(NativeBeta12Contract):
+    tag = "v0.5.6-beta.15"
+    candidate = "v0.5.6-beta.15-candidate.6"
+    build = "301"
+    preflight_mode = "beta15-candidate-preflight"
+
+    def test_exact_frozen_project_build(self):
+        root = Path(__file__).resolve().parents[2]
+        project = (root / "app/project.yml").read_text()
+        gradle = (root / "android/app/build.gradle.kts").read_text()
+        self.assertEqual(MODULE.source_versions(project, gradle, "0.5.6", self.tag), self.build)
+
+    def test_previous_beta15_candidate_cannot_supply_either_original_build(self):
+        receipt = {"schemaVersion": 1, "event": "workflow_dispatch", "ref": "refs/tags/" + self.candidate,
+                   "sourceCommit": self.source, "workflowCommit": self.source, "runId": 5, "attempt": 1,
+                   "inputs": MODULE.APPLE_INPUTS}
+        MODULE.validate_dispatch(receipt, self.pointer, self.tag, self.source)
+        evidence = [f"{name}: {value}" for name, value in (
+            ("release tag", self.candidate), ("release tag commit", self.source), ("source commit", self.source),
+            ("native engine source commit", MODULE.expected_engine(self.tag)),
+            ("native engine Cargo features", "jni,server,resource-host"),
+            ("workflow run", "https://github.com/VortXTV/VortX/actions/runs/5"), ("workflow run attempt", "1"),
+            ("Android versionCode", self.build), ("Android versionName", "0.5.6"),
+        )]
+        MODULE.validate_android_evidence(evidence, self.pointer, self.tag, self.source, "0.5.6", self.build)
+        previous_candidates = (
+            ("1", "296", "b" * 40), ("2", "297", "c" * 40), ("3", "298", "d" * 40), ("4", "299", "e" * 40),
+            ("5", "300", "f" * 40),
+        )
+        for previous, previous_build, previous_source in previous_candidates:
+            previous_tag = f"{self.tag}-candidate.{previous}"
+            with self.subTest(previous_tag=previous_tag):
+                for changed in ({"ref": "refs/tags/" + previous_tag},
+                                {"sourceCommit": previous_source, "workflowCommit": previous_source}):
+                    with self.assertRaisesRegex(ValueError, "original typed Apple dispatch inputs"):
+                        MODULE.validate_dispatch({**receipt, **changed}, self.pointer, self.tag, self.source)
+                for label, value in (("release tag", previous_tag), ("source commit", previous_source),
+                                     ("Android versionCode", previous_build)):
+                    changed = [f"{label}: {value}" if line.startswith(label + ": ") else line for line in evidence]
+                    with self.assertRaisesRegex(ValueError, f"original Android evidence identity differs: {label}"):
+                        MODULE.validate_android_evidence(changed, self.pointer, self.tag, self.source, "0.5.6", self.build)
+                with self.assertRaisesRegex(ValueError, "exact cross-platform build"):
+                    MODULE.source_versions(NativeBeta11Contract.project(build=previous_build),
+                                           NativeBeta11Contract.gradle(build=previous_build), "0.5.6", self.tag)
+
+    def test_update_playback_and_recovery_gates_cannot_be_skipped(self):
+        for lane, gate in (("apple", "Verify protected Beta 15 artifact-only dispatch"),
+                           ("apple", "Verify protected Apple legacy archive recovery"),
+                           ("apple", MODULE.BETA15_APPLE_UPDATE), ("apple", MODULE.BETA15_APPLE_TRAILER),
+                           ("apple", MODULE.BETA15_APPLE_SHORT_HISTORY), ("apple", MODULE.BETA12_LIVE_ABI),
+                           ("android", MODULE.BETA13_ANDROID_BACKUP_CAS),
+                           ("android", MODULE.BETA14_ANDROID_REGRESSIONS)):
+            with self.subTest(lane=lane, gate=gate):
+                original = NativeBeta7Contract.job(self, lane, self.tag)
+                MODULE.successful_job([original], lane, 5, 1, self.source, self.tag)
+                original["steps"] = [step for step in original["steps"] if step["name"] != gate]
+                with self.assertRaisesRegex(ValueError, gate):
+                    MODULE.successful_job([original], lane, 5, 1, self.source, self.tag)
+
+    def test_host_preference_marker_binds_to_live_abi_step_and_source(self):
+        self.assertTrue({
+            "app/SourcesShared/VortxNativeHostPreferences.swift", "app/Tests/VortxNativeProfileEditHostTests.swift",
+            "scripts/test-native-cutover-live-abi.sh", "app/Tests/VortxNativeLiveABITests.swift",
+        } <= set(MODULE.BETA12_TOOLS + MODULE.BETA15_APPLE_TOOLS))
+        ordered = (
+            "Show toolchain", MODULE.BETA15_APPLE_UPDATE, MODULE.BETA15_APPLE_TRAILER,
+            MODULE.BETA15_APPLE_SHORT_HISTORY, "Verify complete native engine ABI", MODULE.BETA12_LIVE_ABI,
+            MODULE.BETA12_APPLE_GATE, MODULE.BETA12_APPLE_EVIDENCE,
+            "Capture exact native SDK and player inputs before app compilation", "Build tvOS (Full)",
+        )
+        def stamp(second):
+            return f"2026-11-16T00:00:{second:02d}Z"
+
+        steps = [{"name": name, "number": index + 1, "started_at": stamp(3 * index),
+                  "completed_at": stamp(3 * index + 2)} for index, name in enumerate(ordered)]
+        job = {"steps": steps}
+        moments = {name: stamp(3 * index + 1) for index, name in enumerate(ordered)}
+        live_abi = moments[MODULE.BETA12_LIVE_ABI]
+        marker = f"{live_abi} {MODULE.BETA15_APPLE_HOST_PREFS_MARKER}"
+        standalone_markers = [
+            f"{moments[MODULE.BETA15_APPLE_UPDATE]} {MODULE.BETA15_APPLE_UPDATE_MARKER}",
+            f"{moments[MODULE.BETA15_APPLE_TRAILER]} {MODULE.BETA15_APPLE_TRAILER_MARKER}",
+            f"{moments[MODULE.BETA15_APPLE_SHORT_HISTORY]} {MODULE.BETA15_APPLE_SHORT_HISTORY_MARKER}1 checks passed",
+            f"{moments[MODULE.BETA15_APPLE_SHORT_HISTORY]} {MODULE.BETA15_APPLE_WATCHED_CALLSITE_MARKER}",
+            f"{live_abi} app/Tests/VortxNativeLiveABITests.swift: OK",
+            f"{live_abi} Verified unchanged library {'a' * 64}",
+            f"{live_abi} Verified unchanged header {'b' * 64}",
+        ]
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(MODULE, "protected_gate_zip", return_value=({}, {})), \
+                mock.patch.object(MODULE, "protected_apple_gate", return_value={}):
+            work = Path(directory)
+            log = work / "apple.log"
+            log.write_text("\n".join([*standalone_markers, marker]) + "\n")
+            MODULE.protected_gate_proof("apple", self.pointer, self.tag, self.source, 1, job, log, work)
+            for host_markers in ([], [marker, marker], [
+                marker.replace(live_abi, moments[MODULE.BETA15_APPLE_SHORT_HISTORY]),
+            ], [marker + " unexpectedly"]):
+                with self.subTest(host_markers=host_markers):
+                    log.write_text("\n".join([*standalone_markers, *host_markers]) + "\n")
+                    with self.assertRaisesRegex(ValueError, "log marker"):
+                        MODULE.protected_gate_proof("apple", self.pointer, self.tag, self.source, 1, job, log, work)
 
 
 if __name__ == "__main__":

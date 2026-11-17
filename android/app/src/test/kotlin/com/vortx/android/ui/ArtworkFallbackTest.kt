@@ -2,6 +2,7 @@ package com.vortx.android.ui
 
 import com.vortx.android.ui.components.artworkCandidates
 import com.vortx.android.ui.components.nextArtworkCandidate
+import com.vortx.android.ui.components.preferredArtworkCandidates
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -17,5 +18,16 @@ class ArtworkFallbackTest {
         assertEquals(3, nextArtworkCandidate(2, 2, 3))
         assertEquals(3, nextArtworkCandidate(3, 2, 3))
         assertEquals(0, nextArtworkCandidate(0, 0, 0))
+    }
+
+    @Test fun `wide art keeps episode precedence and never duplicates the poster request`() {
+        val episode = "https://art.example/episode.jpg"
+        val showBackdrop = "https://art.example/show.jpg"
+        val poster = "https://art.example/poster.jpg?signature=Keep%2BMe"
+        assertEquals(
+            listOf(episode, showBackdrop),
+            preferredArtworkCandidates(listOf(" $episode ", poster, showBackdrop, episode, null), " $poster "),
+        )
+        assertEquals(emptyList<String>(), preferredArtworkCandidates(listOf(poster, ""), poster))
     }
 }

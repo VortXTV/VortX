@@ -63,14 +63,14 @@ manifest={'sourceSHA256':{paths[key]:hashlib.sha256(text.encode()).hexdigest() f
 (out/'extraction.json').write_text(json.dumps(manifest,indent=2)+'\n')
 # Wiring assertions complement executable methods; they do not stand in for lifecycle checks.
 settings=sources['settings']; profiles=sources['profiles']; touch=sources['touch']
-assert settings.count('if diagnosticExportIsAllowed { DiagnosticLogExportButton(grant: exportGrant) }')==2
+assert settings.count('if diagnosticExportIsAllowed { DiagnosticLogExportButton(grant: exportGrant, recoveryOnly: recoveryDiagnosticsOnly) }')==2
 assert 'diagnosticGrant: diagnosticGrant' in profiles
 assert 'accountHelpDiagnosticGrant = diagnosticGrant()' in profiles
 assert 'if let diagnosticGrant { return diagnosticGrant }' in settings
 assert settings.index('if let code = authentication.recoveryCodeForCurrentOwner') < settings.index('else if sync.isSignedIn')
 assert 'newRecoveryCode' not in settings
 assert 'diagnosticCredential.map { CredentialScopeRegistry.shared.isCurrent($0) }' in settings
-assert 'accountHelpAllowsDiagnostics = exportAllowedBeforeProfile && pinTarget == nil' in profiles
+assert 'accountHelpAllowsDiagnostics = pinTarget == nil' in profiles
 assert 'accountHelpDiagnosticCredential = CredentialScopeRegistry.shared.capture()' in profiles
 assert 'accountHelpAllowsDiagnostics = false\n            accountHelpDiagnosticCredential = nil' in profiles
 assert 'var allowsDiagnosticExport = true' in profiles # existing unlocked-profile callers retain default
@@ -90,7 +90,9 @@ assert 'authentication: accountAuthentication)' in profiles
 assert 'accountAuthentication.credentialDidChange()' in profiles
 assert '.sheet(item: $qrPresentation)' in settings
 assert '.onDisappear { cancelQR(attempt: presentation.id) }' in settings
-assert 'resolveConflict(decision) { await sync.mergeBoth()' in settings
+assert 'resolveConflict(decision) { await sync.mergeBoth() }' in settings
+assert 'let reconnect = sync.accountSignInAgainRequired' in settings
+assert 'sync.backupUploadReconnectRequired' in settings
 assert 'resolveConflict(decision) { await sync.useAccountData()' in settings
 assert 'Button("Not now", role: .cancel) { cancelConflict(decision) }' in settings
 assert 'Button("Review sync conflict") { reviewConflict(decision) }' in settings

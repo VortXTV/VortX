@@ -293,7 +293,7 @@ struct iOSRootView: View {
             Task { await armSeedingNag() }
         }) { release in
             UpdatePromptView(release: release) {
-                updates.dismissPrompt()
+                updates.dismissPrompt(matching: release.key)
             }
         }
         .onValueChange(of: launchReady) { _ in presentUpdateIfReady() }
@@ -406,9 +406,11 @@ struct iOSRootView: View {
         // clipped the trailing Add Profile circle off the window's right edge. iPhone / iPad keep a real
         // `.fullScreenCover`. The shell behind stays hidden by the opacity gate above.
         .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView(authentication: profileAuthentication, pickerPresentation: profiles.pickerPresentation()) }
+        .modifier(ProfilePickerRecoveryOffer(profiles: profiles, canPresent: launchReady && !playbackGate.playerActive))
         #else
         shellWithTabPreferenceRouting
             .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView(authentication: profileAuthentication, pickerPresentation: profiles.pickerPresentation()) }
+            .modifier(ProfilePickerRecoveryOffer(profiles: profiles, canPresent: launchReady && !playbackGate.playerActive))
         #endif
     }
 
@@ -1176,11 +1178,22 @@ struct iOSHomeView: View {
     @State private var overlayHistory = ApplePresentationPublicationCache<[String: WatchEntry],
         (cw: [CoreCWItem], library: [CoreCWItem])>()
     @State private var cachedContinueWatching: iOSCWPresentationSnapshot?
-    @State private var path = NavigationPath()
+    @State private var path = NavigationPath() {
+        didSet { if path != oldValue { continueWatchingRequestID = nil } }
+    }
+    private var pathBinding: Binding<NavigationPath> {
+        Binding(get: { path }, set: { path = $0 })
+    }
     @State private var unavailableContinueWatching: String?
     @State private var showCustomizeHome = false   // presents the Home rows reorder/hide editor
     /// A Continue-Watching card's direct resume launches the player straight from Home (#11).
-    @State private var player: iOSPlayerLaunch?
+    @State private var player: iOSPlayerLaunch? {
+        didSet { if player?.id != oldValue?.id { continueWatchingRequestID = nil } }
+    }
+    private var playerBinding: Binding<iOSPlayerLaunch?> {
+        Binding(get: { player }, set: { player = $0 })
+    }
+    @State private var continueWatchingRequestID: UUID?
     /// Owns the post-playback source contribution started by a direct resume.
     /// Cancellation must follow Home teardown instead of escaping in a detached task.
     @State private var resumeHoardTask: Task<Void, Never>?
@@ -1461,7 +1474,7 @@ struct iOSHomeView: View {
     private var homeNavigation: some View {
         let renderedContinueWatching = continueWatchingRenderSnapshot
         let renderedNextEpisodes = continueWatchingSnapshot.nextEpisodes.filter(TraktNextEpisodeHomeRow.permitsOpening)
-        NavigationStack(path: $path) {
+        NavigationStack(path: pathBinding) {
             // The hero is the first scrolling element (an ambient billboard header), not a
             // behind-the-scroll backdrop: that keeps its Play / Trailer buttons + the tappable poster
             // cards reachable (a ScrollView layered over a hero would otherwise eat the hero's taps).
@@ -1712,10 +1725,10 @@ struct iOSHomeView: View {
                               autoPlayOnAppear: target.autoPlay)
             }
             .navigationDestination(for: HubTarget.self) { target in
-                iOSCategoryBrowse(target: target, path: $path)
+                iOSCategoryBrowse(target: target, path: pathBinding)
             }
             .navigationDestination(for: CinemaBoardCatalogTarget.self) { target in
-                CinemaBoardCatalogBrowse(target: target, path: $path)
+                CinemaBoardCatalogBrowse(target: target, path: pathBinding)
             }
             .navigationDestination(for: XperienceHomeRoute.self) { _ in
                 XperienceCollectionsBrowserView()
@@ -1723,7 +1736,7 @@ struct iOSHomeView: View {
                     .macBackAffordance()
                     #endif
             }
-            .iOSPlayerCover($player, account: account, core: core)
+            .iOSPlayerCover(playerBinding, account: account, core: core)
         }
     }
 
@@ -1736,7 +1749,7 @@ struct iOSHomeView: View {
         .macBleedUnderTitlebar()
         // Re-tapping the active Home tab pops any pushed detail back to root (#22); the scroll-to-top
         // above then lands on the root anchor. Switching tabs never bumps, so pushes survive switches.
-        .popToRootOnBump(TabScrollKeys.home, path: $path)
+        .popToRootOnBump(TabScrollKeys.home, path: pathBinding)
         .onValueChange(of: path.count) { onNavigationDepthChanged?($0) }
         .onAppear { onNavigationDepthChanged?(path.count) }
         // Hidden tabs stay mounted (opacity-switched) and never hit onDisappear, so quiet the ambient
@@ -1746,7 +1759,10 @@ struct iOSHomeView: View {
                 refreshContinueWatchingPresentation(selectionChanged: false)
                 if scenePhase == .active { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
                 hero.seed(heroCandidates, reduceMotion: reduceMotion)
-            } else { hero.stop() }
+            } else {
+                continueWatchingRequestID = nil
+                hero.stop()
+            }
         }
         .onValueChange(of: scenePhase) { phase in
             if phase == .active, isActive {
@@ -1925,6 +1941,7 @@ struct iOSHomeView: View {
     }
 
     private func stopHomeTasks() {
+        continueWatchingRequestID = nil
         hero.stop()
         resumeHoardTask?.cancel()
         resumeHoardTask = nil
@@ -2406,6 +2423,7 @@ struct iOSHomeView: View {
     ) {
         hero.noteInteraction()
         guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return }
+        continueWatchingRequestID = nil
         if let reason = provenance.intent.unavailableReason(id: item.id, type: item.type, videoID: item.cwVideoId) {
             unavailableContinueWatching = reason
             return
@@ -2416,14 +2434,33 @@ struct iOSHomeView: View {
         }
         // Computing the resume offset may await the account, so resolve the direct-resume launch in a
         // Task; fall back to opening detail when no remembered link fits.
-        Task {
-            if let launch = await iOSDirectResume(
+        let requestID = UUID()
+        continueWatchingRequestID = requestID
+        let stillCurrent: @MainActor () -> Bool = {
+            !Task.isCancelled && continueWatchingRequestID == requestID && player == nil
+                && provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID)
+        }
+        Task { @MainActor in
+            guard stillCurrent() else { return }
+            let launch = await iOSDirectResume(
                 for: item,
                 core: core,
                 account: account,
-                expectedTraktSession: provenance.traktSessionID
-            ) {
-                guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return }
+                expectedTraktSession: provenance.traktSessionID,
+                isCurrentLocalDownloadTarget: { target in
+                    guard provenance.source == .local else { return false }
+                    let rendered = continueWatchingRenderSnapshot
+                    let localItems = core.usesNativeProfileState || profiles.activeUsesEngineHistory
+                        ? core.continueWatching : profiles.cwItems
+                    return rendered.provenance.intent == provenance.intent
+                        && rendered.items.contains { $0.offlineDownloadTarget == target }
+                        && localItems.contains { DownloadedContinueWatchingTarget(item: $0) == target }
+                },
+                stillCurrent: stillCurrent
+            )
+            guard stillCurrent() else { return }
+            continueWatchingRequestID = nil
+            if let launch {
                 player = launch
                 resumeHoardTask?.cancel()
                 if let contentID = launch.resumeHoardContentID,
@@ -2640,7 +2677,13 @@ struct iOSLibraryView: View {
     // heterogeneous path needs the type-erased container. A typed `[FeaturedHeroItem]` binding also
     // DISABLES any view-destination `NavigationLink` in the subtree (SwiftUI can't encode it into the
     // typed path); that is the root cause of the dead Downloads pill (#25).
-    @State private var path = NavigationPath()
+    @State private var path = NavigationPath() {
+        didSet { if path != oldValue { continueWatchingRequestID = nil } }
+    }
+    private var pathBinding: Binding<NavigationPath> {
+        Binding(get: { path }, set: { path = $0 })
+    }
+    @State private var continueWatchingRequestID: UUID?
     /// Active client-side type segment (Movies / TV / Anime); `.all` keeps the flat, mixed grid.
     @State private var segment: LibrarySegment = .all
     @State private var showAccountRecovery = false
@@ -2662,7 +2705,12 @@ struct iOSLibraryView: View {
     @State private var overlayHeroCandidates: [FeaturedHeroItem] = []
     #if !os(tvOS)
     @ObservedObject private var downloads = DownloadStore.shared   // offline downloads section (#30)
-    @State private var downloadPlayer: iOSPlayerLaunch?            // play-from-local cover
+    @State private var downloadPlayer: iOSPlayerLaunch? {
+        didSet { if downloadPlayer?.id != oldValue?.id { continueWatchingRequestID = nil } }
+    }
+    private var downloadPlayerBinding: Binding<iOSPlayerLaunch?> {
+        Binding(get: { downloadPlayer }, set: { downloadPlayer = $0 })
+    }
     #endif
 
     /// Non-detail Library pushes (value-routed so they work alongside the typed detail destinations).
@@ -2739,16 +2787,20 @@ struct iOSLibraryView: View {
 
     /// The Library's compact Continue Watching shelf uses the same owner/profile source and the same
     /// direct-resume primitive as Home. It is a second entry point, not a second history model.
-    private var libraryContinueWatchingItems: [RailItem] {
+    private var libraryContinueWatching: (items: [RailItem], owner: PlaybackMutationTarget)? {
+        let owner = PlaybackMutationTarget.capture(core: core)
+        guard owner.stillOwnsCurrentContext(core: core) else { return nil }
         let source = core.usesNativeProfileState || profiles.activeUsesEngineHistory
             ? core.continueWatching
             : profiles.cwItems
         let residentCatalog = core.boardRows.flatMap(\.items)
-        return source.map { cinemaHistoryRailItem($0, catalog: residentCatalog, residentMeta: core.metaDetails?.meta) }
+        let items = source.map { cinemaHistoryRailItem($0, catalog: residentCatalog, residentMeta: core.metaDetails?.meta) }
+        guard owner.stillOwnsCurrentContext(core: core) else { return nil }
+        return (items, owner)
     }
 
     var body: some View {
-        NavigationStack(path: $path) {
+        NavigationStack(path: pathBinding) {
             ScrollView {
                 Color.clear.frame(height: 0).scrollToTopAnchor()   // re-tap Library tab -> scroll here
                 #if !os(tvOS)
@@ -2795,10 +2847,13 @@ struct iOSLibraryView: View {
                 .padding(.bottom, Theme.Space.lg)
                 .background(VortXProfileGlassCanvas(tint: Theme.Palette.accent))
                 #endif
-                if !libraryContinueWatchingItems.isEmpty {
+                if let shelf = libraryContinueWatching, !shelf.items.isEmpty {
                     PosterRail(title: "Continue Watching", eyebrow: "Pick up where you left off",
-                               items: libraryContinueWatchingItems, onTap: resumeLibraryContinueWatching,
-                               menu: .continueWatching, onDetails: { path.append(FeaturedHeroItem.from(rail: $0)) })
+                               items: shelf.items, onTap: { resumeLibraryContinueWatching($0, producer: shelf.owner) },
+                               menu: .continueWatching, onDetails: { item in
+                        guard shelf.owner.stillOwnsCurrentContext(core: core) else { return }
+                        path.append(FeaturedHeroItem.from(rail: item))
+                    })
                 }
                 // The owner profile's Library is the account library (engine), with its type/sort filter
                 // chips; an overlay profile's Library is its own private watch overlay, with no engine
@@ -2861,7 +2916,7 @@ struct iOSLibraryView: View {
                                 message: "The server did not accept this VortX session. Open Settings, then VortX account & sync, to sign in again. This device's saved data was not replaced.")
                             Button("Account settings") { showAccountRecovery = true }
                                 .buttonStyle(ChipButtonStyle())
-                            DiagnosticLogExportButton()
+                            DiagnosticLogExportButton(recoveryOnly: true)
                         }
                         .frame(minHeight: 420)
                     } else if vortxSync.isSignedIn, vortxSync.accountRestoreState == .failed {
@@ -2870,7 +2925,7 @@ struct iOSLibraryView: View {
                                 message: "Open VortX account & sync in Settings to retry. This device's saved data was not replaced.")
                             Button("Account settings") { showAccountRecovery = true }
                                 .buttonStyle(ChipButtonStyle())
-                            DiagnosticLogExportButton()
+                            DiagnosticLogExportButton(recoveryOnly: true)
                         }
                         .frame(minHeight: 420)
                     } else {
@@ -2910,7 +2965,7 @@ struct iOSLibraryView: View {
                 case .networkShares: iOSNetworkSharesView(onPlay: { downloadPlayer = $0 })
                 }
             }
-            .iOSPlayerCover($downloadPlayer, account: account, core: core)
+            .iOSPlayerCover(downloadPlayerBinding, account: account, core: core)
             #endif
             .onAppear { if core.library?.catalog.isEmpty != false { core.loadLibrary() } }
         }
@@ -2969,11 +3024,12 @@ struct iOSLibraryView: View {
         .onDisappear { if randomLibraryRoute == nil { clearRandomLibraryPick() } }
         // END RANDOM PICK LIBRARY LIFECYCLE
         // Re-tapping the active Library tab pops any pushed detail/Downloads back to root (#22).
-        .popToRootOnBump(TabScrollKeys.library, path: $path)
+        .popToRootOnBump(TabScrollKeys.library, path: pathBinding)
         // Quiet the ambient hero while this tab is hidden (mounted but opacity 0, so onDisappear never
         // fires); re-arm on return. Reseeds below are gated the same way so re-emits can't re-arm it.
         .onValueChange(of: isActive) { active in
             #if !os(tvOS)
+            if !active { continueWatchingRequestID = nil }
             // Offline launch routing handoff (#120), already-mounted case: hidden tabs stay mounted
             // forever (opacity-switched, #24), so a Library visited earlier in the session gets NO
             // fresh onAppear when the shell routes back to it; without this, the staged push would be
@@ -3019,7 +3075,12 @@ struct iOSLibraryView: View {
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
         // installed meta add-on. tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
         .onValueChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
-        .onDisappear { hero.stop() }
+        .onDisappear {
+            #if !os(tvOS)
+            continueWatchingRequestID = nil
+            #endif
+            hero.stop()
+        }
     }
 
     /// Tapping a card opens its detail (decoupled hero, #53); it only quiets the billboard rotation.
@@ -3126,11 +3187,34 @@ struct iOSLibraryView: View {
     }
     // END RANDOM PICK LIBRARY HELPERS
 
-    private func resumeLibraryContinueWatching(_ item: RailItem) {
+    private func resumeLibraryContinueWatching(_ item: RailItem, producer: PlaybackMutationTarget) {
+        let owner = PlaybackMutationTarget.capture(core: core)
+        guard isActive, owner == producer, owner.stillOwnsCurrentContext(core: core) else { return }
         hero.noteInteraction()
         #if !os(tvOS)
-        Task {
-            if let launch = await iOSDirectResume(for: item, core: core, account: account, expectedTraktSession: nil) {
+        let requestID = UUID()
+        let profileID = profiles.activeID
+        let accountBoundary = account.credentialBoundaryGeneration
+        continueWatchingRequestID = requestID
+        let stillCurrent: @MainActor () -> Bool = {
+            !Task.isCancelled && continueWatchingRequestID == requestID && downloadPlayer == nil
+                && owner.stillOwnsCurrentContext(core: core) && profiles.activeID == profileID
+                && account.credentialBoundaryGeneration == accountBoundary
+        }
+        Task { @MainActor in
+            guard stillCurrent() else { return }
+            let launch = await iOSDirectResume(
+                for: item, core: core, account: account, expectedTraktSession: nil,
+                isCurrentLocalDownloadTarget: { target in
+                    let localItems = core.usesNativeProfileState || profiles.activeUsesEngineHistory
+                        ? core.continueWatching : profiles.cwItems
+                    return localItems.contains { DownloadedContinueWatchingTarget(item: $0) == target }
+                },
+                stillCurrent: stillCurrent
+            )
+            guard stillCurrent() else { return }
+            continueWatchingRequestID = nil
+            if let launch {
                 downloadPlayer = launch
             } else {
                 path.append(FeaturedHeroItem.from(rail: item))
@@ -3383,6 +3467,10 @@ struct DownloadsView: View {
 
     @ObservedObject private var store = DownloadStore.shared
     private let manager = DownloadManager.shared
+    #if os(macOS)
+    @State private var showsUnavailableExternalDownload = false
+    @ObservedObject private var downloadLocations = MacDownloadLocations.shared
+    #endif
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
@@ -3391,6 +3479,10 @@ struct DownloadsView: View {
                     .font(Theme.Typography.cardTitle)
                     .foregroundStyle(Theme.Palette.textPrimary)
                 Spacer(minLength: 0)
+                #if os(macOS)
+                MacDownloadFolderButton()
+                    .buttonStyle(.bordered)
+                #endif
                 Text(store.formattedTotalSize())
                     .font(Theme.Typography.label)
                     .foregroundStyle(Theme.Palette.textTertiary)
@@ -3406,6 +3498,13 @@ struct DownloadsView: View {
                 }
             }
         }
+        #if os(macOS)
+        .alert("Download unavailable", isPresented: $showsUnavailableExternalDownload) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Reconnect the download drive or check that the file is still in its download folder.")
+        }
+        #endif
     }
 
     // MARK: Show folder
@@ -3522,13 +3621,19 @@ struct DownloadsView: View {
         let parts: [String] = {
             switch record.state {
             case .completed:
+                #if os(macOS)
+                if let location = record.macDownloadLocationID,
+                   downloadLocations.directory(for: location) == nil {
+                    return [String(localized: "Reconnect download drive"), record.qualityText].compactMap { $0 }
+                }
+                #endif
                 let size = ByteCountFormatter.string(fromByteCount: max(record.bytesDone, record.bytesTotal), countStyle: .file)
                 return [record.qualityText, size].compactMap { $0 }
             case .downloading:
                 let pct = Int(record.fractionComplete * 100)
                 return [String(localized: "Downloading \(pct)%"), record.retryNote].compactMap { $0 }
             case .paused:
-                return [String(localized: "Paused"), record.retryNote].compactMap { $0 }
+                return [record.errorText ?? String(localized: "Paused"), record.retryNote].compactMap { $0 }
             case .failed:
                 // Keep the honest retry note alongside the failure, so a doubly-failed batch episode reads
                 // "Failed · Retried with next-best source", not a bare "Failed" that hides the auto-swap (#119).
@@ -3557,7 +3662,15 @@ struct DownloadsView: View {
             case .queued:
                 EmptyView()
             }
-            iconButton("trash", "Delete") { manager.cancel(id: record.id) }
+            iconButton("trash", "Delete") {
+                #if os(macOS)
+                if let location = record.macDownloadLocationID, downloadLocations.directory(for: location) == nil {
+                    showsUnavailableExternalDownload = true
+                    return
+                }
+                #endif
+                manager.cancel(id: record.id)
+            }
         }
     }
 
@@ -3575,11 +3688,17 @@ struct DownloadsView: View {
 
     /// Play a completed download from its LOCAL file. Rebuilds the engine `PlaybackMeta` so progress /
     /// Continue Watching record exactly as for a streamed source; `isTorrent: false` because a finished
-    /// file plays directly (never back through the loopback torrent server). Fail-soft if the file is
-    /// missing (purged out from under us); drop the row.
+    /// file plays directly (never back through the loopback torrent server).
     private func play(_ record: DownloadRecord) {
-        guard record.state == .completed, store.fileExists(for: record) else {
-            if record.state == .completed { manager.cancel(id: record.id) }   // file gone → clean up the stale row
+        guard record.state == .completed else { return }
+        guard store.fileExists(for: record) else {
+            #if os(macOS)
+            if record.macDownloadLocationID != nil {
+                showsUnavailableExternalDownload = true
+                return
+            }
+            #endif
+            manager.cancel(id: record.id)   // Missing default-folder file: clean up the stale row.
             return
         }
         onPlay(record)
@@ -3699,25 +3818,12 @@ struct iOSDownloadsScreen: View {
             guard !Task.isCancelled, downloadLaunchRequest == request,
                   ProfileStore.shared.activeID == activeProfileID,
                   owner.stillOwnsCurrentContext(core: core) else { return }
-            // Match by library/episode ID, not whichever unrelated detail is still resident.
-            let engine = core.engineResumeSecondsByLibraryId(for: meta)
-            let resume: Double
-            if let engine, engine.isFinite, engine > 5 {
-                resume = engine
-            } else {
-                resume = await account.resumeOffset(for: meta)
-            }
-            guard !Task.isCancelled, downloadLaunchRequest == request,
+            guard let candidate = DownloadStore.shared.playableDownload(id: record.id, expected: meta),
+                  let prepared = await candidate.prepareForPlayback(core: core),
+                  !Task.isCancelled, downloadLaunchRequest == request,
                   ProfileStore.shared.activeID == activeProfileID,
-                  owner.stillOwnsCurrentContext(core: core),
-                  let current = DownloadStore.shared.records.first(where: { $0.id == record.id }),
-                  current.state == .completed, current.playbackMeta == meta,
-                  DownloadStore.shared.fileExists(for: current) else { return }
-            downloadPlayer = iOSPlayerLaunch(
-                url: DownloadStore.shared.fileURL(for: current), title: current.displayTitle,
-                headers: nil, resume: resume.isFinite ? max(0, resume) : 0, meta: meta,
-                qualityText: current.qualityText, isTorrent: false
-            )
+                  owner.stillOwnsCurrentContext(core: core) else { return }
+            downloadPlayer = iOSPlayerLaunch.downloaded(prepared.copy, resume: prepared.resume)
             downloadLaunchTask = nil
             downloadLaunchRequest = nil
         }
@@ -4846,6 +4952,11 @@ struct RailItem: Identifiable {
     /// The saved resume position in seconds, so a Continue Watching card can show the "1:03" resume
     /// timecode badge. Nil on every non-CW rail, so their cards are byte-for-byte unchanged.
     var resumeSeconds: Double? = nil
+
+    var offlineDownloadTarget: DownloadedContinueWatchingTarget? {
+        DownloadedContinueWatchingTarget(libraryID: id, type: type, cardVideoID: cwVideoId,
+                                         resumeSeconds: resumeSeconds, progress: progress, isUpNext: cwUpNext)
+    }
 }
 
 /// Reuses only metadata the current UI has already received. History membership, artwork identity, and
@@ -4946,6 +5057,14 @@ struct iOSPlayerLaunch: Identifiable {
     /// yt-direct adaptive pair (pasted YouTube links): the separate AUDIO stream mpv mounts alongside the
     /// video-only `url` (`--audio-file` sidecar). Forces the libmpv engine in PlayerScreen.
     var audioSidecarURL: URL? = nil
+    var downloadedPlayback: AppleDownloadedPlayback? = nil
+
+    static func downloaded(_ playback: AppleDownloadedPlayback, resume: Double) -> Self {
+        .init(url: playback.url, title: playback.record.displayTitle,
+              resume: resume.isFinite ? max(0, resume) : 0, meta: playback.record.playbackMeta,
+              qualityText: playback.record.qualityText, isTorrent: false, wasExplicitPick: true,
+              downloadedPlayback: playback)
+    }
 }
 
 extension View {
@@ -4980,7 +5099,24 @@ extension View {
                 // item.meta here attributed every in-player binge advance's saves to the LAUNCH episode.
                 onProgress: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
                 onSeek: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
+                downloadedPlayback: item.downloadedPlayback,
+                ownsDownloadedPresentation: { launch.wrappedValue?.id == item.id },
+                onDownloadedAdvance: { candidate, onFailure in
+                    guard launch.wrappedValue?.id == item.id else { return }
+                    core.unloadEnginePlayer()
+                    Task { @MainActor in
+                        let prepared = await candidate.prepareForPlayback(core: core, refreshSeasonBoundary: false)
+                        guard launch.wrappedValue?.id == item.id else { return }
+                        guard let prepared else {
+                            onFailure()
+                            launch.wrappedValue = nil
+                            return
+                        }
+                        launch.wrappedValue = .downloaded(prepared.copy, resume: prepared.resume)
+                    }
+                },
                 onClose: {
+                    guard launch.wrappedValue?.id == item.id else { return }
                     item.cancelNextEpisodePreparation?()
                     core.unloadEnginePlayer()
                     launch.wrappedValue = nil
@@ -5000,8 +5136,10 @@ extension View {
 @MainActor
 private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                              account: StremioAccount,
-                             expectedTraktSession: TraktSessionID?) async -> iOSPlayerLaunch? {
-    guard expectedTraktSession == nil
+                             expectedTraktSession: TraktSessionID?,
+                             isCurrentLocalDownloadTarget: @MainActor (DownloadedContinueWatchingTarget) -> Bool,
+                             stillCurrent: @MainActor () -> Bool) async -> iOSPlayerLaunch? {
+    guard stillCurrent(), expectedTraktSession == nil
             || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     let pid = ProfileStore.shared.activeID
     let accountBoundary = account.credentialBoundaryGeneration
@@ -5009,11 +5147,48 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     if item.cwUpNext {
         LastStreamStore.logResume("upNext", libraryId: item.id, profileID: pid); return nil
     }
-    guard let entry = LastStreamStore.entry(for: item.id, profileID: pid) else {
+    let remembered = LastStreamStore.entry(for: item.id, profileID: pid)
+    let rememberedURL = remembered.flatMap { URL(string: $0.url) }
+    if expectedTraktSession == nil, ConnectivityMonitor.shared.hasConfirmedOfflinePath,
+       remembered == nil || rememberedURL?.isFileURL == false,
+       let target = item.offlineDownloadTarget, isCurrentLocalDownloadTarget(target) {
+        guard let candidate = DownloadStore.shared.offlineContinueWatchingDownload(for: target) else { return nil }
+        let prepared = await candidate.prepareForPlayback(
+            core: core, displayedResume: target.resumeSeconds, refreshSeasonBoundary: false
+        )
+        guard stillCurrent(), ProfileStore.shared.activeID == pid,
+              account.credentialBoundaryGeneration == accountBoundary,
+              candidate.ownsCurrentContext(core: core),
+              LastStreamStore.entry(for: item.id, profileID: pid) == remembered,
+              isCurrentLocalDownloadTarget(target) else { return nil }
+        if ConnectivityMonitor.shared.hasConfirmedOfflinePath {
+            guard let prepared, prepared.copy.record == candidate.record,
+                  prepared.copy.url == candidate.url else { return nil }
+            return .downloaded(prepared.copy.requiringConfirmedOfflineAtInitialMount(), resume: prepared.resume)
+        }
+    }
+    guard let entry = remembered else {
         LastStreamStore.logResume("noEntry", libraryId: item.id, profileID: pid); return nil
     }
-    guard let url = URL(string: entry.url) else {
+    guard let url = rememberedURL else {
         LastStreamStore.logResume("badURL", libraryId: item.id, profileID: pid); return nil
+    }
+    if url.isFileURL {
+        let meta = PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,
+                                name: entry.name, poster: entry.poster,
+                                season: entry.season, episode: entry.episode)
+        guard item.type == entry.type,
+              let candidate = DownloadStore.shared.rememberedPlayableDownload(
+                  for: meta, cardVideoID: item.cwVideoId, file: url
+              ) else { return nil }
+        let displayedResume = item.resumeSeconds.flatMap { $0 > 0 ? $0 : nil }
+        guard let prepared = await candidate.prepareForPlayback(core: core, displayedResume: displayedResume),
+              stillCurrent(), ProfileStore.shared.activeID == pid,
+              account.credentialBoundaryGeneration == accountBoundary,
+              expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession,
+              prepared.copy.ownsCurrentContext(core: core),
+              LastStreamStore.entry(for: item.id, profileID: pid) == entry else { return nil }
+        return .downloaded(prepared.copy, resume: prepared.resume)
     }
     if PlaybackSettings.torrentsDisabled && entry.torrent == true {
         LastStreamStore.logResume("torrentDisabled", libraryId: item.id, profileID: pid); return nil
@@ -5054,10 +5229,11 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     // entry carries debrid provenance; a non-debrid entry returns the stored url unchanged (refreshed == false),
     // so torrent / plain-direct resumes are byte-identical to before.
     let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
-    guard (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
+    guard stillCurrent(), (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
           ProfileStore.shared.activeID == pid,
           account.credentialBoundaryGeneration == accountBoundary else { return nil }
     let playURL = refreshed ? resolvedURL : url
+    guard !playURL.isFileURL else { return nil }
     if hasEpisodicPhysicalIdentity, entry.torrent == true, entry.fileIdx == nil, !refreshed {
         LastStreamStore.logResume("episodeTorrentMissingFileIdx", libraryId: item.id, profileID: pid)
         return nil
@@ -5097,7 +5273,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         resume = engine
     } else {
         resume = await account.resumeOffset(for: meta)
-        guard expectedTraktSession == nil
+        guard stillCurrent(), expectedTraktSession == nil
                 || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     }
     // For a MOVIE, kick off loading the title's streams in the background so a stale stored link (debrid URLs
@@ -5132,6 +5308,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
             for _ in 0 ..< 6 {
                 if core.metaDetails?.meta?.id == item.id, !(core.metaDetails?.meta?.videos?.isEmpty ?? true) { break }
                 try? await Task.sleep(for: .milliseconds(250))
+                guard stillCurrent() else { return nil }
             }
         }
         let season = entry.season ?? 1
@@ -5265,7 +5442,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
             )
         }
     }
-    guard (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
+    guard stillCurrent(), (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
           ProfileStore.shared.activeID == pid,
           account.credentialBoundaryGeneration == accountBoundary else { return nil }
     return iOSPlayerLaunch(url: playURL, title: entry.title, headers: entry.headers,
@@ -6163,22 +6340,30 @@ private typealias PlatformPosterImage = NSImage
 /// failure. The caller keeps its own frame / crop / clip so the fill-crop framing (F37) is unchanged.
 struct CachedPosterImage: View {
     let url: String?
-    @State private var image: VXPosterImage?
-    @State private var failed = false
+    var fallbackURLs: [String?] = []
+    @State private var result: LoadResult?
     @Environment(\.cinemaFixtureDisablesArtworkLoading) private var disablesArtworkLoading
+
+    private struct LoadResult {
+        let candidates: [String]
+        let image: VXPosterImage?
+    }
 
     /// Paint instantly (no task hop, no blank frame) when the decoded image is already in memory. The
     /// `.task` still runs to load a cold poster; on a warm one it returns immediately.
-    private var synchronousCache: VXPosterImage? {
-        guard let raw = url, let u = URL(string: raw) else { return nil }
-        return PosterImageLoader.cached(u)
+    private func synchronousCache(_ candidates: [String]) -> VXPosterImage? {
+        candidates.lazy.compactMap(URL.init(string:)).compactMap { PosterImageLoader.cached($0) }.first
     }
 
     var body: some View {
+        let candidates = fallbackURLs.isEmpty
+            ? [url].compactMap { $0 }.filter { !$0.isEmpty }
+            : ArtworkFallbackPolicy.candidates([url] + fallbackURLs)
+        let current = result.flatMap { $0.candidates == candidates ? $0 : nil }
         let renderedImage = Group {
-            if let image = image ?? synchronousCache {
+            if let image = current?.image ?? synchronousCache(candidates) {
                 imageView(image).resizable().scaledToFill()
-            } else if failed {
+            } else if current != nil || candidates.isEmpty {
                 Theme.Palette.surface1.overlay(
                     Image(systemName: "film").font(.system(size: 28)).foregroundStyle(Theme.Palette.textTertiary))
             } else {
@@ -6188,7 +6373,7 @@ struct CachedPosterImage: View {
         if disablesArtworkLoading {
             renderedImage
         } else {
-            renderedImage.task(id: url) { await load() }
+            renderedImage.task(id: candidates) { await load(candidates) }
         }
     }
 
@@ -6200,24 +6385,17 @@ struct CachedPosterImage: View {
         #endif
     }
 
-    private func load() async {
-        failed = false
-        guard let raw = url, !raw.isEmpty else { failed = true; return }
-        if let img = await PosterImageLoader.load(raw) {
-            image = img
-            return
+    private func load(_ candidates: [String]) async {
+        var image = await ArtworkFallbackPolicy.firstAvailable(candidates) { await PosterImageLoader.load($0) }
+        guard !Task.isCancelled else { return }
+        if image == nil, !candidates.isEmpty {
+            // Keep one bounded retry for a card that stays visible after a short network interruption.
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled else { return }
+            image = await ArtworkFallbackPolicy.firstAvailable(candidates) { await PosterImageLoader.load($0) }
         }
-        if Task.isCancelled { return }   // scroll-away: leave `failed` false so the recycled cell reloads
-        // One quick retry before latching the film placeholder, so a transient network blip on a card that
-        // stays on screen (not scrolled away) does not leave it permanently blank, the "posters lose their
-        // picture icon" report. Still bounded (a single retry) so a genuinely dead URL settles fast.
-        try? await Task.sleep(nanoseconds: 400_000_000)
-        if Task.isCancelled { return }
-        if let img = await PosterImageLoader.load(raw) {
-            image = img
-        } else if !Task.isCancelled {
-            failed = true
-        }
+        guard !Task.isCancelled else { return }
+        result = .init(candidates: candidates, image: image)
     }
 }
 
@@ -6251,41 +6429,75 @@ private struct WarmCachedPosterImage: View {
 }
 
 /// iOS/Mac cinematic landscape (16:9) catalog art, the touch twin of tvOS `LandscapeArt`: a clean
-/// TEXTLESS TMDB backdrop resolved by id via `LandscapeBackdropCache`. With no TMDB backdrop (no key
-/// set, or none on TMDB) it does NOT crop a 2:3 poster into an ugly slab: it fills with a heavily
-/// blurred + darkened copy of the poster behind a fit copy, so the 16:9 frame always looks intentional.
+/// TEXTLESS TMDB backdrop resolved by id via `LandscapeBackdropCache`. The card can paint its supplied
+/// art while the backdrop lookup is pending or unavailable, using a blurred fill behind a fit copy.
 private struct LandscapeArtiOS: View {
     let id: String
     let type: String
     let title: String
-    let poster: String?
+    let preferredPoster: String?
+    let fallbackPosters: [String?]
     var fallbackIMDb: String? = nil
-    @State private var image: PlatformPosterImage?
-    @State private var logo: PlatformPosterImage?
-    @State private var usedBackdrop = false
-    @State private var failed = false
+    @State private var posterResult: ArtworkResult?
+    @State private var backdropResult: ArtworkResult?
+    @State private var titleLogo: ArtworkResult?
+
+    private struct Request: Hashable {
+        let id: String
+        let type: String
+        let posters: [String]
+        let ratedPoster: String?
+    }
+
+    private struct ArtworkResult {
+        let request: Request
+        let image: PlatformPosterImage?
+        var url: String? = nil
+    }
+
+    private static let maxPixel: CGFloat = 1280
+
+    private var request: Request {
+        let fallbacks = ArtworkFallbackPolicy.candidates(fallbackPosters)
+        let posters = ArtworkFallbackPolicy.candidates([preferredPoster] + fallbackPosters)
+        let ratedPoster = posters.first.flatMap { candidate in
+            PosterArtwork.bakesRatings(forID: id) && !fallbacks.contains(candidate) ? candidate : nil
+        }
+        return .init(id: id, type: type, posters: posters, ratedPoster: ratedPoster)
+    }
 
     var body: some View {
+        let request = request
+        let backdrop = backdropResult.flatMap { $0.request == request ? $0 : nil }
+        let poster = posterResult.flatMap { $0.request == request ? $0 : nil }
+        let logo = titleLogo.flatMap { $0.request == request ? $0.image : nil }
+        let cached = request.posters.lazy.compactMap { raw -> (PlatformPosterImage, String)? in
+            guard let url = URL(string: raw),
+                  let image = PosterImageLoader.cached(url, maxPixel: Self.maxPixel) else { return nil }
+            return (image, raw)
+        }.first
         Group {
-            if let image {
-                if usedBackdrop {
-                    imageView(image).resizable().scaledToFill()
-                        .overlay { titleLayer }
-                } else {
-                    imageView(image).resizable().scaledToFill()
-                        .blur(radius: 18).opacity(0.55)
-                        .overlay(Color.black.opacity(0.35))
-                        .overlay(imageView(image).resizable().scaledToFit())
-                }
-            } else if failed {
+            if let image = backdrop?.image {
+                imageView(image).resizable().scaledToFill()
+                    .overlay { titleLayer(logo: logo) }
+            } else if let image = poster?.image ?? cached?.0 {
+                imageView(image).resizable().scaledToFill()
+                    .blur(radius: 18).opacity(0.55)
+                    .overlay(Color.black.opacity(0.35))
+                    .overlay(imageView(image).resizable().scaledToFit())
+            } else if backdrop != nil, poster != nil {
                 Theme.Palette.surface1.overlay(
                     Image(systemName: "film").font(.system(size: 24)).foregroundStyle(Theme.Palette.textTertiary))
             } else {
                 Theme.Palette.surface1
             }
         }
-        .overlay(alignment: .topLeading) { ratingBadge }
-        .task(id: id) { await load() }
+        .overlay(alignment: .topLeading) {
+            ratingBadge(paintedPoster: backdrop?.image == nil ? (poster?.url ?? cached?.1) : nil,
+                        ratedPoster: request.ratedPoster)
+        }
+        .task(id: request) { await loadPoster(request) }
+        .task(id: request) { await loadBackdrop(request) }
     }
 
     /// The clean 16:9 backdrop carries NO baked rating (unlike the portrait poster the service bakes), so
@@ -6293,17 +6505,17 @@ private struct LandscapeArtiOS: View {
     /// service. Suppressed only when a genuinely BAKED poster is on screen (the rare no-backdrop fallback for
     /// a renderable id), so a rating is never double-drawn. Top-LEADING to clear the watched checkmark (which
     /// owns top-trailing) and the outer PosterCardiOS portrait rating badge (also top-trailing).
-    @ViewBuilder private var ratingBadge: some View {
-        let bakedPosterShown = !usedBackdrop && PosterArtwork.bakesRatings(forID: id)
-        CardRatingBadge(id: id, type: type,
-                        active: PosterArtwork.bakesRatings && !bakedPosterShown,
-                        textSize: 10, reservedTrailing: 28, fallbackIMDb: fallbackIMDb)
+    private func ratingBadge(paintedPoster: String?, ratedPoster: String?) -> some View {
+        let bakedPosterShown = paintedPoster != nil && paintedPoster == ratedPoster
+        return CardRatingBadge(id: id, type: type,
+                               active: PosterArtwork.bakesRatings(forID: id) && !bakedPosterShown,
+                               textSize: 10, reservedTrailing: 28, fallbackIMDb: fallbackIMDb)
             .padding(6)
     }
 
     /// The title ON the backdrop: the clean TMDB clearlogo when one resolves, else styled text, over a
     /// bottom scrim. GeometryReader so the logo scales to the (small) card.
-    @ViewBuilder private var titleLayer: some View {
+    private func titleLayer(logo: PlatformPosterImage?) -> some View {
         GeometryReader { geo in
             ZStack(alignment: .bottomLeading) {
                 LinearGradient(colors: [.clear, .black.opacity(0.75)], startPoint: .center, endPoint: .bottom)
@@ -6329,24 +6541,37 @@ private struct LandscapeArtiOS: View {
         #endif
     }
 
-    private func load() async {
-        failed = false; logo = nil
-        let backdrop = await LandscapeBackdropCache.backdrop(id: id, type: type)
-        usedBackdrop = backdrop != nil
-        let raw = backdrop ?? PosterArtwork.poster(id: id, fallback: poster)
-        guard let raw, !raw.isEmpty, let u = URL(string: raw) else { failed = true; return }
-        guard let img = await fetchImage(u) else { if !Task.isCancelled { failed = true }; return }
-        image = img
-        // On a real backdrop, resolve the title clearlogo for the overlay (titleLayer falls back to text).
-        if usedBackdrop, let lg = await LandscapeBackdropCache.logo(id: id, type: type), let lu = URL(string: lg) {
-            logo = await fetchImage(lu)
+    private func loadPoster(_ request: Request) async {
+        if backdropResult?.request == request, backdropResult?.image != nil { return }
+        if posterResult?.request == request, posterResult?.image != nil { return }
+        let loaded: ArtworkResult? = await ArtworkFallbackPolicy.firstAvailable(request.posters) { url in
+            guard let image = await PosterImageLoader.load(url, maxPixel: Self.maxPixel) else { return nil }
+            return ArtworkResult(request: request, image: image, url: url)
         }
+        guard !Task.isCancelled else { return }
+        posterResult = loaded ?? .init(request: request, image: nil)
     }
 
-    private func fetchImage(_ u: URL) async -> PlatformPosterImage? {
-        // Shared loader: dedicated large URLCache, bounded concurrency, off-main ImageIO decode. Backdrops are
-        // wider than portrait posters, so allow a larger downsample ceiling to keep the 16:9 art crisp.
-        await PosterImageLoader.load(u.absoluteString, maxPixel: 1280)
+    private func loadBackdrop(_ request: Request) async {
+        if backdropResult?.request != request || backdropResult?.image == nil {
+            let backdrop = await LandscapeBackdropCache.backdrop(id: request.id, type: request.type)
+            guard !Task.isCancelled else { return }
+            let image: PlatformPosterImage? = if let backdrop {
+                await PosterImageLoader.load(backdrop, maxPixel: Self.maxPixel)
+            } else {
+                nil
+            }
+            guard !Task.isCancelled else { return }
+            backdropResult = .init(request: request, image: image)
+        }
+        // A scroll-away may have cancelled the logo after the backdrop was already painted.
+        if titleLogo?.request == request, titleLogo?.image != nil { return }
+        guard backdropResult?.request == request, backdropResult?.image != nil, !Task.isCancelled,
+              let logo = await LandscapeBackdropCache.logo(id: request.id, type: request.type),
+              !Task.isCancelled else { return }
+        let loadedLogo = await PosterImageLoader.load(logo, maxPixel: Self.maxPixel)
+        guard !Task.isCancelled else { return }
+        titleLogo = .init(request: request, image: loadedLogo)
     }
 }
 
@@ -6424,6 +6649,8 @@ private struct CinemaPosterCardBody: View {
     private var displayName: String { presentation.displayName }
     /// The poster to show: the pooled localized (language-matched) poster when available, else the add-on's.
     private var displayPoster: String? { presentation.displayPoster }
+    private var publicPoster: String? { PosterArtwork.poster(id: id, fallback: displayPoster ?? fallbackArt) }
+    private var publicPosterFallbacks: [String?] { [displayPoster, poster, fallbackArt] }
 
     /// The existing Appearance control remains authoritative. When Landscape is selected it applies to
     /// every card, including private history rows; those rows use an already-warm-only renderer below.
@@ -6475,7 +6702,8 @@ private struct CinemaPosterCardBody: View {
                         if privateArtwork {
                             privateLandscapeArt
                         } else {
-                            LandscapeArtiOS(id: id, type: type, title: displayName, poster: displayPoster ?? fallbackArt,
+                            LandscapeArtiOS(id: id, type: type, title: displayName, preferredPoster: publicPoster,
+                                            fallbackPosters: publicPosterFallbacks,
                                             fallbackIMDb: imdbRating)
                         }
                     } else if privateArtwork, TraktArtworkPolicy.isFirstPartyArtwork(displayPoster ?? fallbackArt) {
@@ -6486,7 +6714,7 @@ private struct CinemaPosterCardBody: View {
                     } else if privateArtwork {
                         WarmCachedPosterImage(url: displayPoster ?? fallbackArt)
                     } else {
-                        CachedPosterImage(url: PosterArtwork.poster(id: id, fallback: displayPoster ?? fallbackArt))
+                        CachedPosterImage(url: publicPoster, fallbackURLs: publicPosterFallbacks)
                     }
                 }
                     .frame(width: cardW, height: cardH)

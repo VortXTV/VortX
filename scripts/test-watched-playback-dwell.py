@@ -44,8 +44,23 @@ else:
     tv_method = tv_method.replace("{ let d =", "{" + for_source_guard + "let d =", 1)
 
 exit_mark = block(ios[ios.index("@MainActor private func leavePlayback()"):], "if !persistenceBlockedForExit, assetSanityAccepted, !effectivelyLive,")
-eof_ios = block(ios[ios.index("case MPVProperty.endFileEof:"):], "if !markedWatched, !effectivelyLive, let m = curMeta")
-eof_tv = block(tv[tv.index("case MPVProperty.endFileEof:"):], "if !markedWatched, let m = curMeta")
+
+
+def eof_actions(source, watched_marker):
+    handler = block(source, "private func handleProperty(")
+    eof = handler[handler.index("case MPVProperty.endFileEof:"):].split("\n        case ", 1)[0]
+    watched = block(eof, watched_marker)
+    if "--baseline" in sys.argv:
+        return watched
+    admission = block(eof, "guard let historyDuration = automaticHistoryDuration(owner: loadToken)")
+    assert eof.index("rejectPrematureEOFIfNeeded") < eof.index(admission) < eof.index(watched)
+    assert eof.index(admission) < eof.index("ScrobbleCoordinator.shared.playbackStopped")
+    setup = "let loadToken = coordinator.player?.activeLoadToken\n"
+    return setup + admission + "\n_ = historyDuration\n" + watched
+
+
+eof_ios = eof_actions(ios, "if !markedWatched, !effectivelyLive, let m = curMeta")
+eof_tv = eof_actions(tv, "if !markedWatched, let m = curMeta")
 models = (root / "app/SourcesShared/CoreModels.swift").read_text()
 fixture = (root / "app/Tests/WatchedPlaybackDwellCallsiteTests.swift").read_text()
 fixture = fixture.replace("// MODELS", "\n".join(block(models, marker) for marker in ["struct PlayerLoadToken:", "struct PlayerTimePositionEvent:"]))
@@ -61,7 +76,7 @@ if new_policy:
     for source in (ios, tv):
         timepos = source[source.index("case MPVProperty.timePos:"):]
         assert "updateWatchedDwell(with: event)" in timepos[:2000]
-        for marker in ("private func viewerPause()", "private func handleDeferredResumeUserSeek(", "private func resetRawPosition(", "private func resetRuntimeForIssuedSourceSwitch(", "private func resetRuntimeForIssuedEpisode("):
+        for marker in ("private func viewerPause(", "private func handleDeferredResumeUserSeek(", "private func resetRawPosition(", "private func resetRuntimeForIssuedSourceSwitch(", "private func resetRuntimeForIssuedEpisode("):
             assert "watchedDwell.reset()" in block(source, marker), marker
         for prop in ("pause", "pausedForCache", "duration"):
             section = source[source.index("case MPVProperty." + prop + ":"):]
@@ -69,14 +84,6 @@ if new_policy:
     assert "watchedDwell.reset()" in ios[ios.index("onEditingChanged: { editing in"):][:250]
     assert "watchedDwell.reset()" in block(tv, "private func scrubBy(")
     assert "watchedZoneSince" not in tv
-    # True EOF completion code is deliberately not part of this behavior change.
-    for path, source in [("app/Sources/PlayerScreen.swift", ios), ("app/SourcesTV/TVPlayerView.swift", tv)]:
-        original = subprocess.check_output(["git", "-C", str(root), "show", base + ":" + path], text=True)
-        def eof_section(text):
-            handler = block(text, "private func handleProperty(")
-            tail = handler[handler.index("case MPVProperty.endFileEof:"):]
-            return tail.split("\n        case ", 1)[0]
-        assert eof_section(source) == eof_section(original), "Owned EOF admission/completion changed"
 build = root / "app/build/watched-playback-dwell"
 build.mkdir(parents=True, exist_ok=True)
 (build / "CallsiteTests.swift").write_text(fixture)

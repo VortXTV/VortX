@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.ActivityManager
 import android.app.Application
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Process
@@ -28,6 +29,7 @@ import com.vortx.android.net.VortXEdgeAuth
 import com.vortx.android.ui.prefs.PosterStylePreferences
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
 import com.vortx.android.downloads.DownloadManager
@@ -39,6 +41,7 @@ import com.vortx.android.diagnostics.CrashReporter
 import com.vortx.android.engine.NativeCatalogRepository
 import com.vortx.android.engine.AndroidNativePlaybackResolver
 import com.vortx.android.engine.NativeAccountCoordinator
+import com.vortx.android.engine.NativeAccountBinding
 import com.vortx.android.engine.runNativeRetirementAttempt
 import com.vortx.android.engine.NativeProfileAccess
 import com.vortx.android.engine.VortxAccountScope
@@ -57,18 +60,32 @@ import com.vortx.android.notifications.NewEpisodeNotifications
 import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.PlaylistScopeTransition
+import com.vortx.android.player.PlaybackOwnerEpoch
+import com.vortx.android.player.PlaybackOwnerToken
 import com.vortx.android.update.UpdateChecker
 import com.vortx.android.sync.AccountFileRestoreExternalExclusion
+import com.vortx.android.sync.AccountSyncForeground
 import com.vortx.android.sync.ApplicationAccountFileRestoreExclusion
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.sync.SessionOwnerSnapshot
+import com.vortx.android.tv.WatchNextOwnerIdentity
+import com.vortx.android.tv.WatchNextPublisher
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /// Owns the process-lifetime VortX engine session ([NativeAccountCoordinator]) and the repositories built on
 /// it. An `Activity` can be torn down and recreated within the same process, so every `MainActivity.onCreate`
@@ -149,6 +166,69 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             gate
         } }) }
     internal fun nativeStreamingAccounts(): NativeAccountCoordinator = nativeAccounts
+
+    internal fun clearWatchNextIfDisabled() {
+        applicationScope.launch { WatchNextPublisher.clearWhenDisabled(this@VortXApplication) }
+    }
+
+    /** IO only. Unavailable encrypted state is never allowed to retire launcher rows. */
+    private fun retireWatchNextAfterSignOut(manager: VortXSyncManager, owner: SessionOwnerSnapshot.SignedOutLocal) {
+        if (!hasWatchNextLauncher()) return
+        val admit = manager.captureLocalLibraryMutationAdmission() ?: return
+        WatchNextPublisher.clearAfterSignOut(this) { delete ->
+            admit { syncManager === manager && manager.sessionOwnerSnapshot() == owner && delete() }
+        }
+    }
+
+    private fun hasWatchNextLauncher(): Boolean =
+        runCatching { packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) }.getOrDefault(false)
+
+    /** Retire attributable old-account rows without waiting for the next native mount. */
+    private fun retireWatchNextOtherAccounts(manager: VortXSyncManager, owner: SessionOwnerSnapshot.Account): Boolean {
+        if (!hasWatchNextLauncher()) return true
+        val admit = manager.captureLocalLibraryMutationAdmission() ?: return false
+        return WatchNextPublisher.retireOtherAccounts(this, owner.id) { delete ->
+            admit { syncManager === manager && manager.sessionOwnerSnapshot() == owner && delete() }
+        }
+    }
+
+    internal class WatchNextMount(
+        val owner: ContinueWatchingOwner,
+        val identity: WatchNextOwnerIdentity,
+        val admit: (() -> Boolean) -> Boolean,
+    )
+
+    /** Capture the one exact Session, authenticated account, native binding and playback epoch. */
+    internal fun captureWatchNextMount(epoch: PlaybackOwnerToken): WatchNextMount? = runCatching {
+        val session = nativeAccounts.session()
+        session.withCurrentRead { read ->
+            val native = read.owner
+            val manager = syncManager ?: return@withCurrentRead null
+            val account = nativeAccounts.accountFor(session) ?: return@withCurrentRead null
+            val accountAdmission = manager.captureLocalLibraryMutationAdmission() ?: return@withCurrentRead null
+            fun admitCurrentMount(write: () -> Boolean): Boolean = accountAdmission {
+                syncManager === manager && manager.sessionOwnerSnapshot() == account &&
+                    nativeAccounts.withCompletedPickerMount(session, account) {
+                        PlaybackOwnerEpoch.isCurrent(epoch) && write()
+                    }
+            }
+            if (!admitCurrentMount { true }) return@withCurrentRead null
+            val binding = NativeAccountBinding.read(read.state, native.profileID)
+            val scope = native.scope.digest
+            val identity = WatchNextOwnerIdentity(account.id, scope, native.profileID, binding.kind,
+                binding.json().getJSONObject("account").opt("value") as? String, binding.revision, binding.transactionID)
+            val owner = ContinueWatchingOwner(native.profileID, scope, native.scope.accountID, true, native.revision)
+            WatchNextMount(owner, identity) { write ->
+                runCatching {
+                    session.withCurrentRead { current ->
+                        current.owner == native && binding.matches(NativeAccountBinding.read(current.state, native.profileID)) &&
+                            admitCurrentMount(write)
+                    }
+                }.getOrDefault(false)
+            }
+        }
+    }.getOrNull()
+
     private val xperienceCatalogDelegate = lazy {
         com.vortx.android.engine.NativeXperienceCatalogAccess(nativeAccounts, nativeRepository, applicationScope)
     }
@@ -228,6 +308,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         // Fail closed until the encrypted session store has produced a definitive account or sign-out.
         // This process-wide binding precedes every lazy repository, resolver, and settings consumer.
         DebridKeys.bindAccountOwnerSource { DebridAccountOwnerState.UnknownOrUnavailable }
+        DebridKeys.bindUsenetOwnerAdmission(null)
         // Stand up the multi-profile core once, before anything touches the engine (the engine session is
         // built lazily on first catalog/auth access, after this). ProfileStore.init makes
         // ProfileStore.shared/activeProfileId available to the source-pin per-profile key.
@@ -260,10 +341,6 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             PosterStylePreferences.init(this)
             LocalizedMetadataStore.init(this)
         }.onFailure { Log.w(TAG, "Poster-artwork stores init failed; art stays at add-on/default behavior", it) }
-        // Activate the (until-now dormant) VortX account sync engine now that the roster + watch overlay it
-        // folds into are stood up: construct VortXSyncManager, wire its push seams, and add the foreground
-        // pull. Fail-soft inside; a no-op when signed out, and never on the critical launch path.
-        wireAccountSync()
         // Connect the issuer and live consent observer. The repository's typed owner authorization is the
         // only Source Index network entrance; the old Boolean/frontend entrance remains closed.
         wireMoatGroundwork()
@@ -271,6 +348,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             .onFailure { Log.w(TAG, "Media-server store init failed; the feature stays dormant", it) }
         startIPTVCleanupReplay()
         initDownloads()
+        wireAccountSync()
         // New-episode alerts (F5): (re)arm the WorkManager library sweep if the user has alerts on (default
         // ON), so a followed show pings even with no UI opened. Fail-soft: never break app start.
         runCatching { NewEpisodeNotifications.scheduleSweepIfEnabled(this) }
@@ -296,6 +374,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             scope = applicationScope,
             initialize = { IPTVPlaylists.init(this) },
             resumeAll = {
+                awaitAccountSyncStartup()
                 val repo = catalogRepository
                 IPTVCleanupCoordinator(
                     store = IPTVPlaylists.cleanupStore(),
@@ -307,6 +386,9 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             },
         )
     }
+
+    private val downloadStoresReady = CompletableDeferred<Boolean>()
+    private val downloadRecoveryMutex = Mutex()
 
     /**
      * Stand up the offline-downloads subsystem: hydrate the local index, restore the queue-manager settings, then do
@@ -322,62 +404,112 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
      *  2. [com.vortx.android.downloads.DownloadManager.retryDownloadsAwaitingUnlock] is the app-foreground leg of the
      *     #132 recovery. Apple wires three triggers for this (`protectedDataDidBecomeAvailable`, `didBecomeActive`,
      *     `willEnterForeground`); [com.vortx.android.downloads.DownloadUnlockReceiver] covers the unlock/boot legs,
-     *     and this covers the "unlocked while the app was dead, so the broadcast was missed" case. It no-ops when
-     *     nothing is parked, so an ordinary launch pays nothing.
+     *     and this covers the "unlocked while the app was dead, so the broadcast was missed" case.
      */
     private fun initDownloads() {
         runCatching {
             DownloadStore.init(this)
             DownloadManager.init(this)
         }.onFailure {
+            downloadStoresReady.complete(false)
             Log.w(TAG, "Download store init failed; downloads stay dormant this launch", it)
             return
         }
-        CoroutineScope(Dispatchers.IO).launch {
-            runCatching {
-                DownloadManager.reconcileInFlight()
-                DownloadManager.retryDownloadsAwaitingUnlock()
-            }.onFailure {
-                // Fail-soft: a record that could not be reconciled stays as it is and remains resumable by hand,
-                // which is exactly Apple's fallback. Never let download bookkeeping break app start.
-                Log.w(TAG, "Download reconcile failed; in-flight rows stay as they are and remain resumable", it)
-            }
+        downloadStoresReady.complete(true)
+        applicationScope.launch {
+            retryDownloadRecovery()
         }
     }
 
-    /// The process-lifetime VortX account sync engine, or null when it could not be stood up (a
-    /// [ProfileStore] init failure, or a keystore problem building its session store). Held here for the same
-    /// reason as the engine session -- one instance keyed to the [Application], never per Activity --
-    /// so its debounced auto-push scope and the roster/overlay seams it installed on [ProfileStore] live for
-    /// the whole process. Nullable + fail-soft: sync is OFF the critical launch path (VortX works fully
-    /// signed out), so a null here degrades to "no cross-device sync this launch", never a crash.
-    private var sourceIndexSessionObserver: kotlinx.coroutines.Job? = null
-    private var sourceIndexConsentObserver: android.content.SharedPreferences.OnSharedPreferenceChangeListener? = null
-    var syncManager: VortXSyncManager? = null
-        private set(value) {
-            if (field !== value) {
-                com.vortx.android.singularity.SourceIndexLifecycle.invalidateDeferred()
-                com.vortx.android.player.PlaybackOwnerEpoch.transition { field = value }
-                com.vortx.android.singularity.SourceIndexLifecycle.invalidateDeferred()
-                sourceIndexSessionObserver?.cancel()
-                sourceIndexSessionObserver = value?.let { manager -> applicationScope.launch(Dispatchers.IO) {
-                    var observed = runCatching { manager.sessionOwnerSnapshot() }.getOrNull()
-                    manager.sessionUiState.collect { state ->
-                        if (syncManager !== manager) return@collect
-                        val current = runCatching { manager.sessionOwnerSnapshot() }.getOrNull()
-                        if (current != observed || state !is VortXSyncManager.SessionUiState.SignedIn) {
-                            com.vortx.android.singularity.SourceIndexLifecycle.invalidateDeferred()
-                        }
-                        observed = current
-                    }
-                } }
-            }
-        }
+    /** Both callers run on the application IO scope after releasing the session owner locks. */
+    private suspend fun retryDownloadRecovery(expectedManager: VortXSyncManager? = null) {
+        if (!downloadStoresReady.await()) return
 
-    private var pickerFileRestoreBinding: Pair<VortXSyncManager, AccountFileRestoreExternalExclusion>? = null
+        try {
+            downloadRecoveryMutex.withLock {
+                if (expectedManager != null && syncManager !== expectedManager) return@withLock
+                DownloadManager.retryDownloadsAfterOwnerReady()
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            Log.w(TAG, "Download recovery deferred; pending transfers remain retryable")
+        }
+    }
+
+    /** One process-owned publication for the attached manager and its picker Restore binding. */
+    internal sealed interface AccountSyncStartup {
+        data object Preparing : AccountSyncStartup
+        data object Unavailable : AccountSyncStartup
+        class Ready(
+            val manager: VortXSyncManager,
+            val pickerFileRestore: AccountFileRestoreExternalExclusion,
+        ) : AccountSyncStartup
+    }
+
+    private val _accountSyncStartup = MutableStateFlow<AccountSyncStartup>(AccountSyncStartup.Preparing)
+    internal val accountSyncStartup = _accountSyncStartup.asStateFlow()
+    private val accountForeground = MutableStateFlow(AccountSyncForeground(active = false))
+    private var sourceIndexConsentObserver: android.content.SharedPreferences.OnSharedPreferenceChangeListener? = null
+
+    val syncManager: VortXSyncManager?
+        get() = (_accountSyncStartup.value as? AccountSyncStartup.Ready)?.manager
+
+    internal suspend fun awaitAccountSyncStartup() {
+        accountSyncStartup.first { it !== AccountSyncStartup.Preparing }
+    }
 
     internal fun pickerAccountFileRestoreExclusion(expected: VortXSyncManager?): AccountFileRestoreExternalExclusion? =
-        pickerFileRestoreBinding?.takeIf { it.first === expected && syncManager === expected }?.second
+        (_accountSyncStartup.value as? AccountSyncStartup.Ready)
+            ?.takeIf { it.manager === expected }
+            ?.pickerFileRestore
+
+    private fun publishAccountSync(
+        manager: VortXSyncManager,
+        pickerRestore: AccountFileRestoreExternalExclusion,
+        confirmedOwner: SessionOwnerSnapshot,
+    ) {
+        check(_accountSyncStartup.value === AccountSyncStartup.Preparing)
+        com.vortx.android.singularity.SourceIndexLifecycle.invalidateDeferred()
+        val ready = AccountSyncStartup.Ready(manager, pickerRestore)
+        com.vortx.android.player.PlaybackOwnerEpoch.transition {
+            _accountSyncStartup.value = ready
+            com.vortx.android.singularity.SourceIndexLifecycle.invalidateDeferred()
+        }
+        applicationScope.launch {
+            var observed: SessionOwnerSnapshot? = confirmedOwner
+            var recoveredDownloadOwner: SessionOwnerSnapshot? = null
+            var checkedWatchNextAccount: SessionOwnerSnapshot.Account? = null
+            manager.sessionUiState.combine(manager.pickerAccountRevision) { state, _ ->
+                state
+            }.collect { state ->
+                if (syncManager !== manager) return@collect
+                val current = runCatching { manager.sessionOwnerSnapshot() }.getOrNull()
+                if (current is SessionOwnerSnapshot.SignedOutLocal) retireWatchNextAfterSignOut(manager, current)
+                val watchNextAccount = current as? SessionOwnerSnapshot.Account
+                if (watchNextAccount == null) {
+                    checkedWatchNextAccount = null
+                } else if (watchNextAccount != checkedWatchNextAccount && retireWatchNextOtherAccounts(manager, watchNextAccount)) {
+                    checkedWatchNextAccount = watchNextAccount
+                }
+                if (current != observed || state !is VortXSyncManager.SessionUiState.SignedIn) {
+                    com.vortx.android.singularity.SourceIndexLifecycle.invalidateDeferred()
+                }
+                observed = current
+
+                if (state === VortXSyncManager.SessionUiState.UnknownOrUnavailable) {
+                    recoveredDownloadOwner = null
+                }
+                val confirmedOwner = current?.takeIf {
+                    it is SessionOwnerSnapshot.Account || it is SessionOwnerSnapshot.SignedOutLocal
+                }
+                if (confirmedOwner != recoveredDownloadOwner) {
+                    recoveredDownloadOwner = confirmedOwner
+                    if (confirmedOwner != null) applicationScope.launch { retryDownloadRecovery(manager) }
+                }
+            }
+        }
+    }
 
     /**
      * Wire the VortX-account issuer and live consent invalidation. Legacy Source Index Boolean methods
@@ -448,38 +580,40 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         }
     }.getOrNull()
 
-    /**
-     * Activate the account sync engine: construct the (dormant-until-now) [VortXSyncManager], wire its push
-     * seams onto the profile roster + watch overlay via [VortXSyncManager.attachSyncSeams], and register a
-     * process-wide foreground hook that PULLS the account doc on every foreground.
-     *
-     * This is the Android analogue of Apple building `VortXSyncManager.shared` and its
-     * `.onChange(of: scenePhase) { if .active { syncDown() } }` root hook (VortXiOSApp.swift:88 /
-     * VortXTVApp.swift:94): a change made on another device pulls DOWN when this device comes forward. The
-     * engine itself is UNCHANGED -- this only WIRES the already-reviewed manager, whose #145 guards
-     * (tri-state pull, never-shrink / never-zero, tombstone-first fold, per-account version-wins) all live
-     * inside [VortXSyncManager] + [com.vortx.android.sync.VortXSyncDoc]. No merge logic is added here.
-     *
-     * The foreground hook uses [registerActivityLifecycleCallbacks] (not ProcessLifecycleOwner) so it needs
-     * no new dependency and covers BOTH launcher activities from the one process -- the phone [MainActivity]
-     * and the TV [com.vortx.android.ui.tv.TvActivity] -- with a single started-activity counter. The 0 -> 1
-     * started transition IS "the app came to the foreground" (cold launch OR return from background),
-     * matching Apple's scenePhase == .active; [VortXSyncManager.startRealtime] is the manager's foreground
-     * entry point (Apple's scene-.active startRealtime): it opens the SyncRoom WebSocket + fallback poll AND
-     * runs the same catch-up pull the old syncDownSoon hook did. The 1 -> 0 stopped transition mirrors
-     * Apple's scene-.background [VortXSyncManager.stopRealtime], so no socket or poll outlives the
-     * foreground. Rotation does not recreate the launcher activities (they declare configChanges), and a
-     * pull is version-guarded and defers to any queued local push, so even a rare spurious foreground tick
-     * (an uncovered config-change recreation) is a cheap, safe no-op rather than a wipe risk.
-     */
+    /** Both launchers can enter or leave foreground while encrypted account state is opening. */
     private fun wireAccountSync() {
-        if (ProfileStore.sharedOrNull() == null) return   // ProfileStore init failed: leave sync dormant
-        val manager = runCatching {
-            VortXSyncManager(this).also { manager ->
-                // Bind account ownership before either launcher can create a repository, resolver, settings
-                // screen, or view model. The snapshot distinguishes an unreadable session store from a
-                // definitive sign-out, so local legacy keys are never adopted while restore identity is unknown.
+        if (ProfileStore.sharedOrNull() == null) {
+            _accountSyncStartup.value = AccountSyncStartup.Unavailable
+            return
+        }
+        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
+            // ActivityLifecycleCallbacks arrive on Main. The worker observes only the latest intent.
+            private var startedActivities = 0
+
+            override fun onActivityStarted(activity: Activity) {
+                if (startedActivities++ == 0) accountForeground.value = AccountSyncForeground(active = true)
+            }
+
+            override fun onActivityStopped(activity: Activity) {
+                if (startedActivities > 0 && --startedActivities == 0) {
+                    accountForeground.value = AccountSyncForeground(active = false)
+                }
+            }
+
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+            override fun onActivityResumed(activity: Activity) {}
+            override fun onActivityPaused(activity: Activity) {}
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+            override fun onActivityDestroyed(activity: Activity) {}
+        })
+
+        applicationScope.launch {
+            try {
+                val manager = VortXSyncManager(this@VortXApplication) { syncManager === it }
+                // The old Debrid binding performed this second secure read before exposing its owner.
+                val confirmedOwner = manager.sessionOwnerSnapshot()
                 DebridKeys.bindAccountOwnerSource {
+                    if (syncManager !== manager) return@bindAccountOwnerSource DebridAccountOwnerState.UnknownOrUnavailable
                     when (val owner = manager.sessionOwnerSnapshot()) {
                         is SessionOwnerSnapshot.Account ->
                             DebridAccountOwnerState.Account(owner.id, owner.generation)
@@ -489,46 +623,29 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                             DebridAccountOwnerState.UnknownOrUnavailable
                     }
                 }
+                DebridKeys.bindUsenetOwnerAdmission { owner, mutation ->
+                    syncManager === manager && manager.mutateCurrentUsenetOwner(owner, mutation)
+                }
+                com.vortx.android.sync.AccountLibrarySync.bind(this@VortXApplication, manager)
+                val startNativeWork = checkNotNull(manager.prepareNativeGateway(nativeAccounts, accountForeground, confirmedOwner))
+                val pickerRestore = ApplicationAccountFileRestoreExclusion(this@VortXApplication, manager)
+                ensureActive()
+                publishAccountSync(manager, pickerRestore, confirmedOwner)
+                startNativeWork()
+                // For You switches between account fields and the signed-out local copy on sign-in.
+                applicationScope.launch {
+                    manager.account.collect {
+                        com.vortx.android.foryou.ForYouStore.shared(this@VortXApplication).reload(invalidate = true)
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                Log.w(TAG, "Account sync setup failed this launch")
+            } finally {
+                _accountSyncStartup.compareAndSet(AccountSyncStartup.Preparing, AccountSyncStartup.Unavailable)
             }
         }
-            .getOrElse {
-                Log.w(TAG, "Account sync unavailable; cross-device sync stays dormant this launch", it)
-                return
-            }
-        syncManager = manager
-        manager.attachNativeGateway(nativeAccounts)
-        com.vortx.android.sync.AccountLibrarySync.bind(this, manager)
-        // For You switches between the account's synced fields and the signed-out local copy on sign-in.
-        applicationScope.launch { manager.account.collect { com.vortx.android.foryou.ForYouStore.shared(this@VortXApplication).reload(invalidate = true) } }
-        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
-            /// Count of currently-started activities. Touched only from the main thread (every
-            /// ActivityLifecycleCallbacks callback is delivered on the main looper), so a plain Int is safe.
-            private var startedActivities = 0
-
-            override fun onActivityStarted(activity: Activity) {
-                // 0 -> 1: the app is now in the foreground. Open the realtime channel (SyncRoom WebSocket +
-                // fallback poll) AND run the catch-up pull, mirroring Apple's scenePhase == .active
-                // startRealtime. Fail-soft + a no-op when signed out or already live, and every pull it
-                // triggers is version-guarded (applies only a strictly-newer remote and defers while a
-                // local push is queued), so it never clobbers local state.
-                if (startedActivities == 0) manager.setRealtimeForeground(true)
-                startedActivities++
-            }
-
-            override fun onActivityStopped(activity: Activity) {
-                if (startedActivities > 0) startedActivities--
-                // 1 -> 0: the app left the foreground. Close the socket + poll (Apple's scene-.background
-                // stopRealtime); the next foreground re-opens them. Safe to call repeatedly.
-                if (startedActivities == 0) manager.setRealtimeForeground(false)
-            }
-
-            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
-            override fun onActivityResumed(activity: Activity) {}
-            override fun onActivityPaused(activity: Activity) {}
-            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
-            override fun onActivityDestroyed(activity: Activity) {}
-        })
-        pickerFileRestoreBinding = manager to ApplicationAccountFileRestoreExclusion(this, manager)
     }
 
     /// The one [CatalogRepository] the whole app shares, backed by the VortX engine session.

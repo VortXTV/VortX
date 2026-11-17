@@ -36,9 +36,10 @@ const MAC_SHA = "3".repeat(64);
 const NATIVE_PROJECT_TARGETS = ["VortXiOSNative", "VortXMac", "VortXTV", "VortXTopShelf", "VortXTVLite"];
 const projectTargetFixture = (name, build = BUILD) =>
   '  ' + name + ':\n    settings:\n      base:\n        CURRENT_PROJECT_VERSION: "' + build + '"\n';
-function projectFixture({ historical = false, targets = NATIVE_PROJECT_TARGETS, build = BUILD } = {}) {
+function projectFixture({ historical = false, aether = false, targets = NATIVE_PROJECT_TARGETS, build = BUILD } = {}) {
+  const versionedTargets = [...targets, ...(historical ? ["VortX"] : []), ...(aether ? ["VortXAetherKit"] : [])];
   return "name: VortX\ntargets:\n" +
-    [...targets, ...(historical ? ["VortX"] : [])].map(name => projectTargetFixture(name, build)).join("") +
+    versionedTargets.map(name => projectTargetFixture(name, build)).join("") +
     "  CinemaUISmokeRenderer:\n    type: application\nschemes:\n  VortXTV:\n    build:\n";
 }
 
@@ -142,23 +143,33 @@ test("Beta 10 build mismatch is rejected instead of advertising the wrong binary
   );
 });
 
-test("project builds require all five native targets or all six named historical targets", () => {
+test("project builds agree across native, legacy and Aether targets", () => {
   assert.equal(projectBuildFromYmlText(projectFixture()), BUILD);
   assert.equal(projectBuildFromYmlText(projectFixture({ historical: true })), BUILD);
+  assert.equal(projectBuildFromYmlText(projectFixture({ aether: true })), BUILD);
   assert.equal(projectBuildFromYmlText(projectFixture().replace("  CinemaUISmokeRenderer:\n    type: application\n", "")), BUILD);
 });
 
-test("project build rejects missing named native targets in native and historical layouts", () => {
-  for (const historical of [false, true]) {
+test("the full checked-in Apple project has a coherent release build", async () => {
+  const project = await readFile(new URL("../../app/project.yml", import.meta.url), "utf8");
+  assert.match(project, /^  VortXAetherKit:$/m);
+  const build = Number(project.match(/^        CURRENT_PROJECT_VERSION: "([1-9][0-9]*)"$/m)?.[1]);
+  assert(Number.isSafeInteger(build));
+  assert.equal(projectBuildFromYmlText(project), build);
+});
+
+test("project build rejects missing named native targets in every supported layout", () => {
+  for (const layout of [{}, { historical: true }, { aether: true }]) {
     for (const missing of NATIVE_PROJECT_TARGETS) {
-      const text = projectFixture({ historical, targets: NATIVE_PROJECT_TARGETS.filter(name => name !== missing) });
+      const text = projectFixture({ ...layout, targets: NATIVE_PROJECT_TARGETS.filter(name => name !== missing) });
       assert.throws(() => projectBuildFromYmlText(text), { code: "project-build" }, missing);
     }
   }
 });
 
 test("project build rejects duplicate, misplaced, incomplete and counterfeit build metadata", () => {
-  const native = projectFixture(), historical = projectFixture({ historical: true });
+  const native = projectFixture(), historical = projectFixture({ historical: true }), aether = projectFixture({ aether: true });
+  const aetherTarget = projectTargetFixture("VortXAetherKit");
   const field = '        CURRENT_PROJECT_VERSION: "221"\n';
   const incomplete = projectFixture({ targets: NATIVE_PROJECT_TARGETS.filter(name => name !== "VortXTopShelf") });
   const cases = [
@@ -170,7 +181,12 @@ test("project build rejects duplicate, misplaced, incomplete and counterfeit bui
     ["duplicate field", native.replace(field, field.repeat(2))],
     ["counterfeit six fields with a missing target", incomplete.replace(field, field.repeat(3))],
     ["duplicate named target", native.replace("schemes:\n", projectTargetFixture("VortXTV") + "schemes:\n")],
+    ["Aether target missing its build", aether.replace(aetherTarget, "  VortXAetherKit:\n    type: framework\n")],
+    ["Aether target build mismatch", aether.replace(aetherTarget, projectTargetFixture("VortXAetherKit", BUILD - 1))],
+    ["Aether target duplicate build", aether.replace(aetherTarget, aetherTarget + field)],
+    ["duplicate Aether target", aether.replace(aetherTarget, aetherTarget.repeat(2))],
     ["unexpected versioned target", native.replace("schemes:\n", projectTargetFixture("OtherApp") + "schemes:\n")],
+    ["unexpected unversioned target", native.replace("schemes:\n", "  OtherFramework:\n    type: framework\nschemes:\n")],
     ["versioned smoke renderer", native.replace("  CinemaUISmokeRenderer:\n    type: application\n", projectTargetFixture("CinemaUISmokeRenderer"))],
     ["build outside targets", "settings:\n      base:\n" + field + native],
     ["build in schemes", native + field],

@@ -7,6 +7,8 @@ enum VortxProfileOverlayWitness {
     enum Failure: Error { case malformed }
     private static let maximumFrameBytes = 16_777_216
     private static let maximumNodes = 100_000
+    // A cloud account can contain several profiles plus account-wide native history.
+    private static let maximumAccountNodes = 250_000
     private static let maximumDepth = 64
     private indirect enum Value { case null, bool(Bool), number(Double), string(String), array([Value]), object([(String, Value)]) }
 
@@ -20,7 +22,15 @@ enum VortxProfileOverlayWitness {
     /// A Unicode-equivalent Swift dictionary collision is refused rather than silently dropping a
     /// byte-distinct JSON key.
     static func decodeObject(json: Data) throws -> [String: Any] {
-        var parser = try Parser(json)
+        try decodeObject(json: json, account: false)
+    }
+
+    static func decodeAccountObject(json: Data) throws -> [String: Any] {
+        try decodeObject(json: json, account: true)
+    }
+
+    private static func decodeObject(json: Data, account: Bool) throws -> [String: Any] {
+        var parser = try Parser(json, maximumNodes: account ? maximumAccountNodes : maximumNodes)
         let value = try parser.value()
         try parser.finish()
         // Parsing bounds raw input, while framing also accounts for type tags and length words.
@@ -29,10 +39,38 @@ enum VortxProfileOverlayWitness {
         var writer = Writer()
         try writer.append(contentsOf: Array("vortx.profile-overlay/1".utf8) + [0])
         try writer.write(value)
+        if account { try validateAccountOverlayBudgets(value) }
         guard case .object(let pairs) = value, let object = try materialize(value) as? [String: Any], object.count == pairs.count else {
             throw Failure.malformed
         }
         return object
+    }
+
+    private static func validateAccountOverlayBudgets(_ root: Value) throws {
+        func member(_ key: String, of value: Value?) -> Value? {
+            guard case .object(let pairs)? = value else { return nil }
+            return pairs.first { $0.0 == key }?.1
+        }
+        func nodeCount(_ value: Value) -> Int {
+            switch value {
+            case .object(let pairs): return pairs.reduce(1) { $0 + 1 + nodeCount($1.1) }
+            case .array(let values): return values.reduce(1) { $0 + nodeCount($1) }
+            default: return 1
+            }
+        }
+        var counts: [UUID: Int] = [:]
+        func add(_ carrier: Value?, containerNodes: Int) throws {
+            guard case .object(let pairs)? = carrier else { return }
+            for (key, value) in pairs {
+                guard let id = UUID(uuidString: key) else { continue }
+                let count = counts[id, default: 1] + containerNodes + nodeCount(value)
+                guard count <= maximumNodes else { throw Failure.malformed }
+                counts[id] = count
+            }
+        }
+        // Count the synthetic overlay root once, and the key/object nodes on each path.
+        try add(member("byProfile", of: member("vortx", of: root)), containerNodes: 5)
+        try add(member("byProfile", of: member("removed", of: member("webProgress", of: root))), containerNodes: 7)
     }
 
     /// Internal so the focused conformance harness can independently check framing boundaries.
@@ -134,14 +172,16 @@ enum VortxProfileOverlayWitness {
 
     private struct Parser {
         let raw: [UInt8]
+        let maximumNodes: Int
         var index = 0
         var nodes = 0
 
-        init(_ data: Data) throws {
+        init(_ data: Data, maximumNodes: Int = VortxProfileOverlayWitness.maximumNodes) throws {
             // Bound before materializing Data as an Array. The encoder's own aggregate frame limit
             // is stricter than any useful input size and avoids an attacker-controlled bulk copy.
             guard data.count <= VortxProfileOverlayWitness.maximumFrameBytes else { throw Failure.malformed }
             raw = Array(data)
+            self.maximumNodes = maximumNodes
         }
 
         mutating func finish() throws {
@@ -155,7 +195,7 @@ enum VortxProfileOverlayWitness {
 
         mutating func node() throws {
             nodes += 1
-            guard nodes <= VortxProfileOverlayWitness.maximumNodes else { throw Failure.malformed }
+            guard nodes <= maximumNodes else { throw Failure.malformed }
         }
 
         mutating func value(_ depth: Int = 0) throws -> Value {

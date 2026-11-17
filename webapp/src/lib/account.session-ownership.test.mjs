@@ -129,3 +129,17 @@ test("queued edits retain adoption-time ownership when the descriptor disappears
     assert.equal(gets, 0); assert.equal(puts, 0); assert.equal(localStorage.getItem(journal[0]), journal[1]);
   } finally { await cleanup(); }
 });
+
+
+test("one invalid setting from an old local backup cannot block account startup", async () => {
+  const f = await fresh();
+  const old = '{"sourceOrder":null,"accentID":"forest","audioLang":"fr"}';
+  f.local.setItem("vortx.web.settings.v1", old);
+  const account = await import("./account.ts" + f.query);
+  const { getSettings } = await import("./settings.ts" + f.query);
+  assert.equal(account.currentSession(), null);
+  assert.equal(getSettings().accentID, "forest");
+  assert.equal(getSettings().audioLang, "fr");
+  assert.ok(Array.isArray(getSettings().sourceOrder));
+  assert.equal(f.local.getItem("vortx.web.settings.v1"), old, "reading does not rewrite the original settings");
+});

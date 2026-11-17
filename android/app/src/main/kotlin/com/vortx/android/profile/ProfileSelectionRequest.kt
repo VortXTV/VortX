@@ -34,17 +34,16 @@ fun captureProfileSelection(
     store: ProfileStore,
     profile: UserProfile,
     outcome: ProfileStore.SwitchOutcome,
-    nativeAdmission: (() -> Boolean)? = null,
+    nativeAdmission: ((() -> Unit) -> Boolean)? = null,
 ): ProfileSelectionRequest = ContinueWatchingOwnerGate.serialized { revision ->
     var roster = store.profiles
     val selected = checkNotNull(store.active?.takeIf { it.id == profile.id }) { "Choose the profile again." }
     var generation = store.selectionRevision
     val account = if (selected.isOwner || !selected.usesOwnAccount) roster.firstOrNull { it.isOwner } else selected
-    checkNotNull(nativeAdmission) { "Choose the profile again." }
-    store.pickedThisLaunch = false
-    store.selectionPending = true
+    val admit = checkNotNull(nativeAdmission) { "Choose the profile again." }
+    fun stillSelected() = store.selectionRevision == generation && store.profiles === roster && store.activeID == selected.id
     ProfileSelectionRequest(selected, outcome, account?.email?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }, revision,
-        stillSelected = { store.selectionRevision == generation && store.profiles === roster && store.activeID == selected.id && nativeAdmission() },
+        stillSelected = { stillSelected() && admit {} },
         bind = { email ->
             if (account != null && account.email.isNullOrBlank()) {
                 val principal = checkNotNull(email?.trim()?.takeIf { it.isNotEmpty() }) { "The account did not return an email. Try again." }
@@ -53,7 +52,11 @@ fun captureProfileSelection(
                 generation = store.selectionRevision
                 true
             } else false
-        }, completed = { store.pickedThisLaunch = true; store.selectionPending = false },
+        }, completed = {
+            ContinueWatchingOwnerGate.serialized {
+                check(stillSelected() && admit(store::completePickerSelection)) { "Choose the profile again." }
+            }
+        },
         diagnosticAdmission = { ContinueWatchingOwnerGate.serialized { currentRevision ->
             currentRevision == revision && store.selectionRevision == generation &&
                 store.profiles === roster && store.activeID == selected.id

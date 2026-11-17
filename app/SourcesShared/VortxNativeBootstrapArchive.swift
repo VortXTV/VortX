@@ -50,6 +50,10 @@ enum VortxNativeBootstrapArchive {
         "auth", "authkey", "password", "apikey", "apikeys", "authorization", "bearer", "datakey",
         "token", "accesstoken", "refreshtoken", "authtoken", "clientsecret", "credentials", "nativeprovidercredentials"
     ]
+    struct LegacyCapture: Sendable {
+        let document: Data
+        fileprivate let excludedCredentialPaths: [String]
+    }
     /// Fresh authenticated capture only. Do not use this to rewrite an archived source. The caller
     /// supplies the strict-decoded object so binary64 provenance is not reparsed by Foundation.
     /// One unreadable device setting is left out of this capture and logged as held, so it cannot stop
@@ -59,15 +63,28 @@ enum VortxNativeBootstrapArchive {
     /// with their input to prove nothing changed.
     static func credentialFreeDocument(_ source: [String: Any], diagnostics: ((String) -> Void)? = nil,
                                        holdingUnreadableValues: Bool = true) throws -> Data {
+        try captureLegacyDocument(source, diagnostics: diagnostics, holdingUnreadableValues: holdingUnreadableValues).document
+    }
+    static func captureLegacyDocument(_ source: [String: Any], diagnostics: ((String) -> Void)? = nil,
+                                      holdingUnreadableValues: Bool = true) throws -> LegacyCapture {
         var exclusions: [String] = []
         let value = try sanitize(source, path: "", exclusions: &exclusions, diagnostics: diagnostics, textContext: .legacyHost,
                                  holdsUnreadablePreferences: holdingUnreadableValues)
-        return try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
+        let document = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
+        return LegacyCapture(document: document, excludedCredentialPaths: exclusions.filter { $0.hasPrefix("/") })
     }
     static func encode(document: Data, material: Data? = nil, authenticatedSourceArchive: Data? = nil) throws -> Data {
+        try encode(document: document, material: material, authenticatedSourceArchive: authenticatedSourceArchive, priorExclusions: [])
+    }
+    static func encode(capture: LegacyCapture, material: Data? = nil, authenticatedSourceArchive: Data? = nil) throws -> Data {
+        try encode(document: capture.document, material: material, authenticatedSourceArchive: authenticatedSourceArchive,
+                   priorExclusions: capture.excludedCredentialPaths)
+    }
+    private static func encode(document: Data, material: Data?, authenticatedSourceArchive: Data?,
+                               priorExclusions: [String]) throws -> Data {
         guard let source = try decodeJSON(with: document) as? [String: Any] else { throw Failure.malformed }
         try requireUnambiguousJSON(document)
-        var exclusions: [String] = []
+        var exclusions = priorExclusions
         let sanitized = try sanitize(source, path: "", exclusions: &exclusions, textContext: .legacyHost)
         var archive: [String: Any] = ["schemaVersion": 1, "hostDocument": sanitized,
                                       "excludedCredentialPaths": exclusions.sorted()]
@@ -201,9 +218,8 @@ enum VortxNativeBootstrapArchive {
     }
     /// The plain label a loaded copy shows in place of display text that fails every display rule.
     static let replacedDisplayText = "Untitled"
-    /// Recorded in `exclusions` (loading mode only) when a value is held or replaced, so an enclosing
-    /// structured string is rebuilt from the cleaned value. Never a pointer: it cannot reach an archive,
-    /// because the archive writer and validator never hold or replace.
+    /// Recorded while inspecting a capture so an enclosing structured string is rebuilt from the
+    /// cleaned value. These markers are filtered out of the archive's credential paths.
     private static let heldMarker = "held:"
     private static func isSeriesChoicePreference(_ key: String) -> Bool {
         // SeriesSourceSticky.key writes only the active UUID, or the pre-roster default.
@@ -346,8 +362,10 @@ enum VortxNativeBootstrapArchive {
             let close: Character = open == "[" ? "]" : "}"
             guard let end = rest.firstIndex(of: close) else { return false }
             let content = rest[rest.index(after: rest.startIndex)..<end]
-            guard !content.trimmingCharacters(in: .whitespaces).isEmpty, content.count <= 64,
+            guard !content.trimmingCharacters(in: .whitespaces).isEmpty,
+                  content.count <= 64, content.utf8.prefix(257).count <= 256,
                   !content.unicodeScalars.contains(where: tagSyntax.contains),
+                  !isTaggedDisplayCarrier(content),
                   (try? decodeJSON(with: Data(rest[...end].utf8), options: [.fragmentsAllowed])) == nil else { return false }
             rest = rest[rest.index(after: end)...]
             tags += 1
@@ -355,7 +373,7 @@ enum VortxNativeBootstrapArchive {
             guard next.isWhitespace || ":-.,!?)".contains(next) else { return false }
             rest = rest.drop(while: \.isWhitespace)
         }
-        return tags > 0 && !isCarrierRemainder(rest)
+        return tags > 0 && !isTaggedDisplayCarrier(rest)
     }
     private static func hasLiteralTaggedDisplayLabel(_ text: String) -> Bool {
         guard hasLiteralDisplayLabel(text) else { return false }
@@ -364,9 +382,9 @@ enum VortxNativeBootstrapArchive {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let closing: Character = trimmed.first == "[" ? "]" : "}"
         guard let end = trimmed.firstIndex(of: closing) else { return false }
-        return !isCarrierRemainder(trimmed[trimmed.index(after: end)...])
+        return !isTaggedDisplayCarrier(trimmed[trimmed.index(after: end)...])
     }
-    private static func isCarrierRemainder(_ remainder: Substring) -> Bool {
+    private static func isTaggedDisplayCarrier(_ text: Substring) -> Bool {
         let carrierPadding = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{FEFF}"))
         func normalizedCarrierText(_ bytes: Data) -> String {
             let view = (try? jsonUTF8View(bytes)) ?? bytes
@@ -375,15 +393,45 @@ enum VortxNativeBootstrapArchive {
         // Normalize the complete padding run before BOTH inspection and base64 decoding.
         // A BOM before encoded text must not make the decoder fail open after a safe sniff.
         // Separator punctuation must not hide a carrier: "[RD] - {...}" stays refused.
-        let suffix = normalizedCarrierText(Data(remainder.drop(while: { $0.isWhitespace || $0 == "\u{FEFF}" || ":-.,!?)".contains($0) }).utf8))
+        let candidate = normalizedCarrierText(Data(text.drop(while: { $0.isWhitespace || $0 == "\u{FEFF}" || ":-.,!?)".contains($0) }).utf8))
         func carrierPrefix(_ bytes: Data) -> Bool {
             let significant = normalizedCarrierText(bytes).unicodeScalars
             let prefix = String(String.UnicodeScalarView(significant.prefix(32)))
             return structuredPrefix(Data(prefix.utf8)) || prefix.hasPrefix("\"")
         }
-        if carrierPrefix(Data(suffix.utf8)) { return true }
-        if let decoded = Data(base64Encoded: suffix), carrierPrefix(decoded) { return true }
-        return false
+        if carrierPrefix(Data(candidate.utf8)) { return true }
+        if let decoded = Data(base64Encoded: candidate), carrierPrefix(decoded) { return true }
+
+        // Recognize the opening structure even when URL-safe spelling, missing padding or an
+        // invalid trailer prevents exact base64 decoding. This does not decode or preserve the label.
+        let encodedPrefix = candidate.utf8.prefix(128).prefix {
+            (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0)
+                || [43, 45, 47, 95].contains($0)
+        }
+        let count = encodedPrefix.count
+        guard count >= 4 else { return false }
+        let usableCount = count % 4 == 1 ? count - 1 : count
+        var standard = Data(encodedPrefix.prefix(usableCount).map { byte -> UInt8 in
+            switch byte {
+            case 45: return 43
+            case 95: return 47
+            default: return byte
+            }
+        })
+        standard.append(contentsOf: repeatElement(UInt8(61), count: (4 - usableCount % 4) % 4))
+        guard let decoded = Data(base64Encoded: standard), carrierPrefix(decoded) else { return false }
+        // Ordinary tags can coincidentally decode to a delimiter followed by invalid UTF-8.
+        // A recognizable JSON opening still fails if later bytes are corrupted.
+        if decoded.starts(with: "bplist".utf8) { return true }
+        if let view = try? jsonUTF8View(decoded), String(data: view, encoding: .utf8) != nil { return true }
+        let significant = normalizedCarrierText(decoded)
+        let next = significant.dropFirst().first(where: { !$0.isWhitespace })
+        switch significant.first {
+        case "{": return next == "\"" || next == "}"
+        case "[": return next.map { "\"[{]-0123456789tfn".contains($0) } ?? false
+        case "\"": return significant.dropFirst().prefix(while: { $0 != "\u{FFFD}" }).contains("\"")
+        default: return false
+        }
     }
     private static func isAddonDescriptor(_ object: [String: Any]) -> Bool {
         guard let transport = object["transportUrl"] as? String, let url = URLComponents(string: transport),
@@ -417,7 +465,9 @@ enum VortxNativeBootstrapArchive {
                 // A valid JSON prefix followed by extra text is still a malformed container,
                 // not a literal tag: `[true] {"token":...}` must retain the rejection fence.
                 let prefix = String(scalars[...index])
-                return (try? decodeJSON(with: Data(prefix.utf8), options: [.fragmentsAllowed])) == nil
+                let content = String(scalars[scalars.index(after: scalars.startIndex)..<index])
+                return !isTaggedDisplayCarrier(content[...])
+                    && (try? decodeJSON(with: Data(prefix.utf8), options: [.fragmentsAllowed])) == nil
             }
             guard count < 64, allowed.contains(scalar) else { return false }
             count += 1

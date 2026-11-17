@@ -76,6 +76,7 @@ struct PlaybackCompletionEvidence<Token: Equatable> {
     private(set) var owner: Token?
     private var mountGeneration: UInt64 = 0
     private var position: Double?
+    private var settledPosition: Double?
     private var duration: Double?
     private var rejectedEOF = false
 
@@ -86,19 +87,37 @@ struct PlaybackCompletionEvidence<Token: Equatable> {
         self.owner = owner
         self.mountGeneration = mountGeneration
         position = nil
+        settledPosition = nil
         duration = nil
         rejectedEOF = false
     }
 
-    mutating func recordPosition(_ seconds: Double, owner: Token) {
+    mutating func recordPosition(_ seconds: Double, owner: Token, transportSettled: Bool = true) {
         guard self.owner == owner, seconds.isFinite, seconds >= 0 else { return }
         position = seconds
+        settledPosition = transportSettled ? seconds : nil
+    }
+
+    mutating func invalidateSettledPosition(owner: Token) {
+        guard self.owner == owner else { return }
+        settledPosition = nil
+    }
+
+    func settledProgress(owner: Token) -> (position: Double, duration: Double)? {
+        guard self.owner == owner, !rejectedEOF, let settledPosition, let duration else { return nil }
+        return (settledPosition, duration)
     }
 
     mutating func recordDuration(_ seconds: Double, owner: Token) {
         // mpv can clear duration while retiring a file. That must not erase its last valid duration.
         guard self.owner == owner, seconds.isFinite, seconds > 0 else { return }
         duration = seconds
+    }
+
+    func observedDuration(owner: Token?, mountGeneration: UInt64? = nil) -> Double? {
+        guard let owner, self.owner == owner,
+              mountGeneration.map({ self.mountGeneration == $0 }) ?? true else { return nil }
+        return duration
     }
 
     mutating func consumeEOF(owner: Token, isLive: Bool, isTrailer: Bool,
@@ -113,6 +132,23 @@ struct PlaybackCompletionEvidence<Token: Equatable> {
         guard position < duration - tailTolerance else { return .allowCompletion }
         rejectedEOF = true
         return .premature(position: position, duration: duration)
+    }
+}
+
+/// Some online sources serve a short, playable error video for a catalog title. The decoder's
+/// duration can prove that the file ended, but only matching title metadata can vouch for a short.
+enum ShortTitlePlaybackPolicy {
+    static func allowsAutomaticHistory(
+        durationSeconds: Double?,
+        expectedRuntimeSeconds: @autoclosure () -> Double?,
+        isOnlineTitle: Bool
+    ) -> Bool {
+        guard isOnlineTitle else { return true }
+        guard let durationSeconds, durationSeconds.isFinite, durationSeconds > 0 else { return false }
+        guard durationSeconds <= 60 else { return true }
+        guard let expected = expectedRuntimeSeconds(), expected.isFinite, expected > 0 else { return false }
+        // Allow imprecise minute-scale metadata for actual shorts.
+        return durationSeconds >= expected / 2 && expected >= durationSeconds / 2
     }
 }
 

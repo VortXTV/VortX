@@ -261,7 +261,7 @@ enum VortxLegacyBootstrapMaterial {
                        accountID: String? = nil,
                        watchedEvidence: [VortxLegacyWatchedMigration.ValidatedRow] = [],
                        preparePendingMembership: Bool) throws -> Preparation {
-        guard let source = try? VortxProfileOverlayWitness.decodeObject(json: document) else {
+        guard let source = try? VortxProfileOverlayWitness.decodeAccountObject(json: document) else {
             throw ReconciliationRequired(reason: "Account document must be an object")
         }
         for row in watchedEvidence {
@@ -293,7 +293,7 @@ enum VortxLegacyBootstrapMaterial {
                                                    retainedOwnAccountBaseline: Data? = nil,
                                                    retainedOwnAccountSourceEnvelopes: [RetainedOwnAccountSourceEnvelope] = [],
                                                    retainedOwnAccountSlotBaselines: [RetainedOwnAccountSlotBaseline] = []) throws -> [RetainedOwnAccountOverlayDisposition] {
-        let source = try VortxProfileOverlayWitness.decodeObject(json: document)
+        let source = try VortxProfileOverlayWitness.decodeAccountObject(json: document)
         let adapter = try Adapter(document: source, roster: roster, ownerID: ownerProfileID,
                                   modified: rosterModifiedSeconds, deferProfileEdits: true)
         return try adapter.classifyDeferredOwnAccountOverlays(retainedBaseline: retainedOwnAccountBaseline,

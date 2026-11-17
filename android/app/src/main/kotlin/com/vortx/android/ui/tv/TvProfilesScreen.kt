@@ -40,6 +40,7 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import com.vortx.android.BuildConfig
 import com.vortx.android.VortXApplication
+import com.vortx.android.profile.AdmittedPickerRoster
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.ContinueWatchingOwnerGate
 import com.vortx.android.profile.ProfileSelectionRequest
@@ -88,6 +89,7 @@ internal fun selectTvProfile(
 internal class StoreTvProfileGateway(
     private val store: ProfileStore,
     private val native: NativeStreamingAccountViewModel?,
+    private val admittedRoster: AdmittedPickerRoster? = null,
 ) : TvProfileGateway {
     override fun read(): TvProfileGateway.Snapshot {
         val state = native?.state?.value
@@ -97,15 +99,25 @@ internal class StoreTvProfileGateway(
     override fun capture(profile: UserProfile, adding: Boolean, selection: Boolean): TvProfileGateway.Admission? {
         val model = native ?: return null
         val editor = if (selection) model.captureSelection(profile) else model.captureEditor(profile, adding)
-        return editor?.let { TvProfileGateway.Admission { action -> model.commitEditor(it, action) } }
+        val captured = editor ?: return null
+        val expected = admittedRoster
+        if (expected != null && (captured.target.runtime !== expected.mount || captured.account != expected.account)) return null
+        return TvProfileGateway.Admission { action ->
+            model.commitEditor(captured) {
+                check(expected == null || store.pickerRoster.value === expected)
+                action()
+            }
+        }
     }
 
     override fun select(profile: UserProfile, admission: TvProfileGateway.Admission): Result<ProfileSelectionRequest> =
         selectTvProfile(admission) {
             val outcome = store.select(profile)
             val after = checkNotNull(native?.captureSelection(checkNotNull(store.active)))
+            check(admittedRoster == null ||
+                (after.target.runtime === admittedRoster.mount && after.account == admittedRoster.account))
             captureProfileSelection(store, profile, outcome,
-                nativeAdmission = { checkNotNull(native).commitEditor(after) {} })
+                nativeAdmission = { action -> checkNotNull(native).commitEditor(after, action) })
         }
 
     override fun save(profile: UserProfile, adding: Boolean, admission: TvProfileGateway.Admission): Boolean = admission.commit {
@@ -128,7 +140,7 @@ internal data class TvProfileGatewayPresentation(val gateway: TvProfileGateway?,
 
 /** Same native capture/commit admission as the phone editor. A missing mount never borrows a legacy roster. */
 @Composable
-internal fun rememberTvProfileGateway(): TvProfileGatewayPresentation {
+internal fun rememberTvProfileGateway(admittedRoster: AdmittedPickerRoster? = null): TvProfileGatewayPresentation {
     val store = ProfileStore.sharedOrNull()
     val native: NativeStreamingAccountViewModel? = run {
         val app = LocalContext.current.applicationContext as? VortXApplication
@@ -140,7 +152,7 @@ internal fun rememberTvProfileGateway(): TvProfileGatewayPresentation {
     // Observe active edits as well as selection; native roster updates are observed above.
     store?.activeProfile?.collectAsState()?.value
     if (store == null || state?.mounted != true) return TvProfileGatewayPresentation(null, state?.loading == true)
-    val gateway = remember(store, native, state) { StoreTvProfileGateway(store, native) }
+    val gateway = remember(store, native, state, admittedRoster) { StoreTvProfileGateway(store, native, admittedRoster) }
     return TvProfileGatewayPresentation(gateway, false)
 }
 

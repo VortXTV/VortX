@@ -358,13 +358,10 @@ internal class NativeOwnerHistoryCoordinator private constructor(
             val stored = OHJson.Obj(original)
             if (stored["kind"]?.let(OHJson::text) == ENVELOPE) require(OHJson.equal(original, checkpoint.envelope()))
             else require(OHJson.equal(original, checkpoint.snapshot)) { "Checkpoint belongs to another original read" }
-            hostProjection(checkpoint.hostPreferences)
             val sources = NativeOwnerHistorySources.fromLocal(scope, checkpoint.localArchive)
-            val v = Verify(scope, target, checkpoint.readOwnerUID, authority, bindings, sources, Mode.OPEN)
-            val native = NativeOwnerHistoryRuntime.open(bindings, checkpoint.snapshot, v.callback)
+            hostProjection(checkpoint.hostPreferences)
+            val (native, complete) = openRestoredState(scope, target, checkpoint, bindings, authority, sources)
             try {
-                val fence = captureNative(native, v); val normalized = requireNotNull(v.full)
-                val originalState = OHState(checkpoint.snapshot, fence); val complete = originalState.full(normalized, fence)
                 require(OHJson.equal(complete.bytes(), checkpoint.snapshot)) { "Uncheckpointed cold normalization" }
                 authority.withActive { requireCurrent(originalRead) }
                 return NativeOwnerHistoryCoordinator(scope, bindings, native, complete, originalRead, checkpoint, sources, requireCurrent, commit, hostProjection)
@@ -373,6 +370,66 @@ internal class NativeOwnerHistoryCoordinator private constructor(
                 throw failure
             }
         }
+
+        private fun openRestoredState(scope: VortxAccountScope, target: Target, checkpoint: Checkpoint,
+            bindings: NativeOwnerHistoryBindings, authority: NativeOwnerHistoryAuthority,
+            sources: NativeOwnerHistorySources): Pair<NativeOwnerHistoryRuntime, OHState> {
+            val snapshot = checkpoint.snapshot
+            val verifier = Verify(scope, target, checkpoint.readOwnerUID, authority, bindings, sources, Mode.OPEN)
+            val native = NativeOwnerHistoryRuntime.open(bindings, snapshot, verifier.callback)
+            try {
+                val fence = captureNative(native, verifier)
+                val complete = OHState(snapshot, fence).full(requireNotNull(verifier.full), fence)
+                return native to complete
+            } catch (failure: Throwable) {
+                if (!native.close()) { synchronized(RETAINED) { RETAINED.add(native) }; throw Uncertain(failure) }
+                throw failure
+            }
+        }
+
+        fun isMissingColdOwnerLibrary(checkpoint: Checkpoint): Boolean {
+            val state = OHJson.Obj(checkpoint.snapshot)
+            val ownerId = checkpoint.scope.ownerProfileID
+            return state.text("activeProfileId") == ownerId && ownerId !in state.obj("libraries").keys
+        }
+
+        /** Beta 14 could save a cold peer before checking this local presentation bucket.
+         * Require the original authenticated account's matching typed peer before repairing it. */
+        fun repairColdOwnerLibrary(checkpoint: Checkpoint, account: NativeOwnerHistoryAccount,
+            bindings: NativeOwnerHistoryBindings, authority: NativeOwnerHistoryAuthority,
+            hostProjection: (ByteArray) -> HostProjection): Checkpoint {
+            check(isMissingColdOwnerLibrary(checkpoint))
+            val scope = checkpoint.scope
+            val peer = peer(account, scope)
+            require(peer.readUID == checkpoint.readOwnerUID) { "Cold checkpoint owner changed" }
+            peer.sources.validate(OHJson.Obj().set("nativeSync", peer.native).encoded(), bindings, authority)
+            val state = OHJson.Obj(checkpoint.snapshot)
+            val libraries = state.obj("libraries").set(scope.ownerProfileID, OHJson.literal("{}"))
+            val candidate = Checkpoint(scope, state.set("libraries", libraries.encoded()).encoded(),
+                checkpoint.hostPreferences, checkpoint.localArchive, checkpoint.accountBase, checkpoint.readOwnerUID)
+            hostProjection(candidate.hostPreferences)
+            val target = Target(scope.ownerProfileID, candidate.readOwnerUID)
+            val sources = NativeOwnerHistorySources.fromLocal(scope, candidate.localArchive)
+            val (native, complete) = openRestoredState(scope, target, candidate, bindings, authority, sources)
+            try {
+                scope.validateOwnerHistoryPresentation(OHJson.utf8(complete.presentation()))
+                val normalized = OHJson.Obj(complete.bytes())
+                val normalizedLibraries = normalized.obj("libraries")
+                val bucket = normalizedLibraries.raw(scope.ownerProfileID)
+                normalizedLibraries.remove(scope.ownerProfileID)
+                require(OHJson.equal(normalized.set("libraries", normalizedLibraries.encoded()).encoded(), checkpoint.snapshot)) {
+                    "Cold checkpoint repair changed other native state"
+                }
+                authority.withActive { }
+                // Keep every original slice except the one missing bucket, with its native defaults.
+                libraries.set(scope.ownerProfileID, bucket)
+                return Checkpoint(scope, state.set("libraries", libraries.encoded()).encoded(),
+                    checkpoint.hostPreferences, checkpoint.localArchive, checkpoint.accountBase, checkpoint.readOwnerUID)
+            } finally {
+                if (!native.close()) { synchronized(RETAINED) { RETAINED.add(native) }; throw Uncertain() }
+            }
+        }
+
         /** First remote only. Root performs original-absence CAS before opening the returned checkpoint. */
         fun prepareColdPeer(scope: VortxAccountScope, target: Target, account: NativeOwnerHistoryAccount,
             hostPreferences: ByteArray, bindings: NativeOwnerHistoryBindings, authority: NativeOwnerHistoryAuthority,
@@ -383,8 +440,13 @@ internal class NativeOwnerHistoryCoordinator private constructor(
             val n = OHJson.Obj(peer.native); val profiles = n.obj("profiles"); val roster = OHJson.Obj()
             profiles.keys.forEach { id -> val p = profiles.obj(id).raw("profile"); require(OHJson.Obj(p).text("id") == id); roster.set(id, p) }
             val owner = roster.obj(scope.ownerProfileID); require(isTrue(owner, "owner") && (owner["deleted"] == null || isFalse(owner, "deleted")))
+            // Like a fresh native store, the local owner has a library bucket even when
+            // the peer has no mutable library or watch entries. Native restore fills it.
+            val libraries = OHJson.Obj().set(scope.ownerProfileID, OHJson.literal("{}"))
             val input = OHJson.Obj().set("roster", OHJson.Obj().set("profiles", roster.encoded()).encoded())
-                .set("activeProfileId", OHJson.quote(target.profileID)).set("nativeSync", peer.native).encoded()
+                .set("activeProfileId", OHJson.quote(target.profileID))
+                .set("libraries", libraries.encoded())
+                .set("nativeSync", peer.native).encoded()
             peer.sources.validate(input, bindings, authority)
             val v = Verify(scope, target, uid, authority, bindings, peer.sources, Mode.OPEN, openingNative = peer.native)
             val native = NativeOwnerHistoryRuntime.open(bindings, input, v.callback); var attempted = false
@@ -392,6 +454,7 @@ internal class NativeOwnerHistoryCoordinator private constructor(
                 val fence = captureNative(native, v); val normalized = requireNotNull(v.full)
                 // Keep exact peer-native unknown siblings; serde's omission is not a deletion.
                 val complete = OHState(input, fence).full(normalized, fence)
+                scope.validateOwnerHistoryPresentation(OHJson.utf8(complete.presentation()))
                 val merged = OHJson.Obj(localState); val full = OHJson.Obj(complete.bytes())
                 OHState.ROOT.forEach { k -> full[k]?.let { merged.set(k, it) } ?: merged.remove(k) }
                 var result = Checkpoint(scope, merged.encoded(), hostPreferences, peer.sources.local(), account.encoded(), uid)

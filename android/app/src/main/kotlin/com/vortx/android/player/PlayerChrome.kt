@@ -64,6 +64,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -129,7 +130,7 @@ private val LocalPlayerChromeIsTv = staticCompositionLocalOf { false }
 /// zoom), and a bottom play/pause + scrubber row. When the engine reports an error, an overlay offers a
 /// return-to-sources fallback instead of a dead black frame.
 @Composable
-fun PlayerChrome(
+internal fun PlayerChrome(
     playable: Playable,
     state: PlayerState,
     /// Active input/decoded dynamic range for Playback Info, not a display/output guarantee.
@@ -217,9 +218,8 @@ fun PlayerChrome(
     /// worker dispatcher. Changing the destination cancels the old request before it can reach the UI.
     scrubPreview: suspend (Double) -> Bitmap? = { null },
     scrubPreviewRevision: Long = 0L,
-    /// Successful in-place switches increment this even when the replacement resolves to the same URL, closing
-    /// the old sheet and resetting chrome state with the engine-owned session.
-    playbackSessionRevision: Long = 0L,
+    /// Shared with the host so keyboard shortcuts can open these same sheets and yield to an open sheet.
+    controlSheet: MutableState<ControlSheet>,
     sourceOptions: List<StreamSource> = emptyList(),
     qualityOptions: List<Pair<String, StreamSource>> = emptyList(),
     /// Current-season episodes for the in-player EPISODES sheet (series only). Empty hides the control
@@ -283,10 +283,10 @@ fun PlayerChrome(
     /// edits in Settings, which the TV has no keyboard-driven Settings equivalent for.
     shareLink: String? = null,
     isTvPlayer: Boolean = false,
+    keyboardEpisodeShortcutsAvailable: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
-    // Which selection sheet (if any) is open. Local to the chrome; the engine never sees it.
-    var openSheet by remember(playable.url, playbackSessionRevision) { mutableStateOf(ControlSheet.NONE) }
+    var openSheet by controlSheet
     // Session-only source hint, deliberately separate from [trackPrefs]. It reorders release-name metadata in
     // Sources but never writes the user's preferred audio language or selects an engine track. The live engine's
     // [PlayerState.audioTracks] remains the authority once a source mounts.
@@ -1015,6 +1015,15 @@ fun PlayerChrome(
                 options = buildList {
                     add(
                         SheetOption(
+                            label = "Keyboard Shortcuts",
+                            selected = false,
+                            detail = "›",
+                            onPick = { openSheet = ControlSheet.KEYBOARD_SHORTCUTS },
+                            dismissOnPick = false,
+                        ),
+                    )
+                    add(
+                        SheetOption(
                             label = "Sleep Timer",
                             selected = false,
                             detail = sleepStatusDetail(sleepSelectionMinutes, sleepAtEpisodeEnd),
@@ -1250,6 +1259,16 @@ fun PlayerChrome(
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
             )
+            ControlSheet.KEYBOARD_SHORTCUTS -> ControlSelectionSheet(
+                title = "Keyboard Shortcuts",
+                options = listOf(
+                    SheetOption("Back to Player Settings", false, dismissOnPick = false,
+                        onPick = { openSheet = ControlSheet.PLAYER_SETTINGS }),
+                ) + playerKeyboardShortcutHints(isTvPlayer, keyboardEpisodeShortcutsAvailable, onEnterPip != null)
+                    .map { (action, keys) -> SheetOption(action, false, detail = keys, enabled = false) },
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
             ControlSheet.ENGINE -> ControlSelectionSheet(
                 title = "Player Engine",
                 options = engineChoices.map { choice ->
@@ -1386,7 +1405,7 @@ private fun prevChapterTargetMs(chapters: List<PlayerChapter>, positionMs: Long)
 private fun nextChapterTargetMs(chapters: List<PlayerChapter>, positionMs: Long): Long? =
     chapters.map { it.startMs }.sorted().firstOrNull { it > positionMs + 500L }
 
-private enum class ControlSheet {
+internal enum class ControlSheet {
     NONE,
     SOURCES,
     SOURCE_AUDIO,
@@ -1408,6 +1427,7 @@ private enum class ControlSheet {
     HDR_TONE_MAP,
     SHARE,
     INFO,
+    KEYBOARD_SHORTCUTS,
     ENGINE,
     // TV-only sheets (reached only when the host opts in via shareLink / isTvPlayer).
     AUDIO_LANGUAGE,
@@ -1483,7 +1503,7 @@ private val VIDEO_SCALE_MODES: List<Triple<VideoScaleMode, String, String>> = li
 private val SLEEP_TIMER_MINUTES: List<Int> = listOf(15, 30, 45, 60, 90)
 
 /// The playback-speed presets offered in the speed sheet.
-private val SPEED_PRESETS = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+internal val SPEED_PRESETS = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
 
 private data class SheetOption(
     val label: String,

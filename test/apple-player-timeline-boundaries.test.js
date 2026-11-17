@@ -71,8 +71,7 @@ test("the entire bottom bar terminates metadata at concrete rendering boundaries
         source.indexOf("private var bottomTimeline:"));
     assert(bottom.includes("PlayerBottomBarLayout("));
     assert(!bottom.includes("VStack("));
-    const layout = source.slice(source.indexOf("private struct PlayerBottomBarLayout:"),
-        source.indexOf("/// One provider refresh"));
+    const layout = section("private struct PlayerBottomBarLayout:", "/// Pinch is a mode change");
     for (const leaf of ["PlayerLiveIndicator", "PlayerBottomTimeline", "PlayerSkipEditorLayout?", "PlayerTransportToolbar"]) {
         assert(layout.includes(leaf), `outer boundary: ${leaf}`);
     }
@@ -178,7 +177,7 @@ test("pinch owns its multi-touch cycle without also delivering a tap", () => {
         "ownership.consumePinch(pinchCycle)", "onPinch(recognizer.scale)"]) {
         assert(interaction.includes(contract), "retained actual touch ownership: " + contract);
     }
-    const ownership = section("private struct PlayerVideoTouchPolicy", "#if os(iOS)\n@MainActor private struct PlayerVideoInteractionSurface:");
+    const ownership = section("private struct PlayerVideoTouchPolicy<", "\n}\n");
     assert(ownership.includes("expectedCycle == cycle, !multiTouchOwned, !tapDelivered"));
     assert(ownership.includes("expectedCycle == cycle, multiTouchOwned, !pinchDelivered"));
     const enabled = source.slice(source.indexOf("private var touchPinchEnabled:"),

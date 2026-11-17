@@ -10,6 +10,7 @@ struct SyncSettingsView: View {
     var allowsDiagnosticExport: Bool
     var diagnosticCredential: CredentialScopeRegistry.Capture?
     var diagnosticGrant: ProfilePickerToolsDiagnosticGrant?
+    var recoveryDiagnosticsOnly: Bool
     /// Embedded sheets close after authentication and one-time-code acknowledgement.
     /// Account restore remains manager-owned. Ordinary Account settings leave this nil.
     var onSignedIn: (() -> Void)?
@@ -18,11 +19,13 @@ struct SyncSettingsView: View {
     init(allowsDiagnosticExport: Bool = true,
          diagnosticCredential: CredentialScopeRegistry.Capture? = nil,
          diagnosticGrant: ProfilePickerToolsDiagnosticGrant? = nil,
+         recoveryDiagnosticsOnly: Bool = false,
          onSignedIn: (() -> Void)? = nil,
          authentication: AccountAuthenticationPresentation? = nil) {
         self.allowsDiagnosticExport = allowsDiagnosticExport
         self.diagnosticCredential = diagnosticCredential
         self.diagnosticGrant = diagnosticGrant
+        self.recoveryDiagnosticsOnly = recoveryDiagnosticsOnly
         self.onSignedIn = onSignedIn
         _authentication = StateObject(wrappedValue: authentication ?? AccountAuthenticationPresentation())
     }
@@ -35,16 +38,12 @@ struct SyncSettingsView: View {
     private var exportGrant: ProfilePickerToolsDiagnosticGrant? {
         if let diagnosticGrant { return diagnosticGrant }
         guard let credential = diagnosticCredential else { return nil }
-        let sync = sync, store = ProfileStore.shared
-        return .init(allowed: allowsDiagnosticExport, credential: credential, admission: {
-            if sync.accountReconnectRequired || sync.accountRestoreState == .failed { return true }
-            return !store.profiles.contains { $0.pin != nil }
-        })
+        return .init(allowed: allowsDiagnosticExport, credential: credential, recoveryOnly: true, admission: { true })
     }
 
     enum Mode: String, CaseIterable { case signIn = "Sign in", create = "Create", recover = "Recover" }
     @State private var mode: Mode = .signIn
-    private var effectiveMode: Mode { sync.accountReconnectRequired ? .signIn : mode }
+    private var effectiveMode: Mode { sync.accountSignInAgainRequired ? .signIn : mode }
     @State private var email = ""
     @State private var username = ""
     @State private var password = ""
@@ -67,12 +66,12 @@ struct SyncSettingsView: View {
                     recoveryCodeCard(code)
                 } else if authentication.working || authentication.reconciling {
                     ProgressView("Finishing sign-in…")
-                } else if sync.isSignedIn, !sync.accountReconnectRequired, let account = sync.account {
+                } else if sync.isSignedIn, !sync.accountSignInAgainRequired, let account = sync.account {
                     signedIn(account)
                 } else {
                     signedOut
                 }
-                if diagnosticExportIsAllowed { DiagnosticLogExportButton(grant: exportGrant) }
+                if diagnosticExportIsAllowed { DiagnosticLogExportButton(grant: exportGrant, recoveryOnly: recoveryDiagnosticsOnly) }
                 // This screen is now VortX-account-only. The external sync providers (Trakt, SIMKL) moved
                 // to the Integrations screen (IntegrationsSettingsView), alongside the Stremio connect card,
                 // since they enrich VortX rather than belonging to the VortX account itself.
@@ -93,7 +92,7 @@ struct SyncSettingsView: View {
             // Native data uses the causal merge/restore path, never a legacy whole-document override.
             if let decision = authentication.pendingConflict {
                 Button("Merge both (keep all profiles)") {
-                    resolveConflict(decision) { await sync.mergeBoth() ? .completed : .failed }
+                    resolveConflict(decision) { await sync.mergeBoth() }
                 }
                 Button("Use account's data") { resolveConflict(decision) { await sync.useAccountData() } }
                 Button("Not now", role: .cancel) { cancelConflict(decision) }
@@ -102,10 +101,10 @@ struct SyncSettingsView: View {
             Text("This account's profiles differ from this device. Merge both to keep every profile (recommended), or restore the account's data. Saved data is not overwritten by a legacy device backup.")
         }
         .task {
-            if sync.accountReconnectRequired { mode = .signIn; email = sync.account?.email ?? "" }
+            if sync.accountSignInAgainRequired { mode = .signIn; email = sync.account?.email ?? "" }
             await sync.refreshAccount()
         }
-        .onValueChange(of: sync.accountReconnectRequired) { required in
+        .onValueChange(of: sync.accountSignInAgainRequired) { required in
             if required { mode = .signIn; email = sync.account?.email ?? "" }
         }
         .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
@@ -178,10 +177,12 @@ struct SyncSettingsView: View {
 
     @ViewBuilder private var signedOut: some View {
         Group {
-            if sync.accountReconnectRequired {
+            if sync.accountSignInAgainRequired {
                 Text("Reconnect your VortX account")
                     .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
-                Text("The server did not accept this device's session. Sign in again to reconnect. Your profiles and pending changes are still saved on this device.")
+                Text(sync.backupUploadReconnectRequired && !sync.accountReconnectRequired
+                     ? "Sign in again to back up changes. You can keep using your profiles on this device."
+                     : "The server did not accept this device's session. Sign in again to reconnect. Your profiles and pending changes are still saved on this device.")
                     .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
             } else {
                 Text("Optional. A free, end-to-end-encrypted account keeps your profiles, settings, and library safe across devices.")
@@ -192,7 +193,7 @@ struct SyncSettingsView: View {
                 .buttonStyle(ChipButtonStyle())
                 .disabled(working)
 
-            if !sync.accountReconnectRequired {
+            if !sync.accountSignInAgainRequired {
                 HStack(spacing: Theme.Space.sm) {
                     ForEach(Mode.allCases, id: \.self) { m in
                         Button(m.rawValue) { mode = m; message = nil; needsTotp = false }
@@ -237,7 +238,7 @@ struct SyncSettingsView: View {
                     completeQR(attempt: attempt)
                 })
                     .frame(maxWidth: .infinity)
-                if diagnosticExportIsAllowed { DiagnosticLogExportButton(grant: exportGrant) }
+                if diagnosticExportIsAllowed { DiagnosticLogExportButton(grant: exportGrant, recoveryOnly: recoveryDiagnosticsOnly) }
             }
             .padding(Theme.Space.lg)
         }
@@ -384,7 +385,7 @@ struct SyncSettingsView: View {
         let submittedPassword = password
         let submittedTotp = needsTotp ? totp : nil
         let submittedRecoveryCode = recoveryCodeInput
-        let reconnect = sync.accountReconnectRequired
+        let reconnect = sync.accountSignInAgainRequired
         Task { @MainActor in
             guard authentication.mayStartRequest(attempt: attempt) else { return }
             let result: VortXSyncManager.AuthResult

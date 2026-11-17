@@ -177,8 +177,10 @@ class ProfileStore private constructor(context: Context) {
     private val _activeProfile = MutableStateFlow<UserProfile?>(null)
     val activeProfile = _activeProfile.asStateFlow()
 
-    /** The launch picker shows once per cold start, and only when there is a real choice to make. */
-    var pickedThisLaunch: Boolean = false
+    private val _pickerRoster = MutableStateFlow<AdmittedPickerRoster?>(null)
+    internal val pickerRoster = _pickerRoster.asStateFlow()
+    private var launchSelection: PickerLaunchSelection? = null
+    private var pickedThisLaunch: Boolean = false
     /** An admitted selection is not a completed account handoff, including on a one-profile device. */
     @Volatile internal var selectionPending: Boolean = false
         set(value) {
@@ -201,6 +203,31 @@ class ProfileStore private constructor(context: Context) {
      */
     var deletedProfileIDs: Set<String> = emptySet()
         private set(value) { noteRestoreProfileWrite(); field = value }
+
+    private fun publishPickerRoster(account: com.vortx.android.sync.SessionOwnerSnapshot.Account?) {
+        val mount = nativeProjectionMount
+        val selected = active
+        if (mount == null || account == null || selected == null) {
+            _pickerRoster.value = null
+            return
+        }
+        pickedThisLaunch = launchSelection?.matches(account, selected.id) == true
+        val previous = _pickerRoster.value
+        if (previous != null && previous.mount === mount && previous.account == account && previous.profiles === profiles &&
+            previous.activeID == selected.id && previous.selectionPending == selectionPending &&
+            previous.launchConfirmed == pickedThisLaunch) return
+        _pickerRoster.value = AdmittedPickerRoster(
+            mount, account, profiles, selected.id, selectionPending, pickedThisLaunch)
+    }
+
+    internal fun completePickerSelection() {
+        val roster = checkNotNull(_pickerRoster.value)
+        check(selectionPending && roster.mount === nativeProjectionMount &&
+            roster.profiles === profiles && roster.activeID == activeID)
+        launchSelection = PickerLaunchSelection(roster.account, roster.activeID)
+        selectionPending = false
+        publishPickerRoster(roster.account)
+    }
 
     // ---- Seams ----
 
@@ -434,6 +461,7 @@ class ProfileStore private constructor(context: Context) {
         }
         acknowledgedNativeAccount = effects.account; acknowledgedNativeTraktEpoch = effects.traktEpoch
         initialNativeMigrationProfile = null
+        publishPickerRoster(effects.account)
     }
     internal fun refreshNativeProjection(forceSettings: Boolean = false) = withDirectProfileWrite {
         checkNotNull(nativeGateway).withCurrentProjection { current ->
@@ -458,6 +486,8 @@ class ProfileStore private constructor(context: Context) {
                 if (prefs.contains(legacyKey)) prefs.edit().putBoolean(legacyKey, false).apply()
             }
             profiles = emptyList(); activeID = null; pickedThisLaunch = false
+            selectionPending = false
+            publishPickerRoster(null)
             notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(PlaylistScopeTransition.AUTHORITY_BOUNDARY)
             publishActiveProfile(); notifySwitchListeners()
         }
@@ -509,6 +539,7 @@ class ProfileStore private constructor(context: Context) {
         if (!forceSettings && profiles == acknowledged.profiles && activeID == acknowledged.activeID) {
             if (transition == PlaylistScopeTransition.AUTHORITY_BOUNDARY) notifyPlaylistScopeListeners(transition)
             acknowledgedNativeAccount = providerGuard?.owner; acknowledgedNativeTraktEpoch = traktEpoch
+            publishPickerRoster(providerGuard?.owner)
             return
         }
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
@@ -517,6 +548,7 @@ class ProfileStore private constructor(context: Context) {
                 ?: run { notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(transition) }
             acknowledgedNativeAccount = providerGuard?.owner; acknowledgedNativeTraktEpoch = traktEpoch
         }
+        publishPickerRoster(providerGuard?.owner)
     }
 
     /** State-only capture in the established CW -> native Session -> account admission order. */
@@ -718,8 +750,10 @@ class ProfileStore private constructor(context: Context) {
         check(profiles.firstOrNull { it.id == candidate.id } == candidate) { "Profile changed; unlock the current profile again" }
         capturePlaybackLocked()
         captureDiscoveryLocked()
+        // Keep the route closed if the native change succeeds but the follow-up handoff cannot be captured.
+        selectionPending = true
+        publishPickerRoster(_pickerRoster.value?.account)
         applyNativeProjection(checkNotNull(nativeGateway).select(candidate.id))
-        pickedThisLaunch = true
         SwitchOutcome.SameAccount
     }
 
@@ -1091,9 +1125,12 @@ class ProfileStore private constructor(context: Context) {
         // account-bound encrypted transaction, never the unscoped device-local roster file.
         if (touch) active?.let { profile ->
             val gateway = checkNotNull(nativeGateway)
-            try { gateway.save(profile, adding = false) }
-            catch (error: Throwable) {
+            try {
+                gateway.save(profile, adding = false)
+                _pickerRoster.value?.let { publishPickerRoster(it.account) }
+            } catch (error: Throwable) {
                 val durable = gateway.read(); profiles = durable.profiles; activeID = durable.activeID
+                _pickerRoster.value?.let { publishPickerRoster(it.account) }
                 throw error
             }
         }

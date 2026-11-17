@@ -3,11 +3,11 @@ package com.vortx.android.player
 import com.vortx.android.model.InstalledAddon
 import com.vortx.android.model.MediaRef
 import com.vortx.android.model.SubtitleRequestMetadata
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
@@ -86,41 +86,77 @@ object SubtitleAddonService {
     /// deduplicated by resolved canonical URL.
     suspend fun fetch(sources: List<SubtitleAddonSource>, type: String, videoId: String,
                       metadata: SubtitleRequestMetadata = SubtitleRequestMetadata()): List<AddonSubtitle> {
-        if (sources.isEmpty()) return emptyList()
-        val path = metadata.resourcePath(type, videoId)
-        val legacyPath = SubtitleRequestMetadata().resourcePath(type, videoId)
-        val paths = if (path == legacyPath) listOf(path) else listOf(path, legacyPath)
-        val collected = coroutineScope {
-            sources.map { source ->
-                async(Dispatchers.IO) { fetchOne(source, paths) }
-            }.awaitAll()
-        }
-        val seen = mutableSetOf<String>()
-        return collected.flatten().filter { seen.add(it.url) }
+        return subtitles(fetchSources(sources, resourcePaths(type, videoId, metadata)))
     }
 
-    private suspend fun fetchOne(source: SubtitleAddonSource, paths: List<String>): List<AddonSubtitle> =
-        withContext(Dispatchers.IO) {
-            try {
-                val deadline = AddonSubtitleIndexTransport.deadlineAfterTimeout()
-                for ((attempt, path) in paths.withIndex()) {
-                    val endpoint = "${source.baseUrl.trimEnd('/')}/$path"
-                    val response = AddonSubtitleIndexTransport.get(endpoint, source.originalInstalledBase, deadline)
-                        ?: return@withContext emptyList()
-                    if (attempt == 0 && paths.size > 1 && response.status in listOf(404, 405)) continue
-                    if (response.status !in 200..299) return@withContext emptyList()
-                    val body = response.body ?: return@withContext emptyList()
-                    return@withContext parseSubtitles(
-                        body.toString(Charsets.UTF_8), source.name, source.originalInstalledBase, response.finalIndexUri,
-                    )
-                }
-                emptyList()
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (_: Exception) {
-                emptyList()
-            }
+    // Publish the first batch immediately. A subtitle-sheet open may spend one retry on
+    // unresolved providers while preserving ready rows and authoritative empty responses.
+    internal suspend fun discoverForPlayback(
+        sources: List<SubtitleAddonSource>,
+        type: String,
+        videoId: String,
+        metadata: SubtitleRequestMetadata,
+        publish: (List<AddonSubtitle>) -> Boolean,
+        awaitRetry: suspend () -> Boolean,
+    ) {
+        val paths = resourcePaths(type, videoId, metadata)
+        val first = fetchSources(sources, paths)
+        if (!publish(subtitles(first))) return
+        val retryIndices = first.indices.filter { first[it] == SourceOutcome.Retryable }
+        if (retryIndices.isEmpty() || !awaitRetry()) return
+        val retried = fetchSources(retryIndices.map { sources[it] }, paths)
+        val merged = first.toMutableList()
+        retryIndices.forEachIndexed { offset, index -> merged[index] = retried[offset] }
+        publish(subtitles(merged))
+    }
+
+    private sealed interface SourceOutcome {
+        data class Completed(val subtitles: List<AddonSubtitle>) : SourceOutcome
+        data object Retryable : SourceOutcome
+        data object Rejected : SourceOutcome
+    }
+
+    private fun resourcePaths(type: String, videoId: String, metadata: SubtitleRequestMetadata): List<String> {
+        val path = metadata.resourcePath(type, videoId)
+        val legacyPath = SubtitleRequestMetadata().resourcePath(type, videoId)
+        return if (path == legacyPath) listOf(path) else listOf(path, legacyPath)
+    }
+
+    private suspend fun fetchSources(sources: List<SubtitleAddonSource>, paths: List<String>): List<SourceOutcome> =
+        coroutineScope {
+            sources.map { source -> async(Dispatchers.IO) { fetchOne(source, paths) } }.awaitAll()
         }
+
+    private fun subtitles(outcomes: List<SourceOutcome>): List<AddonSubtitle> {
+        val seen = mutableSetOf<String>()
+        return outcomes.filterIsInstance<SourceOutcome.Completed>()
+            .flatMap { it.subtitles }.filter { seen.add(it.url) }
+    }
+
+    private suspend fun fetchOne(source: SubtitleAddonSource, paths: List<String>): SourceOutcome {
+        try {
+            val deadline = AddonSubtitleIndexTransport.deadlineAfterTimeout()
+            for ((attempt, path) in paths.withIndex()) {
+                val endpoint = "${source.baseUrl.trimEnd('/')}/$path"
+                val response = AddonSubtitleIndexTransport.get(endpoint, source.originalInstalledBase, deadline)
+                    ?: return SourceOutcome.Retryable
+                val status = response.status
+                if (attempt == 0 && paths.size > 1 && (status == 404 || status == 405)) continue
+                if (status == 408 || status == 429 || status in 500..599) return SourceOutcome.Retryable
+                if (status !in 200..299) return SourceOutcome.Rejected
+                val body = response.body ?: return SourceOutcome.Retryable
+                val rows = parseSubtitles(
+                    body.toString(Charsets.UTF_8), source.name, source.originalInstalledBase, response.finalIndexUri,
+                ) ?: return SourceOutcome.Retryable
+                return SourceOutcome.Completed(rows)
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return SourceOutcome.Retryable
+        }
+        return SourceOutcome.Rejected
+    }
 
     /// Decode Stremio subtitle rows, resolving references against the actual final index URL.
     /// Each canonical URL and the aggregate UTF-8 URL text are bounded to prevent oversized rows or
@@ -130,10 +166,10 @@ object SubtitleAddonService {
         addonName: String,
         originalInstalledBase: String,
         actualFinalIndexUri: String,
-    ): List<AddonSubtitle> {
-        val root = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
-        val array = root.optJSONArray("subtitles") ?: return emptyList()
-        val index = actualFinalIndexUri.toHttpUrlOrNull() ?: return emptyList()
+    ): List<AddonSubtitle>? {
+        val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
+        val array = root.optJSONArray("subtitles") ?: return null
+        val index = actualFinalIndexUri.toHttpUrlOrNull() ?: return null
         val out = mutableListOf<AddonSubtitle>()
         val seen = mutableSetOf<String>()
         var retainedUrlBytes = 0

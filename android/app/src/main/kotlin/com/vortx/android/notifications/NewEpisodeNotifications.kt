@@ -16,12 +16,21 @@ import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.Operation
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
+import androidx.work.await
 import androidx.work.workDataOf
 import com.vortx.android.MainActivity
 import com.vortx.android.R
 import com.vortx.android.profile.ProfileStore
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.util.concurrent.TimeUnit
 
 /**
@@ -41,11 +50,8 @@ import java.util.concurrent.TimeUnit
  * UserDefaults key in the shared [ProfileStore.PREFS_FILE], default ON (an unset key reads enabled), so it
  * rides the settings backup and means the same thing on iOS/tvOS/Mac/Android/web.
  *
- * PER-PROFILE BOUNDARY (the invariant, mirroring `ReleaseCalendarOwner`): the sweep captures the active
- * profile id when it starts and re-checks it has not changed before it publishes any schedule, so a sweep
- * that outlives a profile switch never schedules another profile's shows. Each scheduled notification also
- * carries its owning profile id and re-checks the current active profile at FIRE time, so even a schedule
- * that slipped through a switch can never POST for the wrong profile.
+ * The sweep and delivery worker both verify the mounted account scope and selected profile.
+ * The durable WorkData identity survives process death. Each worker also holds its own live admission.
  */
 object NewEpisodeNotifications {
 
@@ -60,18 +66,19 @@ object NewEpisodeNotifications {
 
     private const val CHANNEL_ID = "vortx.newepisodes"
     private const val SWEEP_INTERVAL_HOURS = 12L
+    private val scheduleMutex = Mutex()
 
     /** Unique-work names + tags. The tag lets the whole set be cancelled on disable or re-published cleanly. */
     internal const val SWEEP_PERIODIC_NAME = "vortx.newepisode.sweep.periodic"
     internal const val SWEEP_ONESHOT_NAME = "vortx.newepisode.sweep.now"
     internal const val NOTIFY_TAG = "vortx.newepisode.notify"
-    internal const val NOTIFY_OWNER_TAG_PREFIX = "vortx.newepisode.owner:"
-    internal fun notifyWorkName(seriesId: String): String = "vortx.newepisode.nextep:$seriesId"
 
     internal const val KEY_SERIES_ID = "seriesId"
     internal const val KEY_SERIES_NAME = "seriesName"
     internal const val KEY_EPISODE_LABEL = "episodeLabel"
+    internal const val KEY_AIR_EPOCH_MILLIS = "airEpochMillis"
     internal const val KEY_OWNER_PROFILE = "ownerProfileId"
+    internal const val KEY_OWNER_SCOPE = "ownerScopeDigest"
 
     /**
      * On by default: an unset key reads as enabled, so a followed show pings out of the box and the first
@@ -124,26 +131,24 @@ object NewEpisodeNotifications {
         wm.cancelAllWorkByTag(NOTIFY_TAG)
     }
 
-    /**
-     * (Re)publish the per-series alerts after the sweep's boundary check has passed. Cancels every prior
-     * pending alert first (so a series dropped from the library, or one with nothing upcoming, clears), then
-     * schedules exactly one delayed [NewEpisodeNotifyWorker] per series that has an upcoming episode. Each is
-     * keyed by series id (unique work, REPLACE) so re-sweeping replaces rather than duplicates, and tagged
-     * with its owning profile so a switch can cancel the outgoing set.
-     */
-    internal fun applySchedules(
+    /** Reconcile exact WorkManager rows after the network fetch and outside the owner monitors. */
+    internal suspend fun applySchedules(
         context: Context,
-        ownerProfileId: String,
+        captured: EpisodeNotificationOwnerObservation.Mounted,
+        eligibleSeries: Set<String>,
         alerts: List<UpcomingEpisodeAlert>,
-    ) {
+    ): Boolean = scheduleMutex.withLock {
         val wm = WorkManager.getInstance(context.applicationContext)
-        // Cancel-then-enqueue is WorkManager's documented replace-the-whole-set pattern: the cancel captures
-        // the existing work ids before the fresh enqueues below, so the new requests are never swept up by it.
-        wm.cancelAllWorkByTag(NOTIFY_TAG)
-        val now = System.currentTimeMillis()
-        for (alert in alerts) {
-            val delay = alert.airEpochMillis - now
-            if (delay <= 0L) continue
+        val previous = wm.getWorkInfosByTagFlow(NOTIFY_TAG).first()
+        val operation = currentCoroutineContext()
+        val owner = captured.owner
+        val desiredEvents = alerts.mapTo(hashSetOf()) { owner.eventKey(it.seriesId, it.airEpochMillis) }
+        val planningTime = System.currentTimeMillis()
+        val requests = alerts.mapNotNull { alert ->
+            if (alert.airEpochMillis <= 0L) return@mapNotNull null
+            val delay = alert.airEpochMillis - planningTime
+            if (delay <= 0L) return@mapNotNull null
+            val event = owner.eventKey(alert.seriesId, alert.airEpochMillis)
             val request = OneTimeWorkRequestBuilder<NewEpisodeNotifyWorker>()
                 .setInitialDelay(delay, TimeUnit.MILLISECONDS)
                 .setInputData(
@@ -151,14 +156,46 @@ object NewEpisodeNotifications {
                         KEY_SERIES_ID to alert.seriesId,
                         KEY_SERIES_NAME to alert.seriesName,
                         KEY_EPISODE_LABEL to alert.episodeLabel,
-                        KEY_OWNER_PROFILE to ownerProfileId,
+                        KEY_AIR_EPOCH_MILLIS to alert.airEpochMillis,
+                        KEY_OWNER_PROFILE to owner.profileId,
+                        KEY_OWNER_SCOPE to owner.scopeDigest,
                     ),
                 )
                 .addTag(NOTIFY_TAG)
-                .addTag(NOTIFY_OWNER_TAG_PREFIX + ownerProfileId)
+                .addTag(event)
                 .build()
-            wm.enqueueUniqueWork(notifyWorkName(alert.seriesId), ExistingWorkPolicy.REPLACE, request)
+            event to request
         }
+        val current = captured.refreshForScheduling() ?: return@withLock false
+        val submitted = mutableListOf<Operation>()
+        var allCommitted = true
+        val admitted = try {
+            current.publishIfCurrent {
+                operation.ensureActive()
+                if (!isEnabled(context)) return@publishIfCurrent
+                val now = System.currentTimeMillis()
+                // Keep due work for the same owner and a still-saved series, even if the next sweep
+                // found a later episode. An unrelated or legacy job never receives this protection.
+                for (work in previous) {
+                    if (!work.state.isFinished && !owner.retainsWork(work.tags, eligibleSeries, desiredEvents, now)) {
+                        submitted += wm.cancelWorkById(work.id)
+                    }
+                }
+                for ((event, request) in requests) {
+                    submitted += wm.enqueueUniqueWork(event, ExistingWorkPolicy.KEEP, request)
+                }
+            }
+        } finally {
+            // Let already-submitted local database operations settle before another sweep queries.
+            // Neither native nor authenticated-owner monitors are held over this wait.
+            withContext(NonCancellable) {
+                for (command in submitted) {
+                    try { command.await() } catch (_: Exception) { allCommitted = false }
+                }
+            }
+        }
+        operation.ensureActive()
+        admitted && allCommitted
     }
 
     /** Create the channel. Idempotent; required on API 26+, which is our minSdk, so it always runs. */
@@ -179,7 +216,7 @@ object NewEpisodeNotifications {
 
     /**
      * Post the actual "new episode is out" notification. Called only from [NewEpisodeNotifyWorker] AFTER its
-     * enabled + owning-profile checks pass. No-ops when the runtime POST_NOTIFICATIONS permission is missing
+     * enabled + mounted owner checks pass. No-ops when the runtime POST_NOTIFICATIONS permission is missing
      * (API 33+), matching the downloads rule: the feature never crashes on a denied permission, the alert is
      * simply not shown.
      */
@@ -188,12 +225,14 @@ object NewEpisodeNotifications {
         seriesId: String,
         seriesName: String,
         episodeLabel: String,
-    ) {
+        notificationTag: String,
+        admit: (() -> Unit) -> Boolean,
+    ): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
         ) {
-            return
+            return true
         }
         ensureChannel(context)
         val open = PendingIntent.getActivity(
@@ -210,10 +249,11 @@ object NewEpisodeNotifications {
             .setContentIntent(open)
             .setCategory(NotificationCompat.CATEGORY_RECOMMENDATION)
             .build()
-        NotificationManagerCompat.from(context).notify(notificationId(seriesId), notification)
+        val manager = NotificationManagerCompat.from(context)
+        return admit { manager.notify(notificationTag, notificationId(seriesId), notification) }
     }
 
-    /** Stable per-series notification id, kept clear of the downloads id space (0x0D...). */
+    /** The event tag distinguishes episodes within this numeric notification ID range. */
     private fun notificationId(seriesId: String): Int = 0x0E_00_00_00 + (seriesId.hashCode() and 0x00FF_FFFF)
 
     private fun prefs(context: Context) =

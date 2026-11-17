@@ -55,7 +55,7 @@ struct iOSSignInView: View {
                         surface
                         secondaryActions
                         footnote
-                        DiagnosticLogExportButton()
+                        DiagnosticLogExportButton(recoveryOnly: true)
                     }
                     .frame(maxWidth: .infinity)
                     .padding(Theme.Space.lg)

@@ -5,6 +5,9 @@
 //     app/SourcesShared/CatalogRowResolution.swift \
 //     app/SourcesShared/AppleCWSeasonRolloverPolicy.swift \
 //     app/SourcesShared/UsenetStreamValidation.swift \
+//     app/SourcesShared/DebridPlaybackAvailability.swift \
+//     app/SourcesShared/ProfileAddonPreferences.swift \
+//     app/SourcesShared/DiagnosticPlaybackIntegrityPolicy.swift \
 //     app/SourcesShared/CoreModels.swift \
 //     app/SourcesShared/SubtitleReleaseFingerprint.swift \
 //     app/SourcesShared/DownloadModels.swift \
@@ -46,7 +49,18 @@ enum StubError: Error { case unavailable }
 enum VortXSyncManager { static let appliedAddonOrder: [String] = [] }
 enum AddonTombstones { static func normalize(_ value: String) -> String { value } }
 
-final class DebridKeys {
+enum ProfileStore {
+    static func activeDisabledAddons() -> Set<String> { [] }
+    static func activeAddonOrder(accountOrder: [String]) -> [String] { accountOrder }
+}
+
+// This executable exercises the model's identity and local download resolver, not provider transport.
+struct CommunityStreamGateway: Sendable {
+    static let shared = Self()
+    func localURLIfReady(for stream: CoreStream, upstream: URL) -> URL? { nil }
+}
+
+final class DebridKeys: Sendable {
     static let shared = DebridKeys()
     func isConfigured(_ service: DebridService) -> Bool { false }
 }
@@ -77,9 +91,9 @@ struct PlaybackMeta: Hashable {
 
 // MARK: - Assertions and fixtures
 
-private var failures = 0
+@MainActor private var failures = 0
 
-private func expect(_ condition: @autoclosure () -> Bool, _ name: String) {
+@MainActor private func expect(_ condition: @autoclosure () -> Bool, _ name: String) {
     if condition() { print("PASS  \(name)") }
     else { failures += 1; print("FAIL  \(name)") }
 }
@@ -91,12 +105,14 @@ private func playback(type: String, season: Int?, episode: Int?, videoID: String
     )
 }
 
-private func download(type: String, season: Int?, episode: Int?, videoID: String) -> DownloadRecord {
-    DownloadRecord(
-        id: UUID(), contentId: "tt-lifecycle", videoId: videoID, type: type,
+private func download(type: String, season: Int?, episode: Int?, videoID: String,
+                      managedFilename: Bool = false, contentID: String = "tt-lifecycle") -> DownloadRecord {
+    let id = UUID()
+    return DownloadRecord(
+        id: id, contentId: contentID, videoId: videoID, type: type,
         name: "Lifecycle", poster: nil, season: season, episode: episode,
         sourceName: nil, qualityText: nil, isTorrent: false, headers: nil,
-        remoteURL: "https://media.invalid/video", localFilename: "video.mkv",
+        remoteURL: "https://media.invalid/video", localFilename: managedFilename ? "\(id.uuidString).mkv" : "video.mkv",
         bytesTotal: 100, bytesDone: 100, state: .completed,
         addedAt: Date(timeIntervalSince1970: 1)
     )
@@ -176,7 +192,7 @@ private func hasBroadPhysicalWiring(coreModels: String, bridge: String,
 
 @main
 private struct NonSeriesEpisodeLifecycleContractTests {
-    static func main() {
+    @MainActor static func main() {
         let collection = playback(
             type: "collection", season: 1, episode: 2, videoID: "tt-lifecycle:1:2"
         )
@@ -326,6 +342,303 @@ private struct NonSeriesEpisodeLifecycleContractTests {
                && movieDownload.displayTitle == "Lifecycle"
                && movieDownload.groupingKey == "movie:tt-movie",
                "normal movie download behavior remains unchanged")
+
+        let e1 = download(type: "series", season: 1, episode: 1, videoID: "tt-lifecycle:1:1")
+        let e3 = download(type: "series", season: 1, episode: 3, videoID: "tt-lifecycle:1:3")
+        let season2 = download(type: "series", season: 2, episode: 1, videoID: "tt-lifecycle:2:1")
+        var incomplete = download(type: "series", season: 1, episode: 2, videoID: "tt-lifecycle:1:2")
+        incomplete.state = .downloading
+        let alias = download(type: "series", season: 1, episode: 2, videoID: "other-provider-id")
+        expect(DownloadRecord.playableCopy(
+            of: seriesDownload.playbackMeta, in: [e1, incomplete, alias, seriesDownload], fileExists: { $0.id == seriesDownload.id }
+        )?.id == seriesDownload.id, "exact download requires completed identity and actual file")
+        expect(DownloadRecord.playableCopy(
+            of: seriesDownload.playbackMeta, in: [incomplete, alias], fileExists: { _ in true }
+        ) == nil, "no coordinate-only replacement for explicit playback")
+        let offlineEpisode = DownloadedContinueWatchingTarget(
+            libraryID: "tt-lifecycle", type: "series", cardVideoID: "tt-lifecycle:1:2",
+            resumeSeconds: 90, progress: 0.2, isUpNext: false
+        )!
+        let otherTitle = download(type: "series", season: 1, episode: 2, videoID: "tt-lifecycle:1:2",
+                                  contentID: "tt-elsewhere")
+        let contradictory = download(type: "series", season: 3, episode: 4, videoID: "tt-lifecycle:1:2")
+        let missingCoordinates = download(type: "series", season: nil, episode: nil, videoID: "tt-lifecycle:1:2")
+        expect(DownloadRecord.offlineContinueWatchingCopy(
+            for: offlineEpisode, in: [e1, incomplete, alias, otherTitle, seriesDownload],
+            fileExists: { $0.id == seriesDownload.id }
+        )?.id == seriesDownload.id, "offline resume uses exact local title and current card video")
+        for records in [[incomplete, alias, otherTitle], [missingCoordinates], [contradictory], [contradictory, seriesDownload]] {
+            expect(DownloadRecord.offlineContinueWatchingCopy(
+                for: offlineEpisode, in: records, fileExists: { _ in true }
+            ) == nil, "offline resume refuses wrong, pending, unproven and contradictory episode copies")
+        }
+        expect(DownloadRecord.offlineContinueWatchingCopy(
+            for: offlineEpisode, in: [seriesDownload], fileExists: { _ in false }
+        ) == nil, "a completed index row cannot play when its managed file is absent")
+        let opaqueCard = continueWatching(type: "series", videoID: alias.videoId, progress: 0.2)
+        let opaqueTarget = DownloadedContinueWatchingTarget(item: opaqueCard)!
+        expect(opaqueTarget.resumeSeconds == 20 && DownloadRecord.offlineContinueWatchingCopy(
+            for: opaqueTarget, in: [seriesDownload, alias], fileExists: { _ in true }
+        )?.id == alias.id, "an opaque card identity can play only its exact indexed video")
+        let offlineMovie = DownloadedContinueWatchingTarget(
+            libraryID: "tt-movie", type: "movie", cardVideoID: nil,
+            resumeSeconds: 45, progress: 0.3, isUpNext: false
+        )!
+        let exactMovie = download(type: "movie", season: nil, episode: nil, videoID: "tt-movie",
+                                  contentID: "tt-movie")
+        let movieEpisode = download(type: "movie", season: 1, episode: 2, videoID: "tt-movie",
+                                    contentID: "tt-movie")
+        expect(DownloadRecord.offlineContinueWatchingCopy(
+            for: offlineMovie, in: [movieDownload, movieEpisode, exactMovie], fileExists: { _ in true }
+        )?.id == exactMovie.id, "a movie can resume without card video only by exact movie identity")
+        let alternateMovie = download(type: "movie", season: nil, episode: nil, videoID: "provider:movie",
+                                      contentID: "tt-movie")
+        let alternateMovieTarget = DownloadedContinueWatchingTarget(
+            libraryID: "tt-movie", type: "movie", cardVideoID: alternateMovie.videoId,
+            resumeSeconds: 45, progress: 0.3, isUpNext: false
+        )!
+        expect(DownloadRecord.offlineContinueWatchingCopy(
+            for: alternateMovieTarget, in: [exactMovie, alternateMovie], fileExists: { _ in true }
+        )?.id == alternateMovie.id && DownloadRecord.offlineContinueWatchingCopy(
+            for: offlineMovie, in: [alternateMovie], fileExists: { _ in true }
+        ) == nil, "a movie's distinct video identity is eligible only when the card supplies it exactly")
+        expect(DownloadedContinueWatchingTarget(
+            item: continueWatching(type: "series", videoID: seriesDownload.videoId, progress: 0.95)
+        )?.resumeSeconds == 95, "positive unfinished series history retains the existing credits behavior")
+        let admittedMount = DownloadedContinueWatchingInitialMount()
+        expect(admittedMount.admit(confirmedOffline: true, exactCopy: true)
+               && admittedMount.admit(confirmedOffline: false, exactCopy: false),
+               "an admitted original request does not stop already-open playback on reconnect or view reuse")
+        let reconnectedMount = DownloadedContinueWatchingInitialMount()
+        expect(!reconnectedMount.admit(confirmedOffline: false, exactCopy: true)
+               && !reconnectedMount.admit(confirmedOffline: true, exactCopy: true),
+               "a reconnect before first mount refuses the inferred route and does not resurrect it")
+        expect(!DownloadedContinueWatchingInitialMount().admit(confirmedOffline: true, exactCopy: false),
+               "the first mount needs the exact prepared copy")
+        for (type, videoID, seconds, progress, isUpNext) in [
+            ("series", nil, 45.0, 0.2, false),
+            ("series", "tt-lifecycle", 45, 0.2, false),
+            ("series", "tt-lifecycle:1:2", 45, 0.2, true),
+            ("series", "tt-lifecycle:1:2", .infinity, 0.2, false),
+            ("series", "tt-lifecycle:1:2", 0, 0.2, false),
+            ("movie", "tt-lifecycle", 45, 0.9, false),
+            ("movie", "tt-lifecycle:1:2", 45, 0.2, false),
+            ("movie", "", 45, 0.2, false),
+            ("collection", "tt-lifecycle:1:2", 45, 0.2, false)
+        ] as [(String, String?, Double, Double, Bool)] {
+            expect(DownloadedContinueWatchingTarget(
+                libraryID: "tt-lifecycle", type: type, cardVideoID: videoID,
+                resumeSeconds: seconds, progress: progress, isUpNext: isUpNext
+            ) == nil, "offline resume requires unfinished exact current local playback")
+        }
+        expect(DownloadRecord.playableSuccessor(
+            after: e1.playbackMeta, in: [e3, seriesDownload], fileExists: { _ in true }
+        )?.id == seriesDownload.id, "download autoplay chooses immediate E+1")
+        expect(DownloadRecord.playableSuccessor(
+            after: e1.playbackMeta, in: [incomplete, e3, season2], fileExists: { _ in true }
+        ) == nil, "missing E+1 cannot jump a gap or season")
+        expect(DownloadRecord.playableSuccessor(
+            after: e1.playbackMeta, in: [alias, seriesDownload], fileExists: { _ in true }
+        ) == nil, "ambiguous local successor identities are refused")
+        expect(DownloadRecord.playableSuccessor(
+            after: e1.playbackMeta, in: [seriesDownload], fileExists: { _ in false }
+        ) == nil, "evicted immediate successor is not playable")
+        expect(DownloadRecord.playableSuccessor(
+            after: e3.playbackMeta, in: [season2], fileExists: { _ in true }
+        ) == nil, "download inventory alone cannot prove cross-season adjacency")
+        let boundaryTitle = "tt1234567"
+        var finale = download(type: "series", season: 1, episode: 2, videoID: "tt1234567:1:2", contentID: boundaryTitle)
+        let following = download(type: "series", season: 2, episode: 1, videoID: "tt1234567:2:1", contentID: boundaryTitle)
+        let immediate = download(type: "series", season: 1, episode: 3, videoID: "tt1234567:1:3", contentID: boundaryTitle)
+        var later = download(type: "series", season: 1, episode: 4, videoID: "tt1234567:1:4", contentID: boundaryTitle)
+        later.state = .failed
+        let followingAlias = download(type: "series", season: 2, episode: 1, videoID: "other:2:1", contentID: boundaryTitle)
+        let proof = DownloadSeasonBoundary(libraryID: boundaryTitle, finaleVideoID: finale.videoId,
+                                           successorVideoID: following.videoId, season: 1, finaleEpisode: 2,
+                                           tmdbSeriesID: 100, tmdbFinaleID: 102, tmdbSuccessorID: 201)
+        let refreshedProof = DownloadSeasonBoundary(libraryID: boundaryTitle, finaleVideoID: finale.videoId,
+                                                    successorVideoID: following.videoId, season: 1, finaleEpisode: 2,
+                                                    tmdbSeriesID: 100, tmdbFinaleID: 102, tmdbSuccessorID: 202)
+        expect(DownloadSeasonBoundary.Refresh.unavailable.replacement(for: proof) == proof,
+               "unavailable or inconsistent metadata retains the last verified evidence")
+        expect(DownloadSeasonBoundary.Refresh.contradicted.replacement(for: proof) == nil,
+               "a definitive canonical correction removes the stale proof")
+        expect(DownloadSeasonBoundary.Refresh.verified(refreshedProof).replacement(for: proof) == refreshedProof,
+               "new verified evidence replaces the prior proof")
+        var partialObservation = DownloadSeasonBoundary.RefreshObservations(saved: proof)
+        partialObservation.observe(seriesID: 100, finaleEpisode: 2, finaleID: nil, successorID: 201)
+        expect(partialObservation.incompleteResult.replacement(for: proof) == proof,
+               "a missing outgoing season and unchanged observed successor preserve the proof")
+        var changedNext = partialObservation
+        changedNext.observe(successorID: 202)
+        expect(changedNext.incompleteResult.replacement(for: proof) == nil,
+               "a changed authenticated next E1 revokes the proof with the outgoing season unavailable")
+        var changedTitle = DownloadSeasonBoundary.RefreshObservations(saved: proof)
+        changedTitle.observe(seriesID: 101)
+        expect(changedTitle.incompleteResult.replacement(for: proof) == nil,
+               "a changed unique TV match revokes the proof even without TV details")
+        var changedCount = DownloadSeasonBoundary.RefreshObservations(saved: proof)
+        changedCount.observe(seriesID: 100, finaleEpisode: 3)
+        expect(changedCount.incompleteResult.replacement(for: proof) == nil,
+               "a canonical count contradicts the finale even without either season response")
+        let legacyIndex = try! JSONEncoder().encode([finale, following])
+        let legacyRows = try! JSONDecoder().decode([DownloadRecord].self, from: legacyIndex)
+        expect(legacyRows.map(\.id) == [finale.id, following.id] && legacyRows[0].seasonBoundary == nil,
+               "indexes without season proof retain every local record")
+        var malformedRows = try! JSONSerialization.jsonObject(with: legacyIndex) as! [[String: Any]]
+        malformedRows[0]["seasonBoundary"] = ["tmdbSeriesID": "invalid"]
+        malformedRows[1]["seasonBoundary"] = true
+        let recovered = try! JSONDecoder().decode([DownloadRecord].self,
+            from: JSONSerialization.data(withJSONObject: malformedRows))
+        expect(recovered.map(\.id) == [finale.id, following.id] && recovered.allSatisfy { $0.seasonBoundary == nil },
+               "bad optional proof must not erase existing downloaded files from the index")
+        finale.seasonBoundary = proof
+        let upgradedIndex = try! JSONEncoder().encode([finale, following])
+        let upgraded = try! JSONDecoder().decode([DownloadRecord].self, from: upgradedIndex)
+        struct LegacyIdentity: Decodable { let id: UUID; let videoId: String }
+        let rollback = try! JSONDecoder().decode([LegacyIdentity].self, from: upgradedIndex)
+        expect(upgraded[0].seasonBoundary == proof && rollback.map(\.videoId) == [finale.videoId, following.videoId],
+               "valid proof round-trips; rollback readers ignore the additive key")
+        expect(DownloadRecord.playableSuccessor(after: finale.playbackMeta, seasonBoundary: proof,
+            in: [following], fileExists: { _ in true })?.id == following.id,
+            "a proven season boundary can launch the exact local successor")
+        expect(DownloadRecord.playableSuccessor(after: finale.playbackMeta, seasonBoundary: proof,
+            in: [following, immediate], fileExists: { _ in true })?.id == immediate.id,
+            "same-season E+1 keeps priority")
+        for indexed in [[following, later], [following, followingAlias]] {
+            expect(DownloadRecord.playableSuccessor(after: finale.playbackMeta, seasonBoundary: proof,
+                in: indexed, fileExists: { _ in true }) == nil,
+                "later same-season records or ambiguous boundary identities veto rollover")
+        }
+        expect(DownloadRecord.playableSuccessor(after: finale.playbackMeta, seasonBoundary: proof,
+            in: [following], fileExists: { _ in false }) == nil,
+            "a verified successor with an evicted file remains unavailable")
+        expect(DownloadRecord.playableSuccessor(after: immediate.playbackMeta, seasonBoundary: proof,
+            in: [following], fileExists: { _ in true }) == nil,
+            "the proof cannot authorize a different outgoing episode")
+        let witness = DownloadSeasonRolloverWitness(originID: finale.id, originMeta: finale.playbackMeta,
+                                                     proof: proof, successorID: following.id)
+        expect(witness.accepts(following, in: [finale, following], fileExists: { _ in true }),
+               "final mount re-admits the exact original proof and candidate")
+        var revised = finale
+        revised.seasonBoundary = refreshedProof
+        var revoked = finale
+        revoked.seasonBoundary = nil
+        for indexed in [[following], [revoked, following], [revised, following],
+                        [finale, following, later], [finale, following, immediate]] {
+            expect(!witness.accepts(following, in: indexed, fileExists: { _ in true }),
+                   "a missing origin, proof revocation or replacement, or newly conflicting row rejects the old mount")
+        }
+        expect(!witness.accepts(following, in: [finale, following], fileExists: { _ in false }),
+               "a selected file removed during deferred preparation cannot mount")
+        expect(later.contradictsSeasonBoundary(of: finale) && !following.contradictsSeasonBoundary(of: finale)
+               && !later.contradictsSeasonBoundary(of: revoked),
+               "only an indexed later canonical same-season record retires an existing proof")
+
+        let boundaryDecoder = JSONDecoder()
+        boundaryDecoder.keyDecodingStrategy = .convertFromSnakeCase
+        let seriesData = Data(#"{"id":100,"seasons":[{"id":10,"season_number":1,"episode_count":2},{"id":20,"season_number":2,"episode_count":1}],"external_ids":{"imdb_id":"tt1234567"}}"#.utf8)
+        let boundarySeries = try! boundaryDecoder.decode(DownloadSeasonSeries.self, from: seriesData)
+        let fromSeason = boundarySeries.season(1)!
+        let toSeason = boundarySeries.season(2)!
+        expect(boundarySeries.matches(.imdb(boundaryTitle), requestedID: 100)
+               && !boundarySeries.matches(.imdb("tt1234568"), requestedID: 100)
+               && !boundarySeries.matches(.tmdb(101), requestedID: 100),
+               "the TV response corroborates the exact original canonical identity")
+        let first = DownloadSeasonDetails.Episode(id: 101, showId: 100, seasonNumber: 1, episodeNumber: 1)
+        let last = DownloadSeasonDetails.Episode(id: 102, showId: 100, seasonNumber: 1, episodeNumber: 2)
+        let foreign = DownloadSeasonDetails.Episode(id: 102, showId: 200, seasonNumber: 1, episodeNumber: 2)
+        let gap = DownloadSeasonDetails.Episode(id: 103, showId: 100, seasonNumber: 1, episodeNumber: 3)
+        let providerDetails = DownloadSeasonDetails(id: 10, seasonNumber: 1, episodes: [last, first])
+        expect(providerDetails.completeEpisodes(seriesID: 100, season: fromSeason)?.last?.id == 102,
+               "only a complete canonical season confirms its exact finale")
+        for rejected in [[last], [first, gap], [first, foreign], [first, first]] {
+            let incomplete = DownloadSeasonDetails(id: 10, seasonNumber: 1, episodes: rejected)
+            expect(incomplete.completeEpisodes(seriesID: 100, season: fromSeason) == nil,
+                   "count mismatch, gap, foreign show and duplicate episode all fail closed")
+        }
+        expect(providerDetails.completeEpisodes(seriesID: 100, season: toSeason) == nil,
+               "response season identity must match the series summary")
+
+        expect(DownloadRecord.permitsDownloadedAdvance(position: 2_160, duration: 2_400),
+               "a valid local EOF at the 90 percent boundary admits handoff")
+        expect(!DownloadRecord.permitsDownloadedAdvance(position: 10, duration: 2_400)
+               && !DownloadRecord.permitsDownloadedAdvance(position: 2_159, duration: 2_400),
+               "a premature local EOF never advances")
+        expect(!DownloadRecord.permitsDownloadedAdvance(position: nil, duration: 2_400)
+               && !DownloadRecord.permitsDownloadedAdvance(position: .infinity, duration: 2_400)
+               && !DownloadRecord.permitsDownloadedAdvance(position: 10, duration: 0)
+               && !DownloadRecord.permitsDownloadedAdvance(position: 10, duration: .nan),
+               "missing, non-finite or non-positive EOF evidence never advances")
+        var evidence = PlaybackCompletionEvidence<Int>()
+        evidence.begin(owner: 1, mountGeneration: 1)
+        evidence.recordDuration(2_400, owner: 1)
+        evidence.recordPosition(2_395, owner: 1, transportSettled: false)
+        expect(evidence.settledProgress(owner: 1) == nil
+               && evidence.consumeEOF(owner: 1, isLive: false, isTrailer: false) == .allowCompletion,
+               "optimistic near-end clock cannot advance a download; ordinary EOF policy is unchanged")
+        evidence.recordPosition(2_395, owner: 1, transportSettled: true)
+        let localEOF = evidence.settledProgress(owner: 1)
+        expect(evidence.consumeEOF(owner: 1, isLive: false, isTrailer: false) == .allowCompletion
+               && DownloadRecord.permitsDownloadedAdvance(
+                   position: localEOF?.position, duration: localEOF?.duration ?? 0),
+               "owned settled near-end clock and native duration admit normal downloaded EOF")
+        evidence.invalidateSettledPosition(owner: 1)
+        expect(evidence.settledProgress(owner: 1) == nil, "unsettled Aether event retires prior local witness")
+        evidence.recordPosition(2_395, owner: 1, transportSettled: true)
+        evidence.begin(owner: 1, mountGeneration: 2)
+        expect(evidence.settledProgress(owner: 1) == nil && evidence.settledProgress(owner: 2) == nil,
+               "new physical mount and unrelated owner cannot reuse local EOF evidence")
+        expect(DownloadRecord.playableSuccessor(
+            after: oldCollection.playbackMeta, in: [e3], fileExists: { _ in true }
+        ) == nil, "non-series remains outside download autoplay")
+
+        let generatedName = "\(seriesDownload.id.uuidString).mkv"
+        expect(DownloadRecord.isManagedProgressiveFilename(generatedName, id: seriesDownload.id),
+               "managed progressive filename binds the exact record UUID")
+        expect(!DownloadRecord.isManagedProgressiveFilename("../" + generatedName, id: seriesDownload.id),
+               "relative traversal is refused for progressive playback")
+        expect(!DownloadRecord.isManagedProgressiveFilename(generatedName, id: UUID()),
+               "foreign record file cannot be mounted")
+        expect(DownloadRecord.isSafeHLSPackageRelativePath("Library/OSAssetFolder/digest.movpkg"),
+               "HLS playback accepts Apple's variable parent")
+        expect(!DownloadRecord.isSafeHLSPackageRelativePath("Library/../foreign.movpkg")
+               && !DownloadRecord.isSafeHLSPackageRelativePath("/Library/foreign.movpkg"),
+               "HLS playback rejects traversal and absolute paths")
+
+        let remembered = download(type: "series", season: 1, episode: 2,
+                                  videoID: "tt-lifecycle:1:2", managedFilename: true)
+        let otherEdition = download(type: "series", season: 1, episode: 2,
+                                     videoID: remembered.videoId, managedFilename: true)
+        let rememberedPath = URL(fileURLWithPath: "/old-container/Library/Application Support/Downloads")
+            .appendingPathComponent(remembered.localFilename)
+        expect(DownloadRecord.rememberedPlayableCopy(of: remembered.playbackMeta,
+            rememberedFile: rememberedPath, in: [otherEdition, remembered], fileExists: { _ in true })?.id == remembered.id,
+            "a relocated container still selects the exact stored edition instead of the first same-video copy")
+        expect(DownloadRecord.rememberedPlayableCopy(of: remembered.playbackMeta,
+            rememberedFile: rememberedPath, in: [otherEdition], fileExists: { _ in true }) == nil,
+            "an absent indexed file does not fall through to another completed edition")
+        expect(DownloadRecord.rememberedPlayableCopy(of: remembered.playbackMeta,
+            rememberedFile: rememberedPath, in: [otherEdition, remembered], fileExists: { $0.id != remembered.id }) == nil,
+            "an evicted remembered file does not fall through to another completed edition")
+        expect(DownloadRecord.rememberedPlayableCopy(of: e3.playbackMeta,
+            rememberedFile: rememberedPath, in: [remembered], fileExists: { _ in true }) == nil,
+            "a filename hint cannot authorize the wrong title or episode coordinates")
+        let unrelatedPath = URL(fileURLWithPath: "/elsewhere").appendingPathComponent(remembered.localFilename)
+        expect(DownloadRecord.rememberedPlayableCopy(of: remembered.playbackMeta,
+            rememberedFile: unrelatedPath, in: [remembered], fileExists: { _ in true }) == nil,
+            "an unrelated file with the same basename is not a managed-path hint")
+        var hls = remembered
+        hls.hlsRelativePath = "Library/OSAssetFolder/package.movpkg"
+        let hlsPath = URL(fileURLWithPath: "/old-container/Library/OSAssetFolder/package.movpkg")
+        expect(DownloadRecord.rememberedPlayableCopy(of: hls.playbackMeta,
+            rememberedFile: hlsPath, in: [hls], fileExists: { _ in true })?.id == hls.id,
+            "HLS selects its exact indexed relative package from a relocated container")
+        var ambiguousHLS = otherEdition
+        ambiguousHLS.hlsRelativePath = hls.hlsRelativePath
+        expect(DownloadRecord.rememberedPlayableCopy(of: hls.playbackMeta,
+            rememberedFile: hlsPath, in: [hls, ambiguousHLS], fileExists: { _ in true }) == nil,
+            "ambiguous HLS package ownership is refused")
 
         let coreModelsSource = source("SourcesShared/CoreModels.swift")
         let accountSource = source("SourcesShared/StremioAccount.swift")

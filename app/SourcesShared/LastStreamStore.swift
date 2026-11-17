@@ -6,7 +6,7 @@ import Foundation
 /// player's existing load-failure overlay is the fallback when one has.
 @MainActor
 enum LastStreamStore {
-    struct Entry: Codable {
+    struct Entry: Codable, Equatable {
         var videoId: String
         var url: String
         var title: String

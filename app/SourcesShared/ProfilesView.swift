@@ -54,6 +54,36 @@ private extension View {
     }
 }
 
+/// Offers recovery once per admitted account when the ordinary launch picker is not already owed.
+struct ProfilePickerRecoveryOffer: ViewModifier {
+    @ObservedObject var profiles: ProfileStore
+    @ObservedObject private var sync = VortXSyncManager.shared
+    @State private var offeredFor: CredentialScopeRegistry.Capture?
+    let canPresent: Bool
+
+    init(profiles: ProfileStore, canPresent: Bool) {
+        self.profiles = profiles
+        self.canPresent = canPresent
+    }
+
+    private var candidate: CredentialScopeRegistry.Capture? {
+        guard canPresent, sync.isSignedIn,
+              sync.accountReconnectRequired || sync.accountRestoreState == .failed else { return nil }
+        return CredentialScopeRegistry.shared.capture()
+    }
+
+    func body(content: Content) -> some View {
+        let original = candidate
+        content.task(id: original) { @MainActor in
+            guard let original, candidate == original, !Task.isCancelled,
+                  CredentialScopeRegistry.shared.isCurrent(original), offeredFor != original else { return }
+            // Preserve the existing manual picker admission, including the sole profile's PIN.
+            if !profiles.needsPicker { profiles.requestPicker() }
+            if profiles.needsPicker { offeredFor = original }
+        }
+    }
+}
+
 /// Full-screen "Who's watching?" profile picker, shown at cold launch when more than one profile
 /// exists and from Settings as the switcher. Picking a profile applies its theme instantly; when
 /// it binds a different Stremio account the engine session switches in place (never Logout, that
@@ -100,12 +130,11 @@ struct ProfilePickerView: View {
         !nativeSync.accountReconnectRequired && (nativeSync.nativeCheckpointStatus == "restoring" || nativeSync.accountRestoreState == .restoring)
     }
 
-    /// The device log spans every profile's activity. With a PIN-protected profile here, export waits until
-    /// a profile is unlocked (Settings has it), unless profiles failed to load, the stuck case it exists for.
+    /// A failed or incomplete restore cannot prove that the full roster has no PIN-protected profile.
     private var exportAllowedBeforeProfile: Bool {
-        if nativeSync.accountReconnectRequired || profileAction.errorMessage != nil { return true }
-        if nativeSync.accountRestoreState == .failed { return true }
-        return !store.profiles.contains { $0.pin != nil }
+        nativeSync.isSignedIn && nativeSync.accountRestoreState == .ready &&
+            !nativeSync.accountReconnectRequired && profileAction.errorMessage == nil &&
+            !store.profiles.isEmpty && !store.profiles.contains { $0.pin != nil }
     }
 
     init(core: CoreBridge = .shared, authentication: AccountAuthenticationPresentation? = nil,
@@ -121,7 +150,11 @@ struct ProfilePickerView: View {
             return "This device needs to reconnect to your VortX account. Open Account settings and sign in again. Your saved profiles have not been removed."
         }
         if profilesArePreparing { return nil }
-        return profileAction.errorMessage
+        if let error = profileAction.errorMessage { return error }
+        if nativeSync.isSignedIn, nativeSync.accountRestoreState == .failed {
+            return "Couldn't load your profiles. Open Account settings to retry. Your saved data has been kept."
+        }
+        return nil
     }
 
     private var profileActionStatus: String {
@@ -172,10 +205,6 @@ struct ProfilePickerView: View {
                                     Text(deferredSelection.profileID != nil
                                          ? "Your saved data is safe. Your selected profile will open when preparation finishes."
                                          : "Your saved data is safe. You can choose a profile while preparation finishes.")
-                                        .font(.callout).foregroundStyle(.white)
-                                        .multilineTextAlignment(.center)
-                                } else if nativeSync.accountRestoreState == .failed, profileAction.errorMessage == nil {
-                                    Text("Couldn't finish loading your profiles. Tap a profile to try again.")
                                         .font(.callout).foregroundStyle(.white)
                                         .multilineTextAlignment(.center)
                                 }
@@ -367,21 +396,19 @@ struct ProfilePickerView: View {
 
     private func diagnosticGrant() -> ProfilePickerToolsDiagnosticGrant {
         let manualAdmission = pickerPresentation.permitsTools
-        let permitted = exportAllowedBeforeProfile && pinTarget == nil && manualAdmission()
+        let permitted = pinTarget == nil && manualAdmission()
+        let recoveryOnly = !exportAllowedBeforeProfile
         let credential = CredentialScopeRegistry.shared.capture()
-        let store = store, sync = nativeSync, action = profileAction
-        return .init(allowed: permitted, credential: credential, admission: {
-            guard manualAdmission() else { return false }
-            if sync.accountReconnectRequired || action.errorMessage != nil || sync.accountRestoreState == .failed { return true }
-            return !store.profiles.contains { $0.pin != nil }
+        return .init(allowed: permitted, credential: credential, recoveryOnly: recoveryOnly, admission: { [self] in
+            manualAdmission() && self.pinTarget == nil && (recoveryOnly || self.exportAllowedBeforeProfile)
         })
     }
 
     private func openTools() {
         let manualAdmission = pickerPresentation.permitsTools
         guard pinTarget == nil, manualAdmission() else { return }
-        let grant = diagnosticGrant()
         let routeID = UUID()
+        let grant = diagnosticGrant().limiting { [self] in self.toolsRoute?.id == routeID }
         let credential = CredentialScopeRegistry.shared.capture()
         let originalOwner: ProfilePickerToolsController.Owner?
         if nativeSync.isSignedIn, let account = nativeSync.account,
@@ -413,15 +440,15 @@ struct ProfilePickerView: View {
         deferredSelection.cancel()
         // Opening the account form must not grant device-wide log access that the
         // picker refused. Freeze this route's grant before auth changes its roster.
-        accountHelpAllowsDiagnostics = exportAllowedBeforeProfile && pinTarget == nil
+        accountHelpAllowsDiagnostics = pinTarget == nil
         accountHelpDiagnosticCredential = CredentialScopeRegistry.shared.capture()
-        accountHelpDiagnosticGrant = diagnosticGrant()
+        accountHelpDiagnosticGrant = diagnosticGrant().limiting { [self] in self.accountHelpNeeded }
         accountHelpNeeded = true
     }
 
     private func focusDiagnosticRecovery() {
         #if os(tvOS)
-        guard pickerAdmissionPermits, pinTarget == nil, exportAllowedBeforeProfile,
+        guard pickerAdmissionPermits, pinTarget == nil,
               nativeSync.accountReconnectRequired || profileAction.errorMessage != nil || nativeSync.accountRestoreState == .failed else { return }
         diagnosticFocused = true
         #endif
@@ -1157,6 +1184,7 @@ struct ProfileAccountRecoveryView: View {
             SyncSettingsView(allowsDiagnosticExport: allowsDiagnosticExport,
                              diagnosticCredential: diagnosticCredential,
                              diagnosticGrant: diagnosticGrant,
+                             recoveryDiagnosticsOnly: diagnosticGrant == nil,
                              onSignedIn: { dismissIfAllowed() }, authentication: authentication)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())

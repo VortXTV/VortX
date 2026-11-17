@@ -204,20 +204,27 @@ internal object NativeHostPreferences {
         if (incoming == null) return result
         validate(scope, incoming)
         val destination = result.getJSONObject("document")
-        fun mergeFields(target: JSONObject, source: JSONObject) {
+        fun mergeFields(target: JSONObject, source: JSONObject, profile: Boolean) {
             for (field in source.keys()) {
                 val next = source.getJSONObject(field); val old = target.optJSONObject(field)
                 val comparison = if (old == null) 1 else compareValuesBy(next, old, { it.getLong("clock") }, { it.getString("actor") })
-                if (comparison == 0) require(equal(old!!.get("value"), next.get("value"))) { "Conflicting host preference event" }
+                if (comparison == 0) {
+                    val previous = old!!.get("value"); val candidate = next.get("value")
+                    val same = if (profile && field.startsWith(NativeWatchlistCodec.PREFIX) &&
+                        previous is JSONObject && candidate is JSONObject) {
+                        equalWatchlistEventValue(previous, candidate) { key -> equal(previous.get(key), candidate.get(key)) }
+                    } else equal(previous, candidate)
+                    require(same) { "Conflicting host preference event" }
+                }
                 if (comparison > 0) target.put(field, JSONObject(next.toString()))
             }
         }
-        mergeFields(destination.getJSONObject("globals").getJSONObject("fields"), incoming.getJSONObject("globals").getJSONObject("fields"))
+        mergeFields(destination.getJSONObject("globals").getJSONObject("fields"), incoming.getJSONObject("globals").getJSONObject("fields"), profile = false)
         val profiles = destination.getJSONObject("profiles")
         val remoteProfiles = canonicalGroups(incoming.getJSONObject("profiles"))
         for (id in remoteProfiles.keys()) {
             val target = profiles.optJSONObject(id) ?: JSONObject().put("fields", JSONObject()).also { profiles.put(id, it) }
-            mergeFields(target.getJSONObject("fields"), remoteProfiles.getJSONObject(id).getJSONObject("fields"))
+            mergeFields(target.getJSONObject("fields"), remoteProfiles.getJSONObject(id).getJSONObject("fields"), profile = true)
         }
         result.put("counter", maxOf(result.getLong("counter"), maximum(destination)))
         return result
@@ -321,6 +328,16 @@ internal object NativeHostPreferences {
         }
         return result
     }
+    /** Only Watchlist epoch seconds use the codec's binary64 representation for an admitted
+     * same-clock, same-actor event. The caller's policy still compares every sibling. */
+    internal fun equalWatchlistEventValue(first: JSONObject, second: JSONObject, equalSibling: (String) -> Boolean): Boolean {
+        val keys = first.keys().asSequence().toSet()
+        if (keys != second.keys().asSequence().toSet()) return false
+        val a = first.opt("addedAt") as? Number ?: return false
+        val b = second.opt("addedAt") as? Number ?: return false
+        return a.toDouble() == b.toDouble() && keys.all { it == "addedAt" || equalSibling(it) }
+    }
+
     fun equal(a: Any?, b: Any?): Boolean = when {
         (a == null || a == JSONObject.NULL) && (b == null || b == JSONObject.NULL) -> true
         a is JSONObject && b is JSONObject -> a.keys().asSequence().toSet().let { keys -> keys == b.keys().asSequence().toSet() && keys.all { equal(a.get(it), b.get(it)) } }

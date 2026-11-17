@@ -12,21 +12,18 @@ private enum CredentialScopeRegistry {
     static var messages: [String] = []
     static func log(_ category: String, _ message: String) { messages.append(message) }
 }
-private enum VortXSyncCrypto {
-    static func sealDocument(dataKey: Data, plaintext: Data, accountId: String, version: Int, writeV2: Bool) -> String? {
-        // Encryption is a fixture aperture. The production upload/verdict/ACK method is extracted unchanged.
-        plaintext.base64EncodedString()
-    }
-}
 @MainActor private final class UploadHarness {
     // These existing fixtures do not run a concurrent account-file restore.
     var accountFileRestoreBusy = false
-    struct Account { let id = "synthetic-account" }
+    struct Account { let id: String }
     let credentialAuthority = Authority()
-    var account: Account? = Account()
-    var dataKey: Data? = Data([1])
+    var account: Account? = Account(id: "synthetic-account-" + UUID().uuidString)
+    var dataKey: Data? = Data(repeating: 1, count: 32)
     static let writeSyncDocV2 = false
     var pendingApply = false
+    var token: String? = "fixture-bearer"
+    var accountReconnectFailureCapture: CredentialScopeRegistry.Capture?
+    var backupUploadReconnectFailureCapture: CredentialScopeRegistry.Capture?
     var backupUploadFailure: SyncBackupUploadFailure?
     var lastSyncedVersion = 9
     var backupCount = 0
@@ -61,10 +58,24 @@ private enum VortXSyncCrypto {
     }
     func persistLastSyncedVersion() { persistenceCount += 1 }
     func stampSyncSuccess() { successCount += 1 }
-    static func markSawDocV2(_ accountID: String) { preconditionFailure("v2 writes remain disabled") }
-    func openSyncDocument(_ document: String, version: Int) -> Data? { Data(base64Encoded: document) }
-    static func decodeDecryptedSyncDocument(_ data: Data) throws -> [String: Any] {
-        try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    static var versionBoundAccounts: Set<String> = []
+    static func sawDocV2(_ accountID: String) -> Bool { versionBoundAccounts.contains(accountID) }
+    static func markSawDocV2(_ accountID: String) { versionBoundAccounts.insert(accountID) }
+    func accountReconnectRequired(for capture: CredentialScopeRegistry.Capture) -> Bool { accountReconnectFailureCapture == capture }
+    func backupUploadReconnectRequired(for capture: CredentialScopeRegistry.Capture) -> Bool {
+        backupUploadReconnectFailureCapture == capture && isCurrent(capture)
+    }
+    func clearAccountReconnectFailure(for capture: CredentialScopeRegistry.Capture) {
+        if accountReconnectFailureCapture == capture { accountReconnectFailureCapture = nil }
+    }
+    func pullDocument() async -> [String: Any]? {
+        guard case .doc(let doc, _, _, _) = await pullDocVersionedResult() else { return nil }
+        return doc
+    }
+    func supplyBackup(_ bytes: Data, version: Int = 9, writeV2: Bool = true) {
+        let sealed = VortXSyncCrypto.sealDocument(dataKey: dataKey!, plaintext: bytes,
+            accountId: account!.id, version: version, writeV2: writeV2)!
+        readReply = (200, ["version": version, "document": sealed])
     }
     func seedAfterRead() async -> String {
         guard case .empty = await pullDocVersionedResult() else { return "no-seed" }
@@ -95,12 +106,16 @@ private enum VortXSyncCrypto {
     }
     static func main() async {
         for (status, body) in [(200, ["document": NSNull(), "version": 0] as [String: Any]),
-                               (401, [:]), (403, [:]), (503, [:]), (200, ["document": "bad", "version": 0]),
-                               (200, ["document": Data("{}".utf8).base64EncodedString(), "version": 0])] {
+                               (401, [:]), (403, [:]), (503, [:]), (200, ["document": "bad", "version": 0])] {
             let h = UploadHarness(); h.readReply = (status, body); h.reply = (200, ["accepted": true])
             let outcome = await h.seedAfterRead()
             expect(outcome == "no-seed" && h.sentBodies.isEmpty, "only authenticated404 may produce create witness;200null/failure/existing-zero cannot seed")
         }
+        let existingZero = UploadHarness()
+        existingZero.supplyBackup(Data("{}".utf8), version: 0, writeV2: false)
+        let existingZeroOutcome = await existingZero.seedAfterRead()
+        expect(existingZeroOutcome == "no-seed" && existingZero.sentBodies.isEmpty && existingZero.backupCount == 1,
+               "an authenticated existing revision zero is not an absent account")
         let absent = UploadHarness(); absent.reply = (200, ["accepted": true])
         let absentOutcome = await absent.seedAfterRead()
         expect(absentOutcome == "accepted" && absent.sentBodies[0]["baseRevision"] is NSNull && absent.sentBodies[0]["version"] as? Int == 0,
@@ -137,6 +152,64 @@ private enum VortXSyncCrypto {
         expect(accepted.backupCount == 1 && accepted.providerReceiptCount == 1, "accepted payload persists both receipts")
 #endif
         expect(accepted.sentBodies[0]["baseRevision"] as? Int == 9, "wire witness is exact candidate base")
+        expect(!(accepted.sentBodies[0]["document"] as! String).hasPrefix(VortXSyncCrypto.docV2Prefix),
+               "existing legacy rollout remains off for an unrelated account")
+
+        let grace = UploadHarness()
+        grace.reply = (401, nil)
+        let deniedByGrace = await grace.send()
+        expect(deniedByGrace == "error" && grace.backupUploadReconnectFailureCapture == grace.credentialAuthority.capture()
+               && grace.accountReconnectFailureCapture == nil, "write-only authorization loss keeps the account readable")
+        let paused = await grace.send()
+        expect(paused == "error" && grace.sentBodies.count == 1, "paused uploads do not contact the server again")
+        grace.supplyBackup(Data("{}".utf8))
+        let stillReadable = await grace.pullDocument()
+        expect(stillReadable != nil && grace.backupUploadReconnectFailureCapture != nil,
+               "an authenticated grace read stays available and does not clear the write restriction")
+        let renewed = UploadHarness()
+        renewed.reply = (401, nil)
+        renewed.whileSending = { renewed.token = "replacement-bearer" }
+        _ = await renewed.send()
+        expect(renewed.backupUploadReconnectFailureCapture == nil && renewed.backupUploadFailure == nil,
+               "the old bearer cannot pause a renewed session")
+        renewed.readReply = (401, nil)
+        renewed.whileReading = { renewed.token = "new-reader-bearer" }
+        _ = await renewed.pullDocument()
+        expect(renewed.accountReconnectFailureCapture == nil, "late read rejection cannot lock a renewed session")
+        renewed.whileReading = nil
+        _ = await renewed.pullDocument()
+        expect(renewed.accountReconnectFailureCapture == renewed.credentialAuthority.capture(),
+               "current read rejection still requires full same-account reconnect")
+
+        let bound = UploadHarness()
+        let largeBackup = Data(("{\"foreign\":[null" + String(repeating: ",null", count: 109_999) + "]}").utf8)
+        bound.supplyBackup(largeBackup)
+        let wrongKey = UploadHarness(); wrongKey.readReply = bound.readReply
+        let foreign = await wrongKey.pullDocument()
+        expect(foreign == nil && wrongKey.backupCount == 0, "v2 backup cannot open in another account")
+        let originalKey = bound.dataKey
+        bound.dataKey = Data(repeating: 2, count: 32)
+        let corrupt = await bound.pullDocument()
+        expect(corrupt == nil && bound.backupCount == 0, "wrong key cannot acknowledge a backup")
+        bound.dataKey = originalKey
+        let restored = await bound.pullDocument()
+        expect((restored?["foreign"] as? [Any])?.count == 110_000, "authenticated large backup reaches the Apple document path")
+        bound.reply = (200, ["accepted": true])
+        let boundOutcome = await bound.send()
+        expect(boundOutcome == "accepted", "ordinary upload after reading a version-bound backup succeeds")
+        let ciphertext = bound.sentBodies[0]["document"] as! String
+        let id = bound.account!.id, key = bound.dataKey!
+        expect(ciphertext.hasPrefix(VortXSyncCrypto.docV2Prefix)
+               && VortXSyncCrypto.openDocument(dataKey: key, stored: ciphertext, accountId: id, version: 10) != nil
+               && VortXSyncCrypto.openDocument(dataKey: key, stored: ciphertext, accountId: id, version: 11) == nil,
+               "replacement preserves the v2 binding to the exact accepted revision")
+        bound.supplyBackup(Data("{}".utf8), version: 10, writeV2: false)
+        let downgrade = await bound.pullDocument()
+        expect(downgrade == nil, "real read path continues refusing downgraded ciphertext")
+        bound.readReply = (404, nil)
+        let missingBoundHead = await bound.seedAfterRead()
+        expect(missingBoundHead == "error" && bound.sentBodies.count == 1,
+               "an absent head cannot reseed an account that authenticated v2")
         let create = UploadHarness(); create.reply = (200, ["accepted": true])
         _ = await create.send(base: nil, version: 0)
         expect(create.sentBodies[0]["baseRevision"] is NSNull, "absence is explicit null, never omitted")

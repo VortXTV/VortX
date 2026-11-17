@@ -86,6 +86,7 @@ class NativeOwnAccountCoordinatorTest {
         .put("byProfile", JSONObject().put(child.id, JSONObject().put("library", JSONArray().put(JSONObject()
             .put("id", "historical-a-only").put("type", "movie").put("t", 45).put("d", 100))))))
     private fun coordinator(store: Store, journal: Journal, isCurrent: () -> Boolean = { true },
+                            project: suspend (VortxNativeSession) -> Unit = {},
                             after: (String) -> Unit = {}): NativeAccountCoordinator {
         val producer = NativeOwnAccountProducer { path, body ->
             val result = when (path) {
@@ -101,7 +102,7 @@ class NativeOwnAccountCoordinatorTest {
         return NativeAccountCoordinator(bindings(), store, { object : VortxResourceTransport {
             override fun makeCancellation(): VortxResourceCancellation = error("No resources")
             override fun load(requestJson: String, cancellation: VortxResourceCancellation): String = error("No network")
-        } }, { it == account && isCurrent() }, { it() }, {}, ownCredentials = journal.credentials,
+        } }, { it == account && isCurrent() }, { it() }, project, ownCredentials = journal.credentials,
             ownProducer = producer, captureOwnAccountAdmission = { captured -> { action -> captured == account && isCurrent() && action() } })
     }
 
@@ -381,6 +382,49 @@ class NativeOwnAccountCoordinatorTest {
         } finally {
             try { cancelScopeAndJoin(scope) }
             finally { accounts.retire() }
+        }
+    }
+
+    @Test fun `Play Next callbacks run only for completed and still mounted roster`() = runBlocking {
+        for (failProjection in listOf(true, false)) {
+            var candidate: VortxNativeSession? = null
+            val effects = mutableListOf<String>()
+            val writes = listOf("provider delete", "installation key write")
+            lateinit var accounts: NativeAccountCoordinator
+            fun attemptWrites(session: VortxNativeSession, expectAdmitted: Boolean) {
+                for (write in writes) {
+                    assertEquals(expectAdmitted, accounts.withCompletedPickerMount(session, account) {
+                        effects += write
+                        true
+                    })
+                }
+            }
+            accounts = coordinator(Store(), Journal(), project = { provisional ->
+                candidate = provisional
+                assertSame(provisional, accounts.session())
+                assertTrue(accounts.withMountedSession(provisional, account) { true })
+                attemptWrites(provisional, expectAdmitted = false)
+                assertTrue(effects.isEmpty())
+                if (failProjection) error("Synthetic roster projection failure")
+            })
+            try {
+                val bootstrap = runCatching { accounts.applyDocument(account, ownerDocument()) { true } }
+                val attempted = checkNotNull(candidate)
+                if (failProjection) {
+                    assertEquals("Synthetic roster projection failure", bootstrap.exceptionOrNull()?.message)
+                    attemptWrites(attempted, expectAdmitted = false)
+                    assertTrue(effects.isEmpty())
+                } else {
+                    assertTrue(bootstrap.getOrThrow())
+                    attemptWrites(attempted, expectAdmitted = true)
+                    assertEquals(writes, effects)
+                    accounts.retire()
+                    attemptWrites(attempted, expectAdmitted = false)
+                    assertEquals(writes, effects)
+                }
+            } finally {
+                accounts.retire()
+            }
         }
     }
 

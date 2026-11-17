@@ -730,6 +730,7 @@ data class Playable(
     /// then play downloaded B, and A's row moved. Consumers of local sessions must read THIS, never
     /// ambient engine state; see [PlaybackContext].
     val playbackContext: PlaybackContext? = null,
+    val downloadedPlaybackAdmission: com.vortx.android.downloads.DownloadedPlaybackAdmission? = null,
     /** Ephemeral producer ownership for a progressive local source. Never serialized or logged. */
     val playbackLease: AutoCloseable? = null,
     /** Subtitle lookup must use this file's hints even after a source or player switch. */

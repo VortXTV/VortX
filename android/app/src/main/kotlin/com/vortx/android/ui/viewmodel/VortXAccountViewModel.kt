@@ -157,6 +157,7 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     private var activeAuthSubmission: Any? = null
     private var authSubmissionJob: Job? = null
     private var completionOwner: PickerAccountSnapshot? = null
+    private var postAuthInvocation: Any? = null
     private var pickerFileRecoveryIntent: VortXSyncManager.PickerFileRecoverySignIn? = null
     private var activeRecoveryAttempt: AtomicBoolean? = null
     private val _pickerFileRecoverySignIn = MutableStateFlow(false)
@@ -170,6 +171,7 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
 
     private fun clearPendingCompletion() {
         completionOwner = null
+        postAuthInvocation = null
         _postAuthCompleting.value = false
         _recoveryCode.value = null
         _showReconcile.value = false
@@ -266,6 +268,19 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         viewModelScope.launch { sync.pickerAccountRevision.collect { retireObsoleteCompletion() } }
         viewModelScope.launch { sync.sessionUiState.collect { retireObsoleteCompletion() } }
         viewModelScope.launch {
+            var sharedOwner: PickerAccountSnapshot? = null
+            sync.interactiveReconcileOwner.collect { owner ->
+                val previous = sharedOwner
+                sharedOwner = owner
+                if (owner != null) requireAccountReconcile(owner)
+                else if (previous != null && completionOwner === previous) {
+                    _showReconcile.value = false
+                    _syncNotice.value = sync.syncProblem.value
+                    settleCompletionIfFinished()
+                }
+            }
+        }
+        viewModelScope.launch {
             sync.syncProblem.collect { problem -> _syncNotice.value = problem }
         }
     }
@@ -316,39 +331,41 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
                 _qrJoinState.value = VortXQrJoinState.Failed
                 return
             }
-            val mintedAt = System.currentTimeMillis()
-            val reducer = QrJoinerReducer()
-            val approvalUrl = vortxApprovalUrl(session.code, session.devicePublicKey)
-            _qrJoinState.value = VortXQrJoinState.Waiting(session.code, approvalUrl, false)
+            session.use {
+                val mintedAt = System.currentTimeMillis()
+                val reducer = QrJoinerReducer()
+                val approvalUrl = vortxApprovalUrl(session.code, session.devicePublicKey)
+                _qrJoinState.value = VortXQrJoinState.Waiting(session.code, approvalUrl, false)
 
-            var remint = false
-            while (currentCoroutineContext().isActive && !remint) {
-                delay(QR_POLL_INTERVAL_MS)
-                val completion = PickerAuthCompletion()
-                when (
-                    val action = reducer.onResult(
-                        sync.qrPoll(session, completion),
-                        System.currentTimeMillis() - mintedAt,
-                    )
-                ) {
-                    is QrJoinerAction.KeepWaiting ->
-                        _qrJoinState.value = VortXQrJoinState.Waiting(
-                            session.code,
-                            approvalUrl,
-                            action.reachTrouble,
+                var remint = false
+                while (currentCoroutineContext().isActive && !remint) {
+                    delay(QR_POLL_INTERVAL_MS)
+                    val completion = PickerAuthCompletion()
+                    when (
+                        val action = reducer.onResult(
+                            sync.qrPoll(session, completion),
+                            System.currentTimeMillis() - mintedAt,
                         )
-                    QrJoinerAction.Remint -> remint = true
-                    QrJoinerAction.Failed -> {
-                        _qrJoinState.value = VortXQrJoinState.Failed
-                        return
-                    }
-                    is QrJoinerAction.SignedIn -> {
-                        // Adoption updates sessionUiState immediately, which removes this QR composable.
-                        // Detach the current job first so its onDispose does not cancel reconciliation.
-                        qrJoinJob = null
-                        _qrJoinState.value = VortXQrJoinState.SignedIn(action.email)
-                        onQrAuthed(completion.owner)
-                        return
+                    ) {
+                        is QrJoinerAction.KeepWaiting ->
+                            _qrJoinState.value = VortXQrJoinState.Waiting(
+                                session.code,
+                                approvalUrl,
+                                action.reachTrouble,
+                            )
+                        QrJoinerAction.Remint -> remint = true
+                        QrJoinerAction.Failed -> {
+                            _qrJoinState.value = VortXQrJoinState.Failed
+                            return
+                        }
+                        is QrJoinerAction.SignedIn -> {
+                            // Adoption updates sessionUiState immediately, which removes this QR composable.
+                            // Detach the current job first so its onDispose does not cancel reconciliation.
+                            qrJoinJob = null
+                            _qrJoinState.value = VortXQrJoinState.SignedIn(action.email)
+                            onQrAuthed(completion.owner)
+                            return
+                        }
                     }
                 }
             }
@@ -548,7 +565,9 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
             VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> publishCompletion(original) {
                 _syncNotice.value = null; sync.startRealtime()
             }
-            VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA -> requireAccountReconcile(original)
+            // Both account surfaces render the manager's shared pending decision.
+            VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA,
+            VortXSyncManager.SignInReconcile.ALREADY_COMPLETED -> Unit
             VortXSyncManager.SignInReconcile.UNREACHABLE -> publishCompletion(original) {
                 _syncNotice.value = sync.syncProblem.value ?: "Signed in. Your synced data wasn't reachable yet; it will catch up automatically."
                 sync.startRealtime()
@@ -563,10 +582,15 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         val original = checkNotNull(owner)
         when (sync.reconcileAfterSignIn(original)) {
             VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> publishCompletion(original) { _syncNotice.value = null }
+            VortXSyncManager.SignInReconcile.ALREADY_COMPLETED -> Unit
             VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA -> {
-                val restored = sync.useAccountData(original)
-                publishCompletion(original) { if (!restored) _syncNotice.value = sync.syncProblem.value
-                    ?: "Signed in. Your saved data is preserved, but the account restore could not finish yet. Try Sync now again." }
+                sync.interactiveReconcileChoiceFor(original)?.let { choice ->
+                    val restored = sync.useAccountData(choice)
+                    publishCompletion(original) {
+                        if (!restored && sync.interactiveReconcileChoiceFor(original) != null)
+                            _syncNotice.value = sync.syncProblem.value ?: RECONCILE_RETRY_NOTICE
+                    }
+                }
             }
             VortXSyncManager.SignInReconcile.UNREACHABLE -> publishCompletion(original) {
                 _syncNotice.value = sync.syncProblem.value ?: "Signed in. Your synced data wasn't reachable yet; it will catch up automatically."
@@ -581,6 +605,8 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         retireObsoleteCompletion()
         clearAuthInputs()
         if (owner == null || !sync.isPickerCompletionOwnerCurrent(owner)) return
+        val invocation = Any()
+        postAuthInvocation = invocation
         completionOwner = owner; _postAuthCompleting.value = true
         val admit = sync.captureLocalLibraryMutationAdmission()
         try {
@@ -589,7 +615,11 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         catch (_: Exception) {
             admit?.invoke { _syncNotice.value = POST_AUTH_RETRY_NOTICE; true }
         } finally {
-            if (completionOwner === owner) { _postAuthCompleting.value = false; settleCompletionIfFinished() }
+            if (postAuthInvocation === invocation) {
+                postAuthInvocation = null
+                _postAuthCompleting.value = false
+                settleCompletionIfFinished()
+            }
             retireObsoleteCompletion()
         }
     }
@@ -629,15 +659,13 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
             try {
                 val reconciled = action(owner)
                 admit {
-                    if (_showReconcile.value) {
-                        if (reconciled) {
-                            _showReconcile.value = false
-                            settleCompletionIfFinished()
-                            _syncNotice.value = null
-                            sync.startRealtime() // Only a confirmed choice settles reconciliation.
-                        } else {
-                            _syncNotice.value = sync.syncProblem.value ?: RECONCILE_RETRY_NOTICE
-                        }
+                    if (reconciled) {
+                        _showReconcile.value = false
+                        settleCompletionIfFinished()
+                        _syncNotice.value = null
+                        sync.startRealtime() // Only a confirmed choice settles reconciliation.
+                    } else if (_showReconcile.value) {
+                        _syncNotice.value = sync.syncProblem.value ?: RECONCILE_RETRY_NOTICE
                     }
                     true
                 }
@@ -655,7 +683,15 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
 
     /// Manual "Sync now": the documented recommended path (union both ways, then push).
     fun syncNow() {
-        if (_syncing.value) return
+        if (_syncing.value || _postAuthCompleting.value) return
+        sync.pendingInteractiveProbeOwner()?.let { owner ->
+            _syncing.value = true
+            viewModelScope.launch {
+                try { onAuthed(owner) }
+                finally { _syncing.value = false }
+            }
+            return
+        }
         _syncing.value = true
         val admit = sync.captureLocalLibraryMutationAdmission()
         viewModelScope.launch {

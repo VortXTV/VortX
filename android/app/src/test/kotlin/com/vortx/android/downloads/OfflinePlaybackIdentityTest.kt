@@ -5,9 +5,17 @@ import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
+import com.vortx.android.model.MetaItem
+import com.vortx.android.model.PreferredEpisode
 import com.vortx.android.model.Playable
 import com.vortx.android.model.PlaybackContext
+import com.vortx.android.model.StreamGroup
+import com.vortx.android.model.StreamSource
+import com.vortx.android.ui.viewmodel.matchingRememberedEpisodeSource
 import com.vortx.android.player.autoSkipMediaIdentity
+import com.vortx.android.player.DownloadedNaturalEndAdmission
+import com.vortx.android.player.PlayerState
+import com.vortx.android.player.isDownloadedNaturalCompletion
 import com.vortx.android.player.isLocalFilePlayback
 import com.vortx.android.player.subtitleOffsetContentKey
 import org.junit.Assert.assertEquals
@@ -26,9 +34,118 @@ import org.junit.Test
  * logic; the identity derivations they consume are proven here.
  */
 class OfflinePlaybackIdentityTest {
-
     private val ownerEngine = PlaybackContext.Owner(profileId = "owner-profile", usesEngineHistory = true)
     private val ownerOverlay = PlaybackContext.Owner(profileId = "kids-profile", usesEngineHistory = false)
+
+    @Test
+    fun `partial metadata leaves omitted downloads available without duplicating listed episodes`() {
+        val listed = episodeRecord()
+        val otherId = listed.copy(id = "different-video", videoId = "another-video")
+        val nextEpisode = listed.copy(id = "next-episode", videoId = "exact-next", episode = 2)
+        val video = Episode(listed.videoId, "Listed episode", 3, 1)
+        val admitted = DownloadedTitleAvailability(listOf(listed, otherId, nextEpisode), allowsMetadataFallback = true)
+
+        assertEquals(listOf(otherId, nextEpisode), admitted.unlistedEpisodes(listOf(video)))
+        assertEquals(listOf(listed, otherId, nextEpisode), admitted.unlistedEpisodes(emptyList()))
+        assertEquals(emptyList<DownloadRecord>(), admitted.copy(allowsMetadataFallback = false).unlistedEpisodes(listOf(video)))
+        assertEquals(listOf(listed, otherId, nextEpisode), admitted.copy(allowsMetadataFallback = false).unlistedEpisodes(emptyList()))
+        assertEquals(emptyList<DownloadRecord>(), DownloadedTitleAvailability().unlistedEpisodes(listOf(video)))
+    }
+
+    @Test
+    fun `offline next requires exact immediate successor in same series and season`() {
+        val current = episodeRecord().copy(season = 1, episode = 2)
+        val currentContext = current.playbackContext(PlaybackContext.Owner("local", true))
+        val next = current.copy(videoId = "exact-next", episode = 3, state = DownloadState.COMPLETED)
+        val gap = next.copy(videoId = "gap", episode = 4)
+        val rollover = next.copy(videoId = "rollover", season = 2, episode = 1)
+        assertEquals(next, immediateDownloadedSuccessor(currentContext, listOf(gap, next)))
+        assertNull(immediateDownloadedSuccessor(currentContext, listOf(next)) { false })
+        assertNull(immediateDownloadedSuccessor(currentContext, listOf(gap, rollover)))
+        assertNull(immediateDownloadedSuccessor(currentContext, listOf(next.copy(contentId = "other"))))
+        assertNull(immediateDownloadedSuccessor(currentContext, listOf(next.copy(state = DownloadState.PAUSED))))
+        assertNull(immediateDownloadedSuccessor(
+            currentContext, listOf(next, next.copy(videoId = "ambiguous-alias")),
+        ))
+    }
+
+    @Test
+    fun `downloaded early EOF cannot open a successor despite a healthy advertised duration`() {
+        val playable = episodeRecord().localPlayable("file:///fixture.mp4", PlaybackContext.Owner("local", true))
+        val early = PlayerState(positionMs = 10_000L, durationMs = 2_400_000L, hasEnded = true)
+        val credits = early.copy(positionMs = 2_160_000L)
+        assertFalse(isDownloadedNaturalCompletion(playable, early))
+        assertFalse(isDownloadedNaturalCompletion(playable, credits.copy(positionMs = 2_150_000L)))
+        assertTrue(isDownloadedNaturalCompletion(playable, credits))
+        assertFalse(isDownloadedNaturalCompletion(playable, credits.copy(hasEnded = false)))
+        assertFalse(isDownloadedNaturalCompletion(playable, credits.copy(hasError = true)))
+    }
+
+    @Test
+    fun `retired terminal offer stays invalid even after replay ends again`() {
+        var ended = true
+        val original = DownloadedNaturalEndAdmission { ended }
+        assertTrue(original.isCurrent())
+        ended = false
+        assertFalse(original.isCurrent())
+        original.retire()
+        ended = true
+        assertFalse(original.isCurrent())
+        assertTrue(DownloadedNaturalEndAdmission { ended }.isCurrent())
+    }
+
+    @Test
+    fun `manual downloaded playback resumes only a real unfinished local offset`() {
+        assertEquals(120_000L, playableDownloadResumeMs(120_000L, 2_400_000L))
+        assertEquals(0L, playableDownloadResumeMs(2_160_000L, 2_400_000L))
+        assertEquals(0L, playableDownloadResumeMs(120_000L, 0L))
+        assertEquals(0L, playableDownloadResumeMs(-1L, 2_400_000L))
+    }
+
+    @Test
+    fun continueWatchingMovieMatchesOnlyExactCompletedCopy() {
+        val movie = movieRecord()
+        val item = MetaItem(movie.contentId, MediaType.MOVIE, movie.name)
+        val target = requireNotNull(continueWatchingDownloadTarget(item))
+        assertTrue(target.matches(movie))
+        assertFalse(target.matches(movie.copy(contentId = "other")))
+        assertFalse(target.matches(movie.copy(videoId = "other")))
+        assertFalse(target.matches(movie.copy(episode = 1)))
+        assertFalse(target.matches(movie.copy(state = DownloadState.PAUSED)))
+        assertNull(continueWatchingDownloadTarget(item.copy(watched = true)))
+        assertNull(continueWatchingDownloadTarget(item.copy(continueWatchingUnavailableMessage = "unavailable")))
+    }
+
+    @Test
+    fun continueWatchingSeriesRequiresExactUnfinishedEpisodeAndCoordinates() {
+        val episode = episodeRecord()
+        val hint = PreferredEpisode(3, 1, episode.videoId)
+        val item = MetaItem(episode.contentId, MediaType.SERIES, episode.name, preferredEpisode = hint, watched = true)
+        val target = requireNotNull(continueWatchingDownloadTarget(item))
+        assertTrue(target.matches(episode))
+        assertFalse(target.matches(episode.copy(contentId = "other")))
+        assertFalse(target.matches(episode.copy(videoId = "other:3:1")))
+        assertFalse(target.matches(episode.copy(season = 4)))
+        assertFalse(target.matches(episode.copy(episode = 2)))
+        assertNull(continueWatchingDownloadTarget(item.copy(preferredEpisode = null)))
+        assertNull(continueWatchingDownloadTarget(item.copy(preferredEpisode = hint.copy(videoIdentity = null))))
+        assertNull(continueWatchingDownloadTarget(item.copy(preferredEpisode = hint.copy(upNext = true))))
+        assertNull(continueWatchingDownloadTarget(item.copy(preferredEpisode = hint.copy(episode = 0))))
+    }
+
+    @Test
+    fun continueWatchingRememberedEpisodeSourceRejectsInstanceAndPhysicalFileAmbiguity() {
+        val saved = StreamSource("source", "Configured", "Episode", isTorrent = true, infoHash = "hash", fileIdx = 3)
+        val current = saved.copy(nativePlaybackToken = "fresh-lease")
+        val group = StreamGroup(saved.addon, listOf(current), base = "https://example.test/config-a")
+        assertTrue(matchingRememberedEpisodeSource(listOf(group), saved) === current)
+        assertNull(matchingRememberedEpisodeSource(listOf(group.copy(base = "")), saved))
+        assertNull(matchingRememberedEpisodeSource(listOf(group, group.copy(addon = "Alias", streams = emptyList())), saved))
+        assertNull(matchingRememberedEpisodeSource(listOf(group, group.copy(base = "https://example.test/config-b",
+            streams = listOf(current.copy(id = "another-source")))), saved))
+        assertNull(matchingRememberedEpisodeSource(listOf(group.copy(streams = listOf(current, current))), saved))
+        assertNull(matchingRememberedEpisodeSource(listOf(group.copy(streams = listOf(current.copy(fileIdx = 4)))), saved))
+    }
 
     private fun movieRecord() = DownloadRecord(
         id = "dl-movie",

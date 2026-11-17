@@ -46,8 +46,16 @@ class WhosWatchingPickerContractTest {
         assertTrue(source.contains("pinVisible -> onCancelPin()"))
         assertTrue(source.contains("editorVisible -> onCancelEditor()"))
         assertTrue(source.contains(".clickable(onClick = {}) // consume panel taps"))
-        assertTrue(source.contains("nativeModel?.captureSelection(selected)"))
-        assertTrue(source.contains("nativeModel.commitEditor(captured) {}"))
+        assertTrue(source.contains("model.captureSelection(selected)"))
+        assertTrue(source.contains("model.commitEditor(after, action)"))
+        assertTrue(source.contains("original.target.runtime === admittedRoster.mount && original.account == admittedRoster.account"))
+        assertTrue(source.contains("check(store.pickerRoster.value === admittedRoster)"))
+        val originalAdmission = source.substringAfter("check(model.commitEditor(original) {")
+            .substringBefore("checkNotNull(request)")
+        assertTrue(originalAdmission.indexOf("store.select(profile)") >= 0)
+        assertTrue(originalAdmission.indexOf("model.captureSelection(selected)") > originalAdmission.indexOf("store.select(profile)"))
+        assertTrue(originalAdmission.contains("after.target.runtime === original.target.runtime && after.account == original.account"))
+        assertTrue(originalAdmission.contains("request = captureProfileSelection("))
         assertTrue(source.contains("captureProfileSelection(store, profile, outcome, nativeAdmission = nativeAdmission)"))
         assertTrue(source.contains("catch (cancelled: CancellationException)"))
         assertTrue(source.contains("throw cancelled"))
@@ -81,15 +89,15 @@ class WhosWatchingPickerContractTest {
     @Test
     fun `unavailable tv gateway keeps account and Tools reachable without selecting a profile`() {
         val source = readTvSource()
-        val unavailable = source.substringAfter("if (gateway == null) {", "")
-            .substringBefore("val snapshot = gateway.read()")
-        assertTrue(unavailable.contains("BackHandler(onBack = onDone)"))
+        val unavailable = source.substringAfter("if (gateway == null || !matching) {", "")
+            .substringBefore("if (admittedRoster.profiles.size")
+        assertTrue(unavailable.contains("BackHandler(enabled = !admittedRoster.needsSelection, onBack = onDone)"))
         assertTrue(unavailable.contains("onClick = control.onClick"))
         assertTrue(unavailable.contains("Open Tools for backup recovery."))
         assertTrue(unavailable.contains("backFocus.requestFocus()"))
         assertFalse(unavailable.contains("onDone()"))
         assertFalse(unavailable.contains("onSelected("))
-        assertTrue(source.contains("if (snapshot.profiles.size <= 1 && !snapshot.selectionPending)"))
+        assertTrue(source.contains("if (admittedRoster.profiles.size <= 1 && !admittedRoster.selectionPending)"))
     }
 
     private fun readSource(fileName: String): String {

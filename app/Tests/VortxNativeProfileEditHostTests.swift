@@ -51,7 +51,165 @@ struct VortxNativeProfileEditHostTests {
             scope: scope, baseline: baseline, committedReplay: true)
         check(delayed.conflict == nil && delayed.preferences.local.document == newer.local.document)
         try uuidInterop(scope: scope, actor: actor, eventID: eventID, base: base, baseline: baseline)
+        try numericHostEventInterop(scope: scope, actor: actor)
         print("Website host-CAS: shared JavaScript canonical hashes, absent authenticated baseline, sparse siblings, conflict atomicity and exact/newer replay passed")
+    }
+
+    static func numericHostEventInterop(scope: VortxAccountScope, actor: String) throws {
+        let watch = try VortxNativeWatchlist.field(id: "tt-fixture", type: "movie")
+        let interests = "forYou.interests"
+        let collection = "forYou.collection.00000000-0000-0000-0000-000000000002"
+        let localAddedAt = "1700000000.1234567", peerAddedAt = "1700000000.1234568", adjacentAddedAt = "1700000000.123457"
+        func watchlistValue(_ timestamp: String, name: String = "Fixture") -> String {
+            #"{"id":"tt-fixture","type":"movie","name":"\#(name)","addedAt":\#(timestamp)}"#
+        }
+        func carrier(_ field: String, _ suppliedValue: String, clock: String, metadata: String = "",
+                     profileMetadata: String = "", global: Bool = false) throws -> Data {
+            var value = suppliedValue
+            if field == "playback" {
+                var playback = try OwnerHistoryExactJSON.Object(Data(value.utf8))
+                let defaults = ["audioLang": "eng", "subtitleLang": "eng", "forcedPolicy": "forced", "subFont": "system",
+                                "subSize": "medium", "subColor": "white", "subBackground": "none"]
+                for (key, setting) in defaults { playback.set(key, try OwnerHistoryExactJSON.string(setting)) }
+                value = String(decoding: try playback.encoded(), as: UTF8.self)
+            }
+            let fields = #"{"fields":{"\#(field)":{"clock":\#(clock),"actor":"\#(actor)","value":\#(value)\#(metadata)}}\#(profileMetadata)}"#
+            let profiles = global ? "{}" : #"{"\#(scope.ownerProfileID)":\#(fields)}"#
+            let globals = global ? fields : #"{"fields":{}}"#
+            return Data(#"{"schemaVersion":1,"scope":"\#(scope.account)","ownerProfileId":"\#(scope.ownerProfileID)","profiles":\#(profiles),"globals":\#(globals)}"#.utf8)
+        }
+        let timestamps = try [localAddedAt, peerAddedAt, adjacentAddedAt].map {
+            try JSONDecoder().decode(Double.self, from: Data($0.utf8))
+        }
+        check(timestamps[0].bitPattern == timestamps[1].bitPattern && timestamps[0].nextUp == timestamps[2],
+              "the fixture contains one binary64 alias and the immediately adjacent timestamp")
+        for (local, peer) in [(localAddedAt, peerAddedAt), (peerAddedAt, localAddedAt)] {
+            var host = try VortxNativeHostPreferences(scope: scope, actor: actor)
+            let registerMetadata = #", "futureRegister": {"decimal":1.0}"#
+            let profileMetadata = #", "futureProfile": {"decimal":2.0}"#
+            try host.mergeRaw(carrier(watch, watchlistValue(local), clock: "7", metadata: registerMetadata,
+                                      profileMetadata: profileMetadata), scope: scope)
+            let original = try host.rawDocumentData()
+            try host.mergeRaw(carrier(watch, watchlistValue(peer), clock: "7", metadata: registerMetadata,
+                                      profileMetadata: profileMetadata), scope: scope)
+            check(try host.rawDocumentData() == original && host.local.counter == 7,
+                  "watchlist timestamp alias retains the original carrier, opaque siblings and clock")
+        }
+        let aliases: [(field: String, local: String, peer: String, global: Bool)] = [
+            ("avatar", #""star""#, #""star""#, false),
+            ("playback", #"{"maxFileSizeGB":-0.0,"subSizeScale":1.0,"maxResolution":1e0}"#,
+             #"{"maxFileSizeGB":0e0,"subSizeScale":1e0,"maxResolution":1.0}"#, false),
+            (watch, #"{"id":"tt-fixture","type":"movie","name":"Fixture","addedAt":1.0}"#,
+             #"{"id":"tt-fixture","type":"movie","name":"Fixture","addedAt":1e0}"#, false),
+            ("discovery", #"{"providerOrder":[1.0,2e0]}"#, #"{"providerOrder":[1,2]}"#, false),
+            (collection,
+             #"{"createdAt":1.0,"rules":{"minRating":6.50,"people":[{"id":2147483647.0,"name":"Fixture","department":null}]}}"#,
+             #"{"createdAt":1,"rules":{"minRating":65e-1,"people":[{"name":"Fixture","id":2147483647,"department":null}]}}"#, false),
+            (interests,
+             #"{"people":[{"id":7.0,"name":"Fixture","future":1.0},null],"decided":true}"#,
+             #"{"people":[{"future":1.0,"name":"Fixture","id":7e0},null],"decided":true}"#, false),
+            ("stremiox.autoSkipDelaySeconds", "5.0", "5", true)
+        ]
+        for fixture in aliases {
+            var host = try VortxNativeHostPreferences(scope: scope, actor: actor)
+            try host.mergeRaw(carrier(fixture.field, fixture.local, clock: "7.0", global: fixture.global), scope: scope)
+            let original = try host.rawDocumentData()
+            try host.mergeRaw(carrier(fixture.field, fixture.peer, clock: "7e0", global: fixture.global), scope: scope)
+            check(try host.rawDocumentData() == original && host.local.counter == 7,
+                  "equivalent \(fixture.field) event keeps the complete original carrier and clock")
+        }
+        let conflicts: [(label: String, field: String, local: String, peer: String, localMetadata: String, peerMetadata: String)] = [
+            ("different decimal near the floating-point precision limit", "playback", #"{"maxFileSizeGB":9007199254740992.0}"#,
+             #"{"maxFileSizeGB":9007199254740992.1}"#, "", ""),
+            ("rewritten opaque playback number", "playback", #"{"maxFileSizeGB":1,"futureNumeric":1.0}"#,
+             #"{"maxFileSizeGB":1.0,"futureNumeric":1}"#, "", ""),
+            ("reordered providers", "discovery", #"{"providerOrder":[1.0,2]}"#, #"{"providerOrder":[2,1]}"#, "", ""),
+            ("rewritten register metadata", "playback", #"{"maxFileSizeGB":1.0}"#, #"{"maxFileSizeGB":1}"#,
+             #", "futureRegister": 1.0"#, #", "futureRegister": 1"#),
+            ("adjacent binary64 watchlist timestamp", watch,
+             watchlistValue(localAddedAt), watchlistValue(adjacentAddedAt), "", ""),
+            ("different watchlist timestamp", watch,
+             watchlistValue(localAddedAt), watchlistValue("1700000001.1234567"), "", ""),
+            ("changed watchlist name alongside timestamp alias", watch,
+             watchlistValue(localAddedAt), watchlistValue(peerAddedAt, name: "Renamed"), "", ""),
+            ("rewritten watchlist metadata alongside timestamp alias", watch,
+             watchlistValue(localAddedAt), watchlistValue(peerAddedAt),
+             #", "futureRegister": 1.0"#, #", "futureRegister": 1"#),
+            ("different playback decimals with identical binary64 values", "playback",
+             #"{"maxFileSizeGB":\#(localAddedAt)}"#, #"{"maxFileSizeGB":\#(peerAddedAt)}"#, "", ""),
+            ("duplicate person ID", interests,
+             #"{"people":[{"id":7.0,"name":"Fixture"},{"id":7,"name":"Duplicate"}]}"#,
+             #"{"people":[{"id":7,"name":"Fixture"},{"id":7,"name":"Duplicate"}]}"#, "", ""),
+            ("ID reserved by a malformed person", interests,
+             #"{"people":[{"id":7.0,"name":"Fixture"},{"id":7.5}]}"#,
+             #"{"people":[{"id":7,"name":"Fixture"},{"id":7.5}]}"#, "", ""),
+            ("ID reserved by an out-of-range integer", interests,
+             #"{"people":[{"id":7.0,"name":"Fixture"},{"id":4294967303}]}"#,
+             #"{"people":[{"id":7,"name":"Fixture"},{"id":4294967303}]}"#, "", ""),
+            ("nonpositive person ID", interests,
+             #"{"people":[{"id":0.0,"name":"Fixture"}]}"#, #"{"people":[{"id":0,"name":"Fixture"}]}"#, "", ""),
+            ("person ID outside Int32", collection,
+             #"{"rules":{"people":[{"id":2147483648.0,"name":"Fixture"}]}}"#,
+             #"{"rules":{"people":[{"id":2147483648,"name":"Fixture"}]}}"#, "", ""),
+            ("fractional person ID", interests,
+             #"{"people":[{"id":7.5,"name":"Fixture"}]}"#, #"{"people":[{"id":75e-1,"name":"Fixture"}]}"#, "", ""),
+            ("different person ID hidden by floating-point rounding", interests,
+             #"{"people":[{"id":7,"name":"Fixture"}]}"#, #"{"people":[{"id":7.0000000000000001,"name":"Fixture"}]}"#, "", ""),
+            ("blank person name", interests,
+             #"{"people":[{"id":7.0,"name":" "}]}"#, #"{"people":[{"id":7,"name":" "}]}"#, "", ""),
+            ("invalid person department", interests,
+             #"{"people":[{"id":7.0,"name":"Fixture","department":true}]}"#,
+             #"{"people":[{"id":7,"name":"Fixture","department":true}]}"#, "", ""),
+            ("different person ID", interests,
+             #"{"people":[{"id":7.0,"name":"Fixture"}]}"#, #"{"people":[{"id":8,"name":"Fixture"}]}"#, "", ""),
+            ("changed person name", interests,
+             #"{"people":[{"id":7.0,"name":"Fixture"}]}"#, #"{"people":[{"id":7,"name":"Renamed"}]}"#, "", ""),
+            ("reordered people", interests,
+             #"{"people":[{"id":7,"name":"First"},{"id":8,"name":"Second"}]}"#,
+             #"{"people":[{"id":8,"name":"Second"},{"id":7,"name":"First"}]}"#, "", ""),
+            ("rewritten opaque person number", interests,
+             #"{"people":[{"id":7.0,"name":"Fixture","future":{"score":1.0}}]}"#,
+             #"{"people":[{"id":7,"name":"Fixture","future":{"score":1}}]}"#, "", ""),
+            ("numeric alias outside a recognized people path", interests,
+             #"{"future":{"people":[{"id":7.0,"name":"Fixture"}]}}"#,
+             #"{"future":{"people":[{"id":7,"name":"Fixture"}]}}"#, "", ""),
+            ("rewritten opaque preference number", "futurePreference", #"{"score":1.0}"#, #"{"score":1}"#, "", "")
+        ]
+        for fixture in conflicts {
+            var host = try VortxNativeHostPreferences(scope: scope, actor: actor)
+            try host.mergeRaw(carrier(fixture.field, fixture.local, clock: "7", metadata: fixture.localMetadata), scope: scope)
+            let peer = try carrier(fixture.field, fixture.peer, clock: "7", metadata: fixture.peerMetadata)
+            var isolatedPeer = try VortxNativeHostPreferences(scope: scope, actor: actor)
+            try isolatedPeer.mergeRaw(peer, scope: scope)
+            let original = try host.encoded()
+            var failure: VortxNativeHostPreferences.RawMergeFailure?
+            rejects("\(fixture.label) remains contradictory at equal clock and actor") {
+                try host.mergeRaw(peer, scope: scope) { failure = $0 }
+            }
+            let expectedReason: String
+            if !fixture.localMetadata.isEmpty {
+                expectedReason = "equal_event_metadata"
+            } else if fixture.field == interests || fixture.field == collection {
+                expectedReason = "equal_event_for_you"
+            } else if fixture.field == "playback" || fixture.field == "discovery" || fixture.field == watch {
+                expectedReason = "equal_event_known_preference"
+            } else {
+                expectedReason = "equal_event"
+            }
+            check(try failure?.rawValue == expectedReason && host.encoded() == original,
+                  "\(fixture.label) reports \(expectedReason) and leaves the beforeimage intact")
+        }
+        var host = try VortxNativeHostPreferences(scope: scope, actor: actor)
+        try host.mergeRaw(carrier(watch, watchlistValue(localAddedAt), clock: "7",
+                                  profileMetadata: #", "futureProfile": {"decimal":2.0}"#), scope: scope)
+        let original = try host.encoded()
+        var failure: VortxNativeHostPreferences.RawMergeFailure?
+        rejects("watchlist timestamp alias cannot authorize a changed opaque profile member") {
+            try host.mergeRaw(carrier(watch, watchlistValue(peerAddedAt), clock: "7",
+                                      profileMetadata: #", "futureProfile": {"decimal":2}"#), scope: scope) { failure = $0 }
+        }
+        check(try failure?.rawValue == "unknown_wrapper" && host.encoded() == original,
+              "the opaque profile conflict leaves the beforeimage intact")
     }
 
     static func uuidInterop(scope: VortxAccountScope, actor: String, eventID: String, base: VortxJSON,

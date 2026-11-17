@@ -2,6 +2,8 @@ package com.vortx.android.ui.viewmodel
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.vortx.android.data.AddonAccountReadiness
+import com.vortx.android.data.AddonAccountSetupRequiredException
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.AddonManagementSnapshot
 import com.vortx.android.engine.AddonHealth
@@ -13,8 +15,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 /// Add-on management (S04, DESIGN-SYSTEM.md §4 "Add-ons"): the installed list read live from
@@ -26,6 +30,8 @@ class AddonsViewModel(
 ) : ViewModel() {
     private val _state = MutableStateFlow<UiState<List<InstalledAddon>>>(UiState.Loading)
     val state: StateFlow<UiState<List<InstalledAddon>>> = _state.asStateFlow()
+    val accountReadiness: StateFlow<AddonAccountReadiness> = repo.addonAccountReadiness()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, AddonAccountReadiness.Checking)
 
     val health = healthStore.status
 
@@ -184,7 +190,10 @@ class AddonsViewModel(
                     _urlInput.value = ""
                     load()
                 },
-                onFailure = { _installMessage.value = (it.message ?: "Couldn't install that add-on.") to true },
+                onFailure = {
+                    _installMessage.value = if (it is AddonAccountSetupRequiredException) ADDON_ACCOUNT_SETUP_MESSAGE to true
+                    else (it.message ?: "Couldn't install that add-on.") to true
+                },
             )
             _installing.value = false
         }
@@ -230,7 +239,10 @@ class AddonsViewModel(
                         _changeUrlDone.value += 1
                         load()
                     },
-                    onFailure = { _changeUrlMessage.value = (it.message ?: "Couldn't update that add-on.") to true },
+                    onFailure = {
+                        _changeUrlMessage.value = if (it is AddonAccountSetupRequiredException) ADDON_ACCOUNT_SETUP_MESSAGE to true
+                        else (it.message ?: "Couldn't update that add-on.") to true
+                    },
                 )
             } finally {
                 _changingUrl.value = false
@@ -363,3 +375,5 @@ class AddonsViewModel(
         }
     }
 }
+
+internal const val ADDON_ACCOUNT_SETUP_MESSAGE = "Finish setting up your VortX account before installing or changing add-ons."

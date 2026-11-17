@@ -14,6 +14,8 @@ import com.vortx.android.debrid.DebridResolver
 import com.vortx.android.debrid.DebridService
 import com.vortx.android.catalog.DetailMetaRecoveryPolicy
 import com.vortx.android.downloads.DownloadManager
+import com.vortx.android.downloads.DownloadedSeasonBoundaryRefreshFence
+import com.vortx.android.downloads.refreshDownloadedSeasonBoundaries
 import com.vortx.android.engine.SourceListModel
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.integrations.buildMediaRef
@@ -37,6 +39,8 @@ import com.vortx.android.model.TrackPreferences
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.person.TMDBPersonClient
 import com.vortx.android.player.PlaybackBehaviorSettings
+import com.vortx.android.player.PlaybackOwnerEpoch
+import com.vortx.android.player.PlaybackOwnerToken
 import com.vortx.android.player.PlayerSourceSwitchCommitGate
 import com.vortx.android.player.PlayerSourceSwitchResolution
 import com.vortx.android.singularity.SourceIndexClient
@@ -277,6 +281,19 @@ internal fun currentAssembledBest(
     request != null &&
         state.requestGeneration == request.generation &&
         state.streamId == request.targetId
+}
+
+/** The remembered row has transport evidence but no historical configured-instance identity. */
+internal fun matchingRememberedEpisodeSource(groups: List<StreamGroup>, saved: StreamSource): StreamSource? {
+    if (saved.url.isNullOrBlank() && saved.infoHash.isNullOrBlank() && saved.nzbUrl.isNullOrBlank()) return null
+    val group = groups.singleOrNull { it.addon == saved.addon || it.streams.any { row -> row.addon == saved.addon } }
+        ?: return null
+    if (group.base.isBlank() || groups.count { it.sourceInstanceId == group.sourceInstanceId } != 1) return null
+    return group.streams.singleOrNull {
+        it.id == saved.id && it.addon == saved.addon && it.url == saved.url && it.infoHash == saved.infoHash &&
+            it.fileIdx == saved.fileIdx && it.nzbUrl == saved.nzbUrl && it.usenetKnownHash == saved.usenetKnownHash &&
+            it.fileMustInclude == saved.fileMustInclude && it.isTorrent == saved.isTorrent
+    }
 }
 
 internal fun bestSourceForCurrentRequest(
@@ -554,6 +571,8 @@ class DetailViewModel(
     @Volatile private var metaRecoveryAttempted = false
     private val detailMutationFence = DetailMutationFence()
     private val detailMutationMutex = Mutex()
+    private val offlineSeasonBoundaryFence = DownloadedSeasonBoundaryRefreshFence()
+    private var offlineSeasonBoundaryRefresh: Job? = null
 
     // ---- Source-list assembly + debrid orchestration (the assembly + coordinator wave) ----
     //
@@ -1017,7 +1036,21 @@ class DetailViewModel(
 
     private fun publishMeta(detail: MetaDetail): MetaDetail {
         _meta.value = UiState.Success(detail)
+        if (detail.type == MediaType.SERIES) refreshOfflineSeasonBoundary(detail.id, PlaybackOwnerEpoch.capture())
         return detail
+    }
+
+    private fun refreshOfflineSeasonBoundary(detailId: String, owner: PlaybackOwnerToken?) {
+        if (owner == null || !PlaybackOwnerEpoch.isCurrent(owner) || !isRouteAdmissionCurrent() ||
+            metaId != detailId
+        ) return
+        val request = offlineSeasonBoundaryFence.begin()
+        offlineSeasonBoundaryRefresh?.cancel()
+        offlineSeasonBoundaryRefresh = viewModelScope.launch {
+            refreshDownloadedSeasonBoundaries(setOf(id, detailId), owner,
+                routeGenerationCurrent = { offlineSeasonBoundaryFence.isCurrent(request) && metaId == detailId },
+                routeCurrentOnMain = ::isRouteAdmissionCurrent)
+        }
     }
 
     /// A minimal placeholder meta for the current [metaId] (a `tt`): a hero + the standard metahub backdrop/
@@ -1029,6 +1062,8 @@ class DetailViewModel(
     /// the ORIGINAL route id again (not the previously-recovered one), and re-run the load. Mirrors Apple
     /// `retryMeta`.
     fun retryMeta() {
+        offlineSeasonBoundaryFence.invalidate()
+        offlineSeasonBoundaryRefresh?.cancel()
         clearRandomEpisodePick()
         detailMutationFence.invalidate()
         invalidateWarmNextSource()
@@ -2103,6 +2138,7 @@ class DetailViewModel(
         val detail = (_meta.value as? UiState.Success)?.data ?: return
         val episode = detail.videos.firstOrNull { it.id == _selectedEpisodeId.value }
         val actionOwner = debridKeys.ownerToken()
+        val boundaryOwner = PlaybackOwnerEpoch.capture()
         _downloadNotice.value = "Preparing download…"
         viewModelScope.launch {
             resolveForOwner(source, episode, actionOwner).fold(
@@ -2138,6 +2174,9 @@ class DetailViewModel(
                         debridOwnerGeneration = debridDownloadOwner?.generation,
                     )
                     _downloadNotice.value = downloadNoticeFor(record)
+                    if (record.type == "series" && record.state != DownloadState.FAILED) {
+                        refreshOfflineSeasonBoundary(detail.id, boundaryOwner)
+                    }
                 },
                 onFailure = { _downloadNotice.value = it.message ?: "Couldn't start this download." },
             )
@@ -2426,14 +2465,29 @@ class DetailViewModel(
     fun resumeAvailable(): Boolean = resumeOffsetMs() > 0L
 
     /** WHY audit R01: Home's first CW hero restores the persisted exact source through CWResume. */
-    fun playLastStream(): Boolean {
+    fun playLastStream(expectedEpisode: PreferredEpisode? = null): Boolean {
         if (!isRouteAdmissionCurrent()) return false
-        val saved = lastStreamStore.load()?.takeIf { it.mediaId == id && it.mediaType == type } ?: return false
+        val saved = lastStreamStore.load()?.takeIf {
+            it.mediaId == id && it.mediaType == type && !it.url.startsWith("file:", ignoreCase = true)
+        } ?: return false
+        if (expectedEpisode != null && (expectedEpisode.upNext || expectedEpisode.videoIdentity.isNullOrBlank() ||
+                saved.mediaRef?.let { it.isSeries && it.season == expectedEpisode.season && it.episode == expectedEpisode.episode } != true))
+            return false
         viewModelScope.launch {
             val streamState = com.vortx.android.home.continueWatchingAdmittedResult(continueWatchingAdmission) {
                 Result.success(streams.first { it !is UiState.Loading })
             }.getOrNull() ?: return@launch
             if (streamState !is UiState.Success) return@launch
+            if (expectedEpisode != null) {
+                if (_selectedEpisodeId.value != expectedEpisode.videoIdentity ||
+                    currentModelEpisode()?.let { it.season == expectedEpisode.season && it.episode == expectedEpisode.episode } != true)
+                    return@launch
+                val source = matchingRememberedEpisodeSource(streamState.data, saved.source) ?: return@launch
+                if (!isRouteAdmissionCurrent() || _selectedEpisodeId.value != expectedEpisode.videoIdentity ||
+                    streams.value !== streamState) return@launch
+                play(source, manualPick = false, startPositionOverrideMs = saved.positionMs)
+                return@launch
+            }
             val owner = debridKeys.ownerToken()
             val service = saved.debridService
             if (owner != null && service != null) {

@@ -36,6 +36,7 @@ import com.vortx.android.ui.profilepicker.PickerToolsSelectedBackup
 import com.vortx.android.ui.profilepicker.PickerToolsSaveReceipt
 import com.vortx.android.ui.profilepicker.PickerToolsWorkGate
 import com.vortx.android.ui.profilepicker.ProfilePickerToolsController
+import com.vortx.android.ui.screens.shareAccountRecoveryDiagnostics
 import com.vortx.android.ui.screens.shareDiagnosticLog
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -198,6 +199,13 @@ internal class ProfilePickerToolsViewModel private constructor(
         controller.diagnostics(route, requiredPolicy) { admission ->
             // Never use shareDiagnosticLog's permissive default on a picker route.
             shareDiagnosticLog(applicationContext, mayShare = admission)
+        }
+    }
+    fun recoveryDiagnostics(route: PickerToolsActionGrant, context: Context) {
+        val applicationContext = context.applicationContext
+        // The controller still checks the rendered route. Only fixed recovery codes may be exported.
+        controller.diagnostics(route, policy = { true }) { admission ->
+            shareAccountRecoveryDiagnostics(applicationContext, mayShare = admission)
         }
     }
     override fun onCleared() {

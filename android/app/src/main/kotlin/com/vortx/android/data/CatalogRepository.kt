@@ -24,6 +24,11 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
+
+enum class AddonAccountReadiness { Checking, Ready, SetupRequired }
+
+internal class AddonAccountSetupRequiredException : IllegalStateException()
 
 /**
  * Immutable identity of the profile/account session that owns a Home snapshot. [revision] is process-local
@@ -294,6 +299,9 @@ interface CatalogRepository {
     /// Every add-on installed on the signed-in account (S04 "Add-on management"), read live from
     /// `ctx.profile.addons`.
     suspend fun installedAddons(): Result<List<InstalledAddon>>
+
+    /** Authenticated native storage must be open before account add-ons can be managed. */
+    fun addonAccountReadiness(): Flow<AddonAccountReadiness> = flowOf(AddonAccountReadiness.Ready)
 
     /** A management screen must retain the authority that produced its rows, before any tap is queued. */
     suspend fun addonManagementSnapshot(): Result<AddonManagementSnapshot> =

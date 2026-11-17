@@ -12,14 +12,14 @@ class ProfileSelectionWiringTest {
     @Test fun `both cold hosts gate content on typed completion and return Back to picker`() {
         val phone = source("ui/VortXApp.kt")
         val tv = source("ui/tv/TvApp.kt")
-        assertTrue(phone.contains("WhosWatchingScreen(onDone = { showWhosWatching = false }, onSelected = {"))
+        assertTrue(phone.contains("WhosWatchingScreen(pickerRoster, onDone = { showWhosWatching = false }, onSelected = {"))
         assertTrue(phone.contains("if (showProfiles) ProfileSelectionOrigin.PROFILE_MANAGEMENT else ProfileSelectionOrigin.PICKER"))
-        assertTrue(tv.contains("TvWhosWatching(onDone = { showPicker = false }, onSelected = { profileSelection = it }, accountControl = control)"))
+        assertTrue(tv.contains("TvWhosWatching(pickerRoster, onDone = { manualPicker = false },"))
         for (host in listOf(phone, tv)) {
             val selection = host.substringAfter("profileSelection?.let {").substringBefore("// The title currently")
             assertTrue(selection.contains("ProfileSelectionSurface(request, handoff,"))
             assertTrue(selection.contains("return@VortXTheme"))
-            assertTrue(selection.contains("onChooseAgain = { profileSelection = null; show"))
+            assertTrue(selection.contains("onChooseAgain = { profileSelection = null;"))
         }
         for (host in listOf(phone, tv)) {
             assertTrue(host.contains("ProfilePickerAccountHost(syncManager, pickerAccountModel, diagnosticAdmission = ::currentPickerDiagnosticExportAllowed, retirePickerUi = { profileSelection = null }"))
@@ -62,7 +62,8 @@ class ProfileSelectionWiringTest {
         assertTrue(tools.contains("entryFocus.requestFocus()"))
         assertTrue(tools.contains("remember(model, state.routeGeneration) { controller.attachPicker() }"))
         assertTrue(tools.contains("remember(model, attachment, state.presentationId) { controller.renderedActions(attachment) }"))
-        assertTrue(tools.contains("onDownload = { actionGrant?.let(controller::download) }"))
+        assertTrue(tools.contains("if (state.open && presentationCurrent && actionGrant != null)"))
+        assertTrue(tools.contains("onDownload = { controller.download(actionGrant) }"))
         val controller = source("ui/profilepicker/ProfilePickerToolsController.kt")
         val download = controller.substringAfter("fun download(expected: PickerToolsActionGrant)").substringBefore("fun claimDestinationLaunch")
         assertFalse(download.contains("accounts.capture()"))
@@ -83,18 +84,74 @@ class ProfileSelectionWiringTest {
 
     @Test fun `restore exclusion is one application binding for the exact attached manager`() {
         val app = source("VortXApplication.kt")
-        val binding = "pickerFileRestoreBinding = manager to ApplicationAccountFileRestoreExclusion(this, manager)"
-        val attachment = app.indexOf("manager.attachNativeGateway(nativeAccounts)")
-        val publication = app.indexOf(binding)
-        assertTrue(attachment >= 0 && publication > attachment)
-        assertEquals(publication, app.lastIndexOf(binding))
-        assertTrue(app.contains("it.first === expected && syncManager === expected"))
+        val attachment = app.indexOf("manager.prepareNativeGateway(nativeAccounts, accountForeground, confirmedOwner)")
+        val binding = "val pickerRestore = ApplicationAccountFileRestoreExclusion(this@VortXApplication, manager)"
+        val construction = app.indexOf(binding)
+        val publication = app.indexOf("publishAccountSync(manager, pickerRestore, confirmedOwner)")
+        assertTrue(attachment >= 0 && construction > attachment && publication > construction)
+        assertEquals(construction, app.lastIndexOf(binding))
+        assertTrue(app.contains("_accountSyncStartup.value = ready"))
+        assertTrue(app.contains("?.takeIf { it.manager === expected }"))
+        assertTrue(app.contains("if (syncManager !== manager) return@bindAccountOwnerSource"))
         val model = source("ui/viewmodel/ProfilePickerToolsViewModel.kt")
         assertTrue(model.contains("if (manager != null && externalRestore != null)"))
         for (path in listOf("MainActivity.kt", "ui/tv/TvActivity.kt")) {
             val activity = source(path)
-            assertTrue(activity.contains("syncManager = app.syncManager"))
+            assertTrue(activity.contains("app.accountSyncStartup.collectAsStateWithLifecycle()"))
+            assertTrue(activity.contains("AccountStartupLoading()"))
+            assertTrue(activity.contains("syncManager = (startup as? VortXApplication.AccountSyncStartup.Ready)?.manager"))
             assertFalse(activity.contains("ApplicationAccountFileRestoreExclusion("))
+        }
+    }
+
+    @Test fun `cold account initialization waits to release foreground and owner-sensitive work`() {
+        val app = source("VortXApplication.kt")
+        val startup = app.substringAfter("private fun wireAccountSync()").substringBefore("/// The one [CatalogRepository]")
+        val lifecycle = startup.indexOf("registerActivityLifecycleCallbacks")
+        val worker = startup.indexOf("applicationScope.launch {")
+        val constructor = startup.indexOf("VortXSyncManager(this@VortXApplication)")
+        val published = startup.indexOf("publishAccountSync(manager, pickerRestore, confirmedOwner)")
+        assertTrue(lifecycle >= 0 && worker > lifecycle && constructor > worker)
+        assertTrue(published > constructor && startup.indexOf("startNativeWork()") > published)
+        assertTrue(startup.contains("accountForeground.value = AccountSyncForeground(active = false)"))
+        assertTrue(startup.contains("val confirmedOwner = manager.sessionOwnerSnapshot()"))
+
+        // Download ownership is tri-state. Direct work and unlock replay do not wait for account I/O.
+        for (path in listOf("downloads/DownloadWorker.kt", "downloads/DownloadUnlockReceiver.kt")) {
+            assertFalse(source(path).contains("awaitAccountSyncStartup()"))
+        }
+        assertTrue(app.contains("manager.sessionUiState.combine(manager.pickerAccountRevision)"))
+        assertTrue(app.contains("if (confirmedOwner != null) applicationScope.launch { retryDownloadRecovery(manager) }"))
+        assertTrue(app.contains("if (current is SessionOwnerSnapshot.SignedOutLocal) retireWatchNextAfterSignOut(manager, current)"))
+
+        for (path in listOf("notifications/NewEpisodeSweepWorker.kt", "notifications/NewEpisodeNotifyWorker.kt")) {
+            val workerSource = source(path)
+            assertTrue(workerSource.indexOf("app.awaitAccountSyncStartup()") in
+                0 until workerSource.indexOf("captureEpisodeNotificationOwner(app)"))
+        }
+        val watchNext = app.substringAfter("private fun retireWatchNextOtherAccounts").substringBefore("private val xperienceCatalogDelegate")
+        assertTrue(watchNext.contains("manager.sessionOwnerSnapshot() == owner && delete()"))
+        val completedMount = watchNext.indexOf("nativeAccounts.withCompletedPickerMount(session, account)")
+        assertTrue(completedMount >= 0 && watchNext.indexOf("PlaybackOwnerEpoch.isCurrent(epoch) && write()") > completedMount)
+        val coordinator = source("engine/NativeAccountCoordinator.kt").substringAfter("internal fun withCompletedPickerMount(")
+            .substringBefore("override fun retire()")
+        val lifecycleFence = coordinator.indexOf("withMountedSession(session, account)")
+        assertTrue(lifecycleFence >= 0 && coordinator.indexOf("isPickerMountCurrent(session, account) && action()") > lifecycleFence)
+        assertTrue(watchNext.contains("binding.matches(NativeAccountBinding.read(current.state, native.profileID))"))
+
+        val publisher = source("tv/WatchNextPublisher.kt")
+        assertTrue(publisher.contains("cursor.getString(rowPackage) == context.packageName"))
+        val tv = source("ui/tv/TvActivity.kt").substringAfter("repeatOnLifecycle(Lifecycle.State.STARTED)")
+        val retire = tv.indexOf("WatchNextPublisher.prepareMountedOwner(")
+        val read = tv.indexOf("repo.continueWatchingSnapshot(mount.owner)")
+        assertTrue(retire >= 0 && read > retire && tv.indexOf("WatchNextPublisher.publish(") > read)
+        val wait = tv.indexOf("app.awaitAccountSyncStartup()")
+        assertTrue(tv.indexOf("app.clearWatchNextIfDisabled()") in 0 until wait)
+        assertTrue(wait in 0 until tv.indexOf("val repo = app.catalogRepository"))
+        for (path in listOf("MainActivity.kt", "ui/tv/TvActivity.kt")) {
+            val activity = source(path)
+            assertTrue(activity.contains("deepLinkEvent = deepLinks.pendingEvent"))
+            assertTrue(activity.contains("onDeepLinkHandled = deepLinks::acknowledge"))
         }
     }
 
@@ -113,9 +170,48 @@ class ProfileSelectionWiringTest {
     @Test fun `pending selection survives composition recreation without bypassing native authority`() {
         assertTrue(source("profile/ProfileStore.kt").contains("selectionPending || (profiles.size > 1 && !pickedThisLaunch)"))
         val request = source("profile/ProfileSelectionRequest.kt")
-        assertTrue(request.contains("store.selectionPending = true"))
-        assertTrue(request.contains("store.selectionPending = false"))
+        val store = source("profile/ProfileStore.kt")
+        assertTrue(store.contains("selectionPending = true"))
+        assertTrue(store.contains("selectionPending = false"))
         assertTrue(request.contains("checkNotNull(nativeAdmission)"))
-        assertTrue(request.contains("store.activeID == selected.id && nativeAdmission()"))
+        assertTrue(request.contains("stillSelected() && admit(store::completePickerSelection)"))
+    }
+
+    @Test fun `late admitted roster controls launch while absence never substitutes for signed out`() {
+        val account = com.vortx.android.sync.SessionOwnerSnapshot.Account("test-account", 7L)
+        val adult = UserProfile(id = "owner", name = "Adult", avatar = "emoji:🎬")
+        val child = UserProfile(id = "child", name = "Child", avatar = "emoji:🌸")
+        val mount = Any()
+        fun roster(profiles: List<UserProfile>, pending: Boolean = false, picked: Boolean = false) =
+            AdmittedPickerRoster(mount, account, profiles, adult.id, pending, picked)
+
+        assertEquals(ProfilePickerEntry.UNAVAILABLE, profilePickerEntry(true, false, null))
+        assertEquals(ProfilePickerEntry.CONTENT, profilePickerEntry(true, true, null))
+        assertEquals(ProfilePickerEntry.CONTENT, profilePickerEntry(true, false, roster(listOf(adult))))
+        assertEquals(ProfilePickerEntry.CHOOSE, profilePickerEntry(true, false, roster(listOf(adult, child))))
+        assertEquals(ProfilePickerEntry.CONTENT, profilePickerEntry(true, false, roster(listOf(adult, child), picked = true)))
+        assertEquals(ProfilePickerEntry.CHOOSE, profilePickerEntry(true, false, roster(listOf(adult), pending = true, picked = true)))
+    }
+
+    @Test fun `launch confirmation follows the exact account generation and selected profile`() {
+        val account = com.vortx.android.sync.SessionOwnerSnapshot.Account("test-account", 7L)
+        val chosen = PickerLaunchSelection(account, "child")
+        assertTrue(chosen.matches(account.copy(), "child"))
+        assertFalse(chosen.matches(account.copy(generation = 8L), "child"))
+        assertFalse(chosen.matches(account.copy(id = "other-account"), "child"))
+        assertFalse(chosen.matches(account, "owner"))
+    }
+
+    @Test fun `phone and TV hold title delivery until picker return and acknowledge applied detail`() {
+        for (path in listOf("ui/VortXApp.kt", "ui/tv/TvApp.kt")) {
+            val host = source(path)
+            val picker = host.indexOf(if (path == "ui/VortXApp.kt") "if (showAdmittedPicker ||" else "if (showPicker ||")
+            val route = host.indexOf("LaunchedEffect(deepLinkEvent, pickerRoster")
+            assertTrue(picker >= 0 && route > picker)
+            val delivery = host.substring(route, host.indexOf("onDeepLinkHandled(event)", route))
+            assertTrue(delivery.contains("event.sequence <= handledDeepLinkSequence"))
+            assertTrue(delivery.contains("app?.isPickerRosterCurrent(syncManager, pickerRoster)"))
+            assertTrue(delivery.contains("handledDeepLinkSequence = event.sequence"))
+        }
     }
 }

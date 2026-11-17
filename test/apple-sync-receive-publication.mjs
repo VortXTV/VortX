@@ -61,6 +61,7 @@ if (process.argv[2] === '--extract') {
     source('app/SourcesShared/CatalogPreferences.swift'), source('app/SourcesShared/HomeRailPreferences.swift')]);
   const managerMethods = ['    private static func sawDocV2(', '    private static func markSawDocV2(',
     '    private func accountReconnectRequired(for capture:', '    private func clearAccountReconnectFailure(for capture:',
+    '    private func backupUploadReconnectRequired(for capture:', '    private func finishSyncWaiters(', '    private func finishSyncDown(',
     '    private func conditionalReceiveVersion(', '    private func rememberCompletedNativeReceive(',
     '    private func completedFileRestoreReceive(',
     '    private func hasPendingReceivedProviderApply(', '    private func receivedProviderOwnerIsCurrent(',
@@ -101,6 +102,22 @@ if (process.argv[2] === '--extract') {
     '    private func nativeLegacyConversionKey(', '    private func nativeLegacyConversionDecision(',
     '    private func recordNativeLegacyConversion('].map(marker => member(manager, marker));
   conversionMembers.push(exactDeclaration(/^    private static let nativeExportKeys = \[[^\]]+\]/gm, 'native export keys'));
+  if (manager.text.includes('private struct NativeWebsiteAccountAdoption {')) {
+    conversionMembers.push(member(manager, '    private struct NativeWebsiteAccountAdoption {'));
+    conversionMembers.push(`    // Existing receive and causal-repair scenarios hold a real, preexisting roster.
+    private func authorizedWebsiteAccountAdoption(_ document: [String: Any], plaintext: Data, revision: Int,
+        capture: CredentialScopeRegistry.Capture, requiringCheckpoint: Bool) throws -> NativeWebsiteAccountAdoption? { nil }
+    private func prepareNativeLegacyMaterial(_ document: [String: Any], capture: CredentialScopeRegistry.Capture,
+        websiteAdoption: NativeWebsiteAccountAdoption?) async throws -> NativeLegacyPreparation {
+        precondition(websiteAdoption == nil)
+        return try await prepareNativeLegacyMaterial(document, capture: capture)
+    }`);
+  }
+  if (manager.text.includes('private func promoteUnpublishedWebsiteRoster(')) {
+    conversionMembers.push(`    // Established-account receive fixtures do not publish a first roster.
+    private func promoteUnpublishedWebsiteRoster(_ pulled: VersionedPull, capture: CredentialScopeRegistry.Capture,
+        authority: ReceivedProviderCloudAuthority) async -> VersionedPull { pulled }`);
+  }
   const observation = xperienceInputs.observationProperty(manager.text);
   if (observation) receipts.push({ path: manager.path, marker: 'exact Xperience observation property',
     sourceSHA256: sha256(manager.text), sliceSHA256: sha256(observation) });

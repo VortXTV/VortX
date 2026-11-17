@@ -143,6 +143,7 @@ enum HomeCinemaCharacterTests {
                "actual cold-art fallback is a quiet profile-accent wash")
 
         let heroSource = try source("app/SourcesiOS/FeaturedHeroView.swift", root: root)
+        let detailSource = try source("app/SourcesiOS/iOSDetailView.swift", root: root)
         let rootSource = try source("app/SourcesiOS/iOSRootView.swift", root: root)
         let themeSource = try source("app/SourcesShared/Theme.swift", root: root)
         let card = rootSource.components(separatedBy: "private struct CinemaPosterCardBody: View {")[1]
@@ -151,8 +152,18 @@ enum HomeCinemaCharacterTests {
                "hero keeps exactly its existing one average-color request site")
         expect(heroSource.contains(".task(id: heroTintKey)") && heroSource.contains("await MainActor.run { publishHeroTint"),
                "source task is keyed by exact title/artwork and publishes through MainActor")
-        expect(rootSource.components(separatedBy: "onTintChange: acceptHomeHeroTint").count == 3,
-               "only phone and wider Home heroes opt into canvas tint publication")
+        expect(heroSource.contains("if heroTrailerBlockReason == nil, let hero")
+            && heroSource.contains(".task(id: request) { await resolveHeroClipDirect(request,")
+            && heroSource.contains("guard heroTrailerRequestIsCurrent(request) else { return }"),
+               "the shared Home preview suspends the outer task and refuses a retired trailer lookup")
+        expect(detailSource.contains("if detailTrailerBlockReason == nil {")
+            && detailSource.contains("if playbackGate.playerActive || presentation != nil")
+            && detailSource.contains("detailTrailerBlockReason == nil, detailAmbientYouTubeID == yt else { return }"),
+               "the shared Detail preview closes its outer gate before presentation and refuses late lookup completion")
+        expect(rootSource.components(separatedBy: "onTintChange: acceptHomeHeroTint").count == 2
+            && rootSource.contains("private var homeFeaturedHero: some View")
+            && rootSource.contains("homeFeaturedHero\n                        .scrollToTopAnchor()"),
+               "the single shared Home hero opts into canvas tint publication")
         expect(!EnvironmentValues().cinemaCardHasExternalLift,
                "plain detail/person consumers retain their original card lift by default")
         expect(card.contains(".black.opacity(hasExternalLift ? 0 : 0.28)")

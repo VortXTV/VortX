@@ -24,30 +24,44 @@ import com.vortx.android.diagnostics.DiagnosticsLog
 import com.vortx.android.diagnostics.DiagnosticShareOutcome
 import com.vortx.android.diagnostics.performDiagnosticShare
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.ui.tv.TvProfileButton
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /** Export remains independent of account/native readiness and works with detailed logging disabled. */
 @Composable
-internal fun DiagnosticLogAction(modifier: Modifier = Modifier, mayShare: () -> Boolean = { true }) {
+internal fun DiagnosticLogAction(
+    modifier: Modifier = Modifier,
+    isTv: Boolean = false,
+    recoveryOnly: Boolean = false,
+    mayShare: () -> Boolean = { true },
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val currentMayShare by rememberUpdatedState(mayShare)
     var busy by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<String?>(null) }
     Column(modifier) {
-        TextButton(enabled = !busy, onClick = {
+        val label = when {
+            busy -> "Preparing diagnostic log…"
+            recoveryOnly -> "Share account recovery diagnostics"
+            else -> "Save or share diagnostic log"
+        }
+        val share: () -> Unit = {
             val admission = currentMayShare
             busy = true
             status = null
             scope.launch {
-                try { status = shareDiagnosticLog(context, admission).message }
+                try {
+                    status = if (recoveryOnly) shareAccountRecoveryDiagnostics(context, admission).message
+                    else shareDiagnosticLog(context, admission).message
+                }
                 finally { busy = false }
             }
-        }) {
-            Text(if (busy) "Preparing diagnostic log…" else "Save or share diagnostic log")
         }
+        if (isTv) TvProfileButton(label, enabled = !busy, onClick = share)
+        else TextButton(enabled = !busy, onClick = share) { Text(label) }
         status?.let {
             Text(it, style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary),
                 modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
@@ -55,10 +69,18 @@ internal fun DiagnosticLogAction(modifier: Modifier = Modifier, mayShare: () -> 
     }
 }
 
-internal suspend fun shareDiagnosticLog(context: Context, mayShare: () -> Boolean = { true }): DiagnosticShareOutcome = performDiagnosticShare(
-    // Always include the device header, always-on startup breadcrumbs and pending crashes. Requiring the
-    // optional probe log first would make this action unusable for a failed first sign-in.
-    stage = { withContext(Dispatchers.IO) { DiagnosticsLog.stageExport(context) } },
+internal suspend fun shareDiagnosticLog(context: Context, mayShare: () -> Boolean = { true }): DiagnosticShareOutcome =
+    shareDiagnosticExport(context, mayShare) { DiagnosticsLog.stageExport(context) }
+
+internal suspend fun shareAccountRecoveryDiagnostics(context: Context, mayShare: () -> Boolean): DiagnosticShareOutcome =
+    shareDiagnosticExport(context, mayShare) { DiagnosticsLog.stageAccountRecoveryExport(context) }
+
+private suspend fun shareDiagnosticExport(
+    context: Context,
+    mayShare: () -> Boolean,
+    stageFile: () -> java.io.File,
+): DiagnosticShareOutcome = performDiagnosticShare(
+    stage = { withContext(Dispatchers.IO) { stageFile() } },
     mayShare = mayShare,
     present = { file ->
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)

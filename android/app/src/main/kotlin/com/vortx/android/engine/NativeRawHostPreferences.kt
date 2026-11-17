@@ -1,5 +1,6 @@
 package com.vortx.android.engine
 
+import com.vortx.android.library.NativeWatchlistCodec
 import org.json.JSONObject
 
 /** Raw persistence material only. These observations confer no account, profile or write authority.
@@ -124,8 +125,8 @@ internal object NativeRawHostPreferences {
     private fun eventComparison(left: OHJson.Obj, right: OHJson.Obj) = compareValuesBy(left, right,
         { NumberTokens.clock(it.raw("clock")) }, { it.text("actor") })
 
-    /** Equality of an already structurally admitted event. Only existing schema-owned numbers
-     * use mathematical equality; opaque/future values retain their conservative raw policy. */
+    /** Equality of an already structurally admitted event. Known numbers may use the schema's
+     * equality, including binary64 Watchlist timestamps. Opaque/future values stay exact. */
     internal fun requireEqualEvent(field: String, profile: Boolean, original: ByteArray, incoming: ByteArray) {
         val a = OHJson.Obj(original); val b = OHJson.Obj(incoming)
         require(a.keys == setOf("clock", "actor", "value") && b.keys == a.keys &&
@@ -138,6 +139,7 @@ internal object NativeRawHostPreferences {
 
     private fun equalValue(a: ByteArray, b: ByteArray, profile: Boolean, field: String, path: List<String>): Boolean {
         if (OHJson.equal(a, b)) return true
+        if (profile && path.isEmpty() && field.startsWith(NativeWatchlistCodec.PREFIX)) return equalWatchlistValue(field, a, b)
         if (profile && com.vortx.android.foryou.ForYouEditFields.people(field, path)) return equalPeople(a, b)
         return when (NativeHostPreferences.numericValueKind(profile, field, path)) {
             NativeHostPreferences.NumericValueKind.SCALAR -> NumberTokens.same(a, b)
@@ -147,6 +149,21 @@ internal object NativeRawHostPreferences {
                 left.keys == right.keys && left.keys.all { equalValue(left.raw(it), right.raw(it), profile, field, path + it) }
             } else false
         }
+    }
+
+    private fun equalWatchlistValue(field: String, a: ByteArray, b: ByteArray): Boolean {
+        val left = objectRow(a) ?: return false
+        val right = objectRow(b) ?: return false
+        // This includes the closed value shape, exact identity, numeric type and timestamp bounds.
+        return runCatching {
+            val first = JSONObject(OHJson.utf8(a))
+            val second = JSONObject(OHJson.utf8(b))
+            NativeWatchlistCodec.validate(field, first)
+            NativeWatchlistCodec.validate(field, second)
+            NativeHostPreferences.equalWatchlistEventValue(first, second) { key ->
+                OHJson.equal(left.raw(key), right.raw(key))
+            }
+        }.getOrDefault(false)
     }
 
     private fun equalNumberArray(a: ByteArray, b: ByteArray): Boolean {
