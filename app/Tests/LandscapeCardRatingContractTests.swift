@@ -1,90 +1,58 @@
-// LandscapeCardRatingContractTests: a standalone, runnable verification of the CARD rating-badge decision
-// for the cinematic LANDSCAPE cards, the surface the CEO reported broken ("Show ratings on posters" ON, yet
-// no star on any card). Live repro proved the cause: landscape is the DEFAULT appearance and fills each cell
-// with a CLEAN, textless TMDB backdrop (LandscapeArt / LandscapeArtiOS) that the poster-baking service never
-// touches, so the baked rating that portrait 2:3 posters get never appears. The fix surfaces the rating as a
-// client badge (CardRatingBadge, fed by the keyless VortXRatingsClient) whenever the visible art is NOT itself
-// baked.
-//
-// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per the repository guide), so,
-// exactly like app/Tests/RatingsDisplayContractTests.swift, this is a self-contained Swift executable run with
-// the system toolchain:
-//
-//     swift app/Tests/LandscapeCardRatingContractTests.swift
-//
-// SCOPE: asserts DESIGN PROPERTIES against faithful mirrors of the small decision surface, NOT the shipped
-// SwiftUI views directly (a standalone script cannot link the app target). The mirrors below MUST stay in
-// lockstep with the shipped code they cite; the real proof the shipped code compiles/links is the Xcode build.
+// Standalone checks for landscape-card rating placement and formatting.
+// Run with `swift app/Tests/LandscapeCardRatingContractTests.swift`.
 
 import Foundation
 
 var failures = 0
+@MainActor
 func check(_ cond: Bool, _ label: String) {
     if cond { print("  ok   \(label)") } else { print("  FAIL \(label)"); failures += 1 }
 }
 
-// MARK: - A. renderable-id + bakesRatings(forID:) mirror (XRDBConfig / ERDBConfig / PosterArtwork)
+@MainActor
+func testCardArtworkIndependence() throws {
+    let app = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+    let ios = try String(contentsOf: app.appendingPathComponent("SourcesiOS/iOSRootView.swift"), encoding: .utf8)
+    let posterPolicy = try String(contentsOf: app.appendingPathComponent("SourcesShared/ERDBConfig.swift"), encoding: .utf8)
+    let tv = try String(contentsOf: app.appendingPathComponent("SourcesTV/SharedUI.swift"), encoding: .utf8)
+    let iosCard = ios.components(separatedBy: "private struct LandscapeArtiOS: View {")[1]
+        .components(separatedBy: "struct CinemaPosterCardPresentation")[0]
+    let tvCard = tv.components(separatedBy: "struct LandscapeArt: View {")[1]
+        .components(separatedBy: "struct PosterCard: View {")[0]
 
-/// Mirror of XRDB.renderableID: only tt… and tmdb: ids can be baked by the poster service.
-func xrdbRenderable(_ id: String) -> Bool { id.hasPrefix("tt") || id.hasPrefix("tmdb:") }
-/// Mirror of ERDB.renderableID: tt… plus the tmdb/tvdb/anime schemes.
-func erdbRenderable(_ id: String) -> Bool {
-    if id.hasPrefix("tt") { return true }
-    for s in ["tmdb:", "tvdb:", "kitsu:", "anilist:", "mal:", "anidb:", "realimdb:"] where id.hasPrefix(s) { return true }
-    return false
-}
-/// Mirror of PosterArtwork.bakesRatings(forID:): when ERDB is active it must render the id, else the VortX/XRDB
-/// service must; a non-renderable id yields false.
-func bakesRatingsForID(_ id: String, erdbActive: Bool, xrdbEnabled: Bool) -> Bool {
-    if erdbActive { return erdbRenderable(id) }
-    if xrdbEnabled { return xrdbRenderable(id) }
-    return false
-}
-/// Mirror of PosterArtwork.bakesRatings (provider-level: any baker switched on).
-func bakesRatings(erdbActive: Bool, xrdbEnabled: Bool) -> Bool { erdbActive || xrdbEnabled }
+    check(iosCard.contains("LandscapePosterFallback(image:"), "Mac/iOS fallback uses the framed poster renderer")
+    check(iosCard.contains(".overlay(alignment: .topLeading)"), "Mac/iOS rating draws above the artwork")
+    check(iosCard.contains("active: PosterArtwork.bakesRatings(forID: id) && !usesRatedPoster,"),
+          "Mac/iOS suppress the native badge only for a displayed rated-renderer poster")
+    check(iosCard.contains("visiblePoster?.url == request.ratedPoster"), "Mac/iOS compare the displayed candidate")
+    check(iosCard.contains("PosterArtwork.landscapePosters("), "Mac/iOS use the shared fallback policy")
+    check(tvCard.contains("LandscapePosterFallback(image:"), "tvOS fallback uses the framed poster renderer")
+    check(tvCard.contains(".overlay(alignment: .topLeading) { ratingBadge }"), "tvOS rating draws above the artwork")
+    check(tvCard.contains("active: PosterArtwork.bakesRatings,"), "tvOS rating activation follows settings")
+    check(tvCard.contains("if let id, id.hasPrefix(\"tt\")"), "tvOS displays the native badge for supported titles")
+    check(tvCard.contains("PosterArtwork.landscapePosters("), "tvOS uses the shared fallback policy")
+    let policy = posterPolicy.components(separatedBy: "static func landscapePosters")[1]
+        .components(separatedBy: "static func isWrappableRawArt")[0]
+    check(policy.contains("ArtworkFallbackPolicy.candidates(originals + [metahub]), nil"),
+          "IMDb card fallbacks use plain posters and leave ratings to the card")
+    check(policy.contains("poster(id: id, fallback: nil)"), "other rated candidates keep the original art as a separate fallback")
 
-// MARK: - B. CardRatingBadge `active` gate (mirror of LandscapeArt.ratingBadge / LandscapeArtiOS.ratingBadge)
-
-/// The exact expression both landscape views compute:
-///   bakedPosterShown = !usedBackdrop && bakesRatings(forID:)
-///   active           = bakesRatings && !bakedPosterShown
-/// i.e. draw the client rating when the ratings feature is on AND the visible art is not itself a baked poster.
-func badgeActive(usedBackdrop: Bool, id: String, erdbActive: Bool, xrdbEnabled: Bool) -> Bool {
-    let bakedPosterShown = !usedBackdrop && bakesRatingsForID(id, erdbActive: erdbActive, xrdbEnabled: xrdbEnabled)
-    return bakesRatings(erdbActive: erdbActive, xrdbEnabled: xrdbEnabled) && !bakedPosterShown
-}
-
-func testActiveGate() {
-    print("B. CardRatingBadge active gate (landscape cards)")
-    // DEFAULT install: XRDB enabled (poster.vortx.tv), ERDB off, landscape backdrop on screen.
-    check(badgeActive(usedBackdrop: true, id: "tt0111161", erdbActive: false, xrdbEnabled: true),
-          "default (XRDB on) + clean TMDB backdrop -> badge SHOWS (the CEO's case)")
-    // Ratings feature fully off -> no client badge anywhere.
-    check(!badgeActive(usedBackdrop: true, id: "tt0111161", erdbActive: false, xrdbEnabled: false),
-          "ratings feature off -> badge hidden")
-    // Rare no-backdrop fallback: the baked portrait poster IS on screen for a renderable id -> suppress (no double).
-    check(!badgeActive(usedBackdrop: false, id: "tt0111161", erdbActive: false, xrdbEnabled: true),
-          "baked poster fallback (renderable id) -> badge suppressed, no double badge")
-    // No-backdrop fallback for a NON-renderable id: the shown poster is the raw add-on art (not baked) -> show.
-    check(badgeActive(usedBackdrop: false, id: "hive:abc123", erdbActive: false, xrdbEnabled: true),
-          "poster fallback for non-renderable id (raw art) -> badge SHOWS")
-    // ERDB active also counts as a baker; a renderable id on the baked poster fallback -> suppress.
-    check(!badgeActive(usedBackdrop: false, id: "tmdb:603", erdbActive: true, xrdbEnabled: false),
-          "ERDB active + baked poster fallback -> suppressed")
-    // ERDB active + backdrop on screen (backdrops are TMDB clean, never baked) -> show.
-    check(badgeActive(usedBackdrop: true, id: "tmdb:603", erdbActive: true, xrdbEnabled: false),
-          "ERDB active + clean backdrop -> badge SHOWS")
+    let grid = ios.components(separatedBy: "struct PosterGrid: View {")[1]
+        .components(separatedBy: "struct iOSGroupHeader")[0]
+    check(grid.contains("landscape: catalogPrefs.landscapeCards)"), "grid tracks follow the same orientation as the cards")
+    check(!grid.contains("hasTMDB"), "grid track sizing does not depend on a custom TMDB key")
 }
 
-// MARK: - C. rating lookup + formatting (mirror of CardRatingStore.rating / CardRatingBadge.task gate)
+// Rating lookup and formatting mirrors
 
 /// Mirror of CardRatingStore's format: one decimal, matching the baked poster's IMDb badge.
 func formatImdb(_ v: Double) -> String { String(format: "%.1f", v) }
 /// Mirror of the `.task` gate + VortXRatingsClient.ratings id guard: only tt ids are looked up.
 func fetchesRating(id: String, active: Bool) -> Bool { active && id.hasPrefix("tt") }
 
+@MainActor
 func testFormattingAndFetchGate() {
-    print("C. rating formatting + fetch gate")
+    print("Rating formatting and lookup")
     check(formatImdb(7.0) == "7.0", "7.0 -> \"7.0\" (one-decimal round-trip)")
     check(formatImdb(8.34) == "8.3", "8.34 -> \"8.3\" (one decimal)")
     check(formatImdb(6.849) == "6.8", "6.849 -> \"6.8\"")
@@ -95,6 +63,6 @@ func testFormattingAndFetchGate() {
 }
 
 print("LandscapeCardRatingContractTests")
-testActiveGate()
+try testCardArtworkIndependence()
 testFormattingAndFetchGate()
 if failures == 0 { print("\nALL PASSED") } else { print("\n\(failures) FAILED"); exit(1) }
