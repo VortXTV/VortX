@@ -543,12 +543,14 @@ struct iOSCategoryBrowse: View {
     @State private var items: [RailItem] = []
     @State private var seen = Set<String>()
     @State private var page = 1
-    @State private var loading = false
     @State private var done = false
-    /// Why the grid is empty once `done`, so the empty-state tells the truth (region / offline / 429 / add-on)
-    /// instead of always blaming the region. Set from the first empty page's `CatalogPage.cause`.
+    /// Why the provider returned no items, including a later page that can be retried.
     @State private var emptyCause: CatalogRowResolution.CatalogEmptyCause?
     @State private var loadTask: Task<Void, Never>?
+    /// Retiring a load invalidates the page result even if the provider returns after cancellation.
+    @State private var loadGeneration = 0
+    @State private var isVisible = false
+    @State private var resumePageOnAppear = false
     /// Push debounce: a sticky Bool reset in onAppear died when pop-back did not re-fire onAppear in
     /// the 7-tab opacity-ZStack architecture, eating every tap after the first (owner report). Time-based
     /// so it can never wedge shut.
@@ -576,16 +578,16 @@ struct iOSCategoryBrowse: View {
                 pills
                 if items.isEmpty {
                     if done {
-                        Text(LocalizedStringKey(CatalogRowResolution.emptyGridMessage(cause: emptyCause ?? .region, isServiceTarget: target.isService)))
-                            .font(Theme.Typography.label)
-                            .multilineTextAlignment(.center)
-                            .foregroundStyle(Theme.Palette.textSecondary).frame(maxWidth: .infinity).padding(Theme.Space.xxl)
+                        emptyState
                     } else {
                         ProgressView().frame(maxWidth: .infinity).padding(Theme.Space.xxl)
                     }
                 } else {
                     PosterGrid(items: items, onTap: open, onWatch: watch, menu: .catalog,
-                               showWatchedBadges: true, onReachEnd: { Task { await loadNext() } })
+                               showWatchedBadges: true, onReachEnd: loadNext)
+                    if done && canRetryPage {
+                        emptyState
+                    }
                 }
             }
             .padding(.bottom, Theme.Space.md)
@@ -598,10 +600,42 @@ struct iOSCategoryBrowse: View {
         .navigationBarTitleDisplayMode(.inline)
         #endif
         .macBackAffordance()   // macOS in-content Back + Esc / Cmd-[ (no toolbar back exists)
-        .onAppear { if selectedID.isEmpty, let first = subs.first { select(first.id) } }
+        .onAppear {
+            isVisible = true
+            if selectedID.isEmpty {
+                if let first = subs.first { select(first.id) }
+            } else if items.isEmpty || resumePageOnAppear {
+                resumePageOnAppear = false
+                loadNext()
+            }
+        }
         // Stop the hero's rotation/wake tasks and cancel the resolve so a popped browse leaves nothing looping
         // in the background and never pushes a detail page after the user has left.
-        .onDisappear { loadTask?.cancel(); resolveTask?.cancel(); hero.stop() }
+        .onDisappear {
+            guard isVisible else { return }
+            isVisible = false
+            resumePageOnAppear = loadTask != nil
+            cancelLoad()
+            resolveTask?.cancel()
+            resolveTask = nil
+            resolving = false
+            hero.stop()
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: Theme.Space.sm) {
+            Text(LocalizedStringKey(CatalogRowResolution.emptyGridMessage(cause: emptyCause ?? .region, isServiceTarget: target.isService)))
+                .font(Theme.Typography.label)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(Theme.Palette.textSecondary)
+            if canRetryPage {
+                Button("Try Again", action: retryPage)
+                    .buttonStyle(ChipButtonStyle(selected: false))
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(Theme.Space.xxl)
     }
 
     private var pills: some View {
@@ -659,43 +693,57 @@ struct iOSCategoryBrowse: View {
         resolving = true
         resolveTask = Task { @MainActor in
             let tt = await TMDBClient.imdbID(forCatalogID: item.id, type: item.type)
-            resolving = false
             // The user may have popped this screen during a cold-cache resolve; don't append a detail page
             // behind them (onDisappear cancels this task).
             guard !Task.isCancelled else { return }
+            resolving = false
+            resolveTask = nil
             append(tt.map { item.withResolvedIMDbID($0) } ?? item)
         }
     }
 
     private func select(_ id: String) {
-        guard id != selectedID || items.isEmpty else { return }
+        guard id != selectedID || (items.isEmpty && loadTask == nil) else { return }
+        cancelLoad()
         selectedID = id
-        // Reset `loading` too: cancellation is cooperative, so the outgoing load task may still be suspended at
-        // `await sub.load(page)` with loading==true when the new task starts. Without this reset the new task
-        // hits `guard !loading` and bails, and when the old task finally resumes it only sets loading=false and
-        // returns (id mismatch) - leaving items empty, no task running, and a PERMANENT spinner on the new pill.
-        items = []; seen = []; page = 1; done = false; loading = false; emptyCause = nil
-        loadTask?.cancel()
-        loadTask = Task { await loadNext() }
+        items = []; seen = []; page = 1; done = false; emptyCause = nil
+        loadNext()
     }
 
-    private func loadNext() async {
-        guard !loading, !done, let sub = subs.first(where: { $0.id == selectedID }) else { return }
-        loading = true
-        let requested = selectedID
-        let next = await sub.load(page)
-        guard requested == selectedID else { loading = false; return }
-        loading = false
-        if next.items.isEmpty { emptyCause = next.cause; done = true; return }
-        page += 1
-        let firstPage = (page == 2)   // page was 1 before this increment -> these are the pill's top items
-        let fresh = next.items.filter { seen.insert($0.id).inserted }
-            .map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
-        items.append(contentsOf: fresh)
-        // Seed (and on a pill switch, re-seed) the hero from the top of the freshly loaded catalog so the
-        // billboard reflects what's on screen. The model rotates + enriches from here; later pages don't reseed.
-        if firstPage {
-            hero.seed(Array(items.prefix(6)).map(FeaturedHeroItem.from(rail:)), reduceMotion: reduceMotion)
+    private func cancelLoad() {
+        loadGeneration &+= 1
+        loadTask?.cancel()
+        loadTask = nil
+    }
+
+    private var canRetryPage: Bool {
+        emptyCause == .network || emptyCause == .rateLimited || emptyCause == .parseFailure
+    }
+
+    private func retryPage() {
+        guard isVisible, done, canRetryPage else { return }
+        done = false
+        emptyCause = nil
+        loadNext()
+    }
+
+    private func loadNext() {
+        guard isVisible, loadTask == nil, !done, let sub = subs.first(where: { $0.id == selectedID }) else { return }
+        let generation = loadGeneration
+        let requestedPage = page
+        loadTask = Task { @MainActor in
+            guard !Task.isCancelled else { return }
+            let next = await sub.load(requestedPage)
+            guard !Task.isCancelled, generation == loadGeneration else { return }
+            loadTask = nil
+            if next.items.isEmpty { emptyCause = next.cause; done = true; return }
+            page += 1
+            let fresh = next.items.filter { seen.insert($0.id).inserted }
+                .map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
+            items.append(contentsOf: fresh)
+            if requestedPage == 1 {
+                hero.seed(Array(items.prefix(6)).map(FeaturedHeroItem.from(rail:)), reduceMotion: reduceMotion)
+            }
         }
     }
 }
@@ -917,7 +965,6 @@ struct iOSDiscoverSettingsView: View {
 /// changes unless the user opts in.
 struct iOSPosterStyleView: View {
     @ObservedObject private var prefs = CatalogPreferences.shared
-    @ObservedObject private var apiKeys = ApiKeys.shared
 
     var body: some View {
         Form {
@@ -944,17 +991,12 @@ struct iOSPosterStyleView: View {
             }
 
             Section {
-                // Landscape 16:9 art needs a TMDB key (a clean backdrop); without one the toggle is disabled
-                // and posters stay portrait, so keyless users never get a degraded composite.
                 Toggle("Landscape (16:9) art", isOn: $prefs.landscapeCards)
-                    .disabled(!apiKeys.hasTMDB)
                 Toggle("Hide poster labels", isOn: $prefs.hidePosterLabels)
             } header: {
                 Text("Layout")
             } footer: {
-                Text(apiKeys.hasTMDB
-                     ? "Landscape shows cinematic 16:9 backdrops instead of portrait posters where art is available. Hide labels for a cleaner, poster-only grid."
-                     : "Landscape 16:9 art needs a TMDB key (add one under Streams). Hide labels for a cleaner, poster-only grid.")
+                Text("Landscape shows cinematic 16:9 backdrops instead of portrait posters where art is available. Hide labels for a cleaner, poster-only grid.")
             }
         }
         .formStyle(.grouped)
@@ -974,12 +1016,11 @@ struct iOSPosterStyleView: View {
 /// redraws the instant any control changes.
 private struct PosterStylePreview: View {
     @ObservedObject private var prefs = CatalogPreferences.shared
-    @ObservedObject private var apiKeys = ApiKeys.shared
 
     /// Preview at the REGULAR width so the sample is comfortably large on every device (the grid itself
     /// uses the size-class-aware width). Capped so the widest preset still fits the settings row.
     private var width: CGFloat { min(prefs.posterWidth.regularWidth, 220) }
-    private var landscape: Bool { prefs.landscapeCards && apiKeys.hasTMDB }
+    private var landscape: Bool { prefs.landscapeCards }
     private var height: CGFloat { landscape ? width * 9.0 / 16.0 : width * 3.0 / 2.0 }
 
     /// "Balanced · Rounded" (+ " · Landscape" when on), each piece localized. Built as a String so the

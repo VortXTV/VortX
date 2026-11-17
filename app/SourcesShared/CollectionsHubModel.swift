@@ -134,6 +134,16 @@ struct CatalogPage {
     let items: [MetaPreview]
     let cause: CatalogRowResolution.CatalogEmptyCause?
     static let empty = CatalogPage(items: [], cause: nil)
+
+    /// A sparse rotated page can use page 1. A failed request needs the grid's retry action.
+    var isSparse: Bool {
+        guard items.isEmpty else { return false }
+        switch cause {
+        case nil, .region, .filteredOut, .addonRequired: return true
+        case .network, .rateLimited, .missingKey, .parseFailure: return false
+        }
+    }
+
     init(items: [MetaPreview], cause: CatalogRowResolution.CatalogEmptyCause?) {
         self.items = items
         self.cause = cause
@@ -240,9 +250,7 @@ enum CollectionsCatalog {
         // `fresh` opts a POPULARITY window (Movies / Shows / Trending) into the per-app-open seeded page
         // rotation (CuratedFreshness). Date-sorted and Top-This-* rows keep their semantic order. When a
         // rotated first page comes back empty (a sparse window shorter than the rotation span, e.g. a small
-        // provider's catalog), fall back to the unrotated page 1 so rotation never blanks a working row;
-        // that unrotated retry is also what keeps the service US-region fallback reachable (it only arms
-        // on page 1).
+        // provider's catalog), fall back to the unrotated page 1 so rotation never blanks a working row.
         func sub(_ id: String, _ title: String, movieExtra: ((String) -> String)?, tvExtra: ((String) -> String)?, fresh: Bool = false) -> SubCatalog {
             SubCatalog(id: id, title: title, load: { page in
                 let movie = movieScope.flatMap { s in movieExtra.map { $0(s) } }
@@ -251,7 +259,7 @@ enum CollectionsCatalog {
                 let rotated = await mergedDiscover(
                     movie: movie, tv: tv,
                     region: region, page: page + offset, serviceRegionFallback: serviceFallback, providerID: providerID)
-                if offset > 0, page == 1, rotated.items.isEmpty {
+                if offset > 0, page == 1, rotated.isSparse, !Task.isCancelled {
                     return await mergedDiscover(movie: movie, tv: tv, region: region, page: 1, serviceRegionFallback: serviceFallback, providerID: providerID)
                 }
                 return rotated
@@ -295,7 +303,7 @@ enum CollectionsCatalog {
             SubCatalog(id: id, title: title, load: { page in
                 let offset = fresh ? CuratedFreshness.pageOffset(key: "\(movie ?? "")|\(tv ?? "")") : 0
                 let rotated = await mergedDiscover(movie: movie, tv: tv, region: region, page: page + offset)
-                if offset > 0, page == 1, rotated.items.isEmpty {
+                if offset > 0, page == 1, rotated.isSparse, !Task.isCancelled {
                     return await mergedDiscover(movie: movie, tv: tv, region: region, page: 1)
                 }
                 return rotated

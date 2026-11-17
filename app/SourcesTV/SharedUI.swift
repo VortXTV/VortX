@@ -610,6 +610,16 @@ struct LandscapeArt: View {
     /// Poster corner radius, defaulting to the system card radius. `PosterCard` passes the user's
     /// `posterRadius` preset so the Poster Style corner-radius control is honored on tvOS (#105).
     var radius: CGFloat = Theme.Radius.card
+    private struct Request: Equatable {
+        let id: String?
+        let type: String
+        let posters: [String]
+    }
+
+    private var request: Request {
+        .init(id: id, type: type, posters: PosterArtwork.landscapePosters(id: id, originals: [poster]).urls)
+    }
+
     @State private var image: UIImage?
     @State private var logo: UIImage?
     @State private var usedBackdrop = false
@@ -618,50 +628,32 @@ struct LandscapeArt: View {
     private var height: CGFloat { (width * 9 / 16).rounded() }
 
     var body: some View {
-        Group {
-            if let image {
-                if usedBackdrop {
-                    Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
-                        .overlay { titleLayer }
-                } else {
-                    // A blurred copy of the poster fills the 16:9 frame; with glass and blur off the
-                    // frame is a plain dark fill instead, sparing one blur per card.
-                    Group {
-                        if VisualEffects.glassEnabled {
-                            Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
-                                .blur(radius: 26).opacity(0.55)
-                        } else {
-                            Theme.Palette.surface2
-                        }
+        Theme.Palette.surface2
+            .overlay {
+                if let image {
+                    if usedBackdrop {
+                        Image(uiImage: image).resizable().scaledToFill()
+                    } else {
+                        LandscapePosterFallback(image: Image(uiImage: image), background: Theme.Palette.surface2,
+                                                blurRadius: VisualEffects.glassEnabled ? 26 : nil)
                     }
-                    .overlay(Color.black.opacity(0.35))
-                    .overlay(Image(uiImage: image).resizable().aspectRatio(contentMode: .fit))
-                }
-            } else if failed {
-                Theme.Palette.surface2.overlay(
+                } else if failed {
                     Image(systemName: "film").font(.system(size: 40)).foregroundStyle(Theme.Palette.textTertiary)
-                )
-            } else {
-                Theme.Palette.surface2.overlay(ProgressView().tint(Theme.Palette.textTertiary))
+                } else {
+                    ProgressView().tint(Theme.Palette.textTertiary)
+                }
             }
-        }
-        .frame(width: width, height: height)
-        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
-        .overlay(alignment: .topLeading) { ratingBadge }
-        .task(id: id ?? poster ?? "") { await load() }
+            .overlay { if usedBackdrop { titleLayer } }
+            .frame(width: width, height: height)
+            .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .overlay(alignment: .topLeading) { ratingBadge }
+            .task(id: request) { await load(request) }
     }
 
-    /// The clean 16:9 backdrop these cards show carries NO baked rating (unlike the portrait poster the
-    /// service bakes), so when "Show ratings on posters" is on, surface the rating as a client badge fed by
-    /// the keyless VortX ratings service. Suppressed only when a genuinely BAKED poster is on screen (the
-    /// rare no-backdrop fallback for a renderable id), so a rating is never double-drawn. Top-LEADING to
-    /// clear the watched checkmark, which owns the top-trailing corner. Placed in `PosterCard` at the same
-    /// corner would work too, but `id` and `usedBackdrop` live here.
+    /// IMDb cards draw ratings over either a backdrop or a plain poster.
     @ViewBuilder private var ratingBadge: some View {
-        if let id {
-            let bakedPosterShown = !usedBackdrop && PosterArtwork.bakesRatings(forID: id)
-            CardRatingBadge(id: id, type: type,
-                            active: PosterArtwork.bakesRatings && !bakedPosterShown,
+        if let id, id.hasPrefix("tt") {
+            CardRatingBadge(id: id, type: type, active: PosterArtwork.bakesRatings,
                             textSize: 15, reservedTrailing: 48)
                 .padding(Theme.Space.sm)
         }
@@ -685,18 +677,24 @@ struct LandscapeArt: View {
         }
     }
 
-    private func load() async {
+    private func load(_ request: Request) async {
         image = nil; logo = nil; usedBackdrop = false; failed = false
         // Clean TMDB textless 16:9 backdrop (cached by id). Only a real backdrop fills the cell.
-        if let id, let bd = await LandscapeBackdropCache.backdrop(id: id, type: type), let img = await fetch(bd) {
+        if let id = request.id, let bd = await LandscapeBackdropCache.backdrop(id: id, type: request.type), let img = await fetch(bd) {
+            guard !Task.isCancelled else { return }
             image = img; usedBackdrop = true
             // Title overlay: prefer the clearlogo (PNG); titleLayer falls back to text when nil.
-            if let lg = await LandscapeBackdropCache.logo(id: id, type: type) { logo = await fetch(lg) }
+            if let lg = await LandscapeBackdropCache.logo(id: id, type: request.type) {
+                let loadedLogo = await fetch(lg)
+                guard !Task.isCancelled else { return }
+                logo = loadedLogo
+            }
             return
         }
-        // No TMDB backdrop: composite the poster (blurred fill behind a fit copy), never an ugly 2:3 crop.
-        if let img = await fetch(poster) { image = img; usedBackdrop = false; return }
-        failed = true
+        let loaded = await ArtworkFallbackPolicy.firstAvailable(request.posters) { await fetch($0) }
+        guard !Task.isCancelled else { return }
+        image = loaded
+        failed = loaded == nil
     }
 
     private func fetch(_ raw: String?) async -> UIImage? {
@@ -801,7 +799,8 @@ struct PosterCard: View {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 Group {
                     if landscape {
-                        LandscapeArt(id: id, type: type, title: displayTitle, poster: PosterArtwork.poster(id: id, fallback: displayPoster), width: cardWidth, radius: catalogPrefs.posterRadius.radius)
+                        LandscapeArt(id: id, type: type, title: displayTitle, poster: displayPoster ?? poster,
+                                     width: cardWidth, radius: catalogPrefs.posterRadius.radius)
                     } else if privateArtwork, TraktArtworkPolicy.isFirstPartyArtwork(displayPoster) {
                         // Trakt's documented first-party CDN art is safe to fetch through the normal
                         // cache-backed loader. Keep the exact validated URL from the row: do not wrap it

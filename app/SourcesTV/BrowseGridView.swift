@@ -380,16 +380,14 @@ struct TVCategoryBrowse: View {
     @State private var items: [MetaPreview] = []
     @State private var seen = Set<String>()
     @State private var page = 1
-    @State private var loading = false
     @State private var done = false
-    /// Why the grid is empty once `done`, so the empty-state tells the truth (region / offline / 429 / add-on)
-    /// instead of always blaming the region. Set from the first empty page's `CatalogPage.cause`.
+    /// Why the provider returned no items, including a later page that can be retried.
     @State private var emptyCause: CatalogRowResolution.CatalogEmptyCause?
     @State private var loadTask: Task<Void, Never>?
-    /// Bumped on every pill switch. A load captures it before its await and drops every post-await mutation
-    /// when the token has moved on, so an in-flight (or pagination) load for the OLD pill can never clear the
-    /// spinner or clobber the new pill's `loading` state.
-    @State private var loadGen = 0
+    /// Retiring a load invalidates the page result even if the provider returns after cancellation.
+    @State private var loadGeneration = 0
+    @State private var isVisible = false
+    @State private var resumePageOnAppear = false
 
     private var subs: [SubCatalog] { CollectionsCatalog.subCatalogs(for: target, region: TMDBClient.deviceRegion) }
 
@@ -410,6 +408,9 @@ struct TVCategoryBrowse: View {
                     Text(LocalizedStringKey(target.title)).screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
                     pills
                     grid
+                    if !items.isEmpty && done && canRetryPage {
+                        emptyState
+                    }
                 }
                 .padding(.top, Theme.Space.sm)
                 .padding(.bottom, Theme.Space.xl)
@@ -417,8 +418,21 @@ struct TVCategoryBrowse: View {
             .heroBottomStrip()
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        .onAppear { if selectedID.isEmpty, let first = subs.first { select(first.id) } }
-        .onDisappear { loadTask?.cancel() }
+        .onAppear {
+            isVisible = true
+            if selectedID.isEmpty {
+                if let first = subs.first { select(first.id) }
+            } else if items.isEmpty || resumePageOnAppear {
+                resumePageOnAppear = false
+                loadNext()
+            }
+        }
+        .onDisappear {
+            guard isVisible else { return }
+            isVisible = false
+            resumePageOnAppear = loadTask != nil
+            cancelLoad()
+        }
     }
 
     private var pills: some View {
@@ -436,10 +450,7 @@ struct TVCategoryBrowse: View {
     @ViewBuilder private var grid: some View {
         if items.isEmpty {
             if done {
-                Text(LocalizedStringKey(CatalogRowResolution.emptyGridMessage(cause: emptyCause ?? .region, isServiceTarget: target.isService)))
-                    .font(Theme.Typography.label)
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(Theme.Palette.textSecondary).padding(Theme.Space.xxl).frame(maxWidth: .infinity)
+                emptyState
             } else {
                 BigSpinner().padding(Theme.Space.xxl).frame(maxWidth: .infinity)
             }
@@ -451,7 +462,7 @@ struct TVCategoryBrowse: View {
                                width: TVGridMetrics.posterCellWidth, landscapeWidth: TVGridMetrics.landscapeCellWidth,
                                menu: .catalog,
                                onFocus: { focusModel.focus(hero(for: item)) })
-                        .onAppear { if item.id == items.last?.id { Task { await loadNext() } } }
+                        .onAppear { if item.id == items.last?.id { loadNext() } }
                 }
             }
             .padding(.horizontal, Theme.Space.screenEdge)
@@ -459,32 +470,61 @@ struct TVCategoryBrowse: View {
         }
     }
 
-    private func select(_ id: String) {
-        guard id != selectedID || items.isEmpty else { return }
-        selectedID = id
-        // Reset `loading` too: an in-flight load leaves it true, and without this the next loadNext() bails on
-        // its `guard !loading` and the grid stays stuck on the spinner. Bump the generation so any stale load
-        // (the cancelled loadTask AND any onAppear pagination load) drops its result.
-        items = []; seen = []; page = 1; done = false; loading = false; emptyCause = nil
-        loadGen += 1
-        loadTask?.cancel()
-        loadTask = Task { await loadNext() }
+    private var emptyState: some View {
+        VStack(spacing: Theme.Space.sm) {
+            Text(LocalizedStringKey(CatalogRowResolution.emptyGridMessage(cause: emptyCause ?? .region, isServiceTarget: target.isService)))
+                .font(Theme.Typography.label)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(Theme.Palette.textSecondary)
+            if canRetryPage {
+                Button("Try Again", action: retryPage)
+                    .buttonStyle(ChipButtonStyle(selected: false))
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(Theme.Space.xxl)
     }
 
-    private func loadNext() async {
-        guard !loading, !done, let sub = subs.first(where: { $0.id == selectedID }) else { return }
-        loading = true
-        let gen = loadGen
-        let next = await sub.load(page)
-        // A pill switched mid-fetch: a newer select() already reset `loading` and owns the new load, so return
-        // WITHOUT touching loading (clearing it here would clobber the new pill's in-flight state).
-        guard gen == loadGen else { return }
-        loading = false
-        if next.items.isEmpty { emptyCause = next.cause; done = true; return }
-        page += 1
-        let fresh = next.items.filter { seen.insert($0.id).inserted }
-        items.append(contentsOf: fresh)
-        if focusModel.hero == nil, let first = items.first { focusModel.seedIfEmpty(hero(for: first)) }
+    private func select(_ id: String) {
+        guard id != selectedID || (items.isEmpty && loadTask == nil) else { return }
+        cancelLoad()
+        selectedID = id
+        items = []; seen = []; page = 1; done = false; emptyCause = nil
+        loadNext()
+    }
+
+    private func cancelLoad() {
+        loadGeneration &+= 1
+        loadTask?.cancel()
+        loadTask = nil
+    }
+
+    private var canRetryPage: Bool {
+        emptyCause == .network || emptyCause == .rateLimited || emptyCause == .parseFailure
+    }
+
+    private func retryPage() {
+        guard isVisible, done, canRetryPage else { return }
+        done = false
+        emptyCause = nil
+        loadNext()
+    }
+
+    private func loadNext() {
+        guard isVisible, loadTask == nil, !done, let sub = subs.first(where: { $0.id == selectedID }) else { return }
+        let generation = loadGeneration
+        let requestedPage = page
+        loadTask = Task { @MainActor in
+            guard !Task.isCancelled else { return }
+            let next = await sub.load(requestedPage)
+            guard !Task.isCancelled, generation == loadGeneration else { return }
+            loadTask = nil
+            if next.items.isEmpty { emptyCause = next.cause; done = true; return }
+            page += 1
+            let fresh = next.items.filter { seen.insert($0.id).inserted }
+            items.append(contentsOf: fresh)
+            if focusModel.hero == nil, let first = items.first { focusModel.seedIfEmpty(hero(for: first)) }
+        }
     }
 
     private func hero(for item: MetaPreview) -> FocusedHero {

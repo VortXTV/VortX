@@ -5936,7 +5936,6 @@ struct PosterGrid: View {
     var onReachEnd: (() -> Void)? = nil
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
-    @ObservedObject private var apiKeys = ApiKeys.shared
     // Watched check + dim on catalog covers (#111): one shared per-profile id set, O(1) per card.
     @ObservedObject private var watchedIndex = WatchedIndex.shared
     /// Catalog cards open a compact, reversible preview before the full detail route. Continue Watching
@@ -5949,8 +5948,7 @@ struct PosterGrid: View {
     // Center the adaptive tracks so the cards distribute evenly across the available width.
     private var columns: [GridItem] {
         // Track width must match the card width (PosterCardiOS.cardW) so grid + cards stay in lockstep and
-        // the adaptive column count recomputes from the user's Poster Style preset. `.balanced` (the default)
-        // returns today's 224 regular / 116 compact, so the default layout is unchanged.
+        // the adaptive column count recomputes from the user's Poster Style preset and viewport.
         #if os(iOS)
         let compact = hSize == .compact
         #else
@@ -5958,7 +5956,7 @@ struct PosterGrid: View {
         #endif
         let minTrack = iOSPillMetrics.gridPosterWidth(preset: catalogPrefs.posterWidth, compact: compact,
                                                     container: viewportWidth,
-                                                    landscape: catalogPrefs.landscapeCards && apiKeys.hasTMDB)
+                                                    landscape: catalogPrefs.landscapeCards)
         return [GridItem(.adaptive(minimum: minTrack), spacing: Theme.Space.sm, alignment: .center)]
     }
     var body: some View {
@@ -6403,6 +6401,7 @@ struct CachedPosterImage: View {
 /// poster and never starts a request or writes the shared artwork caches.
 private struct WarmCachedPosterImage: View {
     let url: String?
+    var landscape = false
 
     private var image: VXPosterImage? {
         guard let url, let parsed = URL(string: url) else { return nil }
@@ -6413,10 +6412,15 @@ private struct WarmCachedPosterImage: View {
         Group {
             if let image {
                 #if canImport(UIKit)
-                Image(uiImage: image).resizable().scaledToFill()
+                let poster = Image(uiImage: image)
                 #else
-                Image(nsImage: image).resizable().scaledToFill()
+                let poster = Image(nsImage: image)
                 #endif
+                if landscape {
+                    LandscapePosterFallback(image: poster, background: Theme.Palette.surface1, posterInset: 6)
+                } else {
+                    poster.resizable().scaledToFill()
+                }
             } else {
                 Theme.Palette.surface1.overlay(
                     Image(systemName: "film")
@@ -6435,8 +6439,7 @@ private struct LandscapeArtiOS: View {
     let id: String
     let type: String
     let title: String
-    let preferredPoster: String?
-    let fallbackPosters: [String?]
+    let posters: [String?]
     var fallbackIMDb: String? = nil
     @State private var posterResult: ArtworkResult?
     @State private var backdropResult: ArtworkResult?
@@ -6458,12 +6461,8 @@ private struct LandscapeArtiOS: View {
     private static let maxPixel: CGFloat = 1280
 
     private var request: Request {
-        let fallbacks = ArtworkFallbackPolicy.candidates(fallbackPosters)
-        let posters = ArtworkFallbackPolicy.candidates([preferredPoster] + fallbackPosters)
-        let ratedPoster = posters.first.flatMap { candidate in
-            PosterArtwork.bakesRatings(forID: id) && !fallbacks.contains(candidate) ? candidate : nil
-        }
-        return .init(id: id, type: type, posters: posters, ratedPoster: ratedPoster)
+        let candidates = PosterArtwork.landscapePosters(id: id, originals: posters)
+        return .init(id: id, type: type, posters: candidates.urls, ratedPoster: candidates.ratedPoster)
     }
 
     var body: some View {
@@ -6471,46 +6470,34 @@ private struct LandscapeArtiOS: View {
         let backdrop = backdropResult.flatMap { $0.request == request ? $0 : nil }
         let poster = posterResult.flatMap { $0.request == request ? $0 : nil }
         let logo = titleLogo.flatMap { $0.request == request ? $0.image : nil }
-        let cached = request.posters.lazy.compactMap { raw -> (PlatformPosterImage, String)? in
+        let cached = request.posters.lazy.compactMap { raw -> ArtworkResult? in
             guard let url = URL(string: raw),
                   let image = PosterImageLoader.cached(url, maxPixel: Self.maxPixel) else { return nil }
-            return (image, raw)
+            return ArtworkResult(request: request, image: image, url: raw)
         }.first
-        Group {
-            if let image = backdrop?.image {
-                imageView(image).resizable().scaledToFill()
-                    .overlay { titleLayer(logo: logo) }
-            } else if let image = poster?.image ?? cached?.0 {
-                imageView(image).resizable().scaledToFill()
-                    .blur(radius: 18).opacity(0.55)
-                    .overlay(Color.black.opacity(0.35))
-                    .overlay(imageView(image).resizable().scaledToFit())
-            } else if backdrop != nil, poster != nil {
-                Theme.Palette.surface1.overlay(
-                    Image(systemName: "film").font(.system(size: 24)).foregroundStyle(Theme.Palette.textTertiary))
-            } else {
-                Theme.Palette.surface1
+        let visiblePoster = poster?.image == nil ? cached : poster
+        let usesRatedPoster = backdrop?.image == nil && request.ratedPoster != nil
+            && visiblePoster?.url == request.ratedPoster
+        Theme.Palette.surface1
+            .overlay {
+                if let image = backdrop?.image {
+                    imageView(image).resizable().scaledToFill()
+                } else if let image = visiblePoster?.image {
+                    LandscapePosterFallback(image: imageView(image), background: Theme.Palette.surface1)
+                } else if backdrop != nil, poster != nil {
+                    Image(systemName: "film").font(.system(size: 24)).foregroundStyle(Theme.Palette.textTertiary)
+                }
             }
-        }
-        .overlay(alignment: .topLeading) {
-            ratingBadge(paintedPoster: backdrop?.image == nil ? (poster?.url ?? cached?.1) : nil,
-                        ratedPoster: request.ratedPoster)
-        }
-        .task(id: request) { await loadPoster(request) }
-        .task(id: request) { await loadBackdrop(request) }
-    }
-
-    /// The clean 16:9 backdrop carries NO baked rating (unlike the portrait poster the service bakes), so
-    /// when "Show ratings on posters" is on, surface it as a client badge fed by the keyless VortX ratings
-    /// service. Suppressed only when a genuinely BAKED poster is on screen (the rare no-backdrop fallback for
-    /// a renderable id), so a rating is never double-drawn. Top-LEADING to clear the watched checkmark (which
-    /// owns top-trailing) and the outer PosterCardiOS portrait rating badge (also top-trailing).
-    private func ratingBadge(paintedPoster: String?, ratedPoster: String?) -> some View {
-        let bakedPosterShown = paintedPoster != nil && paintedPoster == ratedPoster
-        return CardRatingBadge(id: id, type: type,
-                               active: PosterArtwork.bakesRatings(forID: id) && !bakedPosterShown,
-                               textSize: 10, reservedTrailing: 28, fallbackIMDb: fallbackIMDb)
-            .padding(6)
+            .clipped()
+            .overlay { if backdrop?.image != nil { titleLayer(logo: logo) } }
+            .overlay(alignment: .topLeading) {
+                CardRatingBadge(id: id, type: type,
+                                active: PosterArtwork.bakesRatings(forID: id) && !usesRatedPoster,
+                                textSize: 10, reservedTrailing: 28, fallbackIMDb: fallbackIMDb)
+                    .padding(6)
+            }
+            .task(id: request) { await loadPoster(request) }
+            .task(id: request) { await loadBackdrop(request) }
     }
 
     /// The title ON the backdrop: the clean TMDB clearlogo when one resolves, else styled text, over a
@@ -6700,10 +6687,10 @@ private struct CinemaPosterCardBody: View {
                         WarmCachedPosterImage(url: nil)
                     } else if landscape {
                         if privateArtwork {
-                            privateLandscapeArt
+                            WarmCachedPosterImage(url: displayPoster ?? fallbackArt, landscape: true)
                         } else {
-                            LandscapeArtiOS(id: id, type: type, title: displayName, preferredPoster: publicPoster,
-                                            fallbackPosters: publicPosterFallbacks,
+                            LandscapeArtiOS(id: id, type: type, title: displayName,
+                                            posters: publicPosterFallbacks,
                                             fallbackIMDb: imdbRating)
                         }
                     } else if privateArtwork, TraktArtworkPolicy.isFirstPartyArtwork(displayPoster ?? fallbackArt) {
@@ -6725,7 +6712,8 @@ private struct CinemaPosterCardBody: View {
                         // the native overlay to avoid a double badge. Also skipped on a watched card, whose
                         // topTrailing corner carries the check badge instead (mirror of tvOS PosterCard).
                         if !presentation.usesInertArtwork,
-                           !isWatched, let rating = imdbRating, !rating.isEmpty, !PosterArtwork.bakesRatings(forID: id) {
+                           !isWatched, let rating = imdbRating, !rating.isEmpty,
+                           (landscape && privateArtwork || !PosterArtwork.bakesRatings(forID: id)) {
                             HStack(spacing: 2) {
                                 Image(systemName: "star.fill").font(.system(size: 8))
                                 Text(rating).font(.system(size: 10, weight: .semibold))
@@ -6824,18 +6812,6 @@ private struct CinemaPosterCardBody: View {
         .contentShape(Rectangle())
     }
 
-    /// A wide private-history card must not call catalog/backdrop services. It simply re-frames the
-    /// already-warm poster over a dim canvas, preserving both privacy and the shared Cinema footprint.
-    private var privateLandscapeArt: some View {
-        ZStack {
-            Theme.Palette.surface1
-            WarmCachedPosterImage(url: displayPoster ?? fallbackArt)
-                .blur(radius: 18).opacity(0.5)
-            WarmCachedPosterImage(url: displayPoster ?? fallbackArt)
-                .scaledToFit()
-                .padding(6)
-        }
-    }
 }
 
 /// Live card wrapper. Keeping the observed preference/localization owners here preserves normal app

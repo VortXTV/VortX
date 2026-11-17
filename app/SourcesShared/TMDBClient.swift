@@ -1,9 +1,8 @@
+import CryptoKit
 import Foundation
 
-/// Minimal TMDB v3 client, used only when the user has set a TMDB key (see ApiKeys). It enriches the
-/// engine's data; it is never required. Recommendations are returned as IMDb ids so they map straight
-/// onto the engine's Cinemeta metas. Every call fails soft (returns nil / []), so a flaky or missing
-/// key never breaks a screen.
+/// TMDB v3 metadata and public catalogs. Recommendations use IMDb ids to match the engine's metas.
+/// Public catalog requests can recover through the VortX edge when a custom TMDB key is configured.
 enum TMDBClient {
     private static let host = "https://api.themoviedb.org/3"
 
@@ -250,21 +249,21 @@ enum TMDBClient {
 
     /// CLEAN landscape artwork for the cinematic cards: a textless 16:9 backdrop + a PNG clearlogo from
     /// TMDB, with NO rating/quality overlay (distinct from the ERDB rating-bake path, which stays opt-in for
-    /// posters). Requires a TMDB key; accepts an IMDb id (tt..., via /find) or a `tmdb:[type:]id`. Either URL
-    /// is nil when absent. The card layer caches the result so each title resolves once.
+    /// posters). Accepts an IMDb id (tt..., via /find) or a `tmdb:[type:]id`. The public catalog route
+    /// also works without a custom key. The card layer caches resolved URLs.
     static func landscapeImages(metaID: String, type: String) async -> (backdrop: String?, logo: String?) {
-        let key = ApiKeys.effectiveTMDBKey()
+        let key = ApiKeys.bundledTMDBKey
         let media = (type == "series") ? "tv" : "movie"
         var tmdbID: Int?
         if metaID.hasPrefix("tt") {
-            guard let found = await get("/find/\(metaID)?external_source=imdb_id&api_key=\(key)"),
+            guard let found = await get("/find/\(metaID)?external_source=imdb_id&api_key=\(key)", publicCatalog: true),
                   let first = (found[media == "tv" ? "tv_results" : "movie_results"] as? [[String: Any]])?.first else { return (nil, nil) }
             tmdbID = first["id"] as? Int
         } else if metaID.hasPrefix("tmdb:") {
             tmdbID = metaID.split(separator: ":").last.flatMap { Int($0) }
         }
         guard let id = tmdbID,
-              let imgs = await get("/\(media)/\(id)/images?api_key=\(key)&include_image_language=en,null") else { return (nil, nil) }
+              let imgs = await get("/\(media)/\(id)/images?api_key=\(key)&include_image_language=en,null", publicCatalog: true) else { return (nil, nil) }
         // Prefer a TEXTLESS backdrop (iso_639_1 == null) for a clean card, else the first available.
         let backdrops = (imgs["backdrops"] as? [[String: Any]]) ?? []
         let bd = ((backdrops.first { ($0["iso_639_1"] as? String) == nil }) ?? backdrops.first)?["file_path"] as? String
@@ -303,7 +302,7 @@ enum TMDBClient {
     /// add-on). Name + poster come from the discover row itself, so this is one discover call + one
     /// external_ids call per title (capped), not a full meta fetch per card.
     static func streamingProviderTitles(providerID: Int, region: String = deviceRegion, limit: Int = 18) async -> [MetaPreview] {
-        let key = ApiKeys.effectiveTMDBKey()
+        let key = ApiKeys.bundledTMDBKey
         async let movieRows = discoverProviderPage(media: "movie", providerID: providerID, region: region, key: key)
         async let tvRows = discoverProviderPage(media: "tv", providerID: providerID, region: region, key: key)
         let movies = await movieRows, series = await tvRows
@@ -353,7 +352,7 @@ enum TMDBClient {
     /// engine-playable Cinemeta (tt) previews. [] with no TMDB key or nothing found; the caller then falls
     /// back to Cinemeta genre catalogs (which need no key) so the Genres group still fills.
     static func genreTitles(_ genre: Genre, region: String = deviceRegion, limit: Int = 18) async -> [MetaPreview] {
-        let key = ApiKeys.effectiveTMDBKey()
+        let key = ApiKeys.bundledTMDBKey
         async let movieRows = discoverGenrePage(media: "movie", genreID: genre.movieGenreID, key: key)
         // Only fetch a TV bucket for genres that map to a TMDB TV genre (Thriller / Horror / Romance are
         // movie-only here); otherwise the rail is movies-only.
@@ -372,7 +371,7 @@ enum TMDBClient {
     /// after `api_key`; nil skips that media), interleaved and resolved to playable tt previews exactly
     /// like the genre rails. Fail-soft: [].
     static func ruleTitles(movieQuery: String?, tvQuery: String?, limit: Int = 20) async -> [MetaPreview] {
-        let key = ApiKeys.effectiveTMDBKey()
+        let key = ApiKeys.bundledTMDBKey
         async let movieRows = rulePage(media: "movie", query: movieQuery, key: key)
         async let tvRows = rulePage(media: "tv", query: tvQuery, key: key)
         return await resolveRows(interleave(await movieRows, await tvRows), key: key, limit: limit)
@@ -380,7 +379,7 @@ enum TMDBClient {
 
     private static func rulePage(media: String, query: String?, key: String) async -> [DiscoverRow] {
         guard let query else { return [] }
-        return parseDiscover(await get("/discover/\(media)?api_key=\(key)&\(query)&language=en-US&page=1"), media: media)
+        return parseDiscover(await get("/discover/\(media)?api_key=\(key)&\(query)&language=en-US&page=1", publicCatalog: true), media: media)
     }
 
     /// A followed person's best-known work for a For You row: acting plus directing and writing credits,
@@ -388,8 +387,8 @@ enum TMDBClient {
     /// left out (they list every guest spot, not the person's work). Fail-soft: [].
     static func personTopTitles(id: Int, limit: Int = 20) async -> [MetaPreview] {
         guard id > 0 else { return [] }
-        let key = ApiKeys.effectiveTMDBKey()
-        guard let obj = await get("/person/\(id)/combined_credits?api_key=\(key)") else { return [] }
+        let key = ApiKeys.bundledTMDBKey
+        guard let obj = await get("/person/\(id)/combined_credits?api_key=\(key)", publicCatalog: true) else { return [] }
         let cast = (obj["cast"] as? [[String: Any]]) ?? []
         let crew = ((obj["crew"] as? [[String: Any]]) ?? []).filter {
             ["Directing", "Writing"].contains($0["department"] as? String ?? "")
@@ -414,7 +413,7 @@ enum TMDBClient {
     /// "Top New": the most popular movies + shows released in the last `newWindowMonths`, merged and
     /// resolved to tt previews. Sorted by popularity (what's hot right now among recent releases).
     static func topNewTitles(region: String = deviceRegion, limit: Int = 24) async -> [MetaPreview] {
-        let key = ApiKeys.effectiveTMDBKey()
+        let key = ApiKeys.bundledTMDBKey
         let (from, to) = newWindow()
         async let movieRows = discoverRecentPage(media: "movie", sort: "popularity.desc", from: from, to: to, region: region, key: key)
         async let tvRows = discoverRecentPage(media: "tv", sort: "popularity.desc", from: from, to: to, region: region, key: key)
@@ -424,7 +423,7 @@ enum TMDBClient {
     /// "New": the freshest movies + shows by release / air date (newest first) within the last
     /// `newWindowMonths`, merged and resolved to tt previews. This is the "just landed" rail.
     static func justNewTitles(region: String = deviceRegion, limit: Int = 24) async -> [MetaPreview] {
-        let key = ApiKeys.effectiveTMDBKey()
+        let key = ApiKeys.bundledTMDBKey
         let (from, to) = newWindow()
         async let movieRows = discoverRecentPage(media: "movie", sort: "primary_release_date.desc", from: from, to: to, region: region, key: key)
         async let tvRows = discoverRecentPage(media: "tv", sort: "first_air_date.desc", from: from, to: to, region: region, key: key)
@@ -490,10 +489,22 @@ enum TMDBClient {
         var resolved: [(Int, MetaPreview)] = []
         var addonGated = 0
         var transientDropped = 0
+        let clock = ContinuousClock()
+        let externalIDDeadline = clock.now + .seconds(15)
         for start in stride(from: 0, to: slice.count, by: 6) {
-            if resolved.count >= limit { break }
+            if resolved.count >= limit || Task.isCancelled { break }
+            if clock.now >= externalIDDeadline {
+                transientDropped += slice.count - start
+                break
+            }
             let batch = Array(slice[start..<min(start + 6, slice.count)])
-            let part: [(Int, RowResult)] = await withTaskGroup(of: (Int, RowResult).self) { group in
+            let part: [(Int, RowResult)] = await withTaskGroup(of: (Int, RowResult)?.self) { group in
+                // Share one deadline across the page and cancel outstanding URLSession work when it fires.
+                group.addTask {
+                    try? await clock.sleep(until: externalIDDeadline, tolerance: .zero)
+                    return nil
+                }
+                defer { group.cancelAll() }
                 for (offset, row) in batch.enumerated() {
                     let i = start + offset
                     group.addTask {
@@ -513,9 +524,14 @@ enum TMDBClient {
                     }
                 }
                 var out: [(Int, RowResult)] = []
-                for await r in group { out.append(r) }
+                for await result in group {
+                    guard let result else { break }
+                    out.append(result)
+                    if out.count == batch.count { break }
+                }
                 return out
             }
+            transientDropped += batch.count - part.count
             for (i, result) in part {
                 switch result {
                 case .kept(let meta):    resolved.append((i, meta))
@@ -538,7 +554,8 @@ enum TMDBClient {
     private static func resolveExternalID(media: String, tmdbID: Int, key: String) async -> CatalogRowResolution.ExternalIDResolution {
         let path = "/\(media)/\(tmdbID)/external_ids?api_key=\(key)"
         for attempt in 0..<2 {
-            switch await getResult(path) {
+            guard !Task.isCancelled else { return .unresolved }
+            switch await getResult(path, publicCatalog: true) {
             case .ok(let obj):
                 if let imdb = obj["imdb_id"] as? String, imdb.hasPrefix("tt") { return .imdb(imdb) }
                 return .none
@@ -565,7 +582,7 @@ enum TMDBClient {
     private static func discoverGenrePage(media: String, genreID: Int, key: String) async -> [DiscoverRow] {
         let path = "/discover/\(media)?api_key=\(key)&with_genres=\(genreID)"
             + "&sort_by=popularity.desc&vote_count.gte=50&language=en-US&page=1"
-        return parseDiscover(await get(path), media: media)
+        return parseDiscover(await get(path, publicCatalog: true), media: media)
     }
 
     /// One TMDB discover page bounded by a release/air-date window, with the given sort (popularity for Top
@@ -575,7 +592,7 @@ enum TMDBClient {
         let dateField = media == "tv" ? "first_air_date" : "primary_release_date"
         let path = "/discover/\(media)?api_key=\(key)&sort_by=\(sort)&\(dateField).gte=\(from)&\(dateField).lte=\(to)"
             + "&vote_count.gte=20&watch_region=\(region)&language=en-US&page=1"
-        return parseDiscover(await get(path), media: media)
+        return parseDiscover(await get(path, publicCatalog: true), media: media)
     }
 
     /// Decode a TMDB discover/results payload into `DiscoverRow`s (id + title/name + poster).
@@ -610,7 +627,7 @@ enum TMDBClient {
         let family = providerFamilyMembers(canonicalProviderID(providerID)).map(String.init).joined(separator: "%7C")
         let path = "/discover/\(media)?api_key=\(key)&watch_region=\(region)&with_watch_providers=\(family)"
             + "&with_watch_monetization_types=\(streamingMonetizationTypes)&sort_by=popularity.desc&language=en-US&page=1"
-        guard let obj = await get(path), let results = obj["results"] as? [[String: Any]] else { return [] }
+        guard let obj = await get(path, publicCatalog: true), let results = obj["results"] as? [[String: Any]] else { return [] }
         return results.compactMap { r in
             guard let id = r["id"] as? Int else { return nil }
             let name = (r["title"] as? String) ?? (r["name"] as? String) ?? ""
@@ -765,9 +782,9 @@ enum TMDBClient {
     private static let canonicalDisplayName: [Int: String] = [531: "Paramount+", 2336: "JioHotstar"]
 
     private static func providerPage(media: String, region: String?) async -> [(tile: ProviderTile, priority: Int)] {
-        let key = ApiKeys.effectiveTMDBKey()
+        let key = ApiKeys.bundledTMDBKey
         let regionParam = region.map { "&watch_region=\($0)" } ?? ""   // nil => the GLOBAL list (no region filter)
-        guard let obj = await get("/watch/providers/\(media)?api_key=\(key)\(regionParam)"),
+        guard let obj = await get("/watch/providers/\(media)?api_key=\(key)\(regionParam)", publicCatalog: true),
               let results = obj["results"] as? [[String: Any]] else { return [] }
         return results.compactMap { p in
             guard let id = p["provider_id"] as? Int, let name = p["provider_name"] as? String else { return nil }
@@ -828,10 +845,10 @@ enum TMDBClient {
     /// a region's rank is the best (lowest) `display_priorities` value it reaches across the family and both
     /// media. `.failed` only when BOTH listing fetches fail (a real transient outage).
     fileprivate static func fetchProviderRegions(canonicalID: Int) async -> CatalogRowResolution.ProviderRegionLookup {
-        let key = ApiKeys.effectiveTMDBKey()
+        let key = ApiKeys.bundledTMDBKey
         let family = Set(providerFamilyMembers(canonicalID))
-        async let movieFetch = getResult("/watch/providers/movie?api_key=\(key)")
-        async let tvFetch = getResult("/watch/providers/tv?api_key=\(key)")
+        async let movieFetch = getResult("/watch/providers/movie?api_key=\(key)", publicCatalog: true)
+        async let tvFetch = getResult("/watch/providers/tv?api_key=\(key)", publicCatalog: true)
         let movieResult = await movieFetch, tvResult = await tvFetch
         var bestPriority: [String: Int] = [:]
         var anyOK = false
@@ -871,11 +888,12 @@ enum TMDBClient {
     /// for the hub grids that render an honest empty message. Native list endpoints are IMDb-keyed, so no
     /// provider `tmdb:` fallback applies here.
     static func listPage(path: String, region: String = deviceRegion, page: Int = 1, limit: Int = 40) async -> (items: [MetaPreview], cause: CatalogRowResolution.CatalogEmptyCause?) {
-        let key = ApiKeys.effectiveTMDBKey()
+        let key = ApiKeys.bundledTMDBKey
         guard !key.isEmpty else { return ([], .missingKey) }
         let media = path.contains("/tv") ? "tv" : "movie"
         let full = "\(path)?api_key=\(key)&language=en-US&page=\(page)&region=\(region)"
-        return await resolveDiscoverResult(await getResult(full), media: media, key: key, limit: limit, providerFallback: false)
+        return await resolveDiscoverResult(await getResult(full, publicCatalog: true), media: media, key: key,
+                                           limit: limit, providerFallback: false)
     }
 
     /// One TMDB /discover page with arbitrary extra params (with_watch_providers / with_genres / sort_by /
@@ -889,10 +907,11 @@ enum TMDBClient {
     /// (region-empty vs a 429 / offline / parse failure vs rows that were all filtered / add-on gated) rather
     /// than always blaming the region.
     static func discoverPage(media: String, extra: String, region: String = deviceRegion, page: Int = 1, limit: Int = 40, providerFallback: Bool = false) async -> (items: [MetaPreview], cause: CatalogRowResolution.CatalogEmptyCause?) {
-        let key = ApiKeys.effectiveTMDBKey()
+        let key = ApiKeys.bundledTMDBKey
         guard !key.isEmpty else { return ([], .missingKey) }
         let full = "/discover/\(media)?api_key=\(key)&language=en-US&watch_region=\(region)&page=\(page)&\(extra)"
-        return await resolveDiscoverResult(await getResult(full), media: media, key: key, limit: limit, providerFallback: providerFallback)
+        return await resolveDiscoverResult(await getResult(full, publicCatalog: true), media: media, key: key,
+                                           limit: limit, providerFallback: providerFallback)
     }
 
     /// Turn a typed fetch result into (items, cause): a fetch failure maps straight to its cause; a 200 is
@@ -903,7 +922,8 @@ enum TMDBClient {
             return ([], CatalogRowResolution.bucketEmptyCause(noUsableKey: false, fetchFailure: fetchCause(error),
                                                               rowsSeen: 0, survivors: 0, droppedAddonGated: 0, droppedTransient: 0))
         case .ok(let obj):
-            let outcome = await resolveRowsDetailed(parseDiscover(obj, media: media), key: key, limit: limit, providerFallback: providerFallback)
+            let outcome = await resolveRowsDetailed(parseDiscover(obj, media: media), key: key, limit: limit,
+                                                    providerFallback: providerFallback)
             let cause = CatalogRowResolution.bucketEmptyCause(noUsableKey: false, fetchFailure: nil,
                                                               rowsSeen: outcome.rowsSeen, survivors: outcome.items.count,
                                                               droppedAddonGated: outcome.droppedAddonGated, droppedTransient: outcome.droppedTransient)
@@ -915,7 +935,7 @@ enum TMDBClient {
     /// bucket (movie bucket preferred; TV when the genre is movies-only), as a w780 URL. One discover call,
     /// fail-soft to nil. Lets the Collections-hub genre tiles show real artwork instead of a flat gradient.
     static func genreBackdrop(movieGenre: Int?, tvGenre: Int?, keyword: Int?, lang: String?, region: String = deviceRegion) async -> String? {
-        let key = ApiKeys.effectiveTMDBKey()
+        let key = ApiKeys.bundledTMDBKey
         let media = movieGenre != nil ? "movie" : "tv"
         let genreID = movieGenre ?? tvGenre
         var parts = ["api_key=\(key)", "sort_by=popularity.desc", "watch_region=\(region)",
@@ -923,7 +943,7 @@ enum TMDBClient {
         if let genreID { parts.append("with_genres=\(genreID)") }
         if let keyword { parts.append("with_keywords=\(keyword)") }
         if let lang { parts.append("with_original_language=\(lang)") }
-        guard let obj = await get("/discover/\(media)?" + parts.joined(separator: "&")),
+        guard let obj = await get("/discover/\(media)?" + parts.joined(separator: "&"), publicCatalog: true),
               let results = obj["results"] as? [[String: Any]] else { return nil }
         // First result that actually carries a backdrop; the scrim in the tile keeps the label legible.
         let bd = results.compactMap { $0["backdrop_path"] as? String }.first
@@ -935,9 +955,9 @@ enum TMDBClient {
     /// fail-soft to nil. The direct mirror of `genreBackdrop` for the Discover tiles. The scrim in the tile
     /// keeps the label legible.
     static func listBackdrop(path: String, region: String = deviceRegion) async -> String? {
-        let key = ApiKeys.effectiveTMDBKey()
+        let key = ApiKeys.bundledTMDBKey
         let full = "\(path)?api_key=\(key)&language=en-US&page=1&region=\(region)"
-        guard let obj = await get(full), let results = obj["results"] as? [[String: Any]] else { return nil }
+        guard let obj = await get(full, publicCatalog: true), let results = obj["results"] as? [[String: Any]] else { return nil }
         let bd = results.compactMap { $0["backdrop_path"] as? String }.first
         return bd.map { "https://image.tmdb.org/t/p/w780\($0)" }
     }
@@ -957,7 +977,7 @@ enum TMDBClient {
         guard let url = comps.url else { return nil }
         var req = URLRequest(url: url)
         VortXEdgeAuth.sign(&req)
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+        guard let (data, resp) = try? await catalogSession.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
         // The edge returns the poster PATH: a JSON object carrying it (path / poster_path / cover), or the bare
         // path as the response body. Prepend the w500 image base unless it is already an absolute URL.
@@ -1557,14 +1577,14 @@ enum TMDBClient {
     private static var edgeBase: String { RemoteConfig.snapshot.catalogsEndpoint.absoluteString }
 
     /// Single fetch choke point. ROUTE by whether the user supplied their OWN TMDB key:
-    ///   - user key present -> talk to TMDB directly (the path already carries their key);
+    ///   - user key present -> talk to TMDB directly, with a bounded edge fallback for public metadata;
     ///   - no user key      -> route through the keyless edge (it injects its own key + caches), signed so
     ///                          the gate attributes the call to VortX. The bundled key is stripped from the
     ///                          path on this route; if the edge is unreachable we fall back to TMDB direct
     ///                          with the bundled key (the path still carries it) so the hub degrades, never
     ///                          dies. `path` is "/...?api_key=<effective>&...".
-    private static func get(_ path: String) async -> [String: Any]? {
-        if case .ok(let obj) = await getResult(path) { return obj }
+    private static func get(_ path: String, publicCatalog: Bool = false) async -> [String: Any]? {
+        if case .ok(let obj) = await getResult(path, publicCatalog: publicCatalog) { return obj }
         return nil
     }
 
@@ -1575,25 +1595,96 @@ enum TMDBClient {
     enum FetchError: Equatable { case transport, rateLimited, http(Int), parse }
     enum FetchResult { case ok([String: Any]); case failure(FetchError) }
 
-    /// Typed twin of `get`, same routing: user key -> TMDB direct; no key -> keyless edge, and on an edge
-    /// failure fall back to bundled-key direct (that direct attempt is the reported result, so a transient
-    /// error reflects the last word).
-    static func getResult(_ path: String) async -> FetchResult {
-        if ApiKeys.tmdbKey() != nil {
-            return await fetchResult(URL(string: host + path), sign: false)
+    // A slow direct connection should not make every card and external-ID batch pay the same timeout.
+    // Back off briefly after a successful public-edge fallback and retry direct on a later request.
+    private actor CatalogDirectBackoff {
+        private var recovery: (key: SHA256.Digest, retryAfter: ContinuousClock.Instant)?
+
+        func prefersEdge(for key: SHA256.Digest) -> Bool {
+            guard let recovery, recovery.key == key else { return false }
+            return ContinuousClock.now < recovery.retryAfter
+        }
+
+        func recordEdgeRecovery(for key: SHA256.Digest) {
+            recovery = (key, ContinuousClock.now.advanced(by: .seconds(60)))
+        }
+
+        func recordDirectRecovery(for key: SHA256.Digest) {
+            if recovery?.key == key { recovery = nil }
+        }
+    }
+
+    private static let catalogDirectBackoff = CatalogDirectBackoff()
+    private static let catalogSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 8
+        config.timeoutIntervalForResource = 10
+        return URLSession(configuration: config)
+    }()
+
+    /// For public metadata, try the custom key directly, then try the keyless VortX catalog edge
+    /// on failure. A successful empty result is still authoritative. Other paths keep direct routing.
+    static func getResult(_ path: String, publicCatalog: Bool = false) async -> FetchResult {
+        let session = publicCatalog ? catalogSession : URLSession.shared
+        let customKey = ApiKeys.tmdbKey()
+        let directURL = publicCatalog ? catalogDirectURL(forPath: path, customKey: customKey) : URL(string: host + path)
+        if let customKey {
+            guard publicCatalog, let edge = edgeURL(forPath: path) else {
+                return await fetchResult(directURL, sign: false, session: session)
+            }
+            let key = SHA256.hash(data: Data(customKey.utf8))
+            if await catalogDirectBackoff.prefersEdge(for: key) {
+                let alternate = await fetchResult(edge, sign: true, session: session)
+                if case .ok = alternate { return alternate }
+                let direct = await fetchResult(directURL, sign: false, session: session)
+                if case .ok = direct { await catalogDirectBackoff.recordDirectRecovery(for: key) }
+                return direct
+            }
+            let direct = await fetchResult(directURL, sign: false, session: session)
+            guard !Task.isCancelled else { return direct }
+            guard case .failure(let error) = direct else {
+                await catalogDirectBackoff.recordDirectRecovery(for: key)
+                return direct
+            }
+            let alternate = await fetchResult(edge, sign: true, session: session)
+            if case .ok = alternate {
+                if shouldBackOffCatalogDirect(after: error) { await catalogDirectBackoff.recordEdgeRecovery(for: key) }
+                return alternate
+            }
+            return direct
         }
         if let edgeURL = edgeURL(forPath: path) {
-            let edge = await fetchResult(edgeURL, sign: true)
+            let edge = await fetchResult(edgeURL, sign: true, session: session)
             if case .ok = edge { return edge }
+            if Task.isCancelled { return edge }
         }
-        return await fetchResult(URL(string: host + path), sign: false)   // edge down -> bundled-key direct
+        return await fetchResult(directURL, sign: false, session: session)
+    }
+
+    private static func shouldBackOffCatalogDirect(after error: FetchError) -> Bool {
+        switch error {
+        case .transport, .rateLimited: return true
+        case .http(let status): return status == 401 || status == 403 || (500..<600).contains(status)
+        case .parse: return false
+        }
+    }
+
+    /// Public paths contain only the bundled key and catalog filters. Inject the custom key only after
+    /// choosing the official direct host, using a query item so its bytes cannot create extra parameters.
+    private static func catalogDirectURL(forPath path: String, customKey: String?) -> URL? {
+        guard let customKey else { return URL(string: host + path) }
+        guard var comps = URLComponents(string: host + path) else { return nil }
+        var query = (comps.queryItems ?? []).filter { $0.name.caseInsensitiveCompare("api_key") != .orderedSame }
+        query.append(URLQueryItem(name: "api_key", value: customKey))
+        comps.queryItems = query
+        return comps.url
     }
 
     /// Build the edge URL for a TMDB path: prefix /3 (already in `host` for direct calls) and DROP the
     /// `api_key` param, since the worker injects its own key server-side.
     private static func edgeURL(forPath path: String) -> URL? {
         guard var comps = URLComponents(string: edgeBase + path) else { return nil }
-        comps.queryItems = (comps.queryItems ?? []).filter { $0.name != "api_key" }
+        comps.queryItems = (comps.queryItems ?? []).filter { $0.name.caseInsensitiveCompare("api_key") != .orderedSame }
         if comps.queryItems?.isEmpty == true { comps.queryItems = nil }
         return comps.url
     }
@@ -1608,12 +1699,12 @@ enum TMDBClient {
     /// GET + decode JSON to a TYPED result: `.ok` on a 200 with a JSON object, else `.failure` classifying
     /// WHY (a thrown request -> transport, HTTP 429 -> rateLimited, other non-200 -> http, a 200 whose body
     /// is not a JSON object -> parse). Signs the edge host exactly like `fetchJSON`.
-    private static func fetchResult(_ url: URL?, sign: Bool) async -> FetchResult {
-        guard let url else { return .failure(.transport) }
+    private static func fetchResult(_ url: URL?, sign: Bool, session: URLSession = .shared) async -> FetchResult {
+        guard !Task.isCancelled, let url else { return .failure(.transport) }
         var req = URLRequest(url: url)
         if sign { VortXEdgeAuth.sign(&req) }
         do {
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await session.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             guard code == 200 else { return .failure(code == 429 ? .rateLimited : .http(code)) }
             guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {

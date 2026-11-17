@@ -152,6 +152,24 @@ enum PosterArtwork {
         return XRDB.imageURL(id: id, fallback: fallback)
     }
 
+    /// Wide cards with an IMDb id draw their own ratings over clean artwork. For other ids,
+    /// keep the configured renderer available since the native rating service only accepts IMDb ids.
+    static func landscapePosters(id: String?, originals: [String?]) -> (urls: [String], ratedPoster: String?) {
+        guard let id else { return (ArtworkFallbackPolicy.candidates(originals), nil) }
+        if id.hasPrefix("tt") {
+            let metahub = "https://images.metahub.space/poster/medium/\(id)/img"
+            return (ArtworkFallbackPolicy.candidates(originals + [metahub]), nil)
+        }
+        let original = originals.compactMap { $0 }.first { !$0.isEmpty }
+        guard isWrappableRawArt(original), bakesRatings(forID: id),
+              let ratedPoster = poster(id: id, fallback: nil) else {
+            return (ArtworkFallbackPolicy.candidates(originals), nil)
+        }
+        // The original is tried separately, so a renderer's missing-art redirect cannot
+        // make the original look like it came from the renderer.
+        return (ArtworkFallbackPolicy.candidates([ratedPoster] + originals), ratedPoster)
+    }
+
     /// Whether `url` is one of the raw, id-derivable art forms our baking service can safely re-render from:
     /// the metahub poster CDN and the TMDB image CDN. Those are clean base images with no baked overlays, so
     /// wrapping one only adds our rating. Any OTHER host is the add-on's own poster (often already baked by a

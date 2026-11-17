@@ -26,7 +26,9 @@ struct PersonView: View {
     // The filmography grid derives its column width from the user's Poster Style preset, so it stays in
     // lockstep with the hub grids (both platforms do this; PosterCard[iOS] read the same preset for card width).
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
+    #if os(tvOS)
     @ObservedObject private var apiKeys = ApiKeys.shared
+    #endif
     #if os(iOS)
     @Environment(\.horizontalSizeClass) private var hSize
     #endif
@@ -298,7 +300,7 @@ struct PersonView: View {
         // by id); portrait keeps the preset poster width.
         let minTrack = iOSPillMetrics.gridPosterWidth(preset: catalogPrefs.posterWidth, compact: isCompact,
                                                       container: viewportWidth,
-                                                      landscape: catalogPrefs.landscapeCards && apiKeys.hasTMDB)
+                                                      landscape: catalogPrefs.landscapeCards)
         return [GridItem(.adaptive(minimum: minTrack), spacing: Theme.Space.sm, alignment: .top)]
     }
 
