@@ -47,6 +47,10 @@ jobs:
             exit 1
           fi
           case "$GITHUB_REF:$RELEASE_TAG" in
+            refs/tags/v0.5.7:*|*:v0.5.7)
+              [[ "$GITHUB_REF:$RELEASE_TAG" == refs/tags/v0.5.7:v0.5.7 &&
+                 "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REPOSITORY" == VortXTV/VortX &&
+                 "$GITHUB_SHA" == "$source_commit" ]] || { echo '::error::0.5.7 requires the exact stable workflow and source'; exit 1; } ;;
             refs/tags/v0.5.6-beta.13:*|*:v0.5.6-beta.13)
               echo "::error::Beta 13 packages must come from the exact protected candidate"; exit 1 ;;
             refs/tags/v0.5.6-beta.14:*|*:v0.5.6-beta.14)
@@ -229,7 +233,8 @@ jobs:
           github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' ||
           github.ref == 'refs/tags/v0.5.6-beta.14-candidate.3' ||
           github.ref == 'refs/tags/v0.5.6-beta.14-candidate.4' ||
-          github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6'
+          github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6' ||
+          github.ref == 'refs/tags/v0.5.7'
         working-directory: android
         timeout-minutes: 15
         env:
@@ -268,7 +273,8 @@ jobs:
           github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' ||
           github.ref == 'refs/tags/v0.5.6-beta.14-candidate.3' ||
           github.ref == 'refs/tags/v0.5.6-beta.14-candidate.4' ||
-          github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6'
+          github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6' ||
+          github.ref == 'refs/tags/v0.5.7'
         working-directory: android
         timeout-minutes: 20
         env:
@@ -292,7 +298,8 @@ jobs:
             downloads.DownloadedSeasonBoundaryTest
           )
           if [[ "$GITHUB_REF" == refs/tags/v0.5.6-beta.14-candidate.[34] ||
-                "$GITHUB_REF" == refs/tags/v0.5.6-beta.15-candidate.6 ]]; then
+                "$GITHUB_REF" == refs/tags/v0.5.6-beta.15-candidate.6 ||
+                "$GITHUB_REF" == refs/tags/v0.5.7 ]]; then
             suites+=(
               diagnostics.DiagnosticExportTest
               profile.ProfileSelectionWiringTest
@@ -305,7 +312,7 @@ jobs:
               sync.VortXQrJoinFlowTest
             )
           fi
-          if [[ "$GITHUB_REF" == refs/tags/v0.5.6-beta.15-candidate.6 ]]; then
+          if [[ "$GITHUB_REF" == refs/tags/v0.5.6-beta.15-candidate.6 || "$GITHUB_REF" == refs/tags/v0.5.7 ]]; then
             test -s "$VORTX_JNI_LIBRARY" && test ! -L "$VORTX_JNI_LIBRARY"
             test "$(sha256sum "$VORTX_JNI_LIBRARY" | cut -d' ' -f1)" = "$VORTX_JNI_EXPECTED_SHA256"
             export VORTX_JNI_SYNC=1
@@ -313,6 +320,9 @@ jobs:
               player.PlayerRecoveryParityTest
               engine.NativeDurableWatchReceiptJniTest
             )
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/v0.5.7 ]]; then
+            suites+=(player.PlayerTvExitContractTest)
           fi
           reports=app/build/test-results/testPlayDebugUnitTest
           filters=()
