@@ -485,6 +485,10 @@ fun PlayerScreen(
     // on TV any D-pad press while hidden re-reveals (consumed, so a blind press never fires an invisible
     // control). The error overlay and the selection sheets are NOT gated (see PlayerChrome).
     var controlsVisible by remember(playbackSessionKey) { mutableStateOf(true) }
+    // Dismiss the HUD on the first Back press; a subsequent Back press while hidden exits the player.
+    BackHandler(enabled = controlsVisible && !controlsLocked && !playerExitRequested) {
+        controlsVisible = false
+    }
     // Monotonic interaction counter: bumping it restarts the auto-hide countdown without toggling
     // visibility (the timer effect keys on it).
     var controlsInteractionTick by remember(playbackSessionKey) { mutableStateOf(0) }
@@ -2421,6 +2425,10 @@ fun PlayerScreen(
                     showControls()
                     true
                 } else {
+                    if (event.key == Key.Escape && !controlsLocked) {
+                        controlsVisible = false
+                        return@onKeyEvent true
+                    }
                     // A key travelling through while the chrome is up (D-pad focus moves between the
                     // buttons bubble up here unconsumed) counts as interaction: re-arm the hide timer.
                     controlsInteractionTick++
