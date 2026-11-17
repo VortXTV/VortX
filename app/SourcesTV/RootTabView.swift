@@ -141,7 +141,6 @@ struct RootView: View {
     @EnvironmentObject private var profiles: ProfileStore
     private var core: CoreBridge { CoreBridge.shared }   // actions only; not observed, so engine events do not re-render it
     @ObservedObject private var router = DeepLinkRouter.shared   // parked `vortx://` destination (Top Shelf taps)
-    @State private var splashDone = false
     @StateObject private var profileAuthentication = AccountAuthenticationPresentation()
     @ObservedObject private var playbackQueue = PlaybackTitleQueue.shared
     @State private var presentedShellCover: ShellCover?
@@ -180,11 +179,9 @@ struct RootView: View {
 
     var body: some View {
         ZStack {
-            // Brand canvas behind everything, so the moment between the splash fading
-            // and the profile picker animating in shows the app's own background, never
-            // a flash of the main profile's Home underneath.
+            // Keep the brand canvas visible while the profile picker presents so Home cannot flash underneath.
             Theme.Palette.canvas.ignoresSafeArea()
-            RootTabView(launchReady: splashDone && shellVisible)
+            RootTabView(launchReady: shellVisible)
                 // Keep profile/account boundary invalidation mounted while the player covers the shell.
                 .modifier(PlaybackTitleQueueBoundaryObserver())
                 .opacity(shellVisible ? 1 : 0)
@@ -251,19 +248,11 @@ struct RootView: View {
                              onClose: { core.unloadEnginePlayer(); presenter.close(requestID: req.id) })
                     .id(req.id)   // clean player teardown per request
             }
-            // The launch splash sits above everything for its ~2 seconds. It has no
-            // focusable content, so the focus engine settles on the shell underneath
-            // and nothing fights it; the profile picker waits for it (binding below).
-            if !splashDone {
-                SplashView { splashDone = true }
-                    .zIndex(10)
-            }
         }
         .fullScreenCover(isPresented: pickerPresented) {
             ProfilePickerView(authentication: profileAuthentication, pickerPresentation: profiles.pickerPresentation())
         }
         .onAppear { syncShellCover() }
-        .onChange(of: splashDone) { _, _ in syncShellCover() }
         .onChange(of: playbackQueue.change) { _, _ in syncShellCover() }
         .onChange(of: router.detailTarget) { _, _ in syncShellCover() }
         // Re-sync the bar's visibility after playback ends: two shots, because the desync can
@@ -304,7 +293,7 @@ struct RootView: View {
 
     private var pickerPresented: Binding<Bool> {
         Binding(
-            get: { profileAuthentication.blocksDismissal || (splashDone && profiles.needsPicker && presenter.request == nil) },
+            get: { profileAuthentication.blocksDismissal || (profiles.needsPicker && presenter.request == nil) },
             set: { presented in
                 guard !profileAuthentication.blocksDismissal else { return }
                 if !presented { profiles.pickedThisLaunch = true }
@@ -375,21 +364,21 @@ struct RootView: View {
         if let presented = presentedShellCover {
             switch presented {
             case .deepLink(let target):
-                guard splashDone, shellVisible, router.detailTarget == target else {
+                guard shellVisible, router.detailTarget == target else {
                     beginHostDismissal(); return
                 }
             case .queueDetail(let route):
-                guard splashDone, shellVisible, playbackQueue.route?.id == route.id else {
+                guard shellVisible, playbackQueue.route?.id == route.id else {
                     beginHostDismissal(); return
                 }
             case .queueEditor(let id):
-                guard splashDone, shellVisible, playbackQueue.editorID == id else {
+                guard shellVisible, playbackQueue.editorID == id else {
                     beginHostDismissal(); return
                 }
             }
             return
         }
-        guard splashDone, shellVisible else { return }
+        guard shellVisible else { return }
         let next: ShellCover?
         if let route = playbackQueue.route {
             next = .queueDetail(route)

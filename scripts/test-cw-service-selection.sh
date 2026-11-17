@@ -42,7 +42,8 @@ if (!shelfPublisher.includes('TopShelfSnapshotWriter.publishCurrent()')) {
   throw new Error('Home must republish from its exact rendered shelf key');
 }
 const app = read('app/SourcesTV/VortXTVApp.swift');
-if (!block(app, 'if phase == .background').includes('TopShelfSnapshotWriter.publishCurrent()')) {
+const shell = block(app, 'private struct WindowShell: View');
+if (!block(shell, 'if phase == .background').includes('TopShelfSnapshotWriter.publishCurrent()')) {
   throw new Error('Direct TV Home/background must publish without closing the player');
 }
 writeFileSync(`${dir}/FixtureContinueWatchingFocus.swift`, 'import Foundation\nenum FixtureContinueWatchingFocus {\n' +

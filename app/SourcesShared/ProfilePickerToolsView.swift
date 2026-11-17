@@ -36,37 +36,49 @@ struct ProfilePickerToolsView: View {
                         .font(Theme.Typography.body)
                         .foregroundStyle(Theme.Palette.textSecondary)
                     accountFileActions
-                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                        Text("Export diagnostic logs").font(Theme.Typography.eyebrow)
-                        DiagnosticLogExportButton(grant: route.diagnostics)
-                            .disabled(!route.diagnostics.permitsExport)
-                            #if os(tvOS)
-                            .focused($focused, equals: .diagnostics)
-                            #endif
-                        Text(route.diagnostics.permitsExport
-                            ? "Save a troubleshooting log to share with support. Review the file before sharing."
-                            : "Unlock a profile to export logs. This remains available when profiles fail to open.")
-                            .font(Theme.Typography.label)
-                            .foregroundStyle(Theme.Palette.textSecondary)
-                    }
-                    .toolsFocusSection()
-                    Button("Back") { close() }
-                        .buttonStyle(ChipButtonStyle())
-                        .accessibilityIdentifier("profile-tools-back")
-                        .accessibilityHint("Return to the profile picker. Any pending file action is cancelled.")
-                        #if os(macOS)
-                        .keyboardShortcut(.cancelAction)
-                        #endif
-                        #if os(tvOS)
-                        .focused($focused, equals: .back)
-                        #endif
+                    #if !os(tvOS)
+                    diagnosticsSection
+                    #endif
+                    #if os(iOS)
+                    backButton
+                    #endif
                 }
                 .padding(Theme.Space.xl)
                 .frame(maxWidth: 760, alignment: .leading)
                 .frame(maxWidth: .infinity)
+                #if !os(macOS)
                 .frame(minHeight: geometry.size.height, alignment: .top)
+                #endif
             }
+            #if os(tvOS)
+            // Keep diagnostics beside Back and directly above the first backup action. A remote
+            // should never have to cross a long stretch of nonfocusable instructions to get out.
+            .safeAreaInset(edge: .top, spacing: 0) {
+                HStack(spacing: Theme.Space.md) {
+                    backButton
+                    diagnosticsButton
+                }
+                .frame(maxWidth: 760, alignment: .leading)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, Theme.Space.sm)
+                .focusSection()
+                .background(Theme.Palette.canvas)
+            }
+            #elseif os(macOS)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                backButton
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, Theme.Space.xl)
+                    .padding(.vertical, Theme.Space.sm)
+                    .background(Theme.Palette.canvas)
+            }
+            #endif
         }
+        #if os(macOS)
+        // A sheet sizes itself from this view. The flexible reader and scroll view
+        // need a viewport that fits inside the smallest supported app window.
+        .frame(width: 640, height: 520)
+        #endif
         .background(Theme.Palette.canvas.ignoresSafeArea())
         // Explicit Back always remains available, including while a provider ignores cancellation.
         .interactiveDismissDisabled(true)
@@ -106,6 +118,40 @@ struct ProfilePickerToolsView: View {
         }
         .onExitCommand { close() }
         #endif
+    }
+
+    private var diagnosticsButton: some View {
+        DiagnosticLogExportButton(grant: route.diagnostics)
+            .disabled(!route.diagnostics.permitsExport)
+            #if os(tvOS)
+            .focused($focused, equals: .diagnostics)
+            #endif
+    }
+
+    #if !os(tvOS)
+    private var diagnosticsSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            Text("Export diagnostic logs").font(Theme.Typography.eyebrow)
+            diagnosticsButton
+            Text(route.diagnostics.permitsExport
+                ? "Save a troubleshooting log to share with support. Review the file before sharing."
+                : "Unlock a profile to export logs. This remains available when profiles fail to open.")
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textSecondary)
+        }
+    }
+    #endif
+
+    private var backButton: some View {
+        Button("Back") { close() }
+            .buttonStyle(ChipButtonStyle())
+            .accessibilityIdentifier("profile-tools-back")
+            .accessibilityHint("Return to the profile picker. Any pending file action is cancelled.")
+            #if os(macOS)
+            .keyboardShortcut(.cancelAction)
+            #elseif os(tvOS)
+            .focused($focused, equals: .back)
+            #endif
     }
 
     private var accountFileActions: some View {

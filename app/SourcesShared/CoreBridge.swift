@@ -3011,12 +3011,13 @@ final class CoreBridge: ObservableObject {
     /// library is already loaded this returns immediately without re-dispatching.
     @MainActor
     func loadLibraryAndAwait(timeout: TimeInterval = 6) async {
+        guard !Task.isCancelled else { return }
         if library == nil { loadLibrary() }
         let deadlineNanos = UInt64(timeout * 1_000_000_000)
         let stepNanos: UInt64 = 200_000_000   // 0.2s poll cadence
         var elapsed: UInt64 = 0
         while library == nil, elapsed < deadlineNanos {
-            try? await Task.sleep(nanoseconds: stepNanos)
+            do { try await Task.sleep(nanoseconds: stepNanos) } catch { return }
             elapsed += stepNanos
         }
     }

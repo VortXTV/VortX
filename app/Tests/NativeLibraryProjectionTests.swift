@@ -80,6 +80,8 @@ private final class CurrentProjection {
     private var values: [String: VortxJSON]
     private var metadataLibraryMembership = VortxLibraryMembership()
     private var generations: [String: UUID] = [:]
+    private var tasks: [String: Task<Void, Never>] = [:]
+    private var failure: String?
     private var closed = false
     // Exact optional generic production hook, left nil in this RAM projection fixture.
     // No concrete Facade alias or typed source-event identity is manufactured here.
@@ -106,10 +108,18 @@ private final class CurrentProjection {
     }
     func fields(_ state: VortxJSON) throws -> VortxJSON {
         let fields = try stateFields(state)
+        values["native_state"] = state
         fields.forEach { values[$0.key] = $0.value }
         return .object(fields)
     }
     func library(_ state: VortxJSON, request: VortxJSON?) -> VortxJSON? { libraryProjection(state: state, request: request) }
+    func loadLibrary(_ request: VortxJSON) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let name = "Load", model = "LibraryWithFilters", field = "library"
+        let action = VortxJSON.object(["args": .object(["args": .object(["request": request])])])
+        // PRODUCTION_LIBRARY_LOAD
+        return false
+    }
     func search(_ state: VortxJSON, query: String, limit: Int) -> VortxJSON? { localSearchProjection(state: state, query: query, maxResults: limit) }
     func resourceDetail(_ id: String, stale: Bool = false) -> VortxJSON? {
         let ticket = UUID()
@@ -121,6 +131,7 @@ private final class CurrentProjection {
     // PRODUCTION_CURRENT_MANAGEMENT
     // PRODUCTION_CURRENT
     // PRODUCTION_CURRENT_PUBLICATION
+    // PRODUCTION_LIBRARY_RECEIPT
 }
 
 private final class BaselineProjection {
@@ -425,6 +436,23 @@ private final class BaselineProjection {
               && recorder.ownedReceipts[1].sequence > recorder.ownedReceipts[0].sequence,
               "equal new resource publication carries an owned receipt without a legacy duplicate")
         print("PASS optional ChangeReceipt publication: RAM fixture receives frozen presentation values")
+        let libraryRecorder = PublicationRecorder()
+        let libraryProjection = CurrentProjection(playback: playback, recorder: libraryRecorder)
+        _ = try libraryProjection.fields(document)
+        let seededLibrary = libraryProjection.captureHostChange(fields: ["library"])!
+        check(libraryProjection.loadLibrary(request("lastwatched", type: nil)), "equal library load is admitted")
+        check(libraryProjection.acceptsChange(seededLibrary, field: "library"), "equal load preserves seeded library receipt")
+        check(libraryRecorder.ownedReceipts.isEmpty && libraryRecorder.legacyEvents.isEmpty,
+              "equal load emits no redundant callbacks")
+        check(libraryProjection.loadLibrary(request("name", type: nil)), "changed library sort is admitted")
+        let sortedLibrary = libraryRecorder.ownedReceipts.last!
+        check(!libraryProjection.acceptsChange(seededLibrary, field: "library")
+              && libraryProjection.acceptsChange(sortedLibrary, field: "library")
+              && libraryRecorder.legacyEvents == [["library"]], "changed sort publishes a replacement receipt to both consumers")
+        check(libraryProjection.loadLibrary(request("name", type: nil))
+              && libraryProjection.acceptsChange(sortedLibrary, field: "library")
+              && libraryRecorder.ownedReceipts.count == 1, "equal sort refresh preserves pending library publication")
+        print("PASS Library load preserves the seeded receipt and replaces it on an actual change")
         if ProcessInfo.processInfo.environment["VORTX_LIBRARY_PROJECTION_FUNCTIONAL_ONLY"] == "1" { return }
 
         // Worst-shaped ordinary library: every saved row is also in a long CW array.
