@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -393,10 +394,10 @@ class NativeBeta11Contract(NativeBeta7Contract):
     def test_historical_six_pair_and_job_contracts_remain_required(self):
         pass  # Covered once by NativeBeta7Contract with the five beta 7 targets.
 
-    def test_current_native_project_uses_all_six_exact_versioned_targets(self):
+    def test_frozen_native_project_uses_all_six_exact_versioned_targets(self):
         root = Path(__file__).resolve().parents[2]
-        project = (root / "app/project.yml").read_text()
-        gradle = (root / "android/app/build.gradle.kts").read_text()
+        project = subprocess.check_output(["git", "show", f"{self.tag}:app/project.yml"], cwd=root, text=True)
+        gradle = subprocess.check_output(["git", "show", f"{self.tag}:android/app/build.gradle.kts"], cwd=root, text=True)
         builds = re.findall(r'^\s*CURRENT_PROJECT_VERSION:\s*"?([0-9]+)"?\s*$', project, re.M)
         self.assertEqual(MODULE.source_versions(project, gradle, "0.5.6", self.tag), builds[0])
         self.assertEqual(len(builds), 6)
@@ -631,8 +632,8 @@ class NativeBeta15Contract(NativeBeta12Contract):
 
     def test_exact_frozen_project_build(self):
         root = Path(__file__).resolve().parents[2]
-        project = (root / "app/project.yml").read_text()
-        gradle = (root / "android/app/build.gradle.kts").read_text()
+        project = subprocess.check_output(["git", "show", f"{self.candidate}:app/project.yml"], cwd=root, text=True)
+        gradle = subprocess.check_output(["git", "show", f"{self.candidate}:android/app/build.gradle.kts"], cwd=root, text=True)
         self.assertEqual(MODULE.source_versions(project, gradle, "0.5.6", self.tag), self.build)
 
     def test_previous_beta15_candidate_cannot_supply_either_original_build(self):
