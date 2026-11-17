@@ -426,8 +426,27 @@ jobs:
               python3 -B -c "import runpy; runpy.run_path('scripts/verify-protected-apple-aether.py')['identity']()" ;;
           esac
 
+      - name: Verify protected stable 0.5.7 dispatch
+        if: github.ref == 'refs/tags/v0.5.7' || inputs.release_tag == 'v0.5.7'
+        env:
+          DISPATCH_INPUTS_JSON: ${{ toJSON(inputs) }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/tags/v0.5.7
+          jq -e '
+            ({recovery_source_commit:"", resume_handoff:"", mpvkit_artifacts_url:"",
+              mpvkit_artifacts_sha256:"", altstore_note:""} + .) as $actual |
+            ($actual.release_id | type == "string" and test("^[1-9][0-9]*$")) and
+            ($actual.altstore_note | type == "string") and
+            ($actual | del(.release_id, .altstore_note)) == {
+              native_only:true, publish_release:false, publish_existing_055:false, tvos_test_only:false,
+              apple_only:false, release_tag:"v0.5.7", recovery_source_commit:"",
+              resume_handoff:"", mpvkit_artifacts_url:"", mpvkit_artifacts_sha256:""
+            }' <<< "$DISPATCH_INPUTS_JSON" >/dev/null
+          python3 -B -c "import runpy; runpy.run_path('scripts/verify-protected-apple-aether.py')['identity']()"
+
       - name: Verify protected Apple legacy archive recovery
-        if: github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' || github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6'
+        if: github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' || github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6' || github.ref == 'refs/tags/v0.5.7'
         timeout-minutes: 10
         run: bash scripts/test-native-migration-phase-a.sh bootstrap
 
@@ -579,7 +598,7 @@ jobs:
           echo "tvos_sdk=$TVOS_SDK" >> "$GITHUB_OUTPUT"
 
       - name: Verify protected Apple update checking and presentation
-        if: github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6'
+        if: github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6' || github.ref == 'refs/tags/v0.5.7'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -592,7 +611,7 @@ jobs:
           echo 'Apple update checker and presentation contracts: verified'
 
       - name: Verify protected Apple trailer seek containment
-        if: github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6'
+        if: github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6' || github.ref == 'refs/tags/v0.5.7'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -604,7 +623,7 @@ jobs:
           "$work/preview-seek-tests"
 
       - name: Verify protected Apple short playback history
-        if: github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6'
+        if: github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6' || github.ref == 'refs/tags/v0.5.7'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -939,14 +958,16 @@ jobs:
         if: github.event_name == 'workflow_dispatch' &&
           (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' ||
            github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' || github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' ||
-           github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6')
+           github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6' || github.ref == 'refs/tags/v0.5.7')
         run: |
           set -euo pipefail
-          jq -e '.inputs == {
-            native_only:true, publish_release:false, publish_existing_055:false,
-            tvos_test_only:false, apple_only:false, release_tag:"", recovery_source_commit:"",
-            resume_handoff:"", mpvkit_artifacts_url:"", mpvkit_artifacts_sha256:"", release_id:"", altstore_note:""
-          }' out/native-ci-dispatch.json >/dev/null
+          if [ "$GITHUB_REF" != refs/tags/v0.5.7 ]; then
+            jq -e '.inputs == {
+              native_only:true, publish_release:false, publish_existing_055:false,
+              tvos_test_only:false, apple_only:false, release_tag:"", recovery_source_commit:"",
+              resume_handoff:"", mpvkit_artifacts_url:"", mpvkit_artifacts_sha256:"", release_id:"", altstore_note:""
+            }' out/native-ci-dispatch.json >/dev/null
+          fi
           test "$BUILD_SOURCE_SHA" = "$GITHUB_SHA"
           PACKAGES="$(mktemp -d "$RUNNER_TEMP/aether-protected-packages.XXXXXXXX")"
           EVIDENCE="$(mktemp -d "$RUNNER_TEMP/aether-protected-evidence.XXXXXXXX")"
@@ -1361,7 +1382,8 @@ jobs:
              { [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.12-candidate.3 ] ||
                [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.13-candidate.1 ] ||
                [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.14-candidate.2 ] ||
-               [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.15-candidate.6 ]; }; then
+               [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.15-candidate.6 ] ||
+               [ "${GITHUB_REF:-}" = refs/tags/v0.5.7 ]; }; then
             python3 scripts/verify-protected-apple-aether.py --sign-macos --key macos \
               --packages "$AETHER_RELEASE_PACKAGES" --lock "$AETHER_RELEASE_LOCK" \
               --resolution-receipt "$AETHER_RELEASE_EVIDENCE/aether-resolved.json" \
@@ -1399,7 +1421,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' &&
           (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' ||
            github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' || github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' ||
-           github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6')
+           github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6' || github.ref == 'refs/tags/v0.5.7')
         run: |
           set -euo pipefail
           check_app() {
@@ -1665,7 +1687,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' &&
           (github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3' ||
            github.ref == 'refs/tags/v0.5.6-beta.13-candidate.1' || github.ref == 'refs/tags/v0.5.6-beta.14-candidate.2' ||
-           github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6')
+           github.ref == 'refs/tags/v0.5.6-beta.15-candidate.6' || github.ref == 'refs/tags/v0.5.7')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-Apple-Aether-release-evidence
@@ -2280,10 +2302,15 @@ jobs:
           RELEASE_ID: ${{ steps.identity.outputs.release_id }}
           EXPECTED_ACTIVE: ${{ steps.identity.outputs.expected_active }}
           APPLE_ONLY: ${{ steps.identity.outputs.apple_only }}
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
           RELEASE_FEED_RECEIPT_SECRET: ${{ secrets.RELEASE_FEED_RECEIPT_SECRET }}
         run: |
           set -euo pipefail
-          [ -n "${RELEASE_FEED_RECEIPT_SECRET:-}" ] || { echo "::error::RELEASE_FEED_RECEIPT_SECRET is not configured"; exit 1; }
+          if [ "$TAG" = v0.5.7 ]; then
+            [ "$PUBLISH_RELEASE" = false ] || { echo "::error::0.5.7 requires the separate combined release coordinator"; exit 1; }
+          else
+            [ -n "${RELEASE_FEED_RECEIPT_SECRET:-}" ] || { echo "::error::RELEASE_FEED_RECEIPT_SECRET is not configured"; exit 1; }
+          fi
           cmp -s feed-artifact/SHA256SUMS-ci.txt out/SHA256SUMS-ci.txt || { echo "::error::feed checksum file differs from the trusted build handoff"; exit 1; }
           for KEY_FILE in \
             "ios:out/VortX-iOS-$TAG-ci.ipa" \
@@ -2351,6 +2378,21 @@ jobs:
               jq -e --arg name "$NAME" --arg sha "$EXPECTED_SHA" '.assets | map(select(.name == $name and .state == "uploaded" and ((.digest // "") | sub("^sha256:"; "") | ascii_downcase) == $sha)) | length == 1' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::Android release asset does not match its checksum: $NAME"; exit 1; }
             done
           fi
+          verify_attached_apple_assets() {
+            local asset_id_file asset_id file
+            for asset_id_file in "$IOS_ID:out/$IOS_NAME" "$TVOS_ID:out/$TVOS_NAME" "$LITE_ID:out/$LITE_NAME" "$MAC_ID:out/$MAC_NAME" "$CHECKSUM_ID:out/SHA256SUMS-ci.txt"; do
+              asset_id="${asset_id_file%%:*}"; file="${asset_id_file#*:}"
+              gh api -H 'Accept: application/octet-stream' -- "repos/$GH_REPO/releases/assets/$asset_id" > "$RUNNER_TEMP/draft-$asset_id"
+              cmp -s "$file" "$RUNNER_TEMP/draft-$asset_id" || { echo "::error::authenticated draft bytes differ for asset $asset_id"; exit 1; }
+            done
+          }
+          if [ "$TAG" = v0.5.7 ]; then
+            verify_attached_apple_assets
+            # The worker seals the first staged receipt for a tag. The 0.5.7 coordinator
+            # stages only the combined Apple and Android feed after checking this draft.
+            echo "draft release $RELEASE_ID has all verified Apple assets; feed staging follows combined verification"
+            exit 0
+          fi
           jq --arg rid "$RELEASE_ID" --arg iid "$IOS_ID" --arg tid "$TVOS_ID" --arg lid "$LITE_ID" --arg mid "$MAC_ID" \
             '.releaseId = $rid | .assets.ios.assetId = ($iid | tonumber) | .assets.tvos.assetId = ($tid | tonumber) | .assets.tvosLite.assetId = ($lid | tonumber) | .assets.mac.assetId = ($mid | tonumber) | .assets[] .state = "uploaded"' \
             feed-artifact/manifest.json > "$RUNNER_TEMP/receipt-manifest.json"
@@ -2371,11 +2413,7 @@ jobs:
               exit 1
             }
           jq -e --arg generation "$(jq -er '.generation' feed-artifact/manifest.json)" '.staged == true and .generation == $generation' <<<"$RECEIPT_RESPONSE" >/dev/null
-          for ASSET_ID_FILE in "$IOS_ID:out/$IOS_NAME" "$TVOS_ID:out/$TVOS_NAME" "$LITE_ID:out/$LITE_NAME" "$MAC_ID:out/$MAC_NAME" "$CHECKSUM_ID:out/SHA256SUMS-ci.txt"; do
-            ASSET_ID="${ASSET_ID_FILE%%:*}"; FILE="${ASSET_ID_FILE#*:}"
-            gh api -H 'Accept: application/octet-stream' -- "repos/$GH_REPO/releases/assets/$ASSET_ID" > "$RUNNER_TEMP/draft-$ASSET_ID"
-            cmp -s "$FILE" "$RUNNER_TEMP/draft-$ASSET_ID" || { echo "::error::authenticated draft bytes differ for asset $ASSET_ID"; exit 1; }
-          done
+          verify_attached_apple_assets
           {
             echo "FEED_GENERATION=$(jq -er '.generation' feed-artifact/manifest.json)"
             echo "IOS_ASSET_ID=$IOS_ID"; echo "TVOS_ASSET_ID=$TVOS_ID"; echo "LITE_ASSET_ID=$LITE_ID"; echo "MAC_ASSET_ID=$MAC_ID"; echo "CHECKSUM_ASSET_ID=$CHECKSUM_ID"
@@ -2386,7 +2424,7 @@ jobs:
           fi
 
       - name: Atomically activate the staged feed, prove routes, then publish last
-        if: inputs.publish_release == true
+        if: inputs.publish_release == true && inputs.release_tag != 'v0.5.7'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
