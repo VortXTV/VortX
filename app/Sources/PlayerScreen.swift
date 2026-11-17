@@ -10124,7 +10124,11 @@ struct PlayerScreen: View {
 
     private var skipSharesChrome: Bool {
         #if os(macOS)
-        return true
+        // On macOS the skip pill shares chrome positioning, but only while chrome is already
+        // visible. Returning true unconditionally forced the pill on screen even when chrome
+        // was auto-hidden, and each button tap called scheduleHide() which set controlsVisible
+        // back to true, keeping the chrome (and cursor) permanently visible on series content.
+        return controlsVisible
         #else
         return false
         #endif
@@ -12732,6 +12736,13 @@ struct PlayerScreen: View {
                 guard controlsAutoHideEligible else { hideTask = nil; return }
                 if ProcessInfo.processInfo.systemUptime < controlsHideClock.deadline { continue }
                 withAnimation(.easeInOut(duration: 0.2)) { controlsVisible = false }
+                #if os(macOS)
+                // Hide the system cursor when chrome auto-hides. setHiddenUntilMouseMoves is a
+                // one-shot: AppKit restores the cursor on the next mouse move, which also fires
+                // macPointerMoved() and brings the chrome back, keeping the two in sync.
+                // No matching unhide() call is needed (the two APIs are not reference-counted).
+                NSCursor.setHiddenUntilMouseMoves(true)
+                #endif
                 hideTask = nil
                 return
             }
