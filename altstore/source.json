@@ -18,6 +18,16 @@
       "screenshotURLs": [],
       "versions": [
         {
+          "version": "0.5.7",
+          "buildVersion": "302",
+          "date": "2026-11-17",
+          "localizedDescription": "Account recovery, offline playback, AetherEngine and browsing improvements.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.5.7/VortX-iOS-v0.5.7-ci.ipa",
+          "size": 70046400,
+          "sha256": "cb51cc821f0aaa7e48e41ca29432faf5456e47fd687194a149886d834045a1bc",
+          "minOSVersion": "16.0"
+        },
+        {
           "version": "0.5.6",
           "buildVersion": "301",
           "date": "2026-11-16",
@@ -86,16 +96,6 @@
           "size": 65723116,
           "sha256": "54837c4e490acbf02610193764dc92cdfbe14d32ad547171b72a838fec4652b8",
           "minOSVersion": "16.0"
-        },
-        {
-          "version": "0.4.0",
-          "buildVersion": "253",
-          "date": "2026-10-01",
-          "localizedDescription": "Beta 17: resume recovery, binge playback, cancellable skip controls, subtitles, and Android fixes.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.17/VortX-iOS-v0.4.0-beta.17-ci.ipa",
-          "size": 65679291,
-          "sha256": "b01e3ae89a9e3d7b40cb374e1551557be0e367330a23ec2acb460f610b886278",
-          "minOSVersion": "16.0"
         }
       ]
     },
@@ -110,6 +110,16 @@
       "category": "entertainment",
       "screenshotURLs": [],
       "versions": [
+        {
+          "version": "0.5.7",
+          "buildVersion": "302",
+          "date": "2026-11-17",
+          "localizedDescription": "Account recovery, offline playback, AetherEngine and browsing improvements.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.5.7/VortX-tvOS-v0.5.7-ci.ipa",
+          "size": 65110700,
+          "sha256": "a72d1b2d2c81d70b9ec19b307c48da388f12a2b547b9c7d2103acfdf4f2e2408",
+          "minOSVersion": "18.0"
+        },
         {
           "version": "0.5.6",
           "buildVersion": "301",
@@ -178,16 +188,6 @@
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.18/VortX-tvOS-v0.4.0-beta.18-ci.ipa",
           "size": 65323426,
           "sha256": "96a4e5e1ccadbd62aa19d4522f598828029dc6cb71fac2a13b1101c577453bd3",
-          "minOSVersion": "18.0"
-        },
-        {
-          "version": "0.4.0",
-          "buildVersion": "253",
-          "date": "2026-10-01",
-          "localizedDescription": "Beta 17: resume recovery, binge playback, cancellable skip controls, subtitles, and Android fixes.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.17/VortX-tvOS-v0.4.0-beta.17-ci.ipa",
-          "size": 65270673,
-          "sha256": "aba43949b0cb7e5cdf7d94f3a71b49b74b8869eb945a0e740600bc6d4a1a61af",
           "minOSVersion": "18.0"
         }
       ]
