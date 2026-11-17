@@ -1242,6 +1242,47 @@ function rosterForSettingsWrite(
   return order.map((id) => byId.get(id)!);
 }
 
+/** Write metadata API keys. Once an app has published doc.nativeProviderCredentials, doc.apiKeys.<key> and
+ *  doc.apiKeys.metadata.<key> are only mirrors of its last-writer-wins registers, and the apps refuse the whole
+ *  account (invalid_snapshot) when a mirror disagrees with its register (VortXSyncManager.mergedNativeProviderState).
+ *  A web edit therefore writes a newer register under this page's actor and keeps both mirrors equal to it.
+ *  A carrier in any other shape belongs to a newer app and stays opaque: only the mirrors are written. */
+export function writeApiKeys(doc: Record<string, unknown>, edits: Record<string, string | null>, actor: string): void {
+  const apiKeys = doc.apiKeys && typeof doc.apiKeys === "object" ? { ...(doc.apiKeys as Record<string, unknown>) } : {};
+  const metadata = apiKeys.metadata && typeof apiKeys.metadata === "object"
+    ? { ...(apiKeys.metadata as Record<string, unknown>) } : undefined;
+  for (const [key, value] of Object.entries(edits)) {
+    if (value) apiKeys[key] = value;
+    else delete apiKeys[key];
+    if (metadata) {
+      if (value) metadata[key] = value;
+      else delete metadata[key];
+    }
+  }
+  if (metadata) apiKeys.metadata = metadata;
+  const carrier = doc.nativeProviderCredentials;
+  const root = carrier && typeof carrier === "object" && !Array.isArray(carrier) ? carrier as Record<string, unknown> : null;
+  const fields = root?.fields && typeof root.fields === "object" && !Array.isArray(root.fields)
+    ? { ...(root.fields as Record<string, unknown>) } : null;
+  if (root && fields && root.schemaVersion === 1 && typeof root.scope === "string") {
+    if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(actor)) throw new Error("This page has no valid sync actor; key edit remains queued.");
+    let clock = 0;
+    for (const raw of Object.values(fields)) {
+      const register = raw as { clock?: unknown } | null;
+      if (!register || typeof register.clock !== "number" || !Number.isSafeInteger(register.clock) || register.clock < 0) {
+        throw new Error("The account's provider keys are not in a known format; key edit remains queued.");
+      }
+      clock = Math.max(clock, register.clock);
+    }
+    for (const [key, value] of Object.entries(edits)) {
+      if (clock >= Number.MAX_SAFE_INTEGER) throw new Error("The account's provider key clock is exhausted; key edit remains queued.");
+      fields[key] = { clock: ++clock, actor, value };
+    }
+    doc.nativeProviderCredentials = { ...root, fields };
+  }
+  doc.apiKeys = apiKeys;
+}
+
 /** Push the changed webapp settings up to the MAIN profile via doc.profileEdits (dashboard-compatible shape).
  *  Delta-merges the main settings onto the latest effective app plus web roster, preserving unrelated
  *  profile edits and settings. Profile settings no-op when there is no synced main profile, while
@@ -1279,19 +1320,10 @@ async function pushSettings(
     }
 
     if (changed.has("tmdbKey") || changed.has("mdblistKey")) {
-      const apiKeys =
-        doc.apiKeys && typeof doc.apiKeys === "object"
-          ? { ...(doc.apiKeys as Record<string, unknown>) }
-          : {};
-      if (changed.has("tmdbKey")) {
-        if (s.tmdbKey) apiKeys.tmdb = s.tmdbKey;
-        else delete apiKeys.tmdb;
-      }
-      if (changed.has("mdblistKey")) {
-        if (s.mdblistKey) apiKeys.mdblist = s.mdblistKey;
-        else delete apiKeys.mdblist;
-      }
-      doc.apiKeys = apiKeys;
+      const edits: Record<string, string | null> = {};
+      if (changed.has("tmdbKey")) edits.tmdb = s.tmdbKey || null;
+      if (changed.has("mdblistKey")) edits.mdblist = s.mdblistKey || null;
+      writeApiKeys(doc, edits, journalPageId);
     }
   }, isCurrent);
 }
