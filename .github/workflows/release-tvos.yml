@@ -135,7 +135,7 @@ jobs:
           set -euo pipefail
           node "$RUNNER_TEMP/publication-055.mjs" publish "$RUNNER_TEMP/publication-plan.json" e0ca40062d06f3b49cc2b7153fa944157249cd6fc3c6febf01958495b7201dc2 "$RUNNER_TEMP/publication-result.json"
       - name: Retain the public-only publication receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: VortX-055-publication-receipt
           path: ${{ runner.temp }}/publication-result.json
@@ -777,7 +777,7 @@ jobs:
       # artifacts, and never expand the immutable app/feed/release asset lists.
       - name: Retain account backup ABI evidence
         if: ${{ always() && steps.account_backup_abi.outcome != 'skipped' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: VortX-account-backup-abi-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/account-backup-abi-evidence/*.json
@@ -1517,7 +1517,7 @@ jobs:
       - name: Upload the immutable app handoff
         id: apps_handoff
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: VortX-tvOS-ci
           path: |
@@ -1536,7 +1536,7 @@ jobs:
       - name: Upload the immutable feed handoff
         id: feed_handoff
         if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: VortX-release-feed
           path: feed-artifact

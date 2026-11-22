@@ -68,7 +68,7 @@ jobs:
           bash scripts/native-media-hosted/build.sh apple 2>&1 | tee _build/native-media/apple/build.log
       - name: Retain candidate and evidence even after failure
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: native-media-apple-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -135,7 +135,7 @@ jobs:
           bash scripts/native-media-hosted/build.sh android 2>&1 | tee _build/native-media/android/build.log
       - name: Retain candidate and evidence even after failure
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: native-media-android-${{ github.run_id }}-${{ github.run_attempt }}
           path: _build/native-media/android/*

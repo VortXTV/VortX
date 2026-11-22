@@ -249,7 +249,7 @@ jobs:
 
       - name: Retain native sync pretag JUnit before owner-history execution
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: VortX-Android-native-sync-host-tests
           path: |
@@ -296,7 +296,7 @@ jobs:
 
       - name: Retain actual host integration JUnit and bounded provenance
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: VortX-Android-owner-history-host-tests
           path: |
@@ -390,14 +390,14 @@ jobs:
           echo "play flavor is clean of libmpv/ffmpeg GPL native libs"
 
       - name: Upload full-flavor APK
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: VortX-Android-full-debug
           path: android/app/build/outputs/apk/full/debug/*.apk
           if-no-files-found: error
 
       - name: Upload play-flavor APK
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: VortX-Android-play-debug
           path: android/app/build/outputs/apk/play/debug/*.apk
@@ -539,7 +539,7 @@ jobs:
 
       - name: Upload signed release APK
         if: steps.signing.outputs.ready == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: VortX-Android-full-release-signed
           path: android/app/build/outputs/apk/full/release/*.apk
@@ -547,7 +547,7 @@ jobs:
 
       - name: Upload signed release AAB
         if: steps.signing.outputs.ready == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: VortX-Android-full-release-bundle
           path: android/app/build/outputs/bundle/fullRelease/*.aab
